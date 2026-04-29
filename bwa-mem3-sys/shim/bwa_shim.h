@@ -88,6 +88,29 @@ void           bwa_shim_batch_free      (BwaBatch *b);
 const char *bwa_shim_last_error(void);
 void        bwa_shim_set_verbosity(int level);
 
+/* Shared-memory index lifecycle. Thin wrappers over bwa-mem3's bwa_shm.h
+ * (POSIX shm_open + a control segment named "/bwactl"). The shim's
+ * `bwa_shim_idx_load` already attaches transparently when a segment named
+ * after the prefix is staged; these entry points expose stage / drop /
+ * list / probe to the Rust caller. */
+
+/* Returns 1 if an index keyed by `prefix`'s basename is currently staged,
+ * 0 if not, -1 on registry-access error. */
+int bwa_shim_shm_test(const char *prefix);
+
+/* Loads the index at `prefix` from disk, packs it, and stages it under
+ * `/bwaidx-<basename>`. Returns 0 on success or if the prefix was already
+ * staged, -1 on error. */
+int bwa_shim_shm_stage(const char *prefix);
+
+/* Drops every staged index segment plus the control segment. Returns 0
+ * on success, -1 on error. Idempotent. */
+int bwa_shim_shm_destroy(void);
+
+/* Prints `<basename>\t<bytes>\n` for every staged segment to stdout (matches
+ * `bwa shm -l`). Returns 0 on success, -1 on registry-access error. */
+int bwa_shim_shm_list(void);
+
 /* Set the @RG ID emitted as `RG:Z:` on all records. `id` may be NULL to
  * clear. Internally sets bwa-mem3's `bwa_rg_id[256]` global, which is
  * process-wide; callers aligning with different read groups from

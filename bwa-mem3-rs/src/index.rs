@@ -18,6 +18,18 @@ impl BwaIndex {
     ///
     /// `prefix` is the path without extension; bwa-mem3 appends its own
     /// suffixes (`.bwt.2bit.64`, `.ann`, `.pac`, etc) internally.
+    ///
+    /// If a shared-memory segment for `prefix` is staged (see
+    /// [`crate::shm::stage`]), bwa-mem3 transparently attaches to it
+    /// instead of reading from disk. Callers that want fail-fast on a
+    /// missing segment should probe first:
+    ///
+    /// ```ignore
+    /// if !bwa_mem3_rs::shm::is_staged(&prefix)? {
+    ///     anyhow::bail!("index not staged in shm");
+    /// }
+    /// let idx = bwa_mem3_rs::BwaIndex::load(&prefix)?;
+    /// ```
     pub fn load(prefix: impl AsRef<Path>) -> Result<Self> {
         let path = prefix.as_ref();
         let s = path
