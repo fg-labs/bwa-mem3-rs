@@ -1,0 +1,23 @@
+# Development environment for the bwa-mem3 Python bindings.
+# Use `pixi run develop` to build a release extension into the env, then
+# `pixi run test` to run pytest. End users do not need pixi — they
+# install via `pip install bwa-mem3` (once published) or build from
+# source with `pip install ./bwa-mem3-py`.
+
+[workspace]
+authors = ["Nils Homer <nilshomer@gmail.com>"]
+channels = ["conda-forge"]
+name = "bwa-mem3-py"
+platforms = ["osx-arm64", "osx-64", "linux-aarch64", "linux-64"]
+version = "0.1.0"
+
+[dependencies]
+python = ">=3.11,<3.13"
+pip = "*"
+maturin = ">=1.5,<2"
+pytest = ">=7"
+
+[tasks]
+develop = { cmd = "maturin develop --release", description = "Build & install the extension into this env" }
+build   = { cmd = "maturin build --release",   description = "Build a wheel into target/wheels" }
+test    = { cmd = "pytest tests -v",          depends-on = ["develop"], description = "Run pytest after rebuilding" }

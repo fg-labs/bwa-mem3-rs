@@ -7,3 +7,17 @@ Cargo.lock.bak
 
 # Local-only superpowers notes (specs/plans live outside version control).
 /docs/superpowers/
+
+# Python / pixi artifacts (bwa-mem3-py). Cargo.lock and pixi.lock ARE
+# committed for reproducible wheel builds.
+/bwa-mem3-py/target/
+/bwa-mem3-py/.pixi/
+/bwa-mem3-py/dist/
+/bwa-mem3-py/build/
+# `maturin develop` drops the editable extension here.
+/bwa-mem3-py/python/bwa_mem3/*.so
+/bwa-mem3-py/python/bwa_mem3/*.dylib
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/

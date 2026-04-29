@@ -1,0 +1,25 @@
+[package]
+name = "bwa-mem3-py"
+description = "Python bindings for bwa-mem3-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/fg-labs/bwa-mem3-rs"
+authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
+publish = false
+
+# Standalone crate — intentionally NOT part of the cargo workspace at the
+# repo root. Building the Python wheel goes through `maturin`, which
+# resolves `bwa-mem3-rs` via the path dependency below. The empty
+# `[workspace]` opts this Cargo.toml out of the parent workspace.
+[workspace]
+
+[lib]
+name = "bwa_mem3"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+bwa-mem3-rs = { path = "../bwa-mem3-rs", version = "0.1.1" }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
