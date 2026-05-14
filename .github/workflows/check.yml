@@ -78,11 +78,14 @@ jobs:
         run: |
           set -euo pipefail
           sha="$(cat bwa-mem3-sys/vendor/COMMIT)"
-          # Blobless single-commit clone of the SHA we vendored. Avoids
-          # pulling the full upstream history every CI run.
-          git clone --filter=blob:none --no-tags --no-checkout \
-            https://github.com/fg-labs/bwa-mem3.git /tmp/bwa-mem3
-          git -C /tmp/bwa-mem3 checkout "$sha"
+          # Blobless + depth-1 fetch of just the SHA we vendored — avoids
+          # pulling the full upstream commit graph every CI run. Requires
+          # `uploadpack.allowAnySHA1InWant` on the remote, which GitHub
+          # enables by default.
+          git init /tmp/bwa-mem3
+          git -C /tmp/bwa-mem3 remote add origin https://github.com/fg-labs/bwa-mem3.git
+          git -C /tmp/bwa-mem3 fetch --filter=blob:none --no-tags --depth=1 origin "$sha"
+          git -C /tmp/bwa-mem3 checkout FETCH_HEAD
           git -C /tmp/bwa-mem3 submodule update --init --recursive --depth 1
           # Single-arch build: PhiX e2e doesn't need the multi-SIMD
           # launcher (which compiles 5 variants).
