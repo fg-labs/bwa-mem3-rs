@@ -81,7 +81,6 @@ bwa-mem3's internal `mem_aln_t.cigar` uses opcode table `MIDSH` (M=0 I=1 D=2 S=3
 
 - `main.cpp` — CLI entry point
 - `bwtindex.cpp` — index builder (not our concern)
-- `runsimd.cpp` — unguarded `int main()` collides with Rust test harness
 - `bam_writer.cpp`, `meth_bam.cpp` — htslib-dependent; shim emits BAM directly
 - `fm_index_writer.cpp`, `index_prelude.cpp`, `libsais_build.cpp` — index builder
 
@@ -92,6 +91,23 @@ re-enable any of them, restore the relevant submodule first (or
 `scripts/refresh-bwa-mem3.sh`'s `DROP_SUBTREES`).
 
 `fastmap.cpp` is built (was previously excluded) so `libbwa-mem3.a` exports `worker_alloc` / `worker_free`. Its `main_mem` entry point doesn't clash with Rust's test harness.
+
+`runsimd.cpp` is gone in bwa-mem3 v0.2.0 — the multi-binary launcher (`bwa-mem3.<tier>` companions) was replaced by single-binary SIMD dispatch in `simd_dispatch.cpp`. The build no longer needs to skip an unguarded `main()`.
+
+### 9. Per-tier kernel build on x86_64 (v0.2.0+)
+
+bwa-mem3 v0.2.0 splits four SIMD-bearing TUs — `bandedSWA.cpp`, `kswv.cpp`,
+`ksw.cpp`, `sam_encode.cpp` — into per-tier kernel compilations. On x86_64
+each is compiled once per tier (`sse41`, `sse42`, `avx`, `avx2`, `avx512bw`)
+with `-DKERNEL_VARIANT=_<tier>` plus the tier's `-m...` flag set; `kernel_dispatch.h`
+mangles every exported symbol to `<name><tier>`. `simd_dispatch.cpp` (compiled
+once at the baseline) provides unmangled wrappers (`make_banded_pair_wise_sw`,
+`make_kswv`, `ksw_extend2`, `sam_encode_seq_fwd`, …) that pick a tier at
+runtime via `__builtin_cpu_supports`. `build.rs` walks
+`KERNEL_TIERS_X86` to emit the five `bwa-mem3-kernel-<tier>` archives and
+excludes the kernel TUs from the baseline build. On aarch64, kernel TUs are
+compiled once with `KERNEL_VARIANT` unset and the dispatcher's `#else` branch
+calls them directly.
 
 ## Commit / PR conventions
 

@@ -110,7 +110,7 @@ typedef struct mem_opt_t {
     int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
     int    meth_mode;       // 1 = bisulfite mode (--meth); implies bam_mode
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
-    int    meth_no_chim;    // 1 to skip the longest-M <44% chimera heuristic
+    int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
 } mem_opt_t;
 
@@ -228,6 +228,13 @@ typedef struct
     SMEM    *lockstep_prev[MAX_THREADS];
     SMEM    *lockstep_match_buf[MAX_THREADS];
     int64_t  lockstep_buf_cap[MAX_THREADS];
+
+    // Pointer into worker_t::ref_string (the unpacked .0123 reference).
+    // Set once in the worker_aln/worker_sam entry points; lets helpers like
+    // mem_seed_sw and the mem_matesw_* family invoke bns_fetch_seq_v2 without
+    // threading ref_string through 8 function signatures. Read-only and
+    // shared across threads — every thread sees the same pointer.
+    uint8_t *ref_string;
 } mem_cache;
 
 // chain moved to .h

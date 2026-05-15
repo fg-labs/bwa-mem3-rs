@@ -3,6 +3,37 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Kernel TUs: bwa-mem3 v0.2.0 compiles these once per SIMD tier on x86_64
+/// (`sse41`, `sse42`, `avx`, `avx2`, `avx512bw`) with `-DKERNEL_VARIANT=_<tier>`
+/// so each per-tier compile emits mangled symbols (`make_kswv_kernel_avx2`,
+/// `ksw_extend2_avx2`, …). The dispatcher wrappers in `simd_dispatch.cpp` (no
+/// `KERNEL_VARIANT`) provide unmangled entry points that pick a tier at runtime.
+///
+/// On arm64 there is only the NEON tier; `simd_dispatch.cpp` calls the unmangled
+/// kernels directly, and the kernels are compiled with `KERNEL_VARIANT` unset.
+const KERNEL_SRCS: &[&str] = &["bandedSWA.cpp", "kswv.cpp", "ksw.cpp", "sam_encode.cpp"];
+
+/// Per-tier ISA flags for the x86_64 kernel multi-build. Mirrors upstream's
+/// `KERNEL_FLAGS_<tier>` groups in `vendor/bwa-mem3/Makefile`. `-mprefer-vector-
+/// width=256` is included for `avx512bw` to match upstream's autovec cap.
+const KERNEL_TIERS_X86: &[(&str, &[&str])] = &[
+    ("sse41", &["-msse4.1"]),
+    ("sse42", &["-msse4.2", "-mpopcnt"]),
+    ("avx", &["-mavx", "-mpopcnt"]),
+    ("avx2", &["-mavx", "-mavx2", "-mpopcnt"]),
+    (
+        "avx512bw",
+        &[
+            "-mavx",
+            "-mavx2",
+            "-mavx512f",
+            "-mavx512bw",
+            "-mpopcnt",
+            "-mprefer-vector-width=256",
+        ],
+    ),
+];
+
 #[allow(clippy::too_many_lines)]
 fn main() {
     // Match cc's deployment target to cargo's to avoid SIGBUS on macOS arm64.
@@ -109,14 +140,52 @@ fn main() {
         }
     }
 
-    // 4b. bwa-mem3 + shim: C++.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let is_x86 = target_arch == "x86_64";
+
+    // 4b. Per-tier kernel TUs (x86_64 only). bwa-mem3 v0.2.0 picks the
+    // matching tier at runtime in `simd_dispatch.cpp`; we must supply all
+    // five mangled tier copies of bandedSWA/kswv/ksw/sam_encode so the
+    // dispatcher's `make_bsw_kernel_<tier>` / `ksw_extend2_<tier>` /
+    // `sam_encode_seq_fwd_<tier>` references resolve at link time.
+    if is_x86 {
+        for (tier, isa_flags) in KERNEL_TIERS_X86 {
+            let mut k_build = cc::Build::new();
+            k_build.cpp(true);
+            for src in KERNEL_SRCS {
+                k_build.file(vendor_src.join(src));
+            }
+            if ssl.is_dir() {
+                k_build.include(ssl.join("include"));
+            }
+            if s2n.is_dir() {
+                k_build.include(&s2n);
+            }
+            k_build.include(manifest.join("shim"));
+            k_build.include(&vendor_src);
+            for flag in *isa_flags {
+                k_build.flag_if_supported(flag);
+            }
+            k_build.std("c++17");
+            k_build.define("ENABLE_PREFETCH", None);
+            k_build.define("V17", Some("1"));
+            k_build.define("MATE_SORT", Some("0"));
+            // kernel_dispatch.h mangles every exported kernel symbol to
+            // `<name><KERNEL_VARIANT>` (e.g. `_avx2`). The dispatcher in
+            // simd_dispatch.cpp expects this exact suffix per tier.
+            k_build.define("KERNEL_VARIANT", Some(format!("_{}", tier).as_str()));
+            apply_common_warning_silencing(&mut k_build);
+            k_build.compile(&format!("bwa-mem3-kernel-{}", tier));
+        }
+    }
+
+    // 4c. bwa-mem3 + shim: C++.
     let mut build = cc::Build::new();
     build.cpp(true);
 
-    let skip: &[&str] = &[
+    let skip_common: &[&str] = &[
         "main.cpp",            // CLI entry point
         "bwtindex.cpp",        // index builder; out of scope (users run bwa-mem3 index)
-        "runsimd.cpp",         // runtime SIMD-dispatch launcher; has unguarded main()
         "bam_writer.cpp",      // bwa-mem3 CLI's htslib-based BAM writer; shim has its own
         "meth_bam.cpp",        // bisulfite BAM writer; htslib-dependent, out of scope
         "fm_index_writer.cpp", // index builder
@@ -126,10 +195,20 @@ fn main() {
     // fastmap.cpp used to be excluded (CLI-side batch driver) but is now
     // built to expose worker_alloc/worker_free. Its entry point is
     // `main_mem`, not `main`, so no collision with the Rust test harness.
+    //
+    // On x86_64 the kernel TUs are compiled separately per tier in 4b
+    // (`KERNEL_TIERS_X86`); skip them here so the baseline build doesn't
+    // also emit unmangled copies (and so this build inherits no `-mavx512bw`
+    // surprises from the baseline ISA). On arm64 the kernels compile once
+    // here with KERNEL_VARIANT unset — `simd_dispatch.cpp`'s arm64 branch
+    // calls the unmangled symbols directly.
     for entry in fs::read_dir(&vendor_src).unwrap() {
         let e = entry.unwrap();
         let name = e.file_name().to_string_lossy().into_owned();
-        if e.path().extension().is_some_and(|x| x == "cpp") && !skip.iter().any(|s| *s == name) {
+        if e.path().extension().is_some_and(|x| x == "cpp")
+            && !skip_common.iter().any(|s| *s == name)
+            && !(is_x86 && KERNEL_SRCS.iter().any(|s| *s == name))
+        {
             build.file(e.path());
         }
     }
@@ -152,14 +231,7 @@ fn main() {
     build.define("ENABLE_PREFETCH", None);
     build.define("V17", Some("1"));
     build.define("MATE_SORT", Some("0"));
-    build.flag_if_supported("-Wno-unused-parameter");
-    build.flag_if_supported("-Wno-sign-compare");
-    build.flag_if_supported("-Wno-unused-variable");
-    build.flag_if_supported("-Wno-unused-function");
-    build.flag_if_supported("-Wno-unused-but-set-variable");
-    build.flag_if_supported("-Wno-deprecated-declarations");
-    build.flag_if_supported("-Wno-format");
-    build.flag_if_supported("-Wno-format-truncation");
+    apply_common_warning_silencing(&mut build);
 
     build.compile("bwa-mem3");
 
@@ -176,6 +248,17 @@ fn main() {
     generate_bindings(&manifest, &vendor_src, &out);
 }
 
+fn apply_common_warning_silencing(build: &mut cc::Build) {
+    build.flag_if_supported("-Wno-unused-parameter");
+    build.flag_if_supported("-Wno-sign-compare");
+    build.flag_if_supported("-Wno-unused-variable");
+    build.flag_if_supported("-Wno-unused-function");
+    build.flag_if_supported("-Wno-unused-but-set-variable");
+    build.flag_if_supported("-Wno-deprecated-declarations");
+    build.flag_if_supported("-Wno-format");
+    build.flag_if_supported("-Wno-format-truncation");
+}
+
 fn apply_simd_flags(build: &mut cc::Build) {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     match arch.as_str() {
@@ -188,7 +271,7 @@ fn apply_simd_flags(build: &mut cc::Build) {
             } else if cfg!(feature = "native") {
                 build.flag_if_supported("-march=native");
             } else {
-                // default: AVX2
+                // default: AVX2 baseline (matches upstream's BASELINE_ARCH).
                 build.flag_if_supported("-mavx2");
                 build.flag_if_supported("-msse4.1");
             }
