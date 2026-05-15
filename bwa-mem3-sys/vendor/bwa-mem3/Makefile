@@ -72,6 +72,14 @@ ifneq ($(strip $(ASAN)),)
     CFLAGS      += $(ASAN_FLAGS)
 endif
 
+# TESTING_BUILD=1 defines BWAMEM3_TESTING which enables test-only injection
+# hooks (BWAMEM3_TESTING_HOST_TIER env var read by simd_dispatch.cpp). Used
+# by test/regression/host_floor_enforce.sh. Production builds leave this
+# unset; integration tests build with `make TESTING_BUILD=1`.
+ifneq ($(TESTING_BUILD),)
+    CXXFLAGS += -DBWAMEM3_TESTING
+endif
+
 # mimalloc integration. Default on — see FG-MAIN.md.
 # Override with USE_MIMALLOC=0 to build a stock bwa-mem3 without mimalloc.
 USE_MIMALLOC ?= 1
@@ -149,7 +157,7 @@ CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 -DLIBSAIS_OPENMP
 # `git describe` (e.g. v2.3-30-g61813ef, with -dirty suffix for modified
 # trees) so the stamped version always reflects the actual build. Fall
 # back to a static tag for source-tarball / shallow-clone builds.
-FG_LABS_VERSION_FALLBACK := 0.1.0-pre
+FG_LABS_VERSION_FALLBACK := 0.2.0
 VERSION_STRING := $(shell git describe --tags --dirty 2>/dev/null || echo $(FG_LABS_VERSION_FALLBACK))
 INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib -Iext/libsais/include
 ifeq ($(USE_MIMALLOC),1)
@@ -177,13 +185,26 @@ else
 endif
 
 LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring -Lext/htslib -lhts $(LIBSAIS_OPENMP_LIBS) $(STATIC_GCC) $(LIBS_EXTRA)
+# Non-kernel objects: always compiled once at the baseline ISA and linked into
+# libbwa.a on every build (arm64 and x86 alike).
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.o \
-			src/kstring.o src/ksw.o src/bntseq.o src/bwamem.o src/profiling.o src/bandedSWA.o \
-			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/kswv.o src/bwa.o \
+			src/kstring.o src/bntseq.o src/bwamem.o src/profiling.o \
+			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
+			src/meth_orig_ref.o src/meth_xm.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
-			src/bwa_shm.o
+			src/bwa_shm.o src/simd_dispatch.o
+
+# Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
+# and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
+# simd_dispatch.cpp provide the unmangled entry points. On arm64 there is only
+# one tier (NEON, unmangled), so the baseline objects ARE the only copies.
+# On x86, the baseline (unsuffixed) objects provide the concrete kswv/ksw/etc.
+# class bodies needed by test binaries (e.g. kswv_nrow_zero_test) that
+# instantiate these classes directly rather than going through the dispatcher.
+KERNEL_BASELINE_OBJS = src/bandedSWA.o src/kswv.o src/ksw.o src/sam_encode.o
+OBJS += $(KERNEL_BASELINE_OBJS)
 BWA_LIB=    libbwa.a
 SAFE_STR_LIB=    ext/safestringlib/libsafestring.a
 HTS_LIB=    ext/htslib/libhts.a
@@ -215,19 +236,44 @@ else ifeq ($(arch),avx2)
 		ARCH_FLAGS=-mavx2
 	endif
 else ifeq ($(arch),avx512)
+	# Legacy alias for arch=avx512bw (preserved for backward compat with
+	# pre-PR #16 invocations). Keep flags identical to the avx512bw branch
+	# below — including the -mprefer-vector-width=256 / -qopt-zmm-usage=low
+	# autovec cap. See the avx512bw branch for the rationale.
 	ifeq ($(CXX), icpc)
-		ARCH_FLAGS=-xCORE-AVX512
+		ARCH_FLAGS=-xCORE-AVX512 -qopt-zmm-usage=low
 	else
-		ARCH_FLAGS=-mavx512f -mavx512bw
+		ARCH_FLAGS=-mavx512f -mavx512bw -mprefer-vector-width=256
 	endif
 else ifeq ($(arch),avx512bw)
 	# Explicit BW target: double the lane width vs AVX2 (64x8-bit / 32x16-bit).
 	# AVX-512BW implies AVX-512F; -mavx512bw alone enables BW+F on gcc/clang
 	# but we list both flags for clarity.
+	#
+	# -mprefer-vector-width=256 (gcc/clang) / -qopt-zmm-usage=low (icpc):
+	# keep AVX-512BW *capabilities* available (32 zmm registers, mask
+	# registers, byte/word lane permutes, gather/scatter) but cap the
+	# auto-vectorizer's preferred SIMD width at 256-bit. Two effects:
+	#   1. AMD Zen 4 (c7a / Genoa) splits 512-bit AVX-512 ops into
+	#      2x 256-bit µops per op. For short-trip-count auto-vec loops
+	#      that's a regression — 2x latency without amortizing the
+	#      reduced iteration count, plus more I-cache pressure. Capping
+	#      at 256-bit keeps the compiler from widening those loops.
+	#   2. Intel Sapphire Rapids (c7i / m7i) has native 512-bit
+	#      execution but pays a ~3-5% AVX-512 frequency downclock under
+	#      sustained heavy use, plus AVX-512↔AVX2 transition penalties
+	#      when non-kernel TUs running 512-bit code call into
+	#      explicitly-256-bit kernel TUs. Capping at 256-bit avoids
+	#      both.
+	# Empirical: c7a wgs-5M shm-warmed -4.4% wall vs avx2 baseline
+	# (vanilla avx512bw was -2.2%, the cap adds another 2% on top).
+	# c7i wgs-5M is a wash either way (-0.7%). The hand-tuned 512-bit
+	# kernel TUs are unaffected — they use intrinsics, not auto-vec.
+	# Canonical mitigation per FFmpeg, libvpx, ISPC docs.
 	ifeq ($(CXX), icpc)
-		ARCH_FLAGS=-xCORE-AVX512
+		ARCH_FLAGS=-xCORE-AVX512 -qopt-zmm-usage=low
 	else
-		ARCH_FLAGS=-mavx512f -mavx512bw
+		ARCH_FLAGS=-mavx512f -mavx512bw -mprefer-vector-width=256
 	endif
 else ifeq ($(arch),native)
 	ARCH_FLAGS=-march=native
@@ -235,7 +281,7 @@ else ifneq ($(arch),)
 # To provide a different architecture flag like -march=core-avx2.
 	ARCH_FLAGS=$(arch)
 else
-myall:multi
+myall:single
 endif
 endif
 
@@ -249,6 +295,33 @@ endif
 endif
 
 CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS) #-Wall ##-xSSE2
+
+# CXXFLAGS used for per-tier kernel TU compilation. Must NOT contain any
+# -m... ISA flag — each per-tier rule appends the right one.
+BASE_CXXFLAGS = -g -O3 -std=gnu++14 -fpermissive $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS)
+
+# Per-tier ISA flag groups for kernel multi-tier compilation (x86_64 only).
+KERNEL_FLAGS_sse41    = -msse4.1
+KERNEL_FLAGS_sse42    = -msse4.2 -mpopcnt
+KERNEL_FLAGS_avx      = -mavx -mpopcnt
+KERNEL_FLAGS_avx2     = -mavx -mavx2 -mpopcnt
+KERNEL_FLAGS_avx512bw = -mavx -mavx2 -mavx512f -mavx512bw -mpopcnt
+
+# Source files compiled at every tier on x86_64.
+KERNEL_SRCS = src/bandedSWA.cpp src/kswv.cpp src/ksw.cpp src/sam_encode.cpp
+
+# All per-tier kernel objects. On x86_64 these are 5 tiers × 4 kernel TUs = 20 .o files.
+ifneq ($(IS_ARM),)
+    # arm64: single unsuffixed build (KERNEL_VARIANT unset). Already in $(OBJS).
+    KERNEL_TIER_OBJS =
+else
+    KERNEL_TIER_OBJS = \
+        $(patsubst src/%.cpp,src/%.sse41.o,$(KERNEL_SRCS)) \
+        $(patsubst src/%.cpp,src/%.sse42.o,$(KERNEL_SRCS)) \
+        $(patsubst src/%.cpp,src/%.avx.o,$(KERNEL_SRCS)) \
+        $(patsubst src/%.cpp,src/%.avx2.o,$(KERNEL_SRCS)) \
+        $(patsubst src/%.cpp,src/%.avx512bw.o,$(KERNEL_SRCS))
+endif
 
 # COVERAGE=1 augments CXXFLAGS/LDFLAGS with --coverage and overrides -O3 with
 # -O0 so gcov line numbers correspond 1:1 with source. Consumed by the CI
@@ -268,13 +341,47 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all clean depend multi print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean
+.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
 .SUFFIXES:.cpp .o
 
 .cpp.o:
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
+# Per-tier kernel compile rules. Active only on x86_64 multi-tier builds.
+src/%.sse41.o: src/%.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_sse41) $(CPPFLAGS) -DKERNEL_VARIANT=_sse41 $(INCLUDES) $< -o $@
+
+src/%.sse42.o: src/%.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_sse42) $(CPPFLAGS) -DKERNEL_VARIANT=_sse42 $(INCLUDES) $< -o $@
+
+src/%.avx.o: src/%.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_avx) $(CPPFLAGS) -DKERNEL_VARIANT=_avx $(INCLUDES) $< -o $@
+
+src/%.avx2.o: src/%.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_avx2) $(CPPFLAGS) -DKERNEL_VARIANT=_avx2 $(INCLUDES) $< -o $@
+
+src/%.avx512bw.o: src/%.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_avx512bw) $(CPPFLAGS) -DKERNEL_VARIANT=_avx512bw $(INCLUDES) $< -o $@
+
 all:$(EXE)
+
+# Note: simd_dispatch.cpp is compiled at the regular BASELINE_ARCH like
+# every other non-kernel TU. An earlier draft of this PR compiled it at
+# -march=x86-64 to keep the precheck path SIGILL-safe on too-old hosts,
+# but that broke `g_build_tier` (a `static constexpr` in this TU derived
+# from __AVX2__/__SSE4_1__/etc., which only get defined when the matching
+# -m flag is in scope). With the override, every binary reported its
+# floor as "scalar" and the precheck silently became a no-op.
+#
+# In practice the precheck path is scalar-only — std::call_once,
+# integer comparisons, getenv, snprintf, fputs, exit — with no array
+# loops the compiler could autovectorize. main.cpp's preamble before
+# the precheck (argc check, rdtsc, sleep, argv strcmp scan) is the
+# same shape: scalar branching + libc calls. Even at -mavx2 the
+# compiler doesn't emit AVX2 for any of this, so the precheck actually
+# fires on EVERY host below the build floor — sse42, sse41, scalar,
+# cross-family — not just one tier below. Verified empirically with
+# the BWAMEM3_TESTING_HOST_TIER injection test.
 
 # Regenerate src/version.h on every invocation, but only touch the file
 # (and thus trigger a main.o rebuild) when the string actually changed.
@@ -288,23 +395,34 @@ src/version.h: FORCE
 
 src/main.o: src/version.h
 
-multi: $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB))
+# Baseline ISA tier for non-kernel TUs in the x86 single-binary build.
+# Defaults to avx2: every host that runs bwa-mem3 in practice has AVX2
+# (Haswell, 2013+; any host with AVX-512 also has AVX2), and dropping the
+# baseline below avx2 measurably slows hot non-kernel paths (chain
+# extension, FMI BWT walks, mate scoring) because the compiler can no
+# longer auto-vectorize them at 256-bit width. Override to sse41 (or
+# sse42, avx) for vintage hardware; the per-tier kernel objects are still
+# compiled at every tier regardless, so kernel dispatch on lower-tier
+# hosts continues to work.
+BASELINE_ARCH ?= avx2
+
+# Single-binary multi-tier build. All kernel TUs are compiled at every
+# tier; the dispatcher picks the right per-tier subclass at runtime.
+# Replaces the `multi` target's 5 sequential clean rebuilds + execv launcher.
+.PHONY: single
+single: $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB))
 ifneq ($(IS_ARM),)
-	@echo "ARM64 detected - building single arm64 binary instead of multi"
+	@echo "ARM64 detected - building single arm64 binary instead of multi-tier"
 	$(MAKE) arm64
 else
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=sse41    EXE=bwa-mem3.sse41    CXX="$(CXX)" all
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=sse42    EXE=bwa-mem3.sse42    CXX="$(CXX)" all
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx    EXE=bwa-mem3.avx    CXX="$(CXX)" all
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx2   EXE=bwa-mem3.avx2     CXX="$(CXX)" all
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx512bw EXE=bwa-mem3.avx512bw CXX="$(CXX)" all
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) -Wall -O3 src/runsimd.cpp -Iext/safestringlib/include -Lext/safestringlib/ -lsafestring $(STATIC_GCC) -o bwa-mem3
+	$(MAKE) arch=$(BASELINE_ARCH) EXE=bwa-mem3 CXX="$(CXX)" KERNEL_TIER_OBJS_LINK="$(KERNEL_TIER_OBJS)" all-single
 endif
+
+# Internal: builds the single binary with the BASELINE_ARCH tier for
+# non-kernel TUs and links all KERNEL_TIER_OBJS_LINK on top.
+.PHONY: all-single
+all-single: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(KERNEL_TIER_OBJS_LINK) src/main.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(KERNEL_TIER_OBJS_LINK) $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $(EXE)
 
 # ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
 arm64:
@@ -321,8 +439,19 @@ $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(U
 # the post-loop `if (i > 0)` guard, the rowMax store writes SIMD_WIDTH* bytes
 # before the allocation and aborts at a later allocator operation; under
 # asan the write is reported directly.
-kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_nrow_zero_test.o
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) test/kswv_nrow_zero_test.o $(BWA_LIB) $(LIBS) -o $@
+#
+# On x86 multi-tier builds, libbwa.a's baseline kswv.o is compiled at the
+# BASELINE_ARCH tier (avx2 by default; sse41 if overridden, in which case
+# the SSE-only stub that calls exit() would fire). Compile a separate
+# native-tier copy of kswv.cpp (src/kswv.native.o) and link it ahead of
+# libbwa.a so the linker picks the host's native-ISA concrete kswv class
+# regardless of BASELINE_ARCH. On arm64 -march=native resolves to the NEON
+# path already covered by the baseline objects.
+src/kswv.native.o: src/kswv.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) src/kswv.native.o test/kswv_nrow_zero_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/kswv_nrow_zero_test.o src/kswv.native.o $(BWA_LIB) $(LIBS) -o $@
 
 # Build the test binaries with the same ARCH_FLAGS as libbwa.a so the
 # test binary's kswv.h preprocessor state (SIMD_WIDTH8, BWA_TESTS_HAVE_KSWV)
@@ -331,11 +460,12 @@ kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_nrow_zero_t
 # libbwa.a, which then lacks kswv::getScores8 — the BWA_TESTS_HAVE_KSWV
 # macro guards the test away).
 .PHONY: test-binaries
-# $(SAFE_STR_LIB) is a real link-time dep: test/Makefile's
+# $(SAFE_STR_LIB) and $(HTS_LIB) are real link-time deps: test/Makefile's
 # bwa_mem3_tests_unit recipe references ../ext/safestringlib/libsafestring.a
-# directly. Without this prereq, callers that skip the bwa-mem3 binary
-# build (which builds it as a side-effect of $(EXE) deps) link-fail.
-test-binaries: $(BWA_LIB) $(SAFE_STR_LIB)
+# and ../ext/htslib/libhts.a directly. Without these prereqs, callers that
+# skip the bwa-mem3 binary build (which builds them as a side-effect of
+# $(EXE) deps) link-fail.
+test-binaries: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB)
 	$(MAKE) -C test framework unit integration \
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
@@ -347,26 +477,56 @@ shm_section_find_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) tes
 shm_pack_round_trip_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_round_trip_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_pack_round_trip_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
+shm_lock_destroy_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_lock_destroy_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 
 # Run the in-tree tests via the unit-test harness in test/, plus the
-# standalone regressions (kswv_nrow_zero_test + shm_section_find_test).
-# shm_pack_round_trip_test runs via test/shm_pack_round_trip_test.sh which
-# builds the phiX index first; invoked from test/run_unit_tests.sh.
-test: test-binaries kswv_nrow_zero_test shm_section_find_test
+# standalone regressions (kswv_nrow_zero_test + shm_section_find_test +
+# shm_lock_destroy_test). shm_pack_round_trip_test runs via
+# test/shm_pack_round_trip_test.sh which builds the phiX index first;
+# invoked from test/run_unit_tests.sh.
+#
+# Note: depends on `bwa-mem3` so version_banner.sh has a binary to grep —
+# previously `test:` only built the test harness binaries, not the main
+# executable.
+test: test-binaries kswv_nrow_zero_test shm_section_find_test shm_lock_destroy_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
 	./kswv_nrow_zero_test
 	./shm_section_find_test
+	./shm_lock_destroy_test
+	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
+
+# Regression test that requires a binary built with TESTING_BUILD=1
+# (enables BWAMEM3_TESTING_HOST_TIER env-var injection). Not invoked by
+# the default `test` target because it requires a non-production build.
+# CI runs `make clean && make TESTING_BUILD=1 && make test-injection`
+# as a separate matrix row.
+test-injection: bwa-mem3
+	BWA_MEM3_TESTING=./bwa-mem3 INJECTED_TIER=sse41 PARITY_FA=/dev/null \
+		./test/regression/host_floor_enforce.sh
 
 test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
-	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 test/shm_section_find_test.o: test/shm_section_find_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
-$(BWA_LIB):$(OBJS)
-	ar rcs $(BWA_LIB) $(OBJS)
+test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+# Archive both the baseline (unmangled) kernel objects from $(OBJS) and the
+# per-tier (mangled) objects from $(KERNEL_TIER_OBJS) into libbwa.a. The
+# duplication with $(KERNEL_TIER_OBJS_LINK) on the all-single recipe is
+# intentional: legacy single-arch builds (`make arch=avx2`, `make arch=sse41`,
+# etc.) link only libbwa.a on the binary line and rely on libbwa.a to satisfy
+# simd_dispatch.o's references to make_kswv_kernel_<tier>, ksw_*_<tier>, and
+# sam_encode_*_<tier>. Dropping per-tier objects from libbwa.a breaks those
+# matrix rows. On arm64 $(KERNEL_TIER_OBJS) is empty.
+$(BWA_LIB):$(OBJS) $(KERNEL_TIER_OBJS)
+	ar rcs $(BWA_LIB) $(OBJS) $(KERNEL_TIER_OBJS)
 
 # safestringlib's safeclib_private.h calls abort() / memcpy() via macros
 # without including <stdlib.h> / <string.h> in the TU, which fails the
@@ -429,13 +589,49 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test bwa-mem3.sse41 bwa-mem3.sse42 bwa-mem3.avx bwa-mem3.avx2 bwa-mem3.avx512bw bwa-mem3.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean
 	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
+
+# ----------------------------------------------------------------------------
+# Documentation (mdbook). See docs/superpowers/specs/ for design.
+# ----------------------------------------------------------------------------
+
+# Sub-commands whose --help is captured into docs/_generated/cli/.
+DOCS_CLI_SUBCMDS := index mem shm version
+
+docs:
+	cd docs && mdbook build
+
+docs-serve:
+	cd docs && mdbook serve --open
+
+docs-cli: $(EXE)
+	@mkdir -p docs/_generated/cli
+	@for sub in $(DOCS_CLI_SUBCMDS); do \
+		echo "  CAPTURE  docs/_generated/cli/$$sub.txt"; \
+		./$(EXE) $$sub --help 2>&1 \
+			| sed -e 's/[[:space:]]*$$//' \
+			| grep -v '^Total time taken:' \
+			| grep -v '^Looking to launch ' \
+			| grep -v '^Launching executable ' \
+			| grep -v '^SIMD floor: ' \
+			| grep -v '^SIMD runtime: ' \
+			| grep -v '^\[W::' \
+			| awk '/^v?[0-9]+\.[0-9]+/ {print "v<MAJOR.MINOR>-<N>-g<COMMIT>"; next} {print}' \
+			> docs/_generated/cli/$$sub.txt; \
+	done
+
+docs-clean:
+	rm -rf docs/book
+
+docs-install-tools:
+	cargo install mdbook --version 0.5.2 --locked
+	cargo install mdbook-mermaid --version 0.17.0 --locked
 
 # Profile-Guided Optimization (PGO) targets.
 #
@@ -555,48 +751,177 @@ depend:
 
 # DO NOT DELETE
 
-src/FMI_search.o: src/FMI_search.h src/bntseq.h src/read_index_ele.h
-src/FMI_search.o: src/utils.h src/macro.h src/bwa.h src/bwt.h
+src/FMI_search.o: src/bwa_madvise.h src/bwa_shm.h src/FMI_search.h
+src/FMI_search.o: src/simd_compat.h src/read_index_ele.h src/utils.h
+src/FMI_search.o: src/bntseq.h src/macro.h src/bwa.h src/bwt.h
+src/FMI_search.o: src/memcpy_bwamem.h src/safestringlib.h
+src/FMI_search.o: ext/safestringlib/include/safe_mem_lib.h
+src/FMI_search.o: ext/safestringlib/include/safe_lib.h
+src/FMI_search.o: ext/safestringlib/include/safe_types.h
+src/FMI_search.o: ext/safestringlib/include/safe_lib_errno.h
+src/FMI_search.o: ext/safestringlib/include/safe_str_lib.h src/profiling.h
 src/FMI_search.o: src/libsais_build.h
-src/libsais_build.o: src/libsais_build.h src/fm_index_writer.h src/index_prelude.h
-src/libsais_build.o: src/packed_text.h src/utils.h src/macro.h
-src/libsais_build.o: ext/libsais/include/libsais.h ext/libsais/include/libsais64.h
-src/bandedSWA.o: src/bandedSWA.h src/macro.h
-src/bntseq.o: src/bntseq.h src/utils.h src/macro.h src/kseq.h src/khash.h
-src/bwa.o: src/bntseq.h src/bwa.h src/bwt.h src/macro.h src/ksw.h src/utils.h
-src/bwa.o: src/kstring.h src/kvec.h src/kseq.h
+src/bam_writer.o: ext/htslib/htslib/sam.h ext/htslib/htslib/hts.h
+src/bam_writer.o: ext/htslib/htslib/hts_defs.h ext/htslib/htslib/hts_log.h
+src/bam_writer.o: ext/htslib/htslib/kstring.h ext/htslib/htslib/kroundup.h
+src/bam_writer.o: ext/htslib/htslib/hts_endian.h ext/htslib/htslib/kstring.h
+src/bam_writer.o: src/bam_writer.h src/bwa.h src/bntseq.h src/bwt.h
+src/bam_writer.o: src/macro.h src/bwamem.h src/kthread.h src/bandedSWA.h
+src/bam_writer.o: src/simd_compat.h src/kernel_dispatch.h src/kstring.h
+src/bam_writer.o: src/ksw.h src/kvec.h src/ksort.h src/utils.h
+src/bam_writer.o: src/profiling.h src/FMI_search.h src/read_index_ele.h
+src/bam_writer.o: src/cigar_util.h
+src/bandedSWA.o: src/kernel_dispatch.h src/bandedSWA.h src/macro.h
+src/bandedSWA.o: src/simd_compat.h
+src/bntseq.o: src/bntseq.h src/utils.h src/macro.h src/kseq.h
+src/bntseq.o: src/memcpy_bwamem.h src/safestringlib.h
+src/bntseq.o: ext/safestringlib/include/safe_mem_lib.h
+src/bntseq.o: ext/safestringlib/include/safe_lib.h
+src/bntseq.o: ext/safestringlib/include/safe_types.h
+src/bntseq.o: ext/safestringlib/include/safe_lib_errno.h
+src/bntseq.o: ext/safestringlib/include/safe_str_lib.h src/khash.h
+src/bwa.o: src/bntseq.h src/bwa.h src/bwt.h src/macro.h src/ksw.h
+src/bwa.o: src/kernel_dispatch.h src/simd_compat.h src/utils.h src/kstring.h
+src/bwa.o: src/kvec.h src/u8vec_scratch.h src/safestringlib.h
+src/bwa.o: ext/safestringlib/include/safe_mem_lib.h
+src/bwa.o: ext/safestringlib/include/safe_lib.h
+src/bwa.o: ext/safestringlib/include/safe_types.h
+src/bwa.o: ext/safestringlib/include/safe_lib_errno.h
+src/bwa.o: ext/safestringlib/include/safe_str_lib.h src/kseq.h
+src/bwa.o: src/memcpy_bwamem.h
+src/bwa_shm.o: src/bwa_shm.h src/bwa.h src/bntseq.h src/bwt.h src/macro.h
+src/bwa_shm.o: src/FMI_search.h src/simd_compat.h src/read_index_ele.h
+src/bwa_shm.o: src/utils.h src/safestringlib.h
+src/bwa_shm.o: ext/safestringlib/include/safe_mem_lib.h
+src/bwa_shm.o: ext/safestringlib/include/safe_lib.h
+src/bwa_shm.o: ext/safestringlib/include/safe_types.h
+src/bwa_shm.o: ext/safestringlib/include/safe_lib_errno.h
+src/bwa_shm.o: ext/safestringlib/include/safe_str_lib.h
 src/bwamem.o: src/bwamem.h src/bwt.h src/bntseq.h src/bwa.h src/macro.h
-src/bwamem.o: src/kthread.h src/bandedSWA.h src/kstring.h src/ksw.h
-src/bwamem.o: src/kvec.h src/ksort.h src/utils.h src/profiling.h
-src/bwamem.o: src/FMI_search.h src/read_index_ele.h src/kbtree.h
+src/bwamem.o: src/kthread.h src/bandedSWA.h src/simd_compat.h
+src/bwamem.o: src/kernel_dispatch.h src/kstring.h src/ksw.h src/kvec.h
+src/bwamem.o: src/ksort.h src/utils.h src/profiling.h src/FMI_search.h
+src/bwamem.o: src/read_index_ele.h src/memcpy_bwamem.h src/safestringlib.h
+src/bwamem.o: ext/safestringlib/include/safe_mem_lib.h
+src/bwamem.o: ext/safestringlib/include/safe_lib.h
+src/bwamem.o: ext/safestringlib/include/safe_types.h
+src/bwamem.o: ext/safestringlib/include/safe_lib_errno.h
+src/bwamem.o: ext/safestringlib/include/safe_str_lib.h src/bam_writer.h
+src/bwamem.o: src/meth_bam.h src/u8vec_scratch.h src/sam_encode.h
+src/bwamem.o: src/kbtree.h
 src/bwamem_extra.o: src/bwa.h src/bntseq.h src/bwt.h src/macro.h src/bwamem.h
-src/bwamem_extra.o: src/kthread.h src/bandedSWA.h src/kstring.h src/ksw.h
-src/bwamem_extra.o: src/kvec.h src/ksort.h src/utils.h src/profiling.h
-src/bwamem_extra.o: src/FMI_search.h src/read_index_ele.h
+src/bwamem_extra.o: src/kthread.h src/bandedSWA.h src/simd_compat.h
+src/bwamem_extra.o: src/kernel_dispatch.h src/kstring.h src/ksw.h src/kvec.h
+src/bwamem_extra.o: src/ksort.h src/utils.h src/profiling.h src/FMI_search.h
+src/bwamem_extra.o: src/read_index_ele.h
 src/bwamem_pair.o: src/kstring.h src/bwamem.h src/bwt.h src/bntseq.h
 src/bwamem_pair.o: src/bwa.h src/macro.h src/kthread.h src/bandedSWA.h
-src/bwamem_pair.o: src/ksw.h src/kvec.h src/ksort.h src/utils.h
-src/bwamem_pair.o: src/profiling.h src/FMI_search.h src/read_index_ele.h
-src/bwamem_pair.o: src/kswv.h
+src/bwamem_pair.o: src/simd_compat.h src/kernel_dispatch.h src/ksw.h
+src/bwamem_pair.o: src/kvec.h src/ksort.h src/utils.h src/profiling.h
+src/bwamem_pair.o: src/FMI_search.h src/read_index_ele.h src/bam_writer.h
+src/bwamem_pair.o: src/u8vec_scratch.h src/kswv.h
 src/bwtindex.o: src/bntseq.h src/bwa.h src/bwt.h src/macro.h src/utils.h
-src/bwtindex.o: src/FMI_search.h src/read_index_ele.h
-src/fastmap.o: src/fastmap.h src/bwa.h src/bntseq.h src/bwt.h src/macro.h
-src/fastmap.o: src/bwamem.h src/kthread.h src/bandedSWA.h src/kstring.h
-src/fastmap.o: src/ksw.h src/kvec.h src/ksort.h src/utils.h src/profiling.h
-src/fastmap.o: src/FMI_search.h src/read_index_ele.h src/kseq.h
+src/bwtindex.o: src/FMI_search.h src/simd_compat.h src/read_index_ele.h
+src/bwtindex.o: src/kseq.h src/memcpy_bwamem.h src/safestringlib.h
+src/bwtindex.o: ext/safestringlib/include/safe_mem_lib.h
+src/bwtindex.o: ext/safestringlib/include/safe_lib.h
+src/bwtindex.o: ext/safestringlib/include/safe_types.h
+src/bwtindex.o: ext/safestringlib/include/safe_lib_errno.h
+src/bwtindex.o: ext/safestringlib/include/safe_str_lib.h src/system.h
+src/fastmap.o: src/bwa_madvise.h src/fastmap.h src/bwa.h src/bntseq.h
+src/fastmap.o: src/bwt.h src/macro.h src/bwamem.h src/kthread.h
+src/fastmap.o: src/bandedSWA.h src/simd_compat.h src/kernel_dispatch.h
+src/fastmap.o: src/kstring.h src/ksw.h src/kvec.h src/ksort.h src/utils.h
+src/fastmap.o: src/profiling.h src/FMI_search.h src/read_index_ele.h
+src/fastmap.o: src/kseq.h src/memcpy_bwamem.h src/safestringlib.h
+src/fastmap.o: ext/safestringlib/include/safe_mem_lib.h
+src/fastmap.o: ext/safestringlib/include/safe_lib.h
+src/fastmap.o: ext/safestringlib/include/safe_types.h
+src/fastmap.o: ext/safestringlib/include/safe_lib_errno.h
+src/fastmap.o: ext/safestringlib/include/safe_str_lib.h src/bam_writer.h
+src/fastmap.o: src/meth_bam.h src/meth_orig_ref.h src/bwa_shm.h
+src/fm_index_writer.o: src/fm_index_writer.h src/FMI_search.h
+src/fm_index_writer.o: src/simd_compat.h src/read_index_ele.h src/utils.h
+src/fm_index_writer.o: src/bntseq.h src/macro.h src/bwa.h src/bwt.h
+src/fm_index_writer.o: src/io_utils.h
+src/index_prelude.o: src/index_prelude.h src/io_utils.h src/utils.h
+src/index_prelude.o: src/packed_text.h
+src/kopen.o: src/memcpy_bwamem.h src/safestringlib.h
+src/kopen.o: ext/safestringlib/include/safe_mem_lib.h
+src/kopen.o: ext/safestringlib/include/safe_lib.h
+src/kopen.o: ext/safestringlib/include/safe_types.h
+src/kopen.o: ext/safestringlib/include/safe_lib_errno.h
+src/kopen.o: ext/safestringlib/include/safe_str_lib.h
 src/kstring.o: src/kstring.h
-src/ksw.o: src/ksw.h src/macro.h
-src/kswv.o: src/kswv.h src/macro.h src/ksw.h src/bandedSWA.h
+src/ksw.o: src/kernel_dispatch.h src/simd_compat.h src/ksw.h src/macro.h
+src/kswv.o: src/kernel_dispatch.h src/kswv.h src/macro.h src/ksw.h
+src/kswv.o: src/simd_compat.h src/bandedSWA.h src/neon_utils.h
 src/kthread.o: src/kthread.h src/macro.h src/bwamem.h src/bwt.h src/bntseq.h
-src/kthread.o: src/bwa.h src/bandedSWA.h src/kstring.h src/ksw.h src/kvec.h
+src/kthread.o: src/bwa.h src/bandedSWA.h src/simd_compat.h
+src/kthread.o: src/kernel_dispatch.h src/kstring.h src/ksw.h src/kvec.h
 src/kthread.o: src/ksort.h src/utils.h src/profiling.h src/FMI_search.h
 src/kthread.o: src/read_index_ele.h
+src/libsais_build.o: src/libsais_build.h src/fm_index_writer.h
+src/libsais_build.o: src/index_prelude.h src/io_utils.h src/utils.h
+src/libsais_build.o: src/macro.h src/packed_text.h
+src/libsais_build.o: ext/libsais/include/libsais.h
+src/libsais_build.o: ext/libsais/include/libsais64.h
 src/main.o: src/main.h src/kstring.h src/utils.h src/macro.h src/bandedSWA.h
-src/main.o: src/profiling.h
-src/profiling.o: src/macro.h
+src/main.o: src/simd_compat.h src/kernel_dispatch.h src/profiling.h
+src/main.o: src/fastmap.h src/bwa.h src/bntseq.h src/bwt.h src/bwamem.h
+src/main.o: src/kthread.h src/ksw.h src/kvec.h src/ksort.h src/FMI_search.h
+src/main.o: src/read_index_ele.h src/kseq.h src/memcpy_bwamem.h
+src/main.o: src/safestringlib.h ext/safestringlib/include/safe_mem_lib.h
+src/main.o: ext/safestringlib/include/safe_lib.h
+src/main.o: ext/safestringlib/include/safe_types.h
+src/main.o: ext/safestringlib/include/safe_lib_errno.h
+src/main.o: ext/safestringlib/include/safe_str_lib.h src/simd_dispatch.h
+src/main.o: src/version.h src/bwa_shm.h ext/mimalloc/include/mimalloc.h
+src/memcpy_bwamem.o: src/memcpy_bwamem.h src/safestringlib.h
+src/memcpy_bwamem.o: ext/safestringlib/include/safe_mem_lib.h
+src/memcpy_bwamem.o: ext/safestringlib/include/safe_lib.h
+src/memcpy_bwamem.o: ext/safestringlib/include/safe_types.h
+src/memcpy_bwamem.o: ext/safestringlib/include/safe_lib_errno.h
+src/memcpy_bwamem.o: ext/safestringlib/include/safe_str_lib.h
+src/meth_bam.o: ext/htslib/htslib/sam.h ext/htslib/htslib/hts.h
+src/meth_bam.o: ext/htslib/htslib/hts_defs.h ext/htslib/htslib/hts_log.h
+src/meth_bam.o: ext/htslib/htslib/kstring.h ext/htslib/htslib/kroundup.h
+src/meth_bam.o: ext/htslib/htslib/hts_endian.h ext/htslib/htslib/kstring.h
+src/meth_bam.o: src/meth_bam.h src/bwa.h src/bntseq.h src/bwt.h src/macro.h
+src/meth_bam.o: src/bwamem.h src/kthread.h src/bandedSWA.h src/simd_compat.h
+src/meth_bam.o: src/kernel_dispatch.h src/kstring.h src/ksw.h src/kvec.h
+src/meth_bam.o: src/ksort.h src/utils.h src/profiling.h src/FMI_search.h
+src/meth_bam.o: src/read_index_ele.h src/bam_writer.h src/cigar_util.h
+src/meth_bam.o: src/meth_orig_ref.h src/meth_xm.h src/version.h
+src/meth_orig_ref.o: src/meth_orig_ref.h src/bntseq.h src/meth_bam.h
+src/meth_orig_ref.o: src/bwa.h src/bwt.h src/macro.h src/bwamem.h
+src/meth_orig_ref.o: src/kthread.h src/bandedSWA.h src/simd_compat.h
+src/meth_orig_ref.o: src/kernel_dispatch.h src/kstring.h src/ksw.h src/kvec.h
+src/meth_orig_ref.o: src/ksort.h src/utils.h src/profiling.h src/FMI_search.h
+src/meth_orig_ref.o: src/read_index_ele.h
+src/meth_xm.o: src/meth_xm.h src/meth_orig_ref.h src/bntseq.h src/meth_bam.h
+src/meth_xm.o: src/bwa.h src/bwt.h src/macro.h src/bwamem.h src/kthread.h
+src/meth_xm.o: src/bandedSWA.h src/simd_compat.h src/kernel_dispatch.h
+src/meth_xm.o: src/kstring.h src/ksw.h src/kvec.h src/ksort.h src/utils.h
+src/meth_xm.o: src/profiling.h src/FMI_search.h src/read_index_ele.h
+src/packed_text.o: src/packed_text.h src/utils.h
+src/profiling.o: src/macro.h src/bwa.h src/bntseq.h src/bwt.h src/profiling.h
 src/read_index_ele.o: src/read_index_ele.h src/utils.h src/bntseq.h
-src/read_index_ele.o: src/macro.h
-src/utils.o: src/utils.h src/ksort.h src/kseq.h
-src/memcpy_bwamem.o: src/memcpy_bwamem.h
-src/bam_writer.o: src/bam_writer.h src/bwamem.h src/bwa.h src/bntseq.h
-src/meth_bam.o: src/meth_bam.h src/bwamem.h src/bwa.h src/bntseq.h src/version.h
+src/read_index_ele.o: src/macro.h src/safestringlib.h
+src/read_index_ele.o: ext/safestringlib/include/safe_mem_lib.h
+src/read_index_ele.o: ext/safestringlib/include/safe_lib.h
+src/read_index_ele.o: ext/safestringlib/include/safe_types.h
+src/read_index_ele.o: ext/safestringlib/include/safe_lib_errno.h
+src/read_index_ele.o: ext/safestringlib/include/safe_str_lib.h
+src/read_index_ele.o: src/bwa_madvise.h src/bwa_shm.h
+src/sam_encode.o: src/sam_encode.h src/kernel_dispatch.h
+src/simd_dispatch.o: src/simd_dispatch.h src/bandedSWA.h src/macro.h
+src/simd_dispatch.o: src/simd_compat.h src/kernel_dispatch.h src/kswv.h
+src/simd_dispatch.o: src/ksw.h src/sam_encode.h
+src/system.o: src/system.h
+src/utils.o: src/utils.h src/ksort.h src/kseq.h src/memcpy_bwamem.h
+src/utils.o: src/safestringlib.h ext/safestringlib/include/safe_mem_lib.h
+src/utils.o: ext/safestringlib/include/safe_lib.h
+src/utils.o: ext/safestringlib/include/safe_types.h
+src/utils.o: ext/safestringlib/include/safe_lib_errno.h
+src/utils.o: ext/safestringlib/include/safe_str_lib.h

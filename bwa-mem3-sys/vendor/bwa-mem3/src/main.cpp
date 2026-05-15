@@ -30,6 +30,7 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 
 // ----------------------------------
 #include "main.h"
+#include "simd_dispatch.h"
 #include "version.h"
 #include "bwa_shm.h"
 
@@ -72,8 +73,9 @@ static void append_pg_cl_arg(kstring_t *pg, const char *arg)
 
 int main(int argc, char* argv[])
 {
-        
-    // ---------------------------------    
+    bwamem3_simd_init();
+
+    // ---------------------------------
     uint64_t tim = __rdtsc();
     sleep(1);
     proc_freq = __rdtsc() - tim;
@@ -84,6 +86,26 @@ int main(int argc, char* argv[])
     if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         usage();
         return 0;
+    }
+
+    /* SIMD host-floor precheck — refuse with exit(2) if the host CPU
+     * cannot execute the build's compiled-in instructions, before any
+     * subcommand body (and the AVX2-compiled banner / @PG ksprintf in
+     * the `mem` branch below) gets a chance to SIGILL on a too-old
+     * host. Diagnostic invocations opt out so operators can still
+     * introspect the binary on a host below floor:
+     *   - `version`               always prints + warns (never refuses)
+     *   - `<subcommand> --help`   prints help (never refuses)
+     *   - `<subcommand> -h`       same
+     * Only argv[2] is checked: matching --help / -h anywhere in argv
+     * would false-positive on pathological invocations like
+     * `mem -R --help ref r1 r2` (where --help is the VALUE of -R) and
+     * skip the precheck for an actual alignment run. Realistic help
+     * invocations put --help right after the subcommand. */
+    bool wants_help = (argc >= 3) &&
+                      (strcmp(argv[2], "--help") == 0 || strcmp(argv[2], "-h") == 0);
+    if (strcmp(argv[1], "version") != 0 && !wants_help) {
+        bwamem3_enforce_host_floor();
     }
 
     if (strcmp(argv[1], "index") == 0)
@@ -137,17 +159,13 @@ int main(int argc, char* argv[])
         extern char *bwa_pg;
 
         fprintf(stderr, "-----------------------------\n");
-#if __AVX512BW__
-        fprintf(stderr, "Executing in AVX512 mode!!\n");
-#elif __AVX2__
-        fprintf(stderr, "Executing in AVX2 mode!!\n");
-#elif __AVX__
-        fprintf(stderr, "Executing in AVX mode!!\n");        
-#elif __SSE4_2__
-        fprintf(stderr, "Executing in SSE4.2 mode!!\n");
-#elif __SSE4_1__
-        fprintf(stderr, "Executing in SSE4.1 mode!!\n");        
-#endif
+        // Print the runtime-dispatched kernel tier rather than the compile-time
+        // baseline. Non-kernel TUs (including this one) build at sse41 baseline
+        // in the single-binary build, so a __AVX2__/__AVX512BW__ banner here
+        // would mislead AVX2/AVX-512 hosts into thinking they're running the
+        // SSE4.1 kernels.
+        fprintf(stderr, "Executing in %s mode!!\n",
+                bwamem3_simd_tier_name(bwamem3_simd_tier()));
         fprintf(stderr, "-----------------------------\n");
 
         #if SA_COMPRESSION
@@ -168,6 +186,7 @@ int main(int argc, char* argv[])
     else if (strcmp(argv[1], "version") == 0)
     {
         puts(PACKAGE_VERSION);
+        bwamem3_print_version_simd(stdout);
 #ifdef USE_MIMALLOC
         {
             int mv = mi_version();

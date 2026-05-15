@@ -65,7 +65,7 @@ typedef struct mem_opt_t {
     int    bam_level;
     int    meth_mode;
     char   meth_set_as_failed;
-    int    meth_no_chim;
+    int    meth_chimera_qc;
     int    supp_rep_hard_cap;
 } mem_opt_t;
 

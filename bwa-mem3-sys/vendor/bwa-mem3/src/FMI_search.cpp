@@ -1341,34 +1341,10 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
 }
 
 
-SMEM FMI_search::backwardExt(SMEM smem, uint8_t a)
-{
-    //beCalls++;
-    uint8_t b;
-
-    int64_t k[4], l[4], s[4];
-    for(b = 0; b < 4; b++)
-    {
-        int64_t sp = (int64_t)(smem.k);
-        int64_t ep = (int64_t)(smem.k) + (int64_t)(smem.s);
-        GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
-        GET_OCC(ep, b, occ_id_ep, y_ep, occ_ep, one_hot_bwt_str_c_ep, match_mask_ep);
-        k[b] = count[b] + occ_sp;
-        s[b] = occ_ep - occ_sp;
-    }
-
-    int64_t sentinel_offset = 0;
-    if((smem.k <= sentinel_index) && ((smem.k + smem.s) > sentinel_index)) sentinel_offset = 1;
-    l[3] = smem.l + sentinel_offset;
-    l[2] = l[3] + s[3];
-    l[1] = l[2] + s[2];
-    l[0] = l[1] + s[1];
-
-    smem.k = k[a];
-    smem.l = l[a];
-    smem.s = s[a];
-    return smem;
-}
+/* FMI_search::backwardExt is now defined inline in FMI_search.h
+ * (issue #87) so the body inlines into all 9 hot callers, eliminating
+ * the SysV-ABI struct-by-value pass and return-slot store that dominate
+ * self-time on gcc 12+. */
 
 int64_t FMI_search::get_sa_entry(int64_t pos)
 {
@@ -1639,7 +1615,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         map_pos[j] = map_ar[i];
         offset[j] = 0;
         
-        if (pos & SA_COMPX_MASK == 0) {
+        if ((pos & SA_COMPX_MASK) == 0) {
             _mm_prefetch(&sa_ms_byte[pos >> SA_COMPX], _MM_HINT_T0);
             _mm_prefetch(&sa_ls_word[pos >> SA_COMPX], _MM_HINT_T0);
         }
@@ -1676,7 +1652,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                     map_pos[k] = map_ar[i++];
                     offset[k] = 0;
                     
-                    if (pos & SA_COMPX_MASK == 0) {
+                    if ((pos & SA_COMPX_MASK) == 0) {
                         _mm_prefetch(&sa_ms_byte[pos >> SA_COMPX], _MM_HINT_T0);
                         _mm_prefetch(&sa_ls_word[pos >> SA_COMPX], _MM_HINT_T0);
                     }
@@ -1690,7 +1666,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             }
             else {
                 working_set[k] = sp;
-                if (sp & SA_COMPX_MASK == 0) {
+                if ((sp & SA_COMPX_MASK) == 0) {
                     _mm_prefetch(&sa_ms_byte[sp >> SA_COMPX], _MM_HINT_T0);
                     _mm_prefetch(&sa_ls_word[sp >> SA_COMPX], _MM_HINT_T0);
                 }

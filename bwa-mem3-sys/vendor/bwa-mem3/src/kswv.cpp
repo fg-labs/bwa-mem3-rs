@@ -30,6 +30,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stddef.h>
 #include <string.h>
 #include <unistd.h>
+#include "kernel_dispatch.h"
 #include "kswv.h"
 #include "limits.h"
 
@@ -408,6 +409,13 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
     uint8_t *Hmax = H8_max + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *F = F8 + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
+
+    /* Per-strip L1 prefetches, mirroring the AVX-512 8-bit + 16-bit kernels.
+     * Args: (addr, rw=0 read, locality=0 lowest — equivalent to x86 NTA). */
+    __builtin_prefetch(F + SIMD_WIDTH8, 0, 0);
+    __builtin_prefetch(seq2SoA, 0, 0);
+    __builtin_prefetch(seq1SoA, 0, 0);
+    __builtin_prefetch(H1 + SIMD_WIDTH8, 0, 0);
 
     /* Initialize arrays */
     for (int i = 0; i <= ncol; i++)
@@ -956,6 +964,13 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
     int16_t *F      = F16      + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *rowMax = rowMax16 + tid * SIMD_WIDTH16 * this->maxRefLen;
 
+    /* Per-strip L1 prefetches, mirroring the AVX-512 16-bit kernel. Args:
+     * (addr, rw=0 read, locality=0 lowest — equivalent to x86 NTA). */
+    __builtin_prefetch(F + SIMD_WIDTH16, 0, 0);
+    __builtin_prefetch(seq2SoA, 0, 0);
+    __builtin_prefetch(seq1SoA, 0, 0);
+    __builtin_prefetch(H1 + SIMD_WIDTH16, 0, 0);
+
     for (int i = 0; i <= ncol; i++) {
         vst1q_s16(H0   + i * SIMD_WIDTH16, zero_vec);
         vst1q_s16(Hmax + i * SIMD_WIDTH16, zero_vec);
@@ -1329,6 +1344,14 @@ int kswv::kswv256_u8(uint8_t seq1SoA[],
     uint8_t *Hmax   = H8_max  + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *F      = F8      + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
+
+    // Per-strip L1 prefetches mirroring the AVX-512 8-bit and 16-bit kernels.
+    // The 8-bit AVX2 path was missing them; without these the inner loop
+    // stalls on L1 misses for F/H1/seq for the first several rows.
+    _mm_prefetch((const char*) (F + SIMD_WIDTH8), _MM_HINT_NTA);
+    _mm_prefetch((const char*) seq2SoA, _MM_HINT_NTA);
+    _mm_prefetch((const char*) seq1SoA, _MM_HINT_NTA);
+    _mm_prefetch((const char*) (H1 + SIMD_WIDTH8), _MM_HINT_NTA);
 
     for (int i = 0; i <= ncol; i++) {
         _mm256_storeu_si256((__m256i*)(H0   + i * SIMD_WIDTH8), zero_vec);
@@ -2002,8 +2025,17 @@ int kswv::kswv512_u8(uint8_t seq1SoA[],
     uint8_t *Hmax   = H8_max + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *F      = F8 + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
-    
-    
+
+    // Mirror kswv512_16's per-strip prefetches (see kswv.cpp ~line 2547).
+    // The 8-bit kernel was overlooked when those prefetches were added in
+    // PR #58; without them the inner loop stalls on L1 misses for F/H1/seq
+    // for the first several rows. Identical hint shape; load addresses
+    // scaled to SIMD_WIDTH8 (64 bytes per row).
+    _mm_prefetch((const char*) (F + SIMD_WIDTH8), _MM_HINT_NTA);
+    _mm_prefetch((const char*) seq2SoA, _MM_HINT_NTA);
+    _mm_prefetch((const char*) seq1SoA, _MM_HINT_NTA);
+    _mm_prefetch((const char*) (H1 + SIMD_WIDTH8), _MM_HINT_NTA);
+
     for (int i=0; i <=ncol; i++)
     {
         _mm512_store_si512((__m512*) (H0 + i * SIMD_WIDTH8), zero512);
@@ -2782,7 +2814,56 @@ int kswv::kswv512_16(int16_t seq1SoA[],
     return 1;
 }
 
-#endif // AVX512BW
+#elif ((!__AVX512BW__) && (!__AVX2__) && (defined(__SSE2__) || defined(__SSSE3__) || defined(__SSE4_1__)))
+/* SSE-only fallback stubs (sse41/sse42/avx tiers).
+ *
+ * The batched kswv kernel requires AVX2 or AVX-512BW. These methods are
+ * unreachable in the single-binary build because the only call site,
+ * mem_sam_pe_batch() in src/bwamem_pair.cpp, is itself reached only from
+ * src/bwamem.cpp inside `#if BWAMEM_BATCHED_MATESW` (see bwamem.cpp:1302
+ * and macro.h:79-86). bwamem.cpp is a non-kernel TU compiled at the sse41
+ * baseline, so __AVX2__ is undefined there and BWAMEM_BATCHED_MATESW=0 —
+ * the entire batched path is excluded at compile time, and the dispatcher
+ * has nothing to route here at runtime.
+ *
+ * The stubs exist only so the Ikswv vtable resolves at link time on every
+ * x86 tier (sse41/sse42/avx all need getScores8/getScores16 bodies even
+ * though the dispatcher never calls them). If a future change opens a
+ * runtime call site for the batched path on SSE tiers, replace these with
+ * a scalar fallback or add a runtime gate in make_kswv() rather than
+ * relying on this exit().
+ */
+void kswv::getScores8(SeqPair * /*pairArray*/,
+                      uint8_t * /*seqBufRef*/,
+                      uint8_t * /*seqBufQer*/,
+                      kswr_t*   /*aln*/,
+                      int32_t   /*numPairs*/,
+                      uint16_t  /*numThreads*/,
+                      int       /*phase*/)
+{
+    fprintf(stderr,
+            "[E::%s] batched kswv kernel not available at this SIMD tier (SSE only). "
+            "Recompile with AVX2+ or use the scalar mate-SW path.\n",
+            __func__);
+    exit(EXIT_FAILURE);
+}
+
+void kswv::getScores16(SeqPair * /*pairArray*/,
+                       uint8_t * /*seqBufRef*/,
+                       uint8_t * /*seqBufQer*/,
+                       kswr_t*   /*aln*/,
+                       int32_t   /*numPairs*/,
+                       uint16_t  /*numThreads*/,
+                       int       /*phase*/)
+{
+    fprintf(stderr,
+            "[E::%s] batched kswv kernel not available at this SIMD tier (SSE only). "
+            "Recompile with AVX2+ or use the scalar mate-SW path.\n",
+            __func__);
+    exit(EXIT_FAILURE);
+}
+
+#endif // AVX512BW / SSE-only fallback
 
 
 
@@ -3532,4 +3613,22 @@ int main(int argc, char *argv[])
     fclose(fsam);
     return 1;
 }
+
 #endif  // MAINY
+
+/* Per-tier factory function. Compiled into each KERNEL_VARIANT build of
+ * this TU; the symbol is mangled by kernel_dispatch.h to
+ * make_kswv_kernel_<tier>. On arm64 (no KERNEL_VARIANT) this is the
+ * unmangled make_kswv_kernel.
+ *
+ * Returns Ikswv* (not unique_ptr) because extern "C" disallows non-POD
+ * return types. The dispatcher in simd_dispatch.cpp wraps it into
+ * unique_ptr at the call site. */
+extern "C" Ikswv *make_kswv_kernel(
+    int o_del, int e_del, int o_ins, int e_ins,
+    int8_t w_match, int8_t w_mismatch,
+    int numThreads, int32_t maxRefLen, int32_t maxQerLen)
+{
+    return new kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                    numThreads, maxRefLen, maxQerLen);
+}
