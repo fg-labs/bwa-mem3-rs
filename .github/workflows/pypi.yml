@@ -1,0 +1,96 @@
+name: PyPI
+
+# Publishes `bwa-mem3` wheels to PyPI when a GitHub release is published.
+#
+# Trigger chain:
+#   1. release-plz PR merges to `main`.
+#   2. `publish.yml` runs `cargo publish` for the Rust crates.
+#   3. `publish.yml` creates a GitHub release tagged `v<VERSION>`.
+#   4. The `release: published` event fires this workflow.
+#
+# `workflow_dispatch` is available for one-off manual republishes against an
+# existing tag; pick the tag in the run dialog (sets `github.ref` to that tag).
+#
+# PyPI authentication uses Trusted Publishing (OIDC). The PyPI project
+# `bwa-mem3` must have a configured publisher pointing at this workflow file
+# and the `pypi` environment before the first run; see CONTRIBUTING.md.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: bwa-mem3-py
+
+jobs:
+  wheels:
+    name: wheel (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # `release: published` carries the tag in event.release.tag_name;
+          # `workflow_dispatch` carries it on github.ref. The expression below
+          # picks whichever is populated.
+          ref: ${{ github.event.release.tag_name || github.ref }}
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: bwa-mem3-py
+          target: ${{ matrix.target }}
+          # `--release` (not `--profile=release`): maturin handles the rest
+          # (abi3, strip) from `pyproject.toml`. `--out dist` lands wheels in
+          # `bwa-mem3-py/dist/`; the upload step picks them up from there.
+          args: --release --out dist
+          # Empty on macOS (auto). On linux the manylinux_2_28 container is
+          # CentOS Stream 8 / RHEL UBI 8 derived and ships zlib-devel, so no
+          # `before-script-linux` is needed for our zlib link dependency.
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: bwa-mem3-py/dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: Upload to PyPI
+    needs: [wheels]
+    runs-on: ubuntu-latest
+    # `pypi` environment gates the upload via GitHub Environment protection
+    # rules (required reviewers, deployment branch policy, etc.) and is the
+    # value PyPI's trusted-publisher config has to be set to match.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/bwa-mem3
+    permissions:
+      # OIDC token for Trusted Publishing. No PYPI_API_TOKEN secret needed.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          # Pull every wheel-* artifact into a single dist/ directory so
+          # `gh-action-pypi-publish` finds the whole set under `packages-dir`.
+          merge-multiple: true
+      - name: Show artifact set
+        working-directory: .
+        run: ls -lh dist/
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: dist/

@@ -115,4 +115,35 @@ etc.).
 Releases are managed by [release-plz](https://release-plz.dev). Merging to
 `main` triggers a release PR that bumps versions and generates `CHANGELOG.md`
 entries from conventional commits. Merging the release PR triggers the
-publish workflow.
+`publish.yml` workflow, which:
+
+1. `cargo publish`es `bwa-mem3-sys`, `bwa-mem3-rs`, and `bwa-mem3-rs-cli` to
+   crates.io via Trusted Publishing.
+2. Creates a GitHub release tagged `v<VERSION>`.
+3. The GitHub release fires `pypi.yml`, which builds the `bwa-mem3` Python
+   wheels (Linux x86_64 / aarch64, macOS arm64) and uploads them to PyPI via
+   Trusted Publishing.
+
+Currently `bwa-mem3-py` is outside the cargo workspace and not driven by
+release-plz; bump its version manually in `bwa-mem3-py/Cargo.toml` and
+`bwa-mem3-py/pixi.toml` to match the workspace before merging the release PR.
+
+### PyPI Trusted Publishing (one-time setup)
+
+Before the first PyPI release, the project maintainer must register a
+[pending publisher](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
+on PyPI for the `bwa-mem3` project:
+
+- PyPI Project Name: `bwa-mem3`
+- Owner: `fg-labs`
+- Repository name: `bwa-mem3-rs`
+- Workflow filename: `pypi.yml`
+- Environment name: `pypi`
+
+The `pypi` GitHub Environment should also exist on the repo (`Settings →
+Environments → New environment`) so the `environment:` clause in `pypi.yml`
+resolves; protection rules (required reviewers, branch policy) are optional
+but recommended for a project that auto-publishes on release.
+
+No `PYPI_API_TOKEN` secret is needed — the workflow exchanges its OIDC token
+for a short-lived upload credential at run time.
