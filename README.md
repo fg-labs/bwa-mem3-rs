@@ -89,6 +89,10 @@ Index building is intentionally out-of-scope for this crate.
 - `bwa-mem3-rs` wraps the FFI crate in a safe Rust API with `Send`/`Sync`
   semantics that let callers drive parallelism externally.
 - `bwa-mem3-rs-cli` is a thin `bwa-rs mem` binary.
+- `bwa-mem3-py` is a [pyo3]-based Python wheel (`import bwa_mem3`) that
+  exposes the same surface to Python — see `bwa-mem3-py/README.md`. It
+  lives outside the cargo workspace and is built via `maturin` /
+  `pixi run develop`.
 
 See `CLAUDE.md` for the project-specific gotchas (CIGAR opcode remap, 2-bit
 seq encoding, vendored `MATE_SORT=0` invariant, etc.).
@@ -108,3 +112,5 @@ The end-to-end regression test (PhiX reference + simulated reads + CLI round-tri
 ## License
 
 MIT.
+
+[pyo3]: https://pyo3.rs

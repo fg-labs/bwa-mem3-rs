@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "bwa-mem3"
+description = "Python bindings for bwa-mem3 alignment with caller-owned parallelism."
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Nils Homer", email = "nils@fulcrumgenomics.com" }]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.maturin]
+module-name = "bwa_mem3._bwa_mem3"
+python-source = "python"
+features = ["pyo3/extension-module"]
+strip = true
