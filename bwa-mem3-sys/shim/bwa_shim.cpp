@@ -1,4 +1,4 @@
-/* bwa-mem3-sys/shim/bwa_shim.c
+/* bwa-mem3-sys/shim/bwa_shim.cpp
  *
  * Shim implementation for the Rust FFI crate.
  *
@@ -33,7 +33,7 @@
 #include <string.h>
 
 /* Forward declarations from vendored bwa-mem3 public headers. We avoid
- * including the full C++ headers here because bwa_shim.c is compiled as
+ * including the full C++ headers here because bwa_shim.cpp is compiled as
  * C++; including "bwa.h" directly pulls in the whole graph. Instead we
  * declare only the symbols we actually call. */
 
@@ -132,6 +132,50 @@ extern "C" void bwa_shim_set_rg_id(const char *id) {
     size_t n = strnlen(id, sizeof(bwa_rg_id) - 1);
     memcpy(bwa_rg_id, id, n);
     bwa_rg_id[n] = '\0';
+}
+
+/* -------- shared memory ------------------------------------------- */
+/* Forward-declare upstream's bwa_shm_* entry points so we don't have to
+ * pull bwa_shm.h into this TU. They're plain C linkage in upstream. */
+extern "C" int bwa_shm_test(const char *prefix);
+extern "C" int bwa_shm_stage(const char *prefix);
+extern "C" int bwa_shm_destroy(void);
+extern "C" int bwa_shm_list(void);
+
+extern "C" int bwa_shim_shm_test(const char *prefix) {
+    shim_clear_err();
+    if (!prefix) {
+        shim_set_err("null prefix");
+        return -1;
+    }
+    int rc = bwa_shm_test(prefix);
+    if (rc < 0) shim_set_err("bwa_shm_test failed (registry inaccessible?)");
+    return rc;
+}
+
+extern "C" int bwa_shim_shm_stage(const char *prefix) {
+    shim_clear_err();
+    if (!prefix) {
+        shim_set_err("null prefix");
+        return -1;
+    }
+    int rc = bwa_shm_stage(prefix);
+    if (rc < 0) shim_set_err("bwa_shm_stage failed for '%s'", prefix);
+    return rc;
+}
+
+extern "C" int bwa_shim_shm_destroy(void) {
+    shim_clear_err();
+    int rc = bwa_shm_destroy();
+    if (rc < 0) shim_set_err("bwa_shm_destroy failed");
+    return rc;
+}
+
+extern "C" int bwa_shim_shm_list(void) {
+    shim_clear_err();
+    int rc = bwa_shm_list();
+    if (rc < 0) shim_set_err("bwa_shm_list failed");
+    return rc;
 }
 
 /* -------- options + pestat lifecycle ------------------------------ */

@@ -16,6 +16,7 @@ pub mod align;
 pub mod error;
 pub mod index;
 pub mod opts;
+pub mod shm;
 pub mod xa;
 
 pub use align::{

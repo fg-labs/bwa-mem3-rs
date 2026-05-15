@@ -9,7 +9,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bwa_mem3_rs::{align_batch, BwaIndex, MemOpts, ReadPair};
+use bwa_mem3_rs::{align_batch, shm, BwaIndex, MemOpts, ReadPair};
 use clap::{Parser, Subcommand};
 use flate2::read::MultiGzDecoder;
 use noodles_bgzf as bgzf;
@@ -45,6 +45,30 @@ enum Cmd {
         #[arg(short = 'k', long)]
         min_seed_len: Option<i32>,
     },
+    /// Manage indexes pinned in POSIX shared memory.
+    Shm {
+        #[command(subcommand)]
+        action: ShmAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ShmAction {
+    /// Stage an index into shared memory so subsequent loads attach.
+    #[command(alias = "stage")]
+    Load {
+        /// Prefix of a prebuilt bwa-mem3 index (e.g. `ref.fa`).
+        prefix: PathBuf,
+    },
+    /// List staged indexes (one `<basename>\t<bytes>` line per entry).
+    List,
+    /// Drop every staged segment.
+    Drop,
+    /// Print whether `<prefix>` is staged. Exits 0 if staged, 1 if not.
+    Status {
+        /// Prefix of a prebuilt bwa-mem3 index (e.g. `ref.fa`).
+        prefix: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -65,6 +89,22 @@ fn main() -> Result<()> {
             batch_size,
             min_seed_len,
         ),
+        Cmd::Shm { action } => run_shm(action),
+    }
+}
+
+fn run_shm(action: ShmAction) -> Result<()> {
+    match action {
+        ShmAction::Load { prefix } => shm::stage(&prefix)
+            .with_context(|| format!("staging index {prefix:?} in shared memory")),
+        ShmAction::List => shm::list().context("listing staged shared-memory segments"),
+        ShmAction::Drop => shm::destroy().context("dropping staged shared-memory segments"),
+        ShmAction::Status { prefix } => {
+            let staged = shm::is_staged(&prefix)
+                .with_context(|| format!("probing shm registry for {prefix:?}"))?;
+            println!("{}", if staged { "staged" } else { "not staged" });
+            std::process::exit(if staged { 0 } else { 1 });
+        }
     }
 }
 
