@@ -53,11 +53,33 @@ def test_memopts_setters() -> None:
     o.set_read_group_id(None)
 
 
-def test_memopts_apply_mode() -> None:
+def test_memopts_apply_mode_pacbio() -> None:
     o = MemOpts()
     o.apply_mode("pacbio")
     assert o.min_seed_len == 17
     assert o.mismatch_penalty == 1
+
+
+def test_memopts_apply_mode_ont2d() -> None:
+    o = MemOpts()
+    o.apply_mode("ont2d")
+    assert o.min_seed_len == 14
+    assert o.mismatch_penalty == 1
+    assert o.minimum_score == 20
+
+
+def test_memopts_apply_mode_intractg() -> None:
+    o = MemOpts()
+    # `intractg` only touches b, o_del, o_ins, pen_clip5, pen_clip3; the seed
+    # length is left at the default.
+    default_seed = MemOpts().min_seed_len
+    o.apply_mode("intractg")
+    assert o.mismatch_penalty == 9
+    assert o.min_seed_len == default_seed
+
+
+def test_memopts_apply_mode_unknown() -> None:
+    o = MemOpts()
     with pytest.raises(ValueError):
         o.apply_mode("nonsense")
 
@@ -178,3 +200,11 @@ def test_readpair_rejects_non_bytes_like() -> None:
 def test_shm_probe_missing() -> None:
     # An almost-certainly-not-staged prefix should report False, not raise.
     assert shm.is_staged("/nonexistent/bwa-mem3-py-test-prefix") is False
+
+
+# NOTE: `BwaIndex("/nonexistent")` cannot be tested here — bwa-mem3 itself
+# calls `exit(1)` (not abort/panic) when the `.bwt.2bit.64` file can't be
+# opened, terminating the Python process before any exception can propagate.
+# A proper "missing prefix raises" test requires either (a) adding a
+# Path::exists pre-flight check in `BwaIndex::load` or (b) interposing
+# exit() at the shim layer. Tracked as a follow-up.
