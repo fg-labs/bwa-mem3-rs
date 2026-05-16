@@ -45,3 +45,56 @@ jobs:
         run: pixi run build
       - name: Smoke tests (no real index)
         run: pixi run pytest tests/test_smoke.py -v
+
+  integration:
+    # Full pytest suite (smoke + alignment) against a PhiX index built from
+    # the same upstream bwa-mem3 commit we vendor. Linux-only because
+    # bwa-mem3's Makefile and shm path are best-supported there; the wheel
+    # matrix above still exercises macOS and arm64 builds with smoke tests.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bwa_arch: sse41
+          - os: ubuntu-24.04-arm
+            bwa_arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev autoconf automake
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+        with:
+          workspaces: bwa-mem3-py
+      # Mirrors check.yml's e2e job: blobless + depth-1 fetch of the vendored
+      # SHA, build a single-arch binary. The vendored snapshot is pruned of
+      # `ext/htslib`, `ext/libsais`, `ext/mimalloc`, etc. (the Rust crate
+      # doesn't compile them), but upstream's Makefile does — so for the
+      # bwa-mem3 binary we re-fetch with submodules.
+      # TODO: switch back to `bioconda::bwa-mem3` once published.
+      - name: Build bwa-mem3 from upstream at vendored COMMIT
+        run: |
+          set -euo pipefail
+          sha="$(cat bwa-mem3-sys/vendor/COMMIT)"
+          git init /tmp/bwa-mem3
+          git -C /tmp/bwa-mem3 remote add origin https://github.com/fg-labs/bwa-mem3.git
+          git -C /tmp/bwa-mem3 fetch --filter=blob:none --no-tags --depth=1 origin "$sha"
+          git -C /tmp/bwa-mem3 checkout FETCH_HEAD
+          git -C /tmp/bwa-mem3 submodule update --init --recursive --depth 1
+          make -C /tmp/bwa-mem3 arch=${{ matrix.bwa_arch }} -j"$(nproc)" all
+          echo "BWA_MEM3_BIN=/tmp/bwa-mem3/bwa-mem3" >> "$GITHUB_ENV"
+      - uses: prefix-dev/setup-pixi@8ca4608ef7f4daeb54f5205b20d0b7cb42f11143 # v0.8.1
+        with:
+          pixi-version: v0.66.0
+          manifest-path: bwa-mem3-py/pixi.toml
+          cache: true
+      - name: Build & install editable extension
+        working-directory: bwa-mem3-py
+        run: pixi run develop
+      - name: Run full pytest suite (smoke + integration)
+        working-directory: bwa-mem3-py
+        run: pixi run pytest tests -v
