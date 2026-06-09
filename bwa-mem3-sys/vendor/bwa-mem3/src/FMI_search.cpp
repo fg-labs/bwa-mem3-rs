@@ -32,20 +32,31 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <stdlib.h>
 #include <inttypes.h>
 #include <climits>
+#include <cstring>
 #include <sys/mman.h>     /* munmap */
 #include "bwa_madvise.h"
 #include "bwa_shm.h"
 #include "FMI_search.h"
-#include "memcpy_bwamem.h"
 #include "profiling.h"
 #include "libsais_build.h"
 
-#include "safestringlib.h"
+/* Build "<prefix><suffix>" into `out` (sized `outsz`); aborts on overflow.
+ * Replaces the prior strcpy_s/strcat_s pattern for assembling FMI sidecar
+ * paths from a user-supplied prefix. */
+static void fmi_build_path(char *out, size_t outsz, const char *prefix, const char *suffix)
+{
+    int n = snprintf(out, outsz, "%s%s", prefix, suffix);
+    if (n < 0 || (size_t)n >= outsz) {
+        fprintf(stderr, "ERROR: FMI path too long for prefix '%s' (suffix '%s')\n",
+                prefix, suffix);
+        exit(EXIT_FAILURE);
+    }
+}
 
 FMI_search::FMI_search(const char *fname)
 {
     fprintf(stderr, "* Entering FMI_search\n");
-    strcpy_s(file_name, PATH_MAX, fname);
+    fmi_build_path(file_name, sizeof(file_name), fname, "");
     reference_seq_len = 0;
     sentinel_index = 0;
     sa_ls_word = NULL;
@@ -170,8 +181,7 @@ int FMI_search::build_index() {
 
     // Read single-strand length from .ann to compute doubled pac_len.
     char ann_path[PATH_MAX];
-    strcpy_s(ann_path, PATH_MAX, prefix);
-    strcat_s(ann_path, PATH_MAX, ".ann");
+    fmi_build_path(ann_path, sizeof(ann_path), prefix, ".ann");
     FILE* fann = fopen(ann_path, "r");
     if (fann == NULL) {
         fprintf(stderr, "ERROR: cannot open '%s'\n", ann_path);
@@ -242,8 +252,7 @@ void FMI_search::load_index()
     char *ref_file_name = file_name;
     //beCalls = 0;
     char cp_file_name[PATH_MAX];
-    strcpy_s(cp_file_name, PATH_MAX, ref_file_name);
-    strcat_s(cp_file_name, PATH_MAX, CP_FILENAME_SUFFIX);
+    fmi_build_path(cp_file_name, sizeof(cp_file_name), ref_file_name, CP_FILENAME_SUFFIX);
 
     // Read the BWT and FM index of the reference sequence
     FILE *cpstream = NULL;
@@ -554,6 +563,22 @@ enum LockstepPhase : uint8_t {
     PH_BWD_INIT = 1,  // between-phases housekeeping pending
     PH_BWD      = 2,  // backward search outer loop active
     PH_DONE     = 3   // slot finished; match_buf ready for flush
+};
+
+// Per-thread cache for the lockstep SMEM driver's prev[]/match_buf[]
+// buffers. RAII wrapper exists so the buffers are released at thread
+// exit instead of leaking until process exit (LSan complaint, issue
+// #116). Holding the cache as `static thread_local LockstepSmemCache`
+// inside getSMEMsOnePosOneThread_lockstep keeps the per-call reuse
+// behavior unchanged; only the cleanup point moves.
+struct LockstepSmemCache {
+    SMEM  *prev     = nullptr;
+    SMEM  *match    = nullptr;
+    size_t per_slot = 0;
+    ~LockstepSmemCache() {
+        if (prev  != nullptr) _mm_free(prev);
+        if (match != nullptr) _mm_free(match);
+    }
 };
 
 // LISA trick #4: hybrid SoA. The per-slot "hot" state stays compact
@@ -924,31 +949,28 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     // TODO(memory): the cache only grows. For mixed-length workloads (e.g.
     // a single ONT-class read with max_readlength≈1e6 mid-stream — sized
     // to ~640 MB per thread, ~10 GB across 16 OMP workers — followed by
-    // short reads), the high-water mark is held until thread/process exit.
+    // short reads), the high-water mark is held until thread exit.
     // Acceptable for the smoke1M Illumina PE150 benchmark (max_readlength≈
     // 150 → ~38 KB/thread). Revisit if a streaming aligner or long-running
     // service pipeline appears: gate the realloc on a configured upper
-    // bound (e.g. MAX_SMEM_PER_SLOT) or shrink when cached_per_slot greatly
-    // exceeds the current batch. Also flagged by leak-sanitizer/Valgrind
-    // because the buffers are released only at process exit.
+    // bound (e.g. MAX_SMEM_PER_SLOT) or shrink when cache.per_slot greatly
+    // exceeds the current batch.
     BatchSlot slots[SMEM_LOCKSTEP_N] = {};
-    static thread_local SMEM   *cached_prev  = NULL;
-    static thread_local SMEM   *cached_match = NULL;
-    static thread_local size_t  cached_per_slot = 0;
+    static thread_local LockstepSmemCache cache;
     const size_t per_slot_smems = (size_t)max_readlength;
-    if (per_slot_smems > cached_per_slot) {
-        if (cached_prev  != NULL) _mm_free(cached_prev);
-        if (cached_match != NULL) _mm_free(cached_match);
+    if (per_slot_smems > cache.per_slot) {
+        if (cache.prev  != nullptr) _mm_free(cache.prev);
+        if (cache.match != nullptr) _mm_free(cache.match);
         const size_t total_slot_bytes = (size_t)N * per_slot_smems * sizeof(SMEM);
-        cached_prev  = (SMEM *)_mm_malloc(total_slot_bytes, 64);
-        assert_not_null(cached_prev, total_slot_bytes, total_slot_bytes);
-        cached_match = (SMEM *)_mm_malloc(total_slot_bytes, 64);
-        assert_not_null(cached_match, total_slot_bytes, (size_t)2 * total_slot_bytes);
-        cached_per_slot = per_slot_smems;
+        cache.prev  = (SMEM *)_mm_malloc(total_slot_bytes, 64);
+        assert_not_null(cache.prev, total_slot_bytes, total_slot_bytes);
+        cache.match = (SMEM *)_mm_malloc(total_slot_bytes, 64);
+        assert_not_null(cache.match, total_slot_bytes, (size_t)2 * total_slot_bytes);
+        cache.per_slot = per_slot_smems;
     }
     for (int32_t s = 0; s < N; s++) {
-        slots[s].prev      = cached_prev  + (size_t)s * cached_per_slot;
-        slots[s].match_buf = cached_match + (size_t)s * cached_per_slot;
+        slots[s].prev      = cache.prev  + (size_t)s * cache.per_slot;
+        slots[s].match_buf = cache.match + (size_t)s * cache.per_slot;
     }
 
     // Seed the first min(N, numReads) slots.
@@ -1034,9 +1056,10 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     }
 
     *__numTotalSmem = numTotalSmem;
-    /* prev/match buffers are owned by thread_local caches above; intentionally
+    /* prev/match buffers are owned by the thread_local cache above; intentionally
      * not freed here so the next call (same thread) reuses them without a
-     * round-trip through the allocator. The caches leak at thread/process exit. */
+     * round-trip through the allocator. They are released by
+     * LockstepSmemCache's destructor at thread exit. */
 }
 
 int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,

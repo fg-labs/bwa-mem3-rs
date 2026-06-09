@@ -17,8 +17,9 @@ mkdir -p "$(dirname "$DST")"
 # Vendor-only subtrees: dropped to keep the snapshot small. We don't compile
 # the upstream CLI's BAM writer (htslib), the index builder (libsais), the
 # allocator override (mimalloc), the unit-test harness (doctest), benches,
-# CI configs, or upstream's docs/scripts. Keep `ext/safestringlib` and
-# `ext/sse2neon` — they are headers/sources we DO compile against.
+# CI configs, or upstream's docs/scripts. Keep `ext/sse2neon` (headers we
+# compile against) and `ext/pdqsort` (the header-only sort dropped in at
+# bwamem.cpp sort sites).
 DROP_SUBTREES=(
     .github bench docs scripts
     ext/htslib ext/libsais ext/mimalloc ext/doctest

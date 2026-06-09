@@ -153,13 +153,21 @@ endif
 
 CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 -DLIBSAIS_OPENMP
 
-# Version string for `bwa-mem3 version` and the @PG VN: field. Prefer
-# `git describe` (e.g. v2.3-30-g61813ef, with -dirty suffix for modified
-# trees) so the stamped version always reflects the actual build. Fall
-# back to a static tag for source-tarball / shallow-clone builds.
-FG_LABS_VERSION_FALLBACK := 0.2.0
-VERSION_STRING := $(shell git describe --tags --dirty 2>/dev/null || echo $(FG_LABS_VERSION_FALLBACK))
-INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib -Iext/libsais/include
+# Version string for `bwa-mem3 version` and the @PG VN: field. The single
+# source of truth is `version.txt` (rewritten by release-please on each
+# release). The logic of "base version + optional git-describe dev suffix"
+# lives in `scripts/version.sh` rather than an inline `$(shell ...)` so
+# the multi-line case statement can stay readable and is independently
+# testable. Tarball / shallow-clone builds with no .git/ get the bare
+# base version; checkouts past or dirty at the tag get an informational
+# dev suffix appended.
+VERSION_STRING := $(shell scripts/version.sh)
+# One path per line so adding or removing a single -I against this list
+# is a one-line diff that never overlaps with edits to adjacent lines
+# (e.g. the VERSION_STRING block above).
+INCLUDES += -Isrc
+INCLUDES += -Iext/htslib
+INCLUDES += -Iext/libsais/include
 ifeq ($(USE_MIMALLOC),1)
     INCLUDES += -Iext/mimalloc/include
 endif
@@ -184,10 +192,42 @@ else
     LIBSAIS_OPENMP_LIBS   = -fopenmp
 endif
 
-LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring -Lext/htslib -lhts $(LIBSAIS_OPENMP_LIBS) $(STATIC_GCC) $(LIBS_EXTRA)
+# Same one-per-line shape as INCLUDES above. -L/-l pairs that name a
+# specific library stay grouped (search path + lib are a unit), so
+# adding or removing a dep is still a one-line diff.
+LIBS  = -lpthread
+LIBS += -lm
+LIBS += -lz
+LIBS += -L. -lbwa
+LIBS += -Lext/htslib -lhts
+LIBS += $(LIBSAIS_OPENMP_LIBS)
+LIBS += $(STATIC_GCC)
+LIBS += $(LIBS_EXTRA)
+# Pull in htslib's transitive deps (-ldeflate when libdeflate is detected,
+# bzlib / lzma / curl when those features are enabled) from the generated
+# htslib_static.mk -- the same mechanism samtools uses (samtools'
+# config.mk.in pulls in both static_LIBS and static_LDFLAGS).
+#
+# Without this, any htslib configure feature that auto-detects on the
+# host -- notably libdeflate on Debian/Ubuntu where libdeflate-dev is
+# the default install -- gives libhts.a unresolved symbols that fail
+# the bwa-mem3 link step.
+#
+# Mechanism (subtle): on a clean tree, htslib_static.mk doesn't exist
+# at parse time, so `-include` silently skips it. To populate
+# HTSLIB_static_LIBS / HTSLIB_static_LDFLAGS in time for the link
+# recipe we rely on GNU Make's "remade-makefiles" restart loop, which
+# only fires when the include file is itself a target with a non-empty
+# recipe in this Makefile. The rule is declared next to the `$(HTS_LIB)`
+# recipe further down (where HTS_LIB is in scope and the build-time
+# concerns sit together); the `@:` recipe there is required -- a
+# prereq-only rule does NOT trigger restart.
+-include ext/htslib/htslib_static.mk
+LIBS    += $(HTSLIB_static_LIBS)
+LDFLAGS += $(HTSLIB_static_LDFLAGS)
 # Non-kernel objects: always compiled once at the baseline ISA and linked into
 # libbwa.a on every build (arm64 and x86 alike).
-OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.o \
+OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/kstring.o src/bntseq.o src/bwamem.o src/profiling.o \
 			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
@@ -206,7 +246,6 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.
 KERNEL_BASELINE_OBJS = src/bandedSWA.o src/kswv.o src/ksw.o src/sam_encode.o
 OBJS += $(KERNEL_BASELINE_OBJS)
 BWA_LIB=    libbwa.a
-SAFE_STR_LIB=    ext/safestringlib/libsafestring.a
 HTS_LIB=    ext/htslib/libhts.a
 
 # Architecture-specific builds (x86 only, ARM uses default from above)
@@ -421,17 +460,17 @@ endif
 # Internal: builds the single binary with the BASELINE_ARCH tier for
 # non-kernel TUs and links all KERNEL_TIER_OBJS_LINK on top.
 .PHONY: all-single
-all-single: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(KERNEL_TIER_OBJS_LINK) src/main.o
+all-single: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(KERNEL_TIER_OBJS_LINK) src/main.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(KERNEL_TIER_OBJS_LINK) $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $(EXE)
 
 # ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
 arm64:
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	rm -f src/*.o $(BWA_LIB)
 	$(MAKE) arch=arm64 EXE=bwa-mem3.arm64 CXX="$(CXX)" all
 	ln -sf bwa-mem3.arm64 bwa-mem3
 
 
-$(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
+$(EXE):$(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
 # Regression test for issue 38 / upstream PR 289: exercises an all-len1==0
@@ -450,7 +489,7 @@ $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(U
 src/kswv.native.o: src/kswv.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
 
-kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) src/kswv.native.o test/kswv_nrow_zero_test.o
+kswv_nrow_zero_test: $(BWA_LIB) $(HTS_LIB) src/kswv.native.o test/kswv_nrow_zero_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/kswv_nrow_zero_test.o src/kswv.native.o $(BWA_LIB) $(LIBS) -o $@
 
 # Build the test binaries with the same ARCH_FLAGS as libbwa.a so the
@@ -460,24 +499,25 @@ kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) src/kswv.native.o tes
 # libbwa.a, which then lacks kswv::getScores8 — the BWA_TESTS_HAVE_KSWV
 # macro guards the test away).
 .PHONY: test-binaries
-# $(SAFE_STR_LIB) and $(HTS_LIB) are real link-time deps: test/Makefile's
-# bwa_mem3_tests_unit recipe references ../ext/safestringlib/libsafestring.a
-# and ../ext/htslib/libhts.a directly. Without these prereqs, callers that
-# skip the bwa-mem3 binary build (which builds them as a side-effect of
-# $(EXE) deps) link-fail.
-test-binaries: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB)
+# $(HTS_LIB) is a real link-time dep: test/Makefile's bwa_mem3_tests_unit
+# recipe references ../ext/htslib/libhts.a directly. Without this prereq,
+# callers that skip the bwa-mem3 binary build (which builds it as a
+# side-effect of $(EXE) deps) link-fail.
+test-binaries: $(BWA_LIB) $(HTS_LIB)
 	$(MAKE) -C test framework unit integration \
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
-	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)'
+	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
+	    HTSLIB_static_LIBS='$(HTSLIB_static_LIBS)' \
+	    HTSLIB_static_LDFLAGS='$(HTSLIB_static_LDFLAGS)'
 
-shm_section_find_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_section_find_test.o
+shm_section_find_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_section_find_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_section_find_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
-shm_pack_round_trip_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_round_trip_test.o
+shm_pack_round_trip_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_round_trip_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_pack_round_trip_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
-shm_lock_destroy_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
+shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_lock_destroy_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
@@ -528,26 +568,6 @@ test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
 $(BWA_LIB):$(OBJS) $(KERNEL_TIER_OBJS)
 	ar rcs $(BWA_LIB) $(OBJS) $(KERNEL_TIER_OBJS)
 
-# safestringlib's safeclib_private.h calls abort() / memcpy() via macros
-# without including <stdlib.h> / <string.h> in the TU, which fails the
-# implicit-function-declaration check in clang >= 15. Some safeclib TUs
-# (strcasecmp_s.c, strcasestr_s.c) likewise call toupper() without
-# including <ctype.h>. Force-include stdlib.h + ctype.h whenever the
-# build CC is clang (Linux clang job) or whenever we're on Darwin (where
-# the system `cc` is always clang). On Darwin we also redefine memset_s:
-# macOS libc declares C11 Annex K memset_s with a different signature,
-# which conflicts with the safestringlib definition.
-SAFE_EXTRA_CFLAGS =
-SAFE_CC_BASENAME := $(notdir $(CC))
-ifeq ($(UNAME_S),Darwin)
-    SAFE_EXTRA_CFLAGS += -include stdlib.h -include ctype.h -Dmemset_s=_safestringlib_memset_s
-else ifneq (,$(findstring clang,$(SAFE_CC_BASENAME)))
-    SAFE_EXTRA_CFLAGS += -include stdlib.h -include ctype.h
-endif
-
-$(SAFE_STR_LIB):
-	cd ext/safestringlib/ && $(MAKE) clean && $(MAKE) CC="$(CC)" CFLAGS="-Iinclude -Isafeclib $(SAFE_EXTRA_CFLAGS) -fstack-protector-strong -fPIE -fPIC -O2" directories libsafestring.a
-
 # htslib: minimal configure (no lzma/bz2/curl/S3/GCS/plugins), zlib only.
 # Guard on config.mk (only created by ./configure) rather than Makefile, which
 # is checked into the htslib tree and would make the guard a no-op.
@@ -556,7 +576,21 @@ $(HTS_LIB):
 	    ([ -f config.mk ] || (autoreconf -i && \
 	        ./configure --disable-lzma --disable-libcurl --disable-gcs \
 	                    --disable-s3 --disable-plugins --disable-bz2)) && \
-	    $(MAKE) libhts.a
+	    $(MAKE) libhts.a htslib_static.mk
+
+# Companion to the `-include ext/htslib/htslib_static.mk` near LIBS:
+# declare the include file as a target with a non-empty recipe so GNU
+# Make's "remade-makefiles" restart loop fires on the first parse,
+# builds $(HTS_LIB) (which generates htslib_static.mk as a side effect
+# of the `make libhts.a htslib_static.mk` invocation above), then
+# re-parses this Makefile so HTSLIB_static_LIBS / HTSLIB_static_LDFLAGS
+# resolve in time for the link recipe. `@:` is required -- without a
+# recipe, Make doesn't consider the include file "remade" and skips
+# the restart, leaving the include variables empty at link time.
+# Must be placed after the default goal (myall / all) so it doesn't
+# accidentally become the default goal of `make` with no arguments.
+ext/htslib/htslib_static.mk: $(HTS_LIB)
+	@:
 
 # libsais: compile the two C sources we use (libsais.c + libsais64.c) as
 # plain .o files. OpenMP enabled via LIBSAIS_OPENMP so libsais64_gsa_omp
@@ -593,7 +627,6 @@ clean: pgo-clean profile-clean lto-clean
 	rm -f $(LIBSAIS_OBJS)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean
-	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
 
@@ -669,13 +702,13 @@ else
 endif
 
 pgo-generate:
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	rm -f src/*.o $(BWA_LIB)
 	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="-fprofile-generate=$(PGO_PROFILE_DIR)" CXX="$(CXX)" all
 	@echo "PGO instrumented binary built: $(PGO_INSTR_EXE) (arch=$(PGO_ARCH), profile dir=$(PGO_PROFILE_DIR))"
 	@echo "Run training workload with $(PGO_INSTR_EXE), then: make pgo-use PGO_ARCH=$(PGO_ARCH) PGO_PROFILE_DIR=$(PGO_PROFILE_DIR)"
 
 pgo-use:
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	rm -f src/*.o $(BWA_LIB)
 	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="-fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX="$(CXX)" all
 	@echo "PGO optimized binary built: $(PGO_FINAL_EXE) (arch=$(PGO_ARCH))"
 
@@ -704,7 +737,7 @@ endif
 #        make profile-build PROFILE_ARCH=avx2     # cross-build
 #        ./bwa-mem3.profile mem -t N idx r1.fq.gz r2.fq.gz
 profile-build:
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	rm -f src/*.o $(BWA_LIB)
 	$(MAKE) arch=$(PROFILE_ARCH) EXE=bwa-mem3.profile EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT" CXX="$(CXX)" all
 	@echo "Compute-only profile binary: bwa-mem3.profile (arch=$(PROFILE_ARCH), output I/O skipped)"
 	# Drop variant-flagged objects from the shared cache so a subsequent
@@ -719,7 +752,7 @@ profile-clean:
 #        make lto-build LTO_ARCH=avx2             # cross-build
 #        ./bwa-mem3.lto mem -t N idx r1.fq.gz r2.fq.gz
 # Compiles all bwa-mem3 sources with LTO and links with LTO. Non-bwa-mem3
-# deps (htslib, mimalloc, safestringlib) keep their non-LTO objects; the
+# deps (htslib, mimalloc) keep their non-LTO objects; the
 # linker still does LTO across bwa-mem3's own .o. On GCC,
 # -fno-semantic-interposition additionally allows more aggressive inlining
 # across translation units (no effect on clang, silently ignored).
@@ -728,11 +761,59 @@ profile-clean:
 # or missing $(CXX) doesn't print a "command not found" warning on every
 # `make` invocation that doesn't even target lto-build.
 lto-build:
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	rm -f src/*.o $(BWA_LIB)
+	# GCC + Docker BuildKit jobserver workaround (fg-labs/bwa-mem3#121).
+	#
+	# Symptom: under BuildKit `make lto-build` dies with
+	#   make[2]: *** write jobserver: Bad file descriptor.  Stop.
+	#   lto-wrapper: fatal error: make returned 2 exit status
+	# linux/arm64 happens to dodge it; linux/amd64 reproduces every time.
+	#
+	# Root cause: GNU make 4.3's jobserver uses a pair of pipe FDs the parent
+	# make advertises in MAKEFLAGS. The chain that breaks under BuildKit is
+	# `make[1]` → `gcc -flto` → `lto-wrapper` → `make[2]`. GCC's hygienic
+	# subprocess infrastructure sets FD_CLOEXEC on inherited file descriptors
+	# it doesn't recognize as compiler-relevant, which closes the jobserver
+	# FDs before lto-wrapper's `make[2]` can see them. `make[2]` reads
+	# MAKEFLAGS, finds the FD numbers, tries to write to them, and dies on
+	# EBADF. This is a known GNU make 4.3 limitation;
+	# `--jobserver-style=fifo` (GNU make 4.4+) would survive the chain by
+	# using a named FIFO instead of FDs, but Debian Bookworm — and therefore
+	# the bwa-mem3-bench Dockerfile's base image — ships make 4.3.
+	#
+	# Tried and rejected:
+	#   - `-flto=auto`: still attempts jobserver negotiation on GCC 12.
+	#   - `-flto=N` alone: lto-wrapper still spawns a sub-make that inherits
+	#     MAKEFLAGS via the GCC env.
+	#   - Clearing MAKEFLAGS for the recursive make `+` `-j$N`: the recursive
+	#     make freshly opens its own jobserver FDs in its process, but those
+	#     FDs still get CLOEXEC'd by GCC during the LTO link step, so
+	#     lto-wrapper's make[2] still hits EBADF.
+	#
+	# Fix that works: drive the recursive make with `-j1` so it does NOT
+	# advertise a jobserver in MAKEFLAGS at all. With nothing advertised,
+	# lto-wrapper's make[2] doesn't try to inherit one — it uses the
+	# parallelism level requested by `-flto=$$LTO_JOBS` directly, via its
+	# own freshly-opened FDs scoped to the lto-wrapper process tree. The
+	# inner compile phase goes serial (~5 min cost on a bench-fleet build);
+	# the LTO link phase, which dominates LTO build time, stays parallel.
+	# Acceptable trade-off for a per-SHA one-shot build.
+	#
+	# When BuildKit is not in the picture (local dev, traditional CI) the
+	# -j1 inner compile is the same single-fork-per-recipe-line behavior
+	# `make all -j1` would have produced — no behavioral regression vs.
+	# running `make lto-build` without -j on the outer level. The fix only
+	# changes the parallelism breakdown, not the build product.
+	#
+	# Clang's `-flto=thin` branch is unaffected — ThinLTO uses its own
+	# parallelism, not the GNU make jobserver, and never participated in
+	# the FD inheritance dance.
 	@CXX_VERSION="$$($(CXX) --version 2>&1 | head -1)"; \
-	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto ;; esac; \
-	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH))"; \
-	  $(MAKE) arch=$(LTO_ARCH) EXE=bwa-mem3.lto EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
+	  LTO_JOBS=$$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1); \
+	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto=$$LTO_JOBS ;; esac; \
+	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH), lto-jobs: $$LTO_JOBS)"; \
+	  MAKEFLAGS= MAKEOVERRIDES= \
+	    $(MAKE) -j1 arch=$(LTO_ARCH) EXE=bwa-mem3.lto EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
 	@echo "LTO binary: bwa-mem3.lto (arch=$(LTO_ARCH))"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -flto / -fno-semantic-interposition
@@ -754,12 +835,7 @@ depend:
 src/FMI_search.o: src/bwa_madvise.h src/bwa_shm.h src/FMI_search.h
 src/FMI_search.o: src/simd_compat.h src/read_index_ele.h src/utils.h
 src/FMI_search.o: src/bntseq.h src/macro.h src/bwa.h src/bwt.h
-src/FMI_search.o: src/memcpy_bwamem.h src/safestringlib.h
-src/FMI_search.o: ext/safestringlib/include/safe_mem_lib.h
-src/FMI_search.o: ext/safestringlib/include/safe_lib.h
-src/FMI_search.o: ext/safestringlib/include/safe_types.h
-src/FMI_search.o: ext/safestringlib/include/safe_lib_errno.h
-src/FMI_search.o: ext/safestringlib/include/safe_str_lib.h src/profiling.h
+src/FMI_search.o: src/profiling.h
 src/FMI_search.o: src/libsais_build.h
 src/bam_writer.o: ext/htslib/htslib/sam.h ext/htslib/htslib/hts.h
 src/bam_writer.o: ext/htslib/htslib/hts_defs.h ext/htslib/htslib/hts_log.h
@@ -774,39 +850,20 @@ src/bam_writer.o: src/cigar_util.h
 src/bandedSWA.o: src/kernel_dispatch.h src/bandedSWA.h src/macro.h
 src/bandedSWA.o: src/simd_compat.h
 src/bntseq.o: src/bntseq.h src/utils.h src/macro.h src/kseq.h
-src/bntseq.o: src/memcpy_bwamem.h src/safestringlib.h
-src/bntseq.o: ext/safestringlib/include/safe_mem_lib.h
-src/bntseq.o: ext/safestringlib/include/safe_lib.h
-src/bntseq.o: ext/safestringlib/include/safe_types.h
-src/bntseq.o: ext/safestringlib/include/safe_lib_errno.h
-src/bntseq.o: ext/safestringlib/include/safe_str_lib.h src/khash.h
+src/bntseq.o: src/khash.h
 src/bwa.o: src/bntseq.h src/bwa.h src/bwt.h src/macro.h src/ksw.h
 src/bwa.o: src/kernel_dispatch.h src/simd_compat.h src/utils.h src/kstring.h
-src/bwa.o: src/kvec.h src/u8vec_scratch.h src/safestringlib.h
-src/bwa.o: ext/safestringlib/include/safe_mem_lib.h
-src/bwa.o: ext/safestringlib/include/safe_lib.h
-src/bwa.o: ext/safestringlib/include/safe_types.h
-src/bwa.o: ext/safestringlib/include/safe_lib_errno.h
-src/bwa.o: ext/safestringlib/include/safe_str_lib.h src/kseq.h
-src/bwa.o: src/memcpy_bwamem.h
+src/bwa.o: src/kvec.h src/u8vec_scratch.h
+src/bwa.o: src/kseq.h
 src/bwa_shm.o: src/bwa_shm.h src/bwa.h src/bntseq.h src/bwt.h src/macro.h
 src/bwa_shm.o: src/FMI_search.h src/simd_compat.h src/read_index_ele.h
-src/bwa_shm.o: src/utils.h src/safestringlib.h
-src/bwa_shm.o: ext/safestringlib/include/safe_mem_lib.h
-src/bwa_shm.o: ext/safestringlib/include/safe_lib.h
-src/bwa_shm.o: ext/safestringlib/include/safe_types.h
-src/bwa_shm.o: ext/safestringlib/include/safe_lib_errno.h
-src/bwa_shm.o: ext/safestringlib/include/safe_str_lib.h
+src/bwa_shm.o: src/utils.h
 src/bwamem.o: src/bwamem.h src/bwt.h src/bntseq.h src/bwa.h src/macro.h
 src/bwamem.o: src/kthread.h src/bandedSWA.h src/simd_compat.h
 src/bwamem.o: src/kernel_dispatch.h src/kstring.h src/ksw.h src/kvec.h
 src/bwamem.o: src/ksort.h src/utils.h src/profiling.h src/FMI_search.h
-src/bwamem.o: src/read_index_ele.h src/memcpy_bwamem.h src/safestringlib.h
-src/bwamem.o: ext/safestringlib/include/safe_mem_lib.h
-src/bwamem.o: ext/safestringlib/include/safe_lib.h
-src/bwamem.o: ext/safestringlib/include/safe_types.h
-src/bwamem.o: ext/safestringlib/include/safe_lib_errno.h
-src/bwamem.o: ext/safestringlib/include/safe_str_lib.h src/bam_writer.h
+src/bwamem.o: src/read_index_ele.h
+src/bwamem.o: src/bam_writer.h
 src/bwamem.o: src/meth_bam.h src/u8vec_scratch.h src/sam_encode.h
 src/bwamem.o: src/kbtree.h
 src/bwamem_extra.o: src/bwa.h src/bntseq.h src/bwt.h src/macro.h src/bwamem.h
@@ -822,23 +879,15 @@ src/bwamem_pair.o: src/FMI_search.h src/read_index_ele.h src/bam_writer.h
 src/bwamem_pair.o: src/u8vec_scratch.h src/kswv.h
 src/bwtindex.o: src/bntseq.h src/bwa.h src/bwt.h src/macro.h src/utils.h
 src/bwtindex.o: src/FMI_search.h src/simd_compat.h src/read_index_ele.h
-src/bwtindex.o: src/kseq.h src/memcpy_bwamem.h src/safestringlib.h
-src/bwtindex.o: ext/safestringlib/include/safe_mem_lib.h
-src/bwtindex.o: ext/safestringlib/include/safe_lib.h
-src/bwtindex.o: ext/safestringlib/include/safe_types.h
-src/bwtindex.o: ext/safestringlib/include/safe_lib_errno.h
-src/bwtindex.o: ext/safestringlib/include/safe_str_lib.h src/system.h
+src/bwtindex.o: src/kseq.h
+src/bwtindex.o: src/system.h
 src/fastmap.o: src/bwa_madvise.h src/fastmap.h src/bwa.h src/bntseq.h
 src/fastmap.o: src/bwt.h src/macro.h src/bwamem.h src/kthread.h
 src/fastmap.o: src/bandedSWA.h src/simd_compat.h src/kernel_dispatch.h
 src/fastmap.o: src/kstring.h src/ksw.h src/kvec.h src/ksort.h src/utils.h
 src/fastmap.o: src/profiling.h src/FMI_search.h src/read_index_ele.h
-src/fastmap.o: src/kseq.h src/memcpy_bwamem.h src/safestringlib.h
-src/fastmap.o: ext/safestringlib/include/safe_mem_lib.h
-src/fastmap.o: ext/safestringlib/include/safe_lib.h
-src/fastmap.o: ext/safestringlib/include/safe_types.h
-src/fastmap.o: ext/safestringlib/include/safe_lib_errno.h
-src/fastmap.o: ext/safestringlib/include/safe_str_lib.h src/bam_writer.h
+src/fastmap.o: src/kseq.h
+src/fastmap.o: src/bam_writer.h
 src/fastmap.o: src/meth_bam.h src/meth_orig_ref.h src/bwa_shm.h
 src/fm_index_writer.o: src/fm_index_writer.h src/FMI_search.h
 src/fm_index_writer.o: src/simd_compat.h src/read_index_ele.h src/utils.h
@@ -846,12 +895,6 @@ src/fm_index_writer.o: src/bntseq.h src/macro.h src/bwa.h src/bwt.h
 src/fm_index_writer.o: src/io_utils.h
 src/index_prelude.o: src/index_prelude.h src/io_utils.h src/utils.h
 src/index_prelude.o: src/packed_text.h
-src/kopen.o: src/memcpy_bwamem.h src/safestringlib.h
-src/kopen.o: ext/safestringlib/include/safe_mem_lib.h
-src/kopen.o: ext/safestringlib/include/safe_lib.h
-src/kopen.o: ext/safestringlib/include/safe_types.h
-src/kopen.o: ext/safestringlib/include/safe_lib_errno.h
-src/kopen.o: ext/safestringlib/include/safe_str_lib.h
 src/kstring.o: src/kstring.h
 src/ksw.o: src/kernel_dispatch.h src/simd_compat.h src/ksw.h src/macro.h
 src/kswv.o: src/kernel_dispatch.h src/kswv.h src/macro.h src/ksw.h
@@ -870,19 +913,9 @@ src/main.o: src/main.h src/kstring.h src/utils.h src/macro.h src/bandedSWA.h
 src/main.o: src/simd_compat.h src/kernel_dispatch.h src/profiling.h
 src/main.o: src/fastmap.h src/bwa.h src/bntseq.h src/bwt.h src/bwamem.h
 src/main.o: src/kthread.h src/ksw.h src/kvec.h src/ksort.h src/FMI_search.h
-src/main.o: src/read_index_ele.h src/kseq.h src/memcpy_bwamem.h
-src/main.o: src/safestringlib.h ext/safestringlib/include/safe_mem_lib.h
-src/main.o: ext/safestringlib/include/safe_lib.h
-src/main.o: ext/safestringlib/include/safe_types.h
-src/main.o: ext/safestringlib/include/safe_lib_errno.h
-src/main.o: ext/safestringlib/include/safe_str_lib.h src/simd_dispatch.h
+src/main.o: src/read_index_ele.h src/kseq.h
+src/main.o: src/simd_dispatch.h
 src/main.o: src/version.h src/bwa_shm.h ext/mimalloc/include/mimalloc.h
-src/memcpy_bwamem.o: src/memcpy_bwamem.h src/safestringlib.h
-src/memcpy_bwamem.o: ext/safestringlib/include/safe_mem_lib.h
-src/memcpy_bwamem.o: ext/safestringlib/include/safe_lib.h
-src/memcpy_bwamem.o: ext/safestringlib/include/safe_types.h
-src/memcpy_bwamem.o: ext/safestringlib/include/safe_lib_errno.h
-src/memcpy_bwamem.o: ext/safestringlib/include/safe_str_lib.h
 src/meth_bam.o: ext/htslib/htslib/sam.h ext/htslib/htslib/hts.h
 src/meth_bam.o: ext/htslib/htslib/hts_defs.h ext/htslib/htslib/hts_log.h
 src/meth_bam.o: ext/htslib/htslib/kstring.h ext/htslib/htslib/kroundup.h
@@ -907,21 +940,11 @@ src/meth_xm.o: src/profiling.h src/FMI_search.h src/read_index_ele.h
 src/packed_text.o: src/packed_text.h src/utils.h
 src/profiling.o: src/macro.h src/bwa.h src/bntseq.h src/bwt.h src/profiling.h
 src/read_index_ele.o: src/read_index_ele.h src/utils.h src/bntseq.h
-src/read_index_ele.o: src/macro.h src/safestringlib.h
-src/read_index_ele.o: ext/safestringlib/include/safe_mem_lib.h
-src/read_index_ele.o: ext/safestringlib/include/safe_lib.h
-src/read_index_ele.o: ext/safestringlib/include/safe_types.h
-src/read_index_ele.o: ext/safestringlib/include/safe_lib_errno.h
-src/read_index_ele.o: ext/safestringlib/include/safe_str_lib.h
+src/read_index_ele.o: src/macro.h
 src/read_index_ele.o: src/bwa_madvise.h src/bwa_shm.h
 src/sam_encode.o: src/sam_encode.h src/kernel_dispatch.h
 src/simd_dispatch.o: src/simd_dispatch.h src/bandedSWA.h src/macro.h
 src/simd_dispatch.o: src/simd_compat.h src/kernel_dispatch.h src/kswv.h
 src/simd_dispatch.o: src/ksw.h src/sam_encode.h
 src/system.o: src/system.h
-src/utils.o: src/utils.h src/ksort.h src/kseq.h src/memcpy_bwamem.h
-src/utils.o: src/safestringlib.h ext/safestringlib/include/safe_mem_lib.h
-src/utils.o: ext/safestringlib/include/safe_lib.h
-src/utils.o: ext/safestringlib/include/safe_types.h
-src/utils.o: ext/safestringlib/include/safe_lib_errno.h
-src/utils.o: ext/safestringlib/include/safe_str_lib.h
+src/utils.o: src/utils.h src/ksort.h src/kseq.h
