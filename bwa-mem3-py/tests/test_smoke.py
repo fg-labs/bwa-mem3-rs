@@ -7,6 +7,7 @@ synthetic batch; that one is gated on BWA_MEM3_RS_TEST_REF.
 from __future__ import annotations
 
 import gc
+from pathlib import Path
 
 import pytest
 
@@ -202,9 +203,18 @@ def test_shm_probe_missing() -> None:
     assert shm.is_staged("/nonexistent/bwa-mem3-py-test-prefix") is False
 
 
-# NOTE: `BwaIndex("/nonexistent")` cannot be tested here — bwa-mem3 itself
-# calls `exit(1)` (not abort/panic) when the `.bwt.2bit.64` file can't be
-# opened, terminating the Python process before any exception can propagate.
-# A proper "missing prefix raises" test requires either (a) adding a
-# Path::exists pre-flight check in `BwaIndex::load` or (b) interposing
-# exit() at the shim layer. Tracked as a follow-up.
+def test_load_missing_index_raises() -> None:
+    # Historically bwa-mem3 called `exit(1)` when `.bwt.2bit.64` was missing,
+    # killing the interpreter (issue #19). The pre-flight in `BwaIndex::load`
+    # now surfaces a recoverable error, so a missing prefix must raise.
+    with pytest.raises(RuntimeError, match="absent"):
+        bwa_mem3.BwaIndex("/nonexistent/absent")
+
+
+def test_load_partial_index_raises(tmp_path: Path) -> None:
+    # Every required companion present except `.ann`: the loader would
+    # otherwise exit() partway through. The error must name the missing file.
+    for suffix in (".bwt.2bit.64", ".amb", ".pac"):
+        (tmp_path / f"partial{suffix}").write_bytes(b"stub")
+    with pytest.raises(RuntimeError, match=r"\.ann"):
+        bwa_mem3.BwaIndex(str(tmp_path / "partial"))
