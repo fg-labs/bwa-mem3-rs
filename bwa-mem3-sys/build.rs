@@ -14,8 +14,13 @@ use std::process::Command;
 const KERNEL_SRCS: &[&str] = &["bandedSWA.cpp", "kswv.cpp", "ksw.cpp", "sam_encode.cpp"];
 
 /// Per-tier ISA flags for the x86_64 kernel multi-build. Mirrors upstream's
-/// `KERNEL_FLAGS_<tier>` groups in `vendor/bwa-mem3/Makefile`. `-mprefer-vector-
-/// width=256` is included for `avx512bw` to match upstream's autovec cap.
+/// `KERNEL_FLAGS_<tier>` groups in `vendor/bwa-mem3/Makefile`, with one
+/// addition: `avx512bw` also carries `-mprefer-vector-width=256`. Upstream
+/// applies that flag only on its baseline auto-vectorized path, not the kernel
+/// TUs (`KERNEL_FLAGS_avx512bw` is just `-mavx -mavx2 -mavx512f -mavx512bw
+/// -mpopcnt`). It is harmless here — the kernels use intrinsics, not
+/// auto-vec — but capping vector width matches upstream's intent on Skylake-X
+/// where 512-bit ops can downclock.
 const KERNEL_TIERS_X86: &[(&str, &[&str])] = &[
     ("sse41", &["-msse4.1"]),
     ("sse42", &["-msse4.2", "-mpopcnt"]),
@@ -111,39 +116,15 @@ fn main() {
     }
 
     let vendor_src = build_dir.join("bwa-mem3/src");
-    let ssl = build_dir.join("bwa-mem3/ext/safestringlib");
+    // bwa-mem3 v0.2.2 (#105) dropped the intel/safestringlib dependency, sweeping
+    // every `*_s` call back to plain libc. There is no longer a safestringlib to
+    // build or include.
     let s2n = build_dir.join("bwa-mem3/ext/sse2neon");
-
-    // 4a. safestringlib is pure C — compile as C with its own cc::Build.
-    if ssl.is_dir() {
-        let safeclib = ssl.join("safeclib");
-        if safeclib.is_dir() {
-            let mut c_build = cc::Build::new();
-            for entry in fs::read_dir(&safeclib).unwrap() {
-                let e = entry.unwrap();
-                if e.path().extension().is_some_and(|x| x == "c") {
-                    c_build.file(e.path());
-                }
-            }
-            c_build.include(ssl.join("include"));
-            c_build.flag_if_supported("-Wno-unused-parameter");
-            c_build.flag_if_supported("-Wno-unused-variable");
-            c_build.flag_if_supported("-Wno-unused-function");
-            c_build.flag_if_supported("-Wno-unused-but-set-variable");
-            c_build.flag_if_supported("-Wno-format");
-            // safestringlib relies on implicit declarations in places; newer
-            // compilers error on these. Relax to a warning.
-            c_build.flag_if_supported("-Wno-implicit-function-declaration");
-            c_build.flag_if_supported("-Wno-incompatible-pointer-types");
-            apply_simd_flags(&mut c_build);
-            c_build.compile("safestring");
-        }
-    }
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let is_x86 = target_arch == "x86_64";
 
-    // 4b. Per-tier kernel TUs (x86_64 only). bwa-mem3 v0.2.0 picks the
+    // 4a. Per-tier kernel TUs (x86_64 only). bwa-mem3 v0.2.0 picks the
     // matching tier at runtime in `simd_dispatch.cpp`; we must supply all
     // five mangled tier copies of bandedSWA/kswv/ksw/sam_encode so the
     // dispatcher's `make_bsw_kernel_<tier>` / `ksw_extend2_<tier>` /
@@ -154,9 +135,6 @@ fn main() {
             k_build.cpp(true);
             for src in KERNEL_SRCS {
                 k_build.file(vendor_src.join(src));
-            }
-            if ssl.is_dir() {
-                k_build.include(ssl.join("include"));
             }
             if s2n.is_dir() {
                 k_build.include(&s2n);
@@ -179,7 +157,7 @@ fn main() {
         }
     }
 
-    // 4c. bwa-mem3 + shim: C++.
+    // 4b. bwa-mem3 + shim: C++.
     let mut build = cc::Build::new();
     build.cpp(true);
 
@@ -196,7 +174,7 @@ fn main() {
     // built to expose worker_alloc/worker_free. Its entry point is
     // `main_mem`, not `main`, so no collision with the Rust test harness.
     //
-    // On x86_64 the kernel TUs are compiled separately per tier in 4b
+    // On x86_64 the kernel TUs are compiled separately per tier in 4a
     // (`KERNEL_TIERS_X86`); skip them here so the baseline build doesn't
     // also emit unmangled copies (and so this build inherits no `-mavx512bw`
     // surprises from the baseline ISA). On arm64 the kernels compile once
@@ -213,9 +191,6 @@ fn main() {
         }
     }
 
-    if ssl.is_dir() {
-        build.include(ssl.join("include"));
-    }
     if s2n.is_dir() {
         build.include(&s2n);
     }

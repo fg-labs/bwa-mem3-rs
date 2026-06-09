@@ -267,6 +267,7 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         w.mmc.wsize_mem[l]     = 0;
         w.mmc.wsize_mem_s[l]   = 0;
         w.mmc.wsize_mem_r[l]   = 0;
+        w.mmc.wsize_qdb[l]     = 0;
         w.mmc.matchArray[l]    = NULL;
         w.mmc.min_intv_ar[l]   = NULL;
         w.mmc.query_pos_ar[l]  = NULL;
@@ -934,8 +935,11 @@ static uint8_t *load_ref_string(const char *prefix, uint8_t *shm_base,
 
     /* Disk path. */
     char binary_seq_file[PATH_MAX];
-    strcpy_s(binary_seq_file, PATH_MAX, prefix);
-    strcat_s(binary_seq_file, PATH_MAX, ".0123");
+    int n = snprintf(binary_seq_file, sizeof(binary_seq_file), "%s.0123", prefix);
+    if (n < 0 || (size_t)n >= sizeof(binary_seq_file)) {
+        fprintf(stderr, "Error: reference prefix too long for path: %s\n", prefix);
+        return NULL;
+    }
 
     fprintf(stderr, "* Binary seq file = %s\n", binary_seq_file);
     FILE *fr = fopen(binary_seq_file, "r");

@@ -30,10 +30,10 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "bwamem.h"
 #include "FMI_search.h"
-#include "memcpy_bwamem.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
 #include "u8vec_scratch.h"
+#include "pdqsort_wrap.h"
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
 
 #include "sam_encode.h"
@@ -50,8 +50,20 @@ extern uint64_t tprof[LIM_R][LIM_C];
 #define chain_cmp(a, b) (((b).pos < (a).pos) - ((a).pos < (b).pos))
 KBTREE_INIT(chn, mem_chain_t, chain_cmp)
 
-#define intv_lt(a, b) ((a).info < (b).info)
+/* mem_intv: primary sort by `info` (composite (m,n) key). Tie-break on
+ * x[0] then x[1] extends to a strict total order so the dedup loop in
+ * mem_collect_intv walking adjacent equal-info intervals sees a
+ * deterministic order regardless of sort algorithm. Without these tie-
+ * breaks, klib introsort vs pdqsort produce different equal-info
+ * neighbor orderings in repetitive regions, which propagates to SAM
+ * via different chain compositions. Matches the mem_ars2 stabilization
+ * rationale. */
+#define intv_lt(a, b) \
+    ((a).info < (b).info || ((a).info == (b).info && \
+     ((a).x[0] < (b).x[0] || ((a).x[0] == (b).x[0] && \
+      (a).x[1] < (b).x[1]))))
 KSORT_INIT(mem_intv, bwtintv_t, intv_lt)
+PDQSORT_INIT(mem_intv, bwtintv_t, intv_lt)
 #define intv_lt1(a, b) ((((uint64_t)(a).m) <<32 | ((uint64_t)(a).n)) < (((uint64_t)(b).m) <<32 | ((uint64_t)(b).n)))  // trial
 KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 
@@ -80,6 +92,7 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 
 #define flt_lt(a, b) ((a).w > (b).w)
 KSORT_INIT(mem_flt, mem_chain_t, flt_lt)
+PDQSORT_INIT(mem_flt, mem_chain_t, flt_lt)
 //------------------------------------------------------------------
 // Alignment: Construct the alignment from a chain *
 
@@ -166,11 +179,27 @@ mem_opt_t *mem_opt_init()
  * De-overlap single-end hits *
  ******************************/
 
-#define alnreg_slt2(a, b) ((a).re < (b).re)
+/* mem_ars2: primary sort by reference END position (`re`). Used by
+ * mem_sort_dedup_patch as the first ordering before its order-sensitive
+ * dedup/patch loop. The tie-break keys (rb, score-desc, qb) make the
+ * order deterministic at equal `re`; without them, the dedup outcome
+ * depended on whichever ordering the underlying sort algorithm happened
+ * to produce (klib introsort is unstable, pdqsort is unstable
+ * differently, radix is stable) — different orderings produced
+ * different surviving alnreg sets, propagating to `sub_n` and MAPQ.
+ * With the full key, every sort algorithm produces the same surviving
+ * set and the SAM is bit-equal regardless of which sort runs. */
+#define alnreg_slt2(a, b) \
+    ((a).re < (b).re || ((a).re == (b).re && \
+     ((a).rb < (b).rb || ((a).rb == (b).rb && \
+      ((a).score > (b).score || ((a).score == (b).score && \
+       (a).qb < (b).qb))))))
 KSORT_INIT(mem_ars2, mem_alnreg_t, alnreg_slt2)
+PDQSORT_INIT(mem_ars2, mem_alnreg_t, alnreg_slt2)
 
 #define alnreg_slt(a, b) ((a).score > (b).score || ((a).score == (b).score && ((a).rb < (b).rb || ((a).rb == (b).rb && (a).qb < (b).qb))))
 KSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
+PDQSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
 
 #define alnreg_hlt(a, b)  ((a).score > (b).score || ((a).score == (b).score && ((a).is_alt < (b).is_alt || ((a).is_alt == (b).is_alt && (a).hash < (b).hash))))
 KSORT_INIT(mem_ars_hash, mem_alnreg_t, alnreg_hlt)
@@ -180,11 +209,11 @@ KSORT_INIT(mem_ars_hash2, mem_alnreg_t, alnreg_hlt2)
 
 #if MATE_SORT
 void sort_alnreg_re(int n, mem_alnreg_t* a) {
-    ks_introsort(mem_ars2, n, a);
+    pdqsort_mem_ars2(n, a);
 }
 
 void sort_alnreg_score(int n, mem_alnreg_t* a) {
-    ks_introsort(mem_ars, n, a);
+    pdqsort_mem_ars(n, a);
 }
 
 #endif
@@ -314,7 +343,7 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
 {
     int m, i, j;
     if (n <= 1) return n;
-    ks_introsort(mem_ars2, n, a); // sort by the END position, not START!
+    pdqsort_mem_ars2(n, a); // sort by the END position, not START!
 
     for (i = 0; i < n; ++i) a[i].n_comp = 1;
     for (i = 1; i < n; ++i)
@@ -358,7 +387,7 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
             else ++m;
         }
     n = m;
-    ks_introsort(mem_ars, n, a);
+    pdqsort_mem_ars(n, a);
     for (i = 1; i < n; ++i) { // mark identical hits
         if (a[i].score == a[i-1].score && a[i].rb == a[i-1].rb && a[i].qb == a[i-1].qb)
             a[i].qe = a[i].qb;
@@ -401,7 +430,7 @@ static int test_and_merge(const mem_opt_t *opt, int64_t l_pac, mem_chain_t *c,
             c->m <<= 1;
             if (pm == SEEDS_PER_CHAIN) {  // re-new memory
                 if ((auxSeedBuf = (mem_seed_t *) calloc(c->m, sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory auxSeedBuf\n"); exit(1); }
-                memcpy_bwamem((char*) (auxSeedBuf), c->m * sizeof(mem_seed_t), c->seeds, c->n * sizeof(mem_seed_t), __FILE__, __LINE__);
+                memcpy((char*) (auxSeedBuf), c->seeds, c->n * sizeof(mem_seed_t));
                 c->seeds = auxSeedBuf;
                 tprof[PE13][tid]++;
             } else {  // new memory
@@ -943,6 +972,8 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
 
                 s.qbeg = p->m;
                 s.score= s.len = slen;
+                // Propagate SMEM SA-count so chain_n_hits gates --supp-rep-hard-cap.
+                s.n_hits = static_cast<int32_t>(p->s);
                 if (s.rbeg < 0 || s.len < 0)
                     fprintf(stderr, "rbeg: %ld, slen: %d, cnt: %d, n: %d, m: %d, num_smem: %ld\n",
                             s.rbeg, s.len, cnt-1, p->n, p->m, num_smem);
@@ -1045,15 +1076,35 @@ int mem_kernel1_core(FMI_search *fmi,
             kv_init(chain_ar[l]);
         return 1;
     }
+    // enc_qdb is sized in *bytes* (= tot_len). Track its capacity via the
+    // dedicated wsize_qdb so it stays correct independent of wsize_mem,
+    // which mem_collect_smem grows in *SMEM-entry* units. On short-read
+    // workloads (≤50 bp aDNA), the post-mem_collect_smem wsize_mem in SMEM
+    // units can exceed tot_len in bytes, which would make the legacy
+    // `if (tot_len >= wsize_mem)` gate skip the enc_qdb realloc on
+    // subsequent batches even when enc_qdb is undersized.
+    if (tot_len > mmc->wsize_qdb[tid]) {
+        int64_t tmp = mmc->wsize_qdb[tid];
+        mmc->enc_qdb[tid] = (uint8_t *) realloc(mmc->enc_qdb[tid],
+                                                tot_len * sizeof(uint8_t));
+        assert(mmc->enc_qdb[tid] != NULL);
+        mmc->wsize_qdb[tid] = tot_len;
+        if (bwa_verbose >= 4) {
+            fprintf(stderr, "[%0.4d] Re-allocating enc_qdb: "
+                    "%" PRId64 " -> %" PRId64 "\n",
+                    tid, tmp, mmc->wsize_qdb[tid]);
+        }
+    }
     // tot_len *= N_SMEM_KERNEL;
     // fprintf(stderr, "wsize: %d, tot_len: %d\n", mmc->wsize_mem[tid], tot_len);
-    // This covers enc_qdb/SMEM reallocs
+    // This covers matchArray and the per-read int arrays. enc_qdb is grown
+    // separately above (wsize_qdb).
     if (tot_len >= mmc->wsize_mem[tid])
     {
         int64_t tmp = mmc->wsize_mem[tid];
         mmc->wsize_mem[tid] = tot_len;
         if (bwa_verbose >= 4) {
-            fprintf(stderr, "[%0.4d] Re-allocating SMEM scratch (enc_qdb): "
+            fprintf(stderr, "[%0.4d] Re-allocating SMEM scratch: "
                     "%" PRId64 " -> %" PRId64 "\n",
                     tid, tmp, mmc->wsize_mem[tid]);
         }
@@ -1066,8 +1117,6 @@ int mem_kernel1_core(FMI_search *fmi,
                                                      mmc->wsize_mem[tid] *  sizeof(int32_t));
         mmc->query_pos_ar[tid] = (int16_t *) realloc(mmc->query_pos_ar[tid],
                                                      mmc->wsize_mem[tid] *  sizeof(int16_t));
-        mmc->enc_qdb[tid]      = (uint8_t *) realloc(mmc->enc_qdb[tid],
-                                                      mmc->wsize_mem[tid] * sizeof(uint8_t));
         mmc->rid[tid]          = (int32_t *) realloc(mmc->rid[tid],
                                                       mmc->wsize_mem[tid] * sizeof(int32_t));
         // w.mmc.lim[l]        = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
@@ -1424,7 +1473,7 @@ void mem_process_seqs(mem_opt_t *opt,
     // PAIRED_END
     if (opt->flag & MEM_F_PE) { // infer insert sizes if not provided
         if (pes0)
-            memcpy_bwamem(pes, 4 * sizeof(mem_pestat_t), pes0, 4 * sizeof(mem_pestat_t), __FILE__, __LINE__); // if pes0 != NULL, set the insert-size
+            memcpy(pes, pes0, 4 * sizeof(mem_pestat_t)); // if pes0 != NULL, set the insert-size
                                                          // distribution as pes0
         else {
             fprintf(stderr, "[0000] Inferring insert size distribution of PE reads from data, "
@@ -1975,7 +2024,14 @@ void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize) {
     }
     void *nptr = _mm_malloc(nsize * dsize, 64);
     assert(nptr != NULL);
-    memcpy_bwamem(nptr, nsize * dsize, ptr, csize, __FILE__, __LINE__);
+    /* csize is in elements (matching nsize), not bytes — multiply by dsize so
+     * callers passing dsize > 1 (sa_coord with sizeof(int64_t), matchArray
+     * with sizeof(SMEM)) get the full pre-grow contents copied across, not
+     * just the first csize bytes. Guard the NULL/empty lazy-init path
+     * (matchArray[tid] starts NULL with wsize_mem[tid]=0). */
+    if (ptr != NULL && csize > 0) {
+        memcpy(nptr, ptr, (size_t)csize * (size_t)dsize);
+    }
     _mm_free(ptr);
 
     return nptr;
