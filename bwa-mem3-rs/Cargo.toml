@@ -15,7 +15,7 @@ readme = "README.md"
 path = "src/lib.rs"
 
 [dependencies]
-bwa-mem3-sys = { version = "0.1.1", path = "../bwa-mem3-sys" }
+bwa-mem3-sys = { version = "0.1.2", path = "../bwa-mem3-sys" }
 thiserror = "1"
 libc = "0.2"
 

@@ -16,7 +16,7 @@ name = "bwa-rs"
 path = "src/main.rs"
 
 [dependencies]
-bwa-mem3-rs = { version = "0.1.1", path = "../bwa-mem3-rs" }
+bwa-mem3-rs = { version = "0.1.2", path = "../bwa-mem3-rs" }
 clap = { version = "4", features = ["derive"] }
 noodles-fastq = "0.18"
 noodles-bgzf = "0.42"
