@@ -3,7 +3,7 @@ resolver = "2"
 members = ["bwa-mem3-sys", "bwa-mem3-rs", "bwa-mem3-rs-cli"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
