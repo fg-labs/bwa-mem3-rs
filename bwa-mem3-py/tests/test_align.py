@@ -1,4 +1,5 @@
-"""Integration tests that require a real bwa-mem3 index.
+"""
+Integration tests that require a real bwa-mem3 index.
 
 Index source priority (see `conftest.py::aligned_index`):
 1. `BWA_MEM3_RS_TEST_REF` — a pre-built large index (hg38, etc.).
@@ -15,17 +16,14 @@ import sys
 from pathlib import Path
 
 import pytest
-
-from bwa_mem3 import (
-    BwaIndex,
-    MemOpts,
-    ReadPair,
-    align_batch,
-    estimate_pestat,
-    extend_batch,
-    seed_batch,
-    shm,
-)
+from bwa_mem3 import BwaIndex
+from bwa_mem3 import MemOpts
+from bwa_mem3 import ReadPair
+from bwa_mem3 import align_batch
+from bwa_mem3 import estimate_pestat
+from bwa_mem3 import extend_batch
+from bwa_mem3 import seed_batch
+from bwa_mem3 import shm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bam import decode as bam_decode  # noqa: E402
@@ -36,8 +34,7 @@ from phix_seq import PHIX_SEQ  # noqa: E402
 def _synthetic_pair(name: bytes) -> ReadPair:
     seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
     qual = b"I" * len(seq)
-    return ReadPair(name_r1=name, seq_r1=seq, qual_r1=qual,
-                    name_r2=name, seq_r2=seq, qual_r2=qual)
+    return ReadPair(name_r1=name, seq_r1=seq, qual_r1=qual, name_r2=name, seq_r2=seq, qual_r2=qual)
 
 
 def test_load_index_and_align(aligned_index: str) -> None:
@@ -103,9 +100,12 @@ def test_estimate_pestat_then_align_with_pestat_in(aligned_index: str) -> None:
 
 
 def test_align_batch_releases_gil_under_thread_pool(aligned_index: str) -> None:
-    """align_batch releases the GIL, so concurrent calls against the same
-    BwaIndex from a ThreadPoolExecutor produce identical results to a serial
-    run (and don't deadlock)."""
+    """
+    align_batch releases the GIL under concurrent use.
+
+    Concurrent calls against the same BwaIndex from a ThreadPoolExecutor
+    produce identical results to a serial run (and don't deadlock).
+    """
     idx = BwaIndex(aligned_index)
     opts = MemOpts()
     opts.set_pe(True)
@@ -129,6 +129,7 @@ def test_align_batch_releases_gil_under_thread_pool(aligned_index: str) -> None:
 
 
 # ---- additional coverage ----
+
 
 def test_align_batch_empty_pairs(aligned_index: str) -> None:
     """Aligning an empty batch returns no records and doesn't crash."""
@@ -174,7 +175,8 @@ def test_read_group_id_emitted_in_records(aligned_index: str) -> None:
 
 
 def test_mismatched_seq_qual_length_surfaces_error(aligned_index: str) -> None:
-    """A read pair where len(seq) != len(qual) is rejected at align time.
+    """
+    A read pair where len(seq) != len(qual) is rejected at align time.
 
     `ReadPair.__init__` only copies bytes; the length-mismatch check lives
     in the Rust `ReadPair::validate`, which `align_batch` (and friends) run
@@ -197,7 +199,8 @@ def test_mismatched_seq_qual_length_surfaces_error(aligned_index: str) -> None:
 
 
 def test_aligns_simulated_phix_reads(aligned_index: str) -> None:
-    """Most simulated PhiX reads should align (FLAG&UNMAPPED == 0).
+    """
+    Most simulated PhiX reads should align (FLAG&UNMAPPED == 0).
 
     Only meaningful when the index is the bundled PhiX (since the simulated
     reads are sampled from the PhiX sequence). With a different
@@ -209,8 +212,12 @@ def test_aligns_simulated_phix_reads(aligned_index: str) -> None:
     pairs_data = simulate_pairs(PHIX_SEQ.encode(), n=50)
     pairs = [
         ReadPair(
-            name_r1=name, seq_r1=r1, qual_r1=b"I" * len(r1),
-            name_r2=name, seq_r2=r2, qual_r2=b"I" * len(r2),
+            name_r1=name,
+            seq_r1=r1,
+            qual_r1=b"I" * len(r1),
+            name_r2=name,
+            seq_r2=r2,
+            qual_r2=b"I" * len(r2),
         )
         for name, r1, r2 in pairs_data
     ]
@@ -227,11 +234,10 @@ def test_aligns_simulated_phix_reads(aligned_index: str) -> None:
     )
 
 
-@pytest.mark.skipif(
-    sys.platform != "linux", reason="bwa-mem3 shm uses Linux /dev/shm semantics"
-)
+@pytest.mark.skipif(sys.platform != "linux", reason="bwa-mem3 shm uses Linux /dev/shm semantics")
 def test_shm_stage_destroy_lifecycle(aligned_index: str) -> None:
-    """Stage the index, see is_staged flip True, destroy, see it flip back.
+    """
+    Stage the index, see is_staged flip True, destroy, see it flip back.
 
     `shm.destroy()` is process-global (clears every bwa-mem3 segment owned by
     this user), so the test must own the staged state and clean up on every

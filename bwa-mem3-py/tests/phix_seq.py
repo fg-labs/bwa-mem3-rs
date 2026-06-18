@@ -1,4 +1,5 @@
-"""PhiX174 reference sequence (NC_001422.1), 5,386 bp.
+"""
+PhiX174 reference sequence (NC_001422.1), 5,386 bp.
 
 Public-domain phage genome; widely used as an NGS alignment fixture.
 Mirrors `bwa-mem3-rs-cli/tests/phix_seq.rs` so the Python tests share the

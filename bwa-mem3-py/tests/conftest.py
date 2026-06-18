@@ -1,4 +1,5 @@
-"""Shared fixtures for the bwa-mem3 Python test suite.
+"""
+Shared fixtures for the bwa-mem3 Python test suite.
 
 Mirrors the pattern used by `bwa-mem3-rs-cli/tests/common/mod.rs`: locate
 `bwa-mem3` on PATH (or via the `BWA_MEM3_BIN` env var), write the embedded
@@ -20,7 +21,6 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterator
 
 import pytest
 
@@ -56,8 +56,10 @@ def bwa_mem3_bin() -> str:
 
 @pytest.fixture(scope="session")
 def phix_index(tmp_path_factory: pytest.TempPathFactory, bwa_mem3_bin: str) -> str:
-    """Build a bwa-mem3 index from the embedded PhiX174 sequence and return
-    the prefix (the path such that `<prefix>.bwt.2bit.64` exists).
+    """
+    Build a bwa-mem3 index from the embedded PhiX174 sequence.
+
+    Returns the prefix (the path such that `<prefix>.bwt.2bit.64` exists).
     """
     work = tmp_path_factory.mktemp("phix")
     fasta = work / "phix.fa"
@@ -78,7 +80,8 @@ def phix_index(tmp_path_factory: pytest.TempPathFactory, bwa_mem3_bin: str) -> s
 
 @pytest.fixture(scope="session")
 def aligned_index(request: pytest.FixtureRequest) -> str:
-    """Index prefix used by integration tests.
+    """
+    Index prefix used by integration tests.
 
     Resolves in priority order:
     1. `BWA_MEM3_RS_TEST_REF` (a pre-built large index); preferred locally.
@@ -137,5 +140,3 @@ def simulate_pairs(
         r2 = _revcomp(ref_seq[start + insert - read_len : start + insert])
         pairs.append((f"r{i}".encode(), bytes(r1), bytes(r2)))
     return pairs
-
-

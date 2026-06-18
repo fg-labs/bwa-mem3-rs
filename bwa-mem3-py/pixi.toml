@@ -16,8 +16,17 @@ python = ">=3.11,<3.13"
 pip = "*"
 maturin = ">=1.5,<2"
 pytest = ">=7"
+ruff = "==0.14.9"
 
 [tasks]
 develop = { cmd = "maturin develop --release", description = "Build & install the extension into this env" }
 build   = { cmd = "maturin build --release",   description = "Build a wheel into target/wheels" }
 test    = { cmd = "pytest tests -v",          depends-on = ["develop"], description = "Run pytest after rebuilding" }
+
+# Static analysis (mirrors the Fulcrum python-template poe task set).
+check-format = { cmd = "ruff format --check --diff", description = "Check Python formatting (no changes)" }
+check-lint   = { cmd = "ruff check",                 description = "Lint Python (no changes)" }
+check-all    = { depends-on = ["check-format", "check-lint"], description = "Run all static checks" }
+fix-format   = { cmd = "ruff format",                description = "Reformat Python in place" }
+fix-lint     = { cmd = "ruff check --fix",           description = "Lint and auto-fix Python in place" }
+fix-all      = { depends-on = ["fix-format", "fix-lint"], description = "Apply all auto-fixes" }

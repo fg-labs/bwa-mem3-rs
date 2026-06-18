@@ -25,3 +25,54 @@ module-name = "bwa_mem3._bwa_mem3"
 python-source = "python"
 features = ["pyo3/extension-module"]
 strip = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+output-format = "full"
+preview = true
+
+[tool.ruff.lint]
+explicit-preview-rules = true
+select = [
+  "A",      # flake8-builtins
+  "ARG",    # flake8-unused-arguments
+  "B",      # flake8-bugbear
+  "C901",   # mccabe complexity
+  "D",      # pydocstyle
+  "D204",
+  "D213",
+  "E",      # pycodestyle errors
+  "F",      # pyflakes
+  "I",      # isort
+  "LOG",    # flake8-logging
+  "N",      # pep8-naming
+  "Q",      # flake8-quotes
+  "RUF008",
+  "RUF012",
+  "RUF024",
+  "W",      # pycodestyle warnings
+]
+ignore = [
+  "E203",   # whitespace before ':' (conflicts with the formatter)
+  "E701",   # multiple statements on one line (colon)
+  "D100",   # missing docstring in public module
+  "D104",   # missing docstring in public package
+  "D212",   # multi-line docstring summary on the first line (we use D213)
+]
+unfixable = ["B"]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Test functions are self-documenting via their names; no docstring required.
+"tests/**.py" = ["D103"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = ["--color=yes", "--import-mode=importlib"]
