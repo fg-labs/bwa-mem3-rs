@@ -109,6 +109,19 @@ excludes the kernel TUs from the baseline build. On aarch64, kernel TUs are
 compiled once with `KERNEL_VARIANT` unset and the dispatcher's `#else` branch
 calls them directly.
 
+### 10. The Python stub mirrors `bwa-mem3-py/src/lib.rs` by hand
+
+`bwa-mem3-py/python/bwa_mem3/_bwa_mem3.pyi` is a hand-written type stub for
+the compiled extension; it ships in the wheel (next to `py.typed`) and is
+what mypy type-checks against. mypy only verifies the stub is *self*-
+consistent — it never imports the `.so` — so a stub that drifts from the
+PyO3 bindings passes silently. When you add or change a `#[pyclass]`,
+`#[pymethods]` member, getter/setter, `#[pyfunction]`, or the `shm`
+submodule in `lib.rs`, update the `.pyi` in the same commit. (`mypy.stubtest`
+isn't wired up: the stub deliberately types `shm` as a `_Shm` instance while
+the runtime `shm` is a submodule, which stubtest would flag without an
+allowlist.)
+
 ## Commit / PR conventions
 
 - Conventional Commits; sign with `-S`; see `CONTRIBUTING.md`.

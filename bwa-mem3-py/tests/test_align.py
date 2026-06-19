@@ -69,7 +69,7 @@ def test_phase_split_matches_align_batch(aligned_index: str) -> None:
     # Same record count and same record bytes per pair (orderings match
     # because both paths run a single thread serially).
     assert len(rec_phased) == len(rec_one_shot)
-    for a, b in zip(rec_phased, rec_one_shot):
+    for a, b in zip(rec_phased, rec_one_shot, strict=True):
         assert a.pair_idx == b.pair_idx
         assert a.bytes == b.bytes
 
@@ -121,9 +121,9 @@ def test_align_batch_releases_gil_under_thread_pool(aligned_index: str) -> None:
         parallel = list(ex.map(lambda b: align_batch(idx, opts, b), batches))
 
     assert len(parallel) == len(serial)
-    for (serial_recs, _), (parallel_recs, _) in zip(serial, parallel):
+    for (serial_recs, _), (parallel_recs, _) in zip(serial, parallel, strict=True):
         assert len(parallel_recs) == len(serial_recs)
-        for a, b in zip(serial_recs, parallel_recs):
+        for a, b in zip(serial_recs, parallel_recs, strict=True):
             assert a.pair_idx == b.pair_idx
             assert a.bytes == b.bytes
 

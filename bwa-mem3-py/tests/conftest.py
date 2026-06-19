@@ -94,7 +94,9 @@ def aligned_index(request: pytest.FixtureRequest) -> str:
         return pre
     # Lazily request phix_index only when BWA_MEM3_RS_TEST_REF isn't set,
     # so users with a large local index don't pay the bwa-mem3 build cost.
-    return request.getfixturevalue("phix_index")
+    # getfixturevalue is untyped (returns Any); pin the local back to str.
+    phix_prefix: str = request.getfixturevalue("phix_index")
+    return phix_prefix
 
 
 def _revcomp(seq: bytes) -> bytes:
