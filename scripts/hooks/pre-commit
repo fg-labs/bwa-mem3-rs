@@ -15,6 +15,15 @@ cargo ci-fmt
 echo "==> cargo ci-lint"
 cargo ci-lint
 
+# Python static analysis for the bwa-mem3-py bindings. Skipped (with a note)
+# when pixi isn't installed so the hook stays usable on Rust-only setups.
+if command -v pixi >/dev/null 2>&1; then
+    echo "==> pixi run check-all (Python: ruff format + lint)"
+    pixi run --manifest-path bwa-mem3-py/pixi.toml check-all
+else
+    echo "==> skipping Python checks (pixi not found on PATH)"
+fi
+
 if [[ "${BWA_MEM2_RS_PRECOMMIT_TEST:-0}" == "1" ]]; then
     echo "==> cargo ci-test"
     cargo ci-test

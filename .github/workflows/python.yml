@@ -5,11 +5,35 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
+  lint:
+    # Python static analysis (ruff format + lint). Pure source check — no
+    # Rust toolchain or built extension needed, so it's a fast, standalone
+    # gate that surfaces style/lint regressions without waiting on the
+    # heavier wheel/integration build matrix (all jobs run concurrently).
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bwa-mem3-py
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@8ca4608ef7f4daeb54f5205b20d0b7cb42f11143 # v0.8.1
+        with:
+          pixi-version: v0.66.0
+          manifest-path: bwa-mem3-py/pixi.toml
+          cache: true
+      - name: Ruff format + lint
+        run: pixi run check-all
+
   wheel:
     strategy:
       fail-fast: false
@@ -27,6 +51,8 @@ jobs:
         working-directory: bwa-mem3-py
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
@@ -62,6 +88,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - name: Install build deps
         run: |
           sudo apt-get update

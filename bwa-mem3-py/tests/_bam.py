@@ -1,4 +1,5 @@
-"""Minimal BAM record decoder for test assertions.
+"""
+Minimal BAM record decoder for test assertions.
 
 `Record.bytes` is laid out as `[u32 le block_size][body]` (the BAM block
 format; see `bwa-mem3-sys/shim/bwa_shim_align.cpp:39`). This module decodes
@@ -67,8 +68,7 @@ def decode(record_bytes: bytes) -> BamRecord:
     (block_size,) = struct.unpack_from("<I", record_bytes, 0)
     if 4 + block_size != len(record_bytes):
         raise ValueError(
-            f"block_size mismatch: header says {block_size}, body has "
-            f"{len(record_bytes) - 4} bytes"
+            f"block_size mismatch: header says {block_size}, body has {len(record_bytes) - 4} bytes"
         )
     body = record_bytes[4:]
     if len(body) < 32:

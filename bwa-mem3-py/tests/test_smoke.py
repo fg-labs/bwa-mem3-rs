@@ -1,4 +1,5 @@
-"""Smoke tests that don't require a real index.
+"""
+Smoke tests that don't require a real index.
 
 The integration test in test_align.py loads a real index and aligns a
 synthetic batch; that one is gated on BWA_MEM3_RS_TEST_REF.
@@ -9,10 +10,13 @@ from __future__ import annotations
 import gc
 from pathlib import Path
 
-import pytest
-
 import bwa_mem3
-from bwa_mem3 import MemOpts, MemPeStat, PeOrient, ReadPair, shm
+import pytest
+from bwa_mem3 import MemOpts
+from bwa_mem3 import MemPeStat
+from bwa_mem3 import PeOrient
+from bwa_mem3 import ReadPair
+from bwa_mem3 import shm
 
 
 def test_module_surface() -> None:
@@ -151,8 +155,7 @@ def test_readpair_owns_input_bytes() -> None:
     name = bytes(b"r0")
     seq = bytes(b"ACGTACGT")
     qual = bytes(b"IIIIIIII")
-    p = ReadPair(name_r1=name, seq_r1=seq, qual_r1=qual,
-                 name_r2=name, seq_r2=seq, qual_r2=qual)
+    p = ReadPair(name_r1=name, seq_r1=seq, qual_r1=qual, name_r2=name, seq_r2=seq, qual_r2=qual)
     # Drop our local refs; ReadPair copies into its own owned buffers and
     # must retain them under GC pressure.
     del name, seq, qual
@@ -161,8 +164,11 @@ def test_readpair_owns_input_bytes() -> None:
 
 
 def test_readpair_accepts_bytearray() -> None:
-    """ReadPair accepts mutable bytearray and copies it (input may be mutated
-    after construction without affecting the ReadPair)."""
+    """
+    ReadPair accepts a mutable bytearray and copies it.
+
+    The input may be mutated after construction without affecting the ReadPair.
+    """
     seq = bytearray(b"ACGTACGT")
     p = ReadPair(
         name_r1=bytearray(b"r0"),
