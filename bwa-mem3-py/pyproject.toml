@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "bwa-mem3"
 description = "Python bindings for bwa-mem3 alignment with caller-owned parallelism."
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Nils Homer", email = "nils@fulcrumgenomics.com" }]
 classifiers = [
@@ -28,7 +28,7 @@ strip = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 output-format = "full"
 preview = true
 
@@ -71,8 +71,39 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 # Test functions are self-documenting via their names; no docstring required.
 "tests/**.py" = ["D103"]
+# Type stubs mirror the native API's parameter names verbatim (e.g. `id`),
+# even where they shadow a builtin.
+"*.pyi" = ["A002"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
 addopts = ["--color=yes", "--import-mode=importlib"]
+
+[tool.mypy]
+# Type-check against the minimum supported interpreter (matches
+# `requires-python` and ruff's `target-version`) rather than the pixi env's
+# newer Python, so version-specific incompatibilities surface here.
+python_version = "3.10"
+files = ["python", "tests"]
+# The package lives under `python/` (maturin's `python-source`) and the test
+# helpers import each other as top-level modules (via sys.path), so both dirs
+# are import roots.
+mypy_path = ["python", "tests"]
+explicit_package_bases = true
+namespace_packages = true
+strict_optional = true
+strict_equality = true
+check_untyped_defs = true
+disallow_any_generics = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_no_return = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_configs = true
+warn_unused_ignores = true
+enable_error_code = ["ignore-without-code", "possibly-undefined", "exhaustive-match"]
