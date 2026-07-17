@@ -133,6 +133,33 @@ isn't wired up: the stub deliberately types `shm` as a `_Shm` instance while
 the runtime `shm` is a submodule, which stubtest would flag without an
 allowlist.)
 
+### 11. Bisulfite (`--meth`) is dual-coordinate
+
+`--meth` (D3) alignment needs a **dual index** built by `bwa-mem3 index --meth`:
+the converted, f/r-doubled seed FM-index (`<ref>.meth.*`) plus the original
+un-converted reference (`<ref>.*`). Load both via `BwaIndex::load_meth(seed,
+orig)` → `shim_align_idx_load_meth`; the shim keeps the original `bns`/`pac`
+and a second unpacked `ref_string` resident on `BwaShimIndex`. Seeding runs
+against the converted index; **everything after the seed→original remap in
+`mem_kernel1_core`/`mem_kernel2_core` runs in original coordinates** — insert
+size, pairing, `mem_reg2aln`, output rids, and the reported contigs
+(`shim_header_bns` returns the original `bns` so the BAM header matches the
+emitted rids). Per read the shim retains the unconverted bases in
+`bseq1_t.meth_orig_seq` and projects `seq` in place (R1 C→T, R2 G→A) before
+seeding; `mem_reg2aln` takes `meth_orig_seq` so NM/MD/CIGAR reflect the
+original read, and `append_bam_record` emits Bismark `XR:Z` (read conversion,
+from R1/R2), `XG:Z` (genome strand, from `mem_aln_t.meth_hypothesis`), and
+`XM:Z` (via upstream `meth_build_xm`, which is compiled — only `meth_bam.cpp`,
+the htslib writer, is excluded). All meth code is gated on `opt->meth_mode` /
+non-NULL `meth_orig_*`, so the non-meth path is unchanged.
+
+Known parity nuance: meth's collapsed C/T scoring lets a few weak partial
+alignments survive extension as low-MAPQ *secondary* records that the CLI
+filters at output but the shim emits (the shim's general "emit every surviving
+region" trait). Primary records and all meth tags match the CLI exactly
+(`bwa-mem3-rs-cli/tests/meth_e2e.rs` pins this); the difference is a handful of
+secondary records on multi-mapping reads.
+
 ## Commit / PR conventions
 
 - Conventional Commits; sign with `-S`; see `CONTRIBUTING.md`.

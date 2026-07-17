@@ -22,6 +22,7 @@
 #include "bwa.h"
 #include "bwamem.h"
 #include "FMI_search.h"
+#include "meth_xm.h"   /* meth_build_xm — D3 (--meth) XM:Z tag */
 
 /* worker_alloc / worker_free — per-worker scratch (chaining arrays, BSW
  * buffers, lazy SMEM buffers) sized for the batch. Upstream defines these in
@@ -201,6 +202,12 @@ struct ShimSeeds {
     mem_opt_t *opts;
     FMI_search *fmi;
     uint8_t *ref_string;  /* borrowed from BwaShimIndex; not freed here */
+    /* D3 (--meth): original-coordinate handles borrowed from BwaShimIndex
+     * (NULL outside --meth). meth_orig_ref_string is the original 2*l_pac
+     * unpacked reference used for extension in place of ref_string. */
+    const bntseq_t *meth_orig_bns;
+    const uint8_t  *meth_orig_pac;
+    uint8_t        *meth_orig_ref_string;
 };
 
 /* Index handle: owns the loaded FMI_search plus the one-time-unpacked
@@ -213,9 +220,46 @@ static uint8_t *build_ref_string(const bntseq_t *bns, const uint8_t *pac);
 struct BwaShimIndex {
     FMI_search *fmi;
     uint8_t    *ref_string;
+    /* D3 (--meth) dual-coordinate handles. In meth mode `fmi` is the
+     * f/r-doubled CONVERTED seed index (`<ref>.meth.*`) used only for candidate
+     * generation, while chaining/extension/output run in ORIGINAL coordinates
+     * loaded here from the un-converted `<ref>.*` prefix. All NULL for a normal
+     * (non-meth) index. `meth_orig_ref_string` is the original 2*l_pac unpacked
+     * reference (analogue of `ref_string` for the original ref). */
+    bntseq_t *meth_orig_bns;
+    uint8_t  *meth_orig_pac;
+    uint8_t  *meth_orig_ref_string;
 };
 
 /* ------------------ Index ------------------ */
+
+void shim_align_idx_free(void *opaque);  /* defined below; used by _load_meth */
+
+/* D3 (--meth): load the ORIGINAL reference's bns + pac from `prefix` as
+ * resident handles (distinct from the converted seed FM-index). Ported from
+ * upstream fastmap.cpp's meth_orig_ref_load_handles: bns_restore then slurp the
+ * whole .pac into memory and close the file. Returns 0 on success (writes
+ * *bns_out / *pac_out), -1 on failure (out-params left NULL). */
+static int shim_meth_orig_ref_load(const char *prefix,
+                                    bntseq_t **bns_out, uint8_t **pac_out) {
+    *bns_out = nullptr;
+    *pac_out = nullptr;
+    bntseq_t *bns = bns_restore(prefix);
+    if (bns == nullptr) return -1;
+    int64_t pac_bytes = bns->l_pac / 4 + 1;
+    uint8_t *pac = (uint8_t *) calloc(pac_bytes, 1);
+    if (pac == nullptr) {
+        bns_destroy(bns);
+        return -1;
+    }
+    /* bns_restore left .pac open in bns->fp_pac; slurp it whole, then close. */
+    err_fread_noeof(pac, 1, pac_bytes, bns->fp_pac);
+    err_fclose(bns->fp_pac);
+    bns->fp_pac = nullptr;
+    *bns_out = bns;
+    *pac_out = pac;
+    return 0;
+}
 
 void *shim_align_idx_load(const char *prefix) {
     FMI_search *fmi = new FMI_search(prefix);
@@ -235,29 +279,61 @@ void *shim_align_idx_load(const char *prefix) {
     return static_cast<void *>(idx);
 }
 
+/* D3 (--meth): load a dual index. `seed_prefix` is the converted seed index
+ * (`<ref>.meth`), `orig_prefix` the un-converted original reference (`<ref>`).
+ * Both the seed FM-index and the original bns/pac/ref_string stay resident. */
+void *shim_align_idx_load_meth(const char *seed_prefix, const char *orig_prefix) {
+    void *opaque = shim_align_idx_load(seed_prefix);
+    if (!opaque) return nullptr;
+    BwaShimIndex *idx = static_cast<BwaShimIndex *>(opaque);
+    if (shim_meth_orig_ref_load(orig_prefix, &idx->meth_orig_bns, &idx->meth_orig_pac) != 0) {
+        shim_align_idx_free(opaque);
+        return nullptr;
+    }
+    idx->meth_orig_ref_string = build_ref_string(idx->meth_orig_bns, idx->meth_orig_pac);
+    if (!idx->meth_orig_ref_string) {
+        shim_align_idx_free(opaque);
+        return nullptr;
+    }
+    return opaque;
+}
+
 void shim_align_idx_free(void *opaque) {
     if (!opaque) return;
     BwaShimIndex *idx = static_cast<BwaShimIndex *>(opaque);
     if (idx->ref_string) _mm_free(idx->ref_string);
+    if (idx->meth_orig_ref_string) _mm_free(idx->meth_orig_ref_string);
+    if (idx->meth_orig_pac) free(idx->meth_orig_pac);
+    if (idx->meth_orig_bns) bns_destroy(idx->meth_orig_bns);
     delete idx->fmi;
     free(idx);
 }
 
+/* Contigs reported to callers (used to build the BAM header) come from the
+ * ORIGINAL reference in --meth mode — emitted records use original rids/coords,
+ * not the f/r-doubled converted seed index. Outside --meth this is the seed
+ * index's bns. */
+static const bntseq_t *shim_header_bns(void *opaque) {
+    BwaShimIndex *idx = static_cast<BwaShimIndex *>(opaque);
+    return idx->meth_orig_bns ? idx->meth_orig_bns : idx->fmi->idx->bns;
+}
+
 size_t shim_align_idx_n_contigs(void *opaque) {
-    return (size_t) static_cast<BwaShimIndex *>(opaque)->fmi->idx->bns->n_seqs;
+    return (size_t) shim_header_bns(opaque)->n_seqs;
 }
 
 const char *shim_align_idx_contig_name(void *opaque, size_t i) {
-    return static_cast<BwaShimIndex *>(opaque)->fmi->idx->bns->anns[i].name;
+    return shim_header_bns(opaque)->anns[i].name;
 }
 
 int64_t shim_align_idx_contig_len(void *opaque, size_t i) {
-    return static_cast<BwaShimIndex *>(opaque)->fmi->idx->bns->anns[i].len;
+    return shim_header_bns(opaque)->anns[i].len;
 }
 
 /* ------------------ Helpers ------------------ */
 
-static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs) {
+static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
+                                   int meth_mode) {
     int nseqs = (int)(2 * n_pairs);
     bseq1_t *seqs = (bseq1_t *) calloc(nseqs, sizeof(bseq1_t));
     if (!seqs) return nullptr;
@@ -285,6 +361,22 @@ static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs) {
                 s->qual = nullptr;
             }
             s->sam = nullptr;
+            /* D3 (--meth): retain the ORIGINAL (unconverted) read bases before
+             * projecting seq to match the converted seed index, then apply the
+             * per-strand bisulfite projection in place. R1 (k==0) is the OT/CT
+             * read (C→T), R2 (k==1) is the OB/GA read (G→A) — matching upstream
+             * fastmap.cpp's YC assignment. mem_kernel1_core 2-bit-encodes the
+             * projected seq; mem_reg2aln / meth_build_xm use meth_orig_seq for
+             * CIGAR/NM/MD and the XM call string. Same orientation as seq. */
+            if (meth_mode) {
+                s->meth_orig_seq = strdup(s->seq);
+                char from = (k == 0) ? 'C' : 'G';
+                char to   = (k == 0) ? 'T' : 'A';
+                for (int j = 0; j < s->l_seq; ++j) {
+                    if (s->seq[j] == from || s->seq[j] == (char)(from + 32))
+                        s->seq[j] = to;
+                }
+            }
         }
     }
     return seqs;
@@ -297,6 +389,7 @@ static void free_seqs(bseq1_t *seqs, int nseqs) {
         free(seqs[i].seq);
         free(seqs[i].qual);
         free(seqs[i].sam);
+        free(seqs[i].meth_orig_seq);  /* NULL outside --meth; free() is NULL-safe */
     }
     free(seqs);
 }
@@ -356,6 +449,18 @@ static inline uint32_t bwa_cigar_to_bam(uint32_t op) {
     uint32_t o = op & 0xf;
     uint32_t bam_o = (o < 5) ? BWA_TO_BAM[o] : o; /* defensive: passthrough unknown */
     return (len << 4) | bam_o;
+}
+
+/* ASCII base complement (A<->T, C<->G, case-insensitive); anything else -> N.
+ * Used to build the D3 (--meth) XM:Z seq_text in emitted-SEQ orientation. */
+static inline char ascii_complement(char b) {
+    switch (b) {
+        case 'A': case 'a': return 'T';
+        case 'C': case 'c': return 'G';
+        case 'G': case 'g': return 'C';
+        case 'T': case 't': return 'A';
+        default:            return 'N';
+    }
 }
 
 /* CIGAR op length consuming reference. Operates on bwa-mem3's 5-op encoding
@@ -470,17 +575,32 @@ static int32_t compute_tlen(const mem_aln_t *a, int a_ref_len,
     return a_begin <= b_begin ? (int32_t)tlen : -(int32_t)tlen;
 }
 
-/* Append one packed BAM record to `out`'s buffer. */
+/* Append one packed BAM record to `out`'s buffer. `opt`/`pac`/`is_r2` are used
+ * only for D3 (--meth) tag emission (is_r2: 0 = R1/OT read, 1 = R2/OB read). */
 static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
-                              const bntseq_t *bns, const bseq1_t *s,
+                              const mem_opt_t *opt, const bntseq_t *bns,
+                              const uint8_t *pac, const bseq1_t *s,
                               const mem_aln_t *p, int n_list,
                               const mem_aln_t *list, int which,
-                              const mem_aln_t *m)
+                              const mem_aln_t *m, int is_r2)
 {
     int l_read_name = (int) strlen(s->name) + 1;
     int l_seq = s->l_seq;
     int n_cigar = p->n_cigar;
     int ref_len = cigar_ref_len(n_cigar, p->cigar);
+
+    /* Emitted-SEQ range: hard-clipped (H) ends are dropped for supplementary
+     * records, so the emitted sequence is a subset of s->seq. Computed up front
+     * because the --meth XM:Z tag below needs it. bwa-mem3 H opcode = 4 (not 5
+     * as in the BAM spec). */
+    int seq_start = 0;
+    int seq_end = l_seq;
+    if (n_cigar > 0) {
+        if ((p->cigar[0] & 0xf) == 4)             seq_start = (int)(p->cigar[0] >> 4);
+        if ((p->cigar[n_cigar - 1] & 0xf) == 4)   seq_end -= (int)(p->cigar[n_cigar - 1] >> 4);
+    }
+    int emit_len = seq_end - seq_start;
+    if (emit_len < 0) emit_len = 0;
 
     /* Build aux first so we know its size. */
     uint8_t *aux = nullptr;
@@ -504,23 +624,37 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
     }
     if (p->XA) aux_put_Z(&aux, &aux_len, &aux_cap, "XA", p->XA);
 
-    /* Choose seq/qual source. For supplementary (flag 0x800) and secondary
-     * (0x100) without soft-clip-supplementary opt, bwa emits hard-clipped:
-     * the sequence and qual are empty-or-subset. We honor p->n_cigar's
-     * H ops by emitting only the non-H-clipped range from s->seq. */
-    int seq_start = 0;
-    int seq_end = l_seq;
-    if (n_cigar > 0) {
-        /* bwa-mem3 H opcode = 4 (not 5 as in BAM spec). */
-        if ((p->cigar[0] & 0xf) == 4) {            /* leading H */
-            seq_start = (int)(p->cigar[0] >> 4);
-        }
-        if ((p->cigar[n_cigar - 1] & 0xf) == 4) {  /* trailing H */
-            seq_end -= (int)(p->cigar[n_cigar - 1] >> 4);
+    /* D3 (--meth) Bismark tags. XR:Z (read conversion) on every record; XG:Z
+     * (genome strand) and XM:Z (per-base methylation call) on mapped records.
+     * XG / is_top_strand come from the winning hypothesis (p->meth_hypothesis:
+     * OT/1 => top/CT, OB/0 or -1 => bottom/GA), NOT the 0x10 RC flag — matching
+     * upstream meth_bam.cpp. XM is built from the ORIGINAL (unconverted) read
+     * bases in emitted-SEQ orientation. */
+    if (opt->meth_mode) {
+        aux_put_Z(&aux, &aux_len, &aux_cap, "XR", is_r2 ? "GA" : "CT");
+        if (p->rid >= 0) {
+            int is_top = (p->meth_hypothesis >= 0 && (p->meth_hypothesis & 1)) ? 1 : 0;
+            aux_put_Z(&aux, &aux_len, &aux_cap, "XG", is_top ? "CT" : "GA");
+            if (s->meth_orig_seq && emit_len > 0 && n_cigar > 0) {
+                char *seq_text = (char *) malloc((size_t)emit_len + 1);
+                uint32_t *bam_cig = (uint32_t *) malloc((size_t)n_cigar * sizeof(uint32_t));
+                if (seq_text && bam_cig) {
+                    for (int i = 0; i < emit_len; ++i) {
+                        seq_text[i] = p->is_rev
+                            ? ascii_complement(s->meth_orig_seq[l_seq - 1 - (seq_start + i)])
+                            : s->meth_orig_seq[seq_start + i];
+                    }
+                    seq_text[emit_len] = '\0';
+                    for (int i = 0; i < n_cigar; ++i) bam_cig[i] = bwa_cigar_to_bam(p->cigar[i]);
+                    char *xm = meth_build_xm(bns, pac, p->rid, (int64_t)p->pos,
+                                             is_top, bam_cig, n_cigar, seq_text, emit_len);
+                    if (xm) aux_put_Z(&aux, &aux_len, &aux_cap, "XM", xm);
+                }
+                free(seq_text);
+                free(bam_cig);
+            }
         }
     }
-    int emit_len = seq_end - seq_start;
-    if (emit_len < 0) emit_len = 0;
 
     /* Reverse-complement the bwa-2bit-encoded query if is_rev; otherwise
      * point at the forward slice. Quality scores mirror the sequence. */
@@ -651,8 +785,15 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
     s->opts = opts;
     s->fmi  = fmi;
     s->n_seqs = (int)(2 * n_pairs);
-    s->seqs = copy_pairs_to_seqs(pairs, n_pairs);
+    s->seqs = copy_pairs_to_seqs(pairs, n_pairs, opts->meth_mode);
     if (!s->seqs) { free(s); return nullptr; }
+
+    /* D3 (--meth): borrow the original-coordinate handles from the index. NULL
+     * outside --meth (or if a non-meth index was loaded), in which case the
+     * NULL meth_orig args select the kernels' legacy (non-meth) path. */
+    s->meth_orig_bns        = idx->meth_orig_bns;
+    s->meth_orig_pac        = idx->meth_orig_pac;
+    s->meth_orig_ref_string = idx->meth_orig_ref_string;
 
     /* Force single-thread; ensure PE flag. */
     opts->n_threads = 1;
@@ -669,6 +810,9 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
     s->w.seqs = s->seqs;
     s->w.n_processed = 0;
     s->w.pes = nullptr;
+    s->w.meth_orig_bns = s->meth_orig_bns;
+    s->w.meth_orig_pac = s->meth_orig_pac;
+    s->w.meth_orig_ref_string = s->meth_orig_ref_string;
 
     /* Borrow the unpacked reference string from the index handle
      * (built once at load time; see BwaShimIndex / shim_align_idx_load). */
@@ -690,7 +834,8 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
                          s->w.seedBuf + (size_t)seq_id * AVG_SEEDS_PER_READ,
                          seedBufSz,
                          &s->w.mmc,
-                         0 /* tid */);
+                         0 /* tid */,
+                         s->meth_orig_bns, s->meth_orig_pac);
     }
     return s;
 }
@@ -722,7 +867,10 @@ static ShimAlignOutput *alloc_align_output(size_t n_pairs) {
 
 /* Run SE extension into w.regs by calling mem_kernel2_core in BATCH_SIZE chunks. */
 static void run_se_extension(ShimSeeds *s) {
-    s->w.ref_string = s->ref_string;
+    /* D3 (--meth): extension/dedup run against the ORIGINAL .0123 ref_string
+     * (seeds were already remapped into original coords in mem_kernel1_core),
+     * matching upstream worker_aln. Outside --meth this is the seed ref. */
+    s->w.ref_string = s->meth_orig_ref_string ? s->meth_orig_ref_string : s->ref_string;
     const bntseq_t *bns = s->fmi->idx->bns;
     const uint8_t *pac  = s->fmi->idx->pac;
     (void)bns; (void)pac;  /* passed via w.fmi->idx */
@@ -736,7 +884,8 @@ static void run_se_extension(ShimSeeds *s) {
                          s->w.chain_ar + seq_id,
                          &s->w.mmc,
                          s->w.ref_string,
-                         0 /* tid */);
+                         0 /* tid */,
+                         s->meth_orig_bns, s->meth_orig_pac);
     }
 }
 
@@ -776,7 +925,11 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
         } else {
             lists[k] = (mem_aln_t *) calloc(a[k].n, sizeof(mem_aln_t));
             for (int j = 0; j < (int)a[k].n; ++j) {
-                lists[k][j] = mem_reg2aln(opt, bns, pac, s[k].l_seq, s[k].seq, &a[k].a[j]);
+                /* D3 (--meth): pass the ORIGINAL read bases so mem_reg2aln
+                 * regenerates CIGAR/NM/MD against the original ref (NULL and a
+                 * no-op outside --meth). */
+                lists[k][j] = mem_reg2aln(opt, bns, pac, s[k].l_seq, s[k].seq,
+                                          &a[k].a[j], s[k].meth_orig_seq);
             }
             n_lists[k] = (int)a[k].n;
         }
@@ -847,8 +1000,8 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
         if (paired && z[!k] >= 0 && z[!k] < n_lists[!k]) mate_idx = z[!k];
         mem_aln_t *mate = (n_lists[!k] > 0) ? &lists[!k][mate_idx] : nullptr;
         for (int j = 0; j < n_lists[k]; ++j) {
-            append_bam_record(out, pair_idx, bns, &s[k],
-                              &lists[k][j], n_lists[k], lists[k], j, mate);
+            append_bam_record(out, pair_idx, opt, bns, pac, &s[k],
+                              &lists[k][j], n_lists[k], lists[k], j, mate, k);
         }
     }
 
@@ -870,8 +1023,12 @@ ShimAlignOutput *shim_extend_batch(void *idx_opaque, ShimSeeds *s,
     FMI_search *fmi = idx ? idx->fmi : s->fmi;
 
     mem_opt_t *opt = s->opts;
-    const bntseq_t *bns = fmi->idx->bns;
-    const uint8_t  *pac = fmi->idx->pac;
+    /* D3 (--meth): after the seed→original remap in the kernels, every
+     * downstream consumer (insert-size, pairing, mem_reg2aln, output coords)
+     * runs in ORIGINAL-reference coordinates — use the original bns/pac, not
+     * the converted seed index's. Outside --meth these are the seed index. */
+    const bntseq_t *bns = s->meth_orig_bns ? s->meth_orig_bns : fmi->idx->bns;
+    const uint8_t  *pac = s->meth_orig_pac ? s->meth_orig_pac : fmi->idx->pac;
 
     /* SE extension. */
     run_se_extension(s);

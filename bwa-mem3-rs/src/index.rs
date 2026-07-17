@@ -109,6 +109,44 @@ impl BwaIndex {
         Ok(BwaIndex { handle })
     }
 
+    /// Load a bisulfite (BS-seq) **dual index** for `--meth` alignment.
+    ///
+    /// `seed_prefix` is the converted seed index (`<ref>.meth`, built by
+    /// `bwa-mem3 index --meth`); `orig_prefix` is the un-converted original
+    /// reference (`<ref>`). Both stay resident: seeding runs against the
+    /// converted index, while chaining/extension/output run in original
+    /// coordinates. Align with a [`MemOpts`](crate::MemOpts) whose
+    /// [`set_meth`](crate::MemOpts::set_meth) is enabled; the emitted records
+    /// carry Bismark `XG`/`XR`/`XM` tags and original-reference coordinates, so
+    /// the contig accessors below report the original contigs.
+    pub fn load_meth(seed_prefix: impl AsRef<Path>, orig_prefix: impl AsRef<Path>) -> Result<Self> {
+        let seed = seed_prefix.as_ref();
+        let orig = orig_prefix.as_ref();
+
+        if !crate::shm::is_staged(seed).unwrap_or(false) {
+            check_index_files(seed)?;
+        }
+        check_index_files(orig)?;
+
+        let seed_s = seed
+            .to_str()
+            .ok_or_else(|| Error::InvalidInput("seed prefix must be valid UTF-8".into()))?;
+        let orig_s = orig
+            .to_str()
+            .ok_or_else(|| Error::InvalidInput("orig prefix must be valid UTF-8".into()))?;
+        let seed_c = CString::new(seed_s)?;
+        let orig_c = CString::new(orig_s)?;
+        let handle =
+            unsafe { bwa_mem3_sys::bwa_shim_idx_load_meth(seed_c.as_ptr(), orig_c.as_ptr()) };
+        if handle.is_null() {
+            return Err(Error::IndexLoad {
+                path: seed.to_owned(),
+                msg: shim_err("meth idx load").to_string(),
+            });
+        }
+        Ok(BwaIndex { handle })
+    }
+
     #[must_use]
     pub fn n_contigs(&self) -> usize {
         unsafe { bwa_mem3_sys::bwa_shim_idx_n_contigs(self.handle) }

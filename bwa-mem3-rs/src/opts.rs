@@ -44,6 +44,30 @@ impl SeedOrder {
     }
 }
 
+/// Bisulfite scoring mode (`--meth-scoring`), mirroring bwa-mem3's
+/// `mem_meth_scoring`. Only meaningful under [`MemOpts::set_meth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethScoring {
+    /// C↔T and G↔A interchangeable (both matrix cells freed) — reproduces
+    /// bwameth. This is bwa-mem3's default.
+    Collapsed = 0,
+    /// Only the bisulfite-conversion cell is freed; the mirror stays a
+    /// mismatch, so genuine variants still score as mismatches (variant-aware,
+    /// truthful NM/MD).
+    Genomic = 1,
+}
+
+impl MethScoring {
+    /// Map the raw `mem_meth_scoring` value to a [`MethScoring`], falling back
+    /// to [`MethScoring::Collapsed`] (the default) for undefined values.
+    fn from_raw(v: i32) -> Self {
+        match v {
+            1 => MethScoring::Genomic,
+            _ => MethScoring::Collapsed,
+        }
+    }
+}
+
 /// bwa-mem3 alignment options (`mem_opt_t`).
 pub struct MemOpts {
     pub(crate) handle: *mut sys::mem_opt_t,
@@ -352,6 +376,55 @@ impl MemOpts {
         self
     }
 
+    // ---------- bisulfite (--meth) knobs ----------
+
+    /// Enable or disable bisulfite (BS-seq) alignment (`--meth`).
+    ///
+    /// When enabled, align with a bisulfite dual index
+    /// ([`BwaIndex::load_meth`](crate::BwaIndex::load_meth)): reads are
+    /// projected to match the converted seed index, alignment runs in original
+    /// coordinates, and each record carries Bismark `XR:Z` / `XG:Z` / `XM:Z`
+    /// tags. Toggling this rebuilds the per-hypothesis scoring matrices.
+    ///
+    /// Aligning with `meth` enabled but a **non-meth** index (loaded via
+    /// [`BwaIndex::load`](crate::BwaIndex::load)) falls back to normal
+    /// (non-bisulfite) behavior, so always pair `set_meth(true)` with
+    /// `load_meth`.
+    pub fn set_meth(&mut self, v: bool) -> &mut Self {
+        unsafe {
+            (*self.handle).meth_mode = i32::from(v);
+            sys::bwa_shim_opts_fill_meth_mat(self.handle);
+        }
+        self
+    }
+    #[must_use]
+    pub fn meth(&self) -> bool {
+        unsafe { (*self.handle).meth_mode != 0 }
+    }
+
+    /// Bisulfite scoring mode (`--meth-scoring`); only meaningful under
+    /// [`set_meth(true)`](Self::set_meth). Rebuilds the scoring matrices.
+    pub fn set_meth_scoring(&mut self, m: MethScoring) -> &mut Self {
+        unsafe {
+            (*self.handle).meth_scoring = m as i32;
+            sys::bwa_shim_opts_fill_meth_mat(self.handle);
+        }
+        self
+    }
+    #[must_use]
+    pub fn meth_scoring(&self) -> MethScoring {
+        MethScoring::from_raw(unsafe { (*self.handle).meth_scoring })
+    }
+
+    /// bwameth.py-style longest-`M` chimera QC heuristic (`--meth-chimera-qc`);
+    /// only meaningful under [`set_meth(true)`](Self::set_meth). Off by default.
+    pub fn set_meth_chimera_qc(&mut self, v: bool) -> &mut Self {
+        unsafe {
+            (*self.handle).meth_chimera_qc = i32::from(v);
+        }
+        self
+    }
+
     pub(crate) fn as_ptr(&self) -> *const sys::mem_opt_t {
         self.handle
     }
@@ -536,6 +609,23 @@ mod tests {
             o.set_seed_order(order);
             assert_eq!(o.seed_order(), order);
         }
+    }
+
+    #[test]
+    fn meth_knobs_roundtrip() {
+        let mut o = MemOpts::new().unwrap();
+        // Defaults: meth off, collapsed scoring.
+        assert!(!o.meth());
+        assert_eq!(o.meth_scoring(), MethScoring::Collapsed);
+        o.set_meth(true)
+            .set_meth_scoring(MethScoring::Genomic)
+            .set_meth_chimera_qc(true);
+        assert!(o.meth());
+        assert_eq!(o.meth_scoring(), MethScoring::Genomic);
+        o.set_meth_scoring(MethScoring::Collapsed);
+        assert_eq!(o.meth_scoring(), MethScoring::Collapsed);
+        o.set_meth(false);
+        assert!(!o.meth());
     }
 
     #[test]
