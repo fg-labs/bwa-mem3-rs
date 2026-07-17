@@ -16,6 +16,34 @@ pub enum Mode {
     Intractg,
 }
 
+/// Seed emission order (`--seed-order`), mirroring bwa-mem3's `seed_order_t`.
+///
+/// [`SeedOrder::Off`] is the default and is byte-identical to the baseline;
+/// the other modes reorder seeds before chaining and are opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOrder {
+    /// Default resolve order — byte-identical to the baseline.
+    Off = 0,
+    GlobalLongest = 1,
+    LocalLongest = 2,
+    AbsorbCount = 3,
+    MostAbsorb = 4,
+}
+
+impl SeedOrder {
+    /// Map the raw `seed_order_t` value to a [`SeedOrder`], falling back to
+    /// [`SeedOrder::Off`] for any value bwa-mem3 does not define.
+    fn from_raw(v: i32) -> Self {
+        match v {
+            1 => SeedOrder::GlobalLongest,
+            2 => SeedOrder::LocalLongest,
+            3 => SeedOrder::AbsorbCount,
+            4 => SeedOrder::MostAbsorb,
+            _ => SeedOrder::Off,
+        }
+    }
+}
+
 /// bwa-mem3 alignment options (`mem_opt_t`).
 pub struct MemOpts {
     pub(crate) handle: *mut sys::mem_opt_t,
@@ -220,6 +248,110 @@ impl MemOpts {
         self
     }
 
+    // ---------- bwa-mem3 0.6.0 opt-in knobs ----------
+    //
+    // All default to off/0 (via mem_opt_init) and, unless noted, are
+    // byte-identical to the baseline when left at their defaults.
+
+    /// Minimum seed length to extend (`--min-ext-len`): seeds shorter than
+    /// this are not banded-SW extended. `0` (the default) disables the filter.
+    /// Opt-in speed lever.
+    #[must_use]
+    pub fn min_ext_len(&self) -> i32 {
+        unsafe { (*self.handle).min_ext_len }
+    }
+    pub fn set_min_ext_len(&mut self, v: i32) -> &mut Self {
+        unsafe {
+            (*self.handle).min_ext_len = v;
+        }
+        self
+    }
+
+    /// Cap on chains extended per read (`--max-extend-chains`): keep only the
+    /// top-N by weight before banded-SW. `0` (the default) disables the cap.
+    /// Opt-in speed lever; **not** byte-identical to the default.
+    #[must_use]
+    pub fn max_extend_chains(&self) -> i32 {
+        unsafe { (*self.handle).max_extend_chains }
+    }
+    pub fn set_max_extend_chains(&mut self, v: i32) -> &mut Self {
+        unsafe {
+            (*self.handle).max_extend_chains = v;
+        }
+        self
+    }
+
+    /// Mate-concordant chain-retention window (`--extend-mate-concordant`),
+    /// applied only when [`set_max_extend_chains`](Self::set_max_extend_chains)
+    /// caps a paired-end read. `0` (the default) is off, `-1` auto-derives the
+    /// window from the estimated proper-pair insert bound, and a positive value
+    /// is a fixed window in bp. **Not** byte-identical to the default.
+    #[must_use]
+    pub fn mate_concordant_window(&self) -> i32 {
+        unsafe { (*self.handle).mate_concordant_window }
+    }
+    pub fn set_mate_concordant_window(&mut self, v: i32) -> &mut Self {
+        unsafe {
+            (*self.handle).mate_concordant_window = v;
+        }
+        self
+    }
+
+    /// Deduplicate fully-identical SMEMs before SA expansion (`--smem-dedup`).
+    /// `false` (the default) is byte-identical to the baseline.
+    #[must_use]
+    pub fn smem_dedup(&self) -> bool {
+        unsafe { (*self.handle).smem_dedup != 0 }
+    }
+    pub fn set_smem_dedup(&mut self, v: bool) -> &mut Self {
+        unsafe {
+            (*self.handle).smem_dedup = i32::from(v);
+        }
+        self
+    }
+
+    /// Skip banded-SW extension of seeds contained (same diagonal) in a longer
+    /// in-chain seed (`--skip-contained-ext`). `false` is the default; enabling
+    /// it is byte-identical to the baseline.
+    #[must_use]
+    pub fn skip_contained_ext(&self) -> bool {
+        unsafe { (*self.handle).skip_contained_ext != 0 }
+    }
+    pub fn set_skip_contained_ext(&mut self, v: bool) -> &mut Self {
+        unsafe {
+            (*self.handle).skip_contained_ext = i32::from(v);
+        }
+        self
+    }
+
+    /// Adaptive chain-geometry banding start band (`--adaptive-band`). `0` (the
+    /// default) disables adaptive banding; a positive value is the starting
+    /// band width (bwa-mem3's `--adaptive-band` uses 20). Long-read speed
+    /// lever; a no-op on the 8-bit short-read tier.
+    #[must_use]
+    pub fn band_start(&self) -> i32 {
+        unsafe { (*self.handle).band_start }
+    }
+    pub fn set_band_start(&mut self, v: i32) -> &mut Self {
+        unsafe {
+            (*self.handle).band_start = v;
+        }
+        self
+    }
+
+    /// Seed emission order (`--seed-order`). [`SeedOrder::Off`] (the default)
+    /// is byte-identical to the baseline.
+    #[must_use]
+    pub fn seed_order(&self) -> SeedOrder {
+        SeedOrder::from_raw(unsafe { (*self.handle).seed_emit_order })
+    }
+    pub fn set_seed_order(&mut self, order: SeedOrder) -> &mut Self {
+        unsafe {
+            (*self.handle).seed_emit_order = order as i32;
+        }
+        self
+    }
+
     pub(crate) fn as_ptr(&self) -> *const sys::mem_opt_t {
         self.handle
     }
@@ -358,6 +490,52 @@ mod tests {
         assert_eq!(o.min_seed_len(), 19);
         assert_eq!(o.band_width(), 50);
         assert_eq!(o.match_score(), 2);
+    }
+
+    #[test]
+    fn new_opt_in_knobs_default_off() {
+        let o = MemOpts::new().unwrap();
+        assert_eq!(o.min_ext_len(), 0);
+        assert_eq!(o.max_extend_chains(), 0);
+        assert_eq!(o.mate_concordant_window(), 0);
+        assert!(!o.smem_dedup());
+        assert!(!o.skip_contained_ext());
+        assert_eq!(o.band_start(), 0);
+        assert_eq!(o.seed_order(), SeedOrder::Off);
+    }
+
+    #[test]
+    fn new_opt_in_knobs_roundtrip() {
+        let mut o = MemOpts::new().unwrap();
+        o.set_min_ext_len(25)
+            .set_max_extend_chains(4)
+            .set_mate_concordant_window(-1)
+            .set_smem_dedup(true)
+            .set_skip_contained_ext(true)
+            .set_band_start(20)
+            .set_seed_order(SeedOrder::MostAbsorb);
+        assert_eq!(o.min_ext_len(), 25);
+        assert_eq!(o.max_extend_chains(), 4);
+        assert_eq!(o.mate_concordant_window(), -1);
+        assert!(o.smem_dedup());
+        assert!(o.skip_contained_ext());
+        assert_eq!(o.band_start(), 20);
+        assert_eq!(o.seed_order(), SeedOrder::MostAbsorb);
+    }
+
+    #[test]
+    fn seed_order_all_variants_roundtrip() {
+        let mut o = MemOpts::new().unwrap();
+        for order in [
+            SeedOrder::Off,
+            SeedOrder::GlobalLongest,
+            SeedOrder::LocalLongest,
+            SeedOrder::AbsorbCount,
+            SeedOrder::MostAbsorb,
+        ] {
+            o.set_seed_order(order);
+            assert_eq!(o.seed_order(), order);
+        }
     }
 
     #[test]
