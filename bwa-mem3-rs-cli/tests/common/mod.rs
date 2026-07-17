@@ -77,6 +77,13 @@ pub fn simulate_pairs(
         .collect()
 }
 
+/// Deterministic ACGT string of length `n`, drawn from `rng`.
+pub fn random_dna(rng: &mut Rng, n: usize) -> String {
+    (0..n)
+        .map(|_| ['A', 'C', 'G', 'T'][(rng.next() % 4) as usize])
+        .collect()
+}
+
 pub fn revcomp(s: &[u8]) -> Vec<u8> {
     s.iter()
         .rev()
@@ -88,6 +95,61 @@ pub fn revcomp(s: &[u8]) -> Vec<u8> {
             _ => b'N',
         })
         .collect()
+}
+
+/// `samtools view` a BAM file, returning its records as SAM text lines.
+pub fn samtools_view(bam: &Path) -> Vec<String> {
+    let out = Command::new("samtools")
+        .args(["view"])
+        .arg(bam)
+        .output()
+        .expect("run samtools view");
+    assert!(out.status.success(), "samtools view failed");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Reduce a SAM line to the fields that must match the reference aligner:
+/// qname, flag, rname, pos, mapq, cigar, and the `NM`/`MD`/`XG`/`XR`/`XM`/`XA`
+/// tags. These are the semantically meaningful fields the shim reproduces
+/// byte-for-byte; SEQ/QUAL/RNEXT/PNEXT/TLEN and the shim's own aux ordering
+/// (which deliberately omits `MQ:i` and places the Bismark tags differently
+/// from upstream's SAM writer) are excluded on purpose.
+///
+/// Callers compare the returned keys as *sorted vectors* — preserving record
+/// multiplicity so a duplicated or missing record is caught, unlike a set.
+/// Panics on a malformed SAM line rather than silently dropping it: `samtools
+/// view` (no header) only ever emits ≥11-column records, so a short line is a
+/// real bug, not noise to hide.
+pub fn record_key_fields(sam_line: &str) -> String {
+    let f: Vec<&str> = sam_line.split('\t').collect();
+    assert!(
+        f.len() >= 11,
+        "malformed SAM line ({} fields, need >= 11): {sam_line}",
+        f.len()
+    );
+    let (mut nm, mut md, mut xg, mut xr, mut xm, mut xa) = ("", "", "", "", "", "");
+    for tag in &f[11..] {
+        if let Some(v) = tag.strip_prefix("NM:") {
+            nm = v;
+        } else if let Some(v) = tag.strip_prefix("MD:") {
+            md = v;
+        } else if let Some(v) = tag.strip_prefix("XG:") {
+            xg = v;
+        } else if let Some(v) = tag.strip_prefix("XR:") {
+            xr = v;
+        } else if let Some(v) = tag.strip_prefix("XM:") {
+            xm = v;
+        } else if let Some(v) = tag.strip_prefix("XA:") {
+            xa = v;
+        }
+    }
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\tNM:{nm}\tMD:{md}\tXG:{xg}\tXR:{xr}\tXM:{xm}\tXA:{xa}",
+        f[0], f[1], f[2], f[3], f[4], f[5]
+    )
 }
 
 pub fn write_fastq(path: &Path, reads: &[(String, Vec<u8>)]) {
@@ -105,6 +167,28 @@ pub fn write_fastq(path: &Path, reads: &[(String, Vec<u8>)]) {
 /// Write the embedded PhiX sequence as a FASTA and build a bwa-mem3 index.
 /// Returns the FASTA path (suitable as an index prefix for bwa-mem3-rs).
 pub fn setup_phix_index(dir: &Path, bwa_mem3_bin: &str, phix_seq: &str) -> PathBuf {
+    setup_phix_index_inner(dir, bwa_mem3_bin, phix_seq, &[], "fa.bwt.2bit.64")
+}
+
+/// Like [`setup_phix_index`] but builds the bisulfite dual index
+/// (`bwa-mem3 index --meth`), producing `<ref>.*` + `<ref>.meth.*`.
+pub fn setup_phix_meth_index(dir: &Path, bwa_mem3_bin: &str, phix_seq: &str) -> PathBuf {
+    setup_phix_index_inner(
+        dir,
+        bwa_mem3_bin,
+        phix_seq,
+        &["--meth"],
+        "fa.meth.bwt.2bit.64",
+    )
+}
+
+fn setup_phix_index_inner(
+    dir: &Path,
+    bwa_mem3_bin: &str,
+    phix_seq: &str,
+    extra_args: &[&str],
+    expect_suffix: &str,
+) -> PathBuf {
     let ref_fa = dir.join("phix.fa");
     let mut f = fs::File::create(&ref_fa).unwrap();
     writeln!(f, ">phix").unwrap();
@@ -115,14 +199,15 @@ pub fn setup_phix_index(dir: &Path, bwa_mem3_bin: &str, phix_seq: &str) -> PathB
     drop(f);
 
     let status = Command::new(bwa_mem3_bin)
-        .args(["index"])
+        .arg("index")
+        .args(extra_args)
         .arg(&ref_fa)
         .status()
         .expect("run bwa-mem3 index");
     assert!(status.success(), "bwa-mem3 index failed");
     assert!(
-        ref_fa.with_extension("fa.bwt.2bit.64").exists(),
-        "bwa-mem3 index did not produce .bwt.2bit.64"
+        ref_fa.with_extension(expect_suffix).exists(),
+        "bwa-mem3 index did not produce {expect_suffix}"
     );
     ref_fa
 }

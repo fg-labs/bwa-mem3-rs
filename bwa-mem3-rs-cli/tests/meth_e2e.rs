@@ -15,51 +15,8 @@
 mod common;
 mod phix_seq;
 
-use std::collections::BTreeSet;
+use common::{record_key_fields, samtools_view};
 use std::process::Command;
-
-/// One record reduced to the fields that must match the CLI, keyed for sorting.
-fn record_key_fields(sam_line: &str) -> Option<String> {
-    let f: Vec<&str> = sam_line.split('\t').collect();
-    if f.len() < 11 {
-        return None;
-    }
-    let (mut nm, mut md, mut xg, mut xr, mut xm, mut xa) = ("", "", "", "", "", "");
-    for tag in &f[11..] {
-        if let Some(v) = tag.strip_prefix("NM:") {
-            nm = v;
-        } else if let Some(v) = tag.strip_prefix("MD:") {
-            md = v;
-        } else if let Some(v) = tag.strip_prefix("XG:") {
-            xg = v;
-        } else if let Some(v) = tag.strip_prefix("XR:") {
-            xr = v;
-        } else if let Some(v) = tag.strip_prefix("XM:") {
-            xm = v;
-        } else if let Some(v) = tag.strip_prefix("XA:") {
-            xa = v;
-        }
-    }
-    // qname, flag, rname, pos, mapq, cigar + meth/edit/alt tags.
-    Some(format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\tNM:{nm}\tMD:{md}\tXG:{xg}\tXR:{xr}\tXM:{xm}\tXA:{xa}",
-        f[0], f[1], f[2], f[3], f[4], f[5]
-    ))
-}
-
-/// `samtools view` a BAM file and return its records as SAM text lines.
-fn samtools_view(bam: &std::path::Path) -> Vec<String> {
-    let out = Command::new("samtools")
-        .args(["view"])
-        .arg(bam)
-        .output()
-        .expect("run samtools view");
-    assert!(out.status.success(), "samtools view failed");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::to_owned)
-        .collect()
-}
 
 #[test]
 fn meth_e2e_cli_parity() {
@@ -75,27 +32,8 @@ fn meth_e2e_cli_parity() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
-    // Write the PhiX FASTA and build the meth DUAL index (<ref>.* + <ref>.meth.*).
-    let ref_fa = dir.join("phix.fa");
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&ref_fa).unwrap();
-        writeln!(f, ">phix").unwrap();
-        for chunk in phix_seq::PHIX_SEQ.as_bytes().chunks(72) {
-            f.write_all(chunk).unwrap();
-            writeln!(f).unwrap();
-        }
-    }
-    let status = Command::new(&bwa)
-        .args(["index", "--meth"])
-        .arg(&ref_fa)
-        .status()
-        .expect("run bwa-mem3 index --meth");
-    assert!(status.success(), "bwa-mem3 index --meth failed");
-    assert!(
-        ref_fa.with_extension("fa.meth.bwt.2bit.64").exists(),
-        "index --meth did not produce the converted seed index"
-    );
+    // Build the meth DUAL index (<ref>.* + <ref>.meth.*).
+    let ref_fa = common::setup_phix_meth_index(dir, &bwa, phix_seq::PHIX_SEQ);
 
     // Simulate deterministic pairs and write FASTQs.
     let pairs = common::simulate_pairs(phix_seq::PHIX_SEQ.as_bytes(), 200, 100, 300, 7);
@@ -119,7 +57,8 @@ fn meth_e2e_cli_parity() {
         .arg(&ref_fa)
         .arg(&r1_fq)
         .arg(&r2_fq)
-        .args(["-o".as_ref(), rs_bam.as_os_str()])
+        .arg("-o")
+        .arg(&rs_bam)
         .status()
         .expect("run bwa-rs mem --meth");
     assert!(status.success(), "bwa-rs mem --meth failed");
@@ -160,15 +99,18 @@ fn meth_e2e_cli_parity() {
     assert!(cli_out.status.success(), "bwa-mem3 mem --meth failed");
     std::fs::write(&cli_bam, &cli_out.stdout).unwrap();
 
-    // Compare ALL records exactly (coords, MAPQ, CIGAR, NM, MD, XG, XR, XM, XA).
-    let cli_recs: BTreeSet<String> = samtools_view(&cli_bam)
+    // Compare ALL records exactly (coords, MAPQ, CIGAR, NM, MD, XG, XR, XM, XA)
+    // as sorted vectors so record multiplicity — not just the distinct key set —
+    // must match the CLI, secondaries and XA:Z folding included. (This PhiX
+    // fixture maps uniquely, so it does not surface XA:Z; the dedicated
+    // repetitive-reference meth XA folding parity lives in meth_cli_parity_xa.)
+    let mut cli_recs: Vec<String> = samtools_view(&cli_bam)
         .iter()
-        .filter_map(|l| record_key_fields(l))
+        .map(|l| record_key_fields(l))
         .collect();
-    let rs_recs: BTreeSet<String> = rs_lines
-        .iter()
-        .filter_map(|l| record_key_fields(l))
-        .collect();
+    let mut rs_recs: Vec<String> = rs_lines.iter().map(|l| record_key_fields(l)).collect();
+    cli_recs.sort();
+    rs_recs.sort();
 
     assert!(!cli_recs.is_empty(), "CLI produced no records");
     assert_eq!(

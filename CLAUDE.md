@@ -172,6 +172,20 @@ repetitive reads and on `--meth` (whose collapsed C/T scoring surfaces extra
 weak hits). `lists[k]` stays 1:1 with `a[k]` so the pairing indices (`z[k]`)
 and mate/SA logic are unaffected; a parallel `emit[k]` mask gates the append.
 
+One paired-branch subtlety the unified emission must reproduce: when
+`mem_pair` selects a non-top region (`z[k] != 0`), `mem_pair_resolve` promotes
+`a[k].a[z[k]]` (sets its `secondary` to `-2`) and runs the `secondary_all`
+switch, which reassigns the old SE-primary (region 0) into `z[k]`'s group —
+leaving it with `secondary < 0` but `secondary_all >= 0`. `mem_gen_alt` folds
+that region into `z[k]`'s `XA:Z`, and upstream `mem_sam_pe`'s paired block emits
+**only** `z[k]` as primary, never the switched-away region. Because our emit
+filter keys off `secondary` alone, the filter also drops any region with
+`secondary < 0 && secondary_all >= 0` on the paired branch; without it the shim
+would surface the old primary as an extra record and demote the `z[k]`
+pair-primary to a `0x800` supplementary. `cli_parity_pair_select.rs` pins this
+(two near-identical motif copies + a mate that anchors R1 to the lower-scoring
+copy, so `z[0] != 0`).
+
 ## Commit / PR conventions
 
 - Conventional Commits; sign with `-S`; see `CONTRIBUTING.md`.

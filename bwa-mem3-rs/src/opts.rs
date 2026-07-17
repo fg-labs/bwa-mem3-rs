@@ -24,9 +24,13 @@ pub enum Mode {
 pub enum SeedOrder {
     /// Default resolve order — byte-identical to the baseline.
     Off = 0,
+    /// Emit seeds longest-first across the whole read.
     GlobalLongest = 1,
+    /// Emit seeds longest-first within each local cluster.
     LocalLongest = 2,
+    /// Order by how many shorter seeds each seed absorbs.
     AbsorbCount = 3,
+    /// Prefer seeds that absorb the most others first.
     MostAbsorb = 4,
 }
 
@@ -386,10 +390,11 @@ impl MemOpts {
     /// coordinates, and each record carries Bismark `XR:Z` / `XG:Z` / `XM:Z`
     /// tags. Toggling this rebuilds the per-hypothesis scoring matrices.
     ///
-    /// Aligning with `meth` enabled but a **non-meth** index (loaded via
-    /// [`BwaIndex::load`](crate::BwaIndex::load)) falls back to normal
-    /// (non-bisulfite) behavior, so always pair `set_meth(true)` with
-    /// `load_meth`.
+    /// `set_meth(true)` only flips a flag; it **must** be paired with a meth
+    /// dual index ([`BwaIndex::load_meth`](crate::BwaIndex::load_meth)).
+    /// Aligning with a mismatch (meth opts + plain index, or vice versa) is
+    /// rejected up front with [`Error::InvalidInput`](crate::Error), so the two
+    /// cannot silently disagree.
     pub fn set_meth(&mut self, v: bool) -> &mut Self {
         unsafe {
             (*self.handle).meth_mode = i32::from(v);
@@ -423,6 +428,10 @@ impl MemOpts {
             (*self.handle).meth_chimera_qc = i32::from(v);
         }
         self
+    }
+    #[must_use]
+    pub fn meth_chimera_qc(&self) -> bool {
+        unsafe { (*self.handle).meth_chimera_qc != 0 }
     }
 
     pub(crate) fn as_ptr(&self) -> *const sys::mem_opt_t {
@@ -617,11 +626,13 @@ mod tests {
         // Defaults: meth off, collapsed scoring.
         assert!(!o.meth());
         assert_eq!(o.meth_scoring(), MethScoring::Collapsed);
+        assert!(!o.meth_chimera_qc());
         o.set_meth(true)
             .set_meth_scoring(MethScoring::Genomic)
             .set_meth_chimera_qc(true);
         assert!(o.meth());
         assert_eq!(o.meth_scoring(), MethScoring::Genomic);
+        assert!(o.meth_chimera_qc());
         o.set_meth_scoring(MethScoring::Collapsed);
         assert_eq!(o.meth_scoring(), MethScoring::Collapsed);
         o.set_meth(false);
