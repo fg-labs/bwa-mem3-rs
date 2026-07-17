@@ -56,6 +56,7 @@ extern "C" {
 
     void *shim_align_idx_load(const char *prefix);
     void *shim_align_idx_load_meth(const char *seed_prefix, const char *orig_prefix);
+    int   shim_align_idx_is_meth(void *fmi);
     void  shim_align_idx_free(void *fmi);
     size_t shim_align_idx_n_contigs(void *fmi);
     const char *shim_align_idx_contig_name(void *fmi, size_t i);
@@ -210,8 +211,8 @@ extern "C" void bwa_shim_opts_free(mem_opt_t *opts) {
 
 /* D3 (--meth): (re)build the per-hypothesis bisulfite scoring matrices
  * (mat_ot / mat_ob) from `mat` per opt->meth_scoring. mem_opt_init already
- * calls this once; Rust must call it again after changing meth_scoring (or the
- * base scoring matrix) so the meth matrices stay consistent. */
+ * calls this once; Rust must call it again after changing meth_scoring so the
+ * meth matrices stay consistent (see MemOpts::set_meth / set_meth_scoring). */
 extern "C" void bwa_shim_opts_fill_meth_mat(mem_opt_t *opts) {
     if (opts) mem_opt_fill_meth_mat(opts);
 }
@@ -296,6 +297,12 @@ extern "C" void bwa_shim_idx_free(BwaIndex *h) {
 
 extern "C" size_t bwa_shim_idx_n_contigs(const BwaIndex *h) {
     return h ? shim_align_idx_n_contigs(h->fmi) : 0;
+}
+
+/* Non-zero iff `h` was loaded via bwa_shim_idx_load_meth (a --meth dual index).
+ * Callers reject a meth_mode/index mismatch before aligning. */
+extern "C" int bwa_shim_idx_is_meth(const BwaIndex *h) {
+    return (h && h->fmi) ? shim_align_idx_is_meth(h->fmi) : 0;
 }
 
 extern "C" const char *bwa_shim_idx_contig_name(const BwaIndex *h, size_t i) {

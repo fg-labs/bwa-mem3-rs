@@ -58,6 +58,8 @@ BwaIndex *bwa_shim_idx_load(const char *prefix);
 /* D3 (--meth): load a dual index — `seed_prefix` = converted `<ref>.meth`,
  * `orig_prefix` = un-converted `<ref>`. Use with meth_mode set on the opts. */
 BwaIndex *bwa_shim_idx_load_meth(const char *seed_prefix, const char *orig_prefix);
+/* Non-zero iff `idx` is a --meth dual index (loaded via bwa_shim_idx_load_meth). */
+int       bwa_shim_idx_is_meth(const BwaIndex *idx);
 void      bwa_shim_idx_free(BwaIndex *idx);
 size_t    bwa_shim_idx_n_contigs(const BwaIndex *idx);
 const char *bwa_shim_idx_contig_name(const BwaIndex *idx, size_t i);

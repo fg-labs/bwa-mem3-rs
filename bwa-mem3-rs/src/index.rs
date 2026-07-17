@@ -51,6 +51,15 @@ fn check_index_files(prefix: &Path) -> Result<()> {
     }
 }
 
+/// Validate `prefix` as UTF-8 and convert it to a `CString` for the FFI.
+/// `what` names the argument for the error message (e.g. "prefix").
+fn prefix_to_cstring(prefix: &Path, what: &str) -> Result<CString> {
+    let s = prefix
+        .to_str()
+        .ok_or_else(|| Error::InvalidInput(format!("{what} must be valid UTF-8")))?;
+    Ok(CString::new(s)?)
+}
+
 /// Handle to a loaded bwa-mem3 reference index.
 ///
 /// The index is immutable after loading. Multiple threads may share a
@@ -95,10 +104,7 @@ impl BwaIndex {
             check_index_files(path)?;
         }
 
-        let s = path
-            .to_str()
-            .ok_or_else(|| Error::InvalidInput("prefix must be valid UTF-8".into()))?;
-        let c = CString::new(s)?;
+        let c = prefix_to_cstring(path, "prefix")?;
         let handle = unsafe { bwa_mem3_sys::bwa_shim_idx_load(c.as_ptr()) };
         if handle.is_null() {
             return Err(Error::IndexLoad {
@@ -128,14 +134,8 @@ impl BwaIndex {
         }
         check_index_files(orig)?;
 
-        let seed_s = seed
-            .to_str()
-            .ok_or_else(|| Error::InvalidInput("seed prefix must be valid UTF-8".into()))?;
-        let orig_s = orig
-            .to_str()
-            .ok_or_else(|| Error::InvalidInput("orig prefix must be valid UTF-8".into()))?;
-        let seed_c = CString::new(seed_s)?;
-        let orig_c = CString::new(orig_s)?;
+        let seed_c = prefix_to_cstring(seed, "seed prefix")?;
+        let orig_c = prefix_to_cstring(orig, "orig prefix")?;
         let handle =
             unsafe { bwa_mem3_sys::bwa_shim_idx_load_meth(seed_c.as_ptr(), orig_c.as_ptr()) };
         if handle.is_null() {
@@ -145,6 +145,14 @@ impl BwaIndex {
             });
         }
         Ok(BwaIndex { handle })
+    }
+
+    /// Whether this index was loaded as a bisulfite dual index via
+    /// [`load_meth`](Self::load_meth). Aligning requires
+    /// [`MemOpts::meth`](crate::MemOpts::meth) to agree with this.
+    #[must_use]
+    pub fn is_meth(&self) -> bool {
+        unsafe { bwa_mem3_sys::bwa_shim_idx_is_meth(self.handle) != 0 }
     }
 
     #[must_use]

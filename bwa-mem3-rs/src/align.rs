@@ -53,6 +53,28 @@ fn validate_all(pairs: &[ReadPair<'_>]) -> Result<()> {
     Ok(())
 }
 
+/// Reject a bisulfite mode/index mismatch before aligning. `MemOpts::set_meth`
+/// only sets a flag; it must be paired with a meth dual index
+/// ([`BwaIndex::load_meth`]). Aligning meth-mode reads against a plain index
+/// (or vice versa) would silently produce wrong output — projected reads
+/// against an unconverted index, or spurious `XR`/`XG`/`XM` tags — so we fail
+/// fast instead.
+fn check_meth_consistency(idx: &BwaIndex, opts: &MemOpts) -> Result<()> {
+    match (opts.meth(), idx.is_meth()) {
+        (true, false) => Err(Error::InvalidInput(
+            "opts have --meth enabled but the index is not a meth dual index \
+             (load it with BwaIndex::load_meth)"
+                .into(),
+        )),
+        (false, true) => Err(Error::InvalidInput(
+            "the index is a meth dual index but opts do not have --meth enabled \
+             (call MemOpts::set_meth(true))"
+                .into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn to_c_pairs(pairs: &[ReadPair<'_>]) -> Vec<bwa_mem3_sys::BwaReadPair> {
     pairs
         .iter()
@@ -151,6 +173,7 @@ unsafe impl Send for AlignmentBatch {}
 /// Phase 1: seed the batch.
 pub fn seed_batch(idx: &BwaIndex, opts: &MemOpts, pairs: &[ReadPair<'_>]) -> Result<Seeds> {
     validate_all(pairs)?;
+    check_meth_consistency(idx, opts)?;
     let c_pairs = to_c_pairs(pairs);
     let handle = unsafe {
         bwa_mem3_sys::bwa_shim_seed_batch(idx.raw(), opts.as_ptr(), c_pairs.as_ptr(), c_pairs.len())
@@ -203,6 +226,7 @@ pub fn align_batch(
     pestat_in: Option<&MemPeStat>,
 ) -> Result<(AlignmentBatch, MemPeStat)> {
     validate_all(pairs)?;
+    check_meth_consistency(idx, opts)?;
     let c_pairs = to_c_pairs(pairs);
     let mut pestat_out = MemPeStat::zero()?;
 
@@ -229,6 +253,7 @@ pub fn estimate_pestat(
     pairs: &[ReadPair<'_>],
 ) -> Result<MemPeStat> {
     validate_all(pairs)?;
+    check_meth_consistency(idx, opts)?;
     let c_pairs = to_c_pairs(pairs);
     let mut pestat_out = MemPeStat::zero()?;
     let rc = unsafe {

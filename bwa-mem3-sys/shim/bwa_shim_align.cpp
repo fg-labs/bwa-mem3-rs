@@ -318,6 +318,11 @@ static const bntseq_t *shim_header_bns(void *opaque) {
     return idx->meth_orig_bns ? idx->meth_orig_bns : idx->fmi->idx->bns;
 }
 
+/* Non-zero iff `opaque` was loaded as a --meth dual index (shim_align_idx_load_meth). */
+int shim_align_idx_is_meth(void *opaque) {
+    return static_cast<BwaShimIndex *>(opaque)->meth_orig_bns != nullptr;
+}
+
 size_t shim_align_idx_n_contigs(void *opaque) {
     return (size_t) shim_header_bns(opaque)->n_seqs;
 }
