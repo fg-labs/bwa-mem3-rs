@@ -5,20 +5,12 @@
 //! `bwa-rs mem --meth` and `bwa-mem3 mem --meth`, and asserts:
 //!   - the bwa-rs BAM is valid and every record carries the Bismark `XR:Z`
 //!     tag, with `XG:Z` + `XM:Z` on every mapped record;
-//!   - every PRIMARY record matches the CLI exactly on RNAME/POS/CIGAR and the
-//!     `NM`/`MD`/`XG`/`XR`/`XM` tags.
+//!   - **every** record matches the CLI exactly on RNAME/POS/CIGAR and the
+//!     `NM`/`MD`/`XG`/`XR`/`XM`/`XA` tags — secondaries and all.
 //!
 //! Requires `bwa-mem3` (for `index --meth` + the reference aligner) and
 //! `samtools` on PATH; set `BWA_MEM3_BIN` if the CLI is not on PATH. Skips
 //! gracefully otherwise.
-//!
-//! Note on the primary-only comparison: meth's collapsed C/T scoring can let a
-//! few weak partial alignments survive extension as low-MAPQ *secondary*
-//! records. The shim emits every surviving region while the CLI filters
-//! sub-threshold secondaries at output, so the two can differ by a handful of
-//! secondary records. The alignment decision and every methylation call — i.e.
-//! the primary records and all meth tags — are identical, which is what this
-//! test pins.
 
 mod common;
 mod phix_seq;
@@ -27,17 +19,12 @@ use std::collections::BTreeSet;
 use std::process::Command;
 
 /// One record reduced to the fields that must match the CLI, keyed for sorting.
-fn primary_key_fields(sam_line: &str) -> Option<String> {
+fn record_key_fields(sam_line: &str) -> Option<String> {
     let f: Vec<&str> = sam_line.split('\t').collect();
     if f.len() < 11 {
         return None;
     }
-    let flag: u32 = f[1].parse().ok()?;
-    // Skip secondary (0x100) and supplementary (0x800).
-    if flag & 0x900 != 0 {
-        return None;
-    }
-    let (mut nm, mut md, mut xg, mut xr, mut xm) = ("", "", "", "", "");
+    let (mut nm, mut md, mut xg, mut xr, mut xm, mut xa) = ("", "", "", "", "", "");
     for tag in &f[11..] {
         if let Some(v) = tag.strip_prefix("NM:") {
             nm = v;
@@ -49,12 +36,14 @@ fn primary_key_fields(sam_line: &str) -> Option<String> {
             xr = v;
         } else if let Some(v) = tag.strip_prefix("XM:") {
             xm = v;
+        } else if let Some(v) = tag.strip_prefix("XA:") {
+            xa = v;
         }
     }
-    // qname, flag, rname, pos, cigar + meth/edit tags.
+    // qname, flag, rname, pos, mapq, cigar + meth/edit/alt tags.
     Some(format!(
-        "{}\t{}\t{}\t{}\t{}\tNM:{nm}\tMD:{md}\tXG:{xg}\tXR:{xr}\tXM:{xm}",
-        f[0], f[1], f[2], f[3], f[5]
+        "{}\t{}\t{}\t{}\t{}\t{}\tNM:{nm}\tMD:{md}\tXG:{xg}\tXR:{xr}\tXM:{xm}\tXA:{xa}",
+        f[0], f[1], f[2], f[3], f[4], f[5]
     ))
 }
 
@@ -171,19 +160,19 @@ fn meth_e2e_cli_parity() {
     assert!(cli_out.status.success(), "bwa-mem3 mem --meth failed");
     std::fs::write(&cli_bam, &cli_out.stdout).unwrap();
 
-    // Compare PRIMARY records exactly (coords, CIGAR, NM, MD, XG, XR, XM).
-    let cli_primaries: BTreeSet<String> = samtools_view(&cli_bam)
+    // Compare ALL records exactly (coords, MAPQ, CIGAR, NM, MD, XG, XR, XM, XA).
+    let cli_recs: BTreeSet<String> = samtools_view(&cli_bam)
         .iter()
-        .filter_map(|l| primary_key_fields(l))
+        .filter_map(|l| record_key_fields(l))
         .collect();
-    let rs_primaries: BTreeSet<String> = rs_lines
+    let rs_recs: BTreeSet<String> = rs_lines
         .iter()
-        .filter_map(|l| primary_key_fields(l))
+        .filter_map(|l| record_key_fields(l))
         .collect();
 
-    assert!(!cli_primaries.is_empty(), "CLI produced no primary records");
+    assert!(!cli_recs.is_empty(), "CLI produced no records");
     assert_eq!(
-        cli_primaries, rs_primaries,
-        "bwa-rs meth primary records diverge from the bwa-mem3 CLI"
+        cli_recs, rs_recs,
+        "bwa-rs meth records diverge from the bwa-mem3 CLI"
     );
 }

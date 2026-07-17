@@ -151,14 +151,26 @@ original read, and `append_bam_record` emits Bismark `XR:Z` (read conversion,
 from R1/R2), `XG:Z` (genome strand, from `mem_aln_t.meth_hypothesis`), and
 `XM:Z` (via upstream `meth_build_xm`, which is compiled — only `meth_bam.cpp`,
 the htslib writer, is excluded). All meth code is gated on `opt->meth_mode` /
-non-NULL `meth_orig_*`, so the non-meth path is unchanged.
+non-NULL `meth_orig_*`, so the non-meth path is unchanged. Output matches the
+CLI byte-for-byte on every record including secondaries/`XA:Z`
+(`bwa-mem3-rs-cli/tests/meth_e2e.rs` pins this), because `pair_and_emit`
+replicates `mem_reg2sam`'s XA folding (see gotcha #12).
 
-Known parity nuance: meth's collapsed C/T scoring lets a few weak partial
-alignments survive extension as low-MAPQ *secondary* records that the CLI
-filters at output but the shim emits (the shim's general "emit every surviving
-region" trait). Primary records and all meth tags match the CLI exactly
-(`bwa-mem3-rs-cli/tests/meth_e2e.rs` pins this); the difference is a handful of
-secondary records on multi-mapping reads.
+### 12. `pair_and_emit` folds secondaries into `XA:Z` like `mem_reg2sam`
+
+The shim emits records from the per-read alnreg list itself rather than calling
+upstream's `mem_reg2sam`, so it must reproduce that function's output policy:
+after `mem_pair_resolve` (which runs `mem_mark_primary_se`), `pair_and_emit`
+calls `mem_gen_alt` to build each read's `XA:Z` string and then, per alnreg,
+**skips** any region that is secondary (`ar->secondary >= 0`, folded into the
+primary's `XA:Z`), below `opt->T`, or below `drop_ratio` — emitting only
+primaries + supplementaries (2nd+ emitted region gets `0x800` and its MAPQ
+lowered to the primary's). Without this the shim emitted every surviving
+region, so multi-mapping reads got a record per hit instead of one record with
+an `XA:Z` tag — harmless for unique mappers but a large divergence on
+repetitive reads and on `--meth` (whose collapsed C/T scoring surfaces extra
+weak hits). `lists[k]` stays 1:1 with `a[k]` so the pairing indices (`z[k]`)
+and mate/SA logic are unaffected; a parallel `emit[k]` mask gates the append.
 
 ## Commit / PR conventions
 

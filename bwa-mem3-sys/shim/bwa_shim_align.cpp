@@ -720,7 +720,13 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
     uint16_t nc = (uint16_t) n_cigar;
     memcpy(w, &nc, 2); w += 2;
 
-    uint16_t flag16 = (uint16_t) p->flag;
+    /* The packed FLAG is 16 bits, but pair_and_emit marks MEM_F_NO_MULTI split
+     * hits with upstream's internal 0x10000 (bit 16). Remap it to the BAM
+     * secondary bit 0x100 here, exactly as mem_aln2sam does at write time.
+     * Keeping the marker at 0x10000 internally (not 0x100) is deliberate: it
+     * lets emit_sa_tag still list NO_MULTI splits in SA:Z (its skip test is
+     * `flag & 0x100`), matching upstream. */
+    uint16_t flag16 = (uint16_t)((p->flag & 0xffff) | ((p->flag & 0x10000) ? 0x100 : 0));
     memcpy(w, &flag16, 2); w += 2;
 
     int32_t ls = emit_len;
@@ -905,33 +911,101 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
     mem_pair_resolve(opt, bns, pac, pes, (uint64_t)pair_idx,
                      s, a, n_pri, z, q_se, &extra_flag, &paired);
 
-    /* Convert each side's regions to mem_aln_t arrays for emission. */
+    /* Build a synthetic unmapped mem_aln_t in `dst[0]` (a single-record list). */
+    auto fill_unmapped = [](mem_aln_t *dst) {
+        dst[0].rid = -1;
+        dst[0].pos = -1;
+        dst[0].flag = 4;
+        dst[0].n_cigar = 0;
+        dst[0].cigar = nullptr;
+        dst[0].mapq = 0;
+        dst[0].NM = 0;
+        dst[0].score = -1;
+        dst[0].sub = -1;
+    };
+
+    /* Convert each side's regions to mem_aln_t arrays for emission and mark
+     * which ones actually get emitted, mirroring mem_reg2sam: secondary
+     * alignments are folded into the primary's XA:Z tag (via mem_gen_alt, which
+     * requires the mem_mark_primary_se that mem_pair_resolve ran) rather than
+     * emitted as their own records, and sub-threshold regions are dropped.
+     * Without this the shim emits every surviving alnreg — over-emitting
+     * secondaries on multi-mapping reads (including --meth's collapsed-scoring
+     * hits) that the CLI folds into XA. `lists[k]` stays 1:1 with `a[k]` so the
+     * pairing indices (z[k]) and mate/SA logic below are unaffected; `emit[k]`
+     * gates the final append. */
     mem_aln_t *lists[2] = {nullptr, nullptr};
     int n_lists[2] = {0, 0};
+    bool *emit[2] = {nullptr, nullptr};
+    char **XA[2] = {nullptr, nullptr};
+    int   *HN[2] = {nullptr, nullptr};
     for (int k = 0; k < 2; ++k) {
         if (a[k].n == 0) {
-            /* Unmapped read still needs a record. Build a synthetic mem_aln_t. */
             lists[k] = (mem_aln_t *) calloc(1, sizeof(mem_aln_t));
-            lists[k][0].rid = -1;
-            lists[k][0].pos = -1;
-            lists[k][0].flag = 4;
-            lists[k][0].n_cigar = 0;
-            lists[k][0].cigar = nullptr;
-            lists[k][0].mapq = 0;
-            lists[k][0].NM = 0;
-            lists[k][0].score = -1;
-            lists[k][0].sub = -1;
+            fill_unmapped(lists[k]);
             n_lists[k] = 1;
-        } else {
-            lists[k] = (mem_aln_t *) calloc(a[k].n, sizeof(mem_aln_t));
-            for (int j = 0; j < (int)a[k].n; ++j) {
-                /* D3 (--meth): pass the ORIGINAL read bases so mem_reg2aln
-                 * regenerates CIGAR/NM/MD against the original ref (NULL and a
-                 * no-op outside --meth). */
-                lists[k][j] = mem_reg2aln(opt, bns, pac, s[k].l_seq, s[k].seq,
-                                          &a[k].a[j], s[k].meth_orig_seq);
+            emit[k] = (bool *) malloc(sizeof(bool));
+            emit[k][0] = true;
+            continue;
+        }
+        if (!(opt->flag & MEM_F_ALL))
+            XA[k] = mem_gen_alt(opt, bns, pac, &a[k], s[k].l_seq, s[k].seq, &HN[k]);
+        lists[k] = (mem_aln_t *) calloc(a[k].n, sizeof(mem_aln_t));
+        emit[k] = (bool *) malloc(a[k].n * sizeof(bool));
+        n_lists[k] = (int)a[k].n;
+        int n_emit = 0;
+        for (int j = 0; j < (int)a[k].n; ++j) {
+            const mem_alnreg_t *ar = &a[k].a[j];
+            /* D3 (--meth): pass the ORIGINAL read bases so mem_reg2aln
+             * regenerates CIGAR/NM/MD against the original ref (NULL and a
+             * no-op outside --meth). */
+            lists[k][j] = mem_reg2aln(opt, bns, pac, s[k].l_seq, s[k].seq,
+                                      ar, s[k].meth_orig_seq);
+            lists[k][j].XA = XA[k] ? XA[k][j] : nullptr;
+            lists[k][j].HN = HN[k] ? HN[k][j] : -1;
+            /* mem_reg2sam emit filter. */
+            bool e = ar->score >= opt->T;
+            if (e && ar->secondary >= 0 && (ar->is_alt || !(opt->flag & MEM_F_ALL)))
+                e = false;
+            if (e && ar->secondary >= 0 && ar->secondary < INT_MAX
+                && ar->score < a[k].a[ar->secondary].score * opt->drop_ratio)
+                e = false;
+            /* Paired branch, z[k] != 0: mem_pair_resolve promoted the
+             * paired-selected region a[k].a[z[k]] (secondary set to -2) and ran
+             * the secondary_all switch, which reassigns the old SE-primary
+             * (region 0) to z[k]'s group — leaving it with secondary < 0 but
+             * secondary_all >= 0. mem_gen_alt folds that region into z[k]'s XA:Z,
+             * and upstream mem_sam_pe's paired block emits ONLY z[k] as primary,
+             * never the switched-away region. Our emit filter keys off
+             * `secondary` alone, so without this it would surface the old primary
+             * as an extra record and demote z[k] to a 0x800 supplementary. Drop
+             * the folded region so array order leaves z[k] first (primary). Never
+             * fires when z[k] == 0 (no switch) or on the no_pairing branch (which
+             * returns before the switch, leaving secondary_all == secondary). */
+            if (e && paired && j != z[k] && ar->secondary < 0
+                && ar->secondary_all >= 0)
+                e = false;
+            emit[k][j] = e;
+            if (e) ++n_emit;
+        }
+        /* No region cleared the threshold → emit a single unmapped record
+         * (mem_reg2sam's `aa.n == 0` branch). */
+        if (n_emit == 0) {
+            for (int j = 0; j < n_lists[k]; ++j) free(lists[k][j].cigar);
+            free(lists[k]);
+            free(emit[k]);
+            if (XA[k]) {
+                for (int j = 0; j < (int)a[k].n; ++j) free(XA[k][j]);
+                free(XA[k]);
+                XA[k] = nullptr;
             }
-            n_lists[k] = (int)a[k].n;
+            free(HN[k]);
+            HN[k] = nullptr;
+            lists[k] = (mem_aln_t *) calloc(1, sizeof(mem_aln_t));
+            fill_unmapped(lists[k]);
+            n_lists[k] = 1;
+            emit[k] = (bool *) malloc(sizeof(bool));
+            emit[k][0] = true;
         }
     }
 
@@ -989,29 +1063,67 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
         }
     }
 
-    /* Emit records. For each side k, emit all n_lists[k] entries; pair mate
-     * is the paired-selected primary of the other side (z[!k] on the paired
-     * branch, 0 otherwise — matching bwamem_pair.cpp:545-556's use of
-     * &a[!i].a[z[!i]] as the mate anchor). Without this the paired branch
-     * would use lists[!k][0] even when mem_pair_resolve picked a non-zero
-     * primary, driving RNEXT/PNEXT/TLEN/MC off the wrong mate alignment. */
+    /* Build the compact emitted list per side (mirrors mem_reg2sam's `aa`):
+     * only regions with emit[k][j] set, with the supplementary flag and lowered
+     * MAPQ applied up front. append_bam_record's SA:Z serialization walks this
+     * compact array, so SA entries reference only emitted records — never a
+     * secondary (folded into XA) or a sub-threshold/drop-ratio region that was
+     * filtered out. Entries are shallow copies sharing each region's cigar
+     * buffer with lists[k]; those buffers are freed once via lists[k] below, so
+     * aa[k] entries are never cigar-freed. */
+    mem_aln_t *aa[2] = {nullptr, nullptr};
+    int n_aa[2] = {0, 0};
+    for (int k = 0; k < 2; ++k) {
+        aa[k] = (mem_aln_t *) calloc((size_t)n_lists[k], sizeof(mem_aln_t));
+        int l = 0;               /* emitted-so-far on this side */
+        for (int j = 0; j < n_lists[k]; ++j) {
+            if (!emit[k][j]) continue;   /* secondary folded into XA, or dropped */
+            mem_aln_t p = lists[k][j];   /* shallow copy (shares cigar ptr) */
+            if (l > 0) {
+                /* 2nd+ emitted region (all secondary<0 here) is supplementary;
+                 * lower its mapq to the primary's unless -5/-q, per mem_reg2sam.
+                 * 0x10000 (not 0x100) under MEM_F_NO_MULTI matches upstream's
+                 * internal marker; append_bam_record remaps it to 0x100 on write. */
+                p.flag |= (opt->flag & MEM_F_NO_MULTI) ? 0x10000 : 0x800;
+                if (!(opt->flag & MEM_F_KEEP_SUPP_MAPQ) && p.mapq > aa[k][0].mapq)
+                    p.mapq = aa[k][0].mapq;
+            }
+            aa[k][l++] = p;
+        }
+        n_aa[k] = l;
+    }
+
+    /* Emit records. For each side k, the pair mate is the paired-selected
+     * primary of the other side (z[!k] on the paired branch, 0 otherwise —
+     * matching bwamem_pair.cpp:545-556's use of &a[!i].a[z[!i]] as the mate
+     * anchor). Without this the paired branch would use lists[!k][0] even when
+     * mem_pair_resolve picked a non-zero primary, driving RNEXT/PNEXT/TLEN/MC
+     * off the wrong mate alignment. */
     for (int k = 0; k < 2; ++k) {
         int mate_idx = 0;
         if (paired && z[!k] >= 0 && z[!k] < n_lists[!k]) mate_idx = z[!k];
         mem_aln_t *mate = (n_lists[!k] > 0) ? &lists[!k][mate_idx] : nullptr;
-        for (int j = 0; j < n_lists[k]; ++j) {
+        for (int j = 0; j < n_aa[k]; ++j) {
             append_bam_record(out, pair_idx, opt, bns, pac, &s[k],
-                              &lists[k][j], n_lists[k], lists[k], j, mate, k);
+                              &aa[k][j], n_aa[k], aa[k], j, mate, k);
         }
     }
 
-    /* Free mem_aln_t cigar buffers. */
+    /* Free the cigar buffers (owned by lists[k]), the compact copies, the emit
+     * masks, and the XA/HN arrays. aa[k] entries share cigar with lists[k] and
+     * must not be cigar-freed. */
     for (int k = 0; k < 2; ++k) {
-        if (!lists[k]) continue;
-        for (int j = 0; j < n_lists[k]; ++j) {
-            free(lists[k][j].cigar);
+        if (lists[k]) {
+            for (int j = 0; j < n_lists[k]; ++j) free(lists[k][j].cigar);
+            free(lists[k]);
         }
-        free(lists[k]);
+        free(aa[k]);
+        free(emit[k]);
+        if (XA[k]) {
+            for (int j = 0; j < (int)a[k].n; ++j) free(XA[k][j]);
+            free(XA[k]);
+        }
+        free(HN[k]);
     }
 }
 
