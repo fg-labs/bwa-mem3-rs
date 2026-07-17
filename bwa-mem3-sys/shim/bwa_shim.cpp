@@ -11,7 +11,7 @@
  * form, and then emitting packed BAM bytes from `mem_aln_t` values
  * directly.
  *
- * See CLAUDE.md for the intended shim semantics + known gotchas.
+ * See the maintenance docs for the intended shim semantics + known gotchas.
  */
 
 #include "bwa_shim.h"
@@ -136,9 +136,18 @@ extern "C" void bwa_shim_set_rg_id(const char *id) {
 
 /* -------- shared memory ------------------------------------------- */
 /* Forward-declare upstream's bwa_shm_* entry points so we don't have to
- * pull bwa_shm.h into this TU. They're plain C linkage in upstream. */
+ * pull bwa_shm.h into this TU. They're plain C linkage in upstream.
+ *
+ * bwa_shm_stage's second parameter (bns_only) has a default in bwa_shm.h,
+ * but a forward declaration here doesn't see it — and C linkage means the
+ * linker won't catch an arity mismatch. Declaring it with one argument and
+ * calling it with one would leave bns_only sourced from an uninitialized
+ * register (garbage on x86-64 SysV, where it rides in esi); a non-zero
+ * value stages BNS-only, producing an FMI-less segment that crashes on
+ * attach. Mirror the real two-argument signature and pass false (full
+ * stage) explicitly. */
 extern "C" int bwa_shm_test(const char *prefix);
-extern "C" int bwa_shm_stage(const char *prefix);
+extern "C" int bwa_shm_stage(const char *prefix, bool bns_only);
 extern "C" int bwa_shm_destroy(void);
 extern "C" int bwa_shm_list(void);
 
@@ -159,7 +168,7 @@ extern "C" int bwa_shim_shm_stage(const char *prefix) {
         shim_set_err("null prefix");
         return -1;
     }
-    int rc = bwa_shm_stage(prefix);
+    int rc = bwa_shm_stage(prefix, /*bns_only=*/false);
     if (rc < 0) shim_set_err("bwa_shm_stage failed for '%s'", prefix);
     return rc;
 }

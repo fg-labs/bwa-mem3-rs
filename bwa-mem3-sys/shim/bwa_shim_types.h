@@ -6,8 +6,10 @@
  *
  * Keep the layouts byte-identical to bwa-mem3's. When refreshing the
  * vendored snapshot, diff against `vendor/bwa-mem3/src/bwamem.h` around
- * lines 77-115 (mem_opt_t) and 172-176 (mem_pestat_t); if either changed,
- * update here.
+ * lines 95-156 (mem_opt_t) and 239-243 (mem_pestat_t); if either changed,
+ * update here. The shim allocates the real struct via upstream's
+ * `mem_opt_init()`, so any field-order/size drift silently corrupts the
+ * offsets Rust reads/writes through the bindgen view of this header.
  */
 #ifndef BWA_SHIM_TYPES_H
 #define BWA_SHIM_TYPES_H
@@ -28,7 +30,7 @@
 #define MEM_F_KEEP_SUPP_MAPQ 0x1000
 #define MEM_F_XB             0x2000
 
-/* Mirror of bwamem.h:77-115. Layout must match exactly. */
+/* Mirror of bwamem.h:95-156. Layout must match exactly. */
 typedef struct mem_opt_t {
     int a, b;
     int o_del, e_del;
@@ -43,6 +45,13 @@ typedef struct mem_opt_t {
     int T;
     int flag;
     int min_seed_len;
+    int min_ext_len;
+    int max_extend_chains;
+    int mate_concordant_window;
+    int est_insert_high;
+    /* upstream type is `seed_order_t`, a plain (int-sized) enum in bwamem.h;
+     * mirrored as int for layout — the Rust API does not expose seed ordering. */
+    int seed_emit_order;
     int min_chain_weight;
     int max_chain_extend;
     float split_factor;
@@ -61,15 +70,21 @@ typedef struct mem_opt_t {
     int max_matesw;
     int max_XA_hits, max_XA_hits_alt;
     int8_t mat[25];
+    int8_t mat_ot[25];
+    int8_t mat_ob[25];
     int    bam_mode;
     int    bam_level;
     int    meth_mode;
+    int    meth_scoring;
     char   meth_set_as_failed;
     int    meth_chimera_qc;
     int    supp_rep_hard_cap;
+    int    smem_dedup;
+    int    skip_contained_ext;
+    int    band_start;
 } mem_opt_t;
 
-/* Mirror of bwamem.h:172-176. */
+/* Mirror of bwamem.h:239-243. */
 typedef struct mem_pestat_t {
     int low, high;
     int failed;

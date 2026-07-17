@@ -22,7 +22,152 @@
 #include "bwa.h"
 #include "bwamem.h"
 #include "FMI_search.h"
-#include "fastmap.h"    /* worker_alloc / worker_free */
+
+/* worker_alloc / worker_free — per-worker scratch (chaining arrays, BSW
+ * buffers, lazy SMEM buffers) sized for the batch. Upstream defines these in
+ * `fastmap.cpp`, but as of bwa-mem3 0.6.0 that TU is transitively coupled to
+ * the new `fast_reader` FASTQ path (libdeflate + zlib-ng) and to numa/htslib,
+ * none of which this crate compiles (the Rust CLI does its own I/O). We
+ * therefore do not build `fastmap.cpp` (see `bwa-mem3-sys/build.rs`) and carry
+ * file-local copies of just these two allocators here.
+ *
+ * The allocation set below is verbatim from upstream's `worker_alloc` /
+ * `worker_free`, with ONE deliberate divergence: upstream's per-call
+ * "Memory pre-allocation" stderr diagnostics are dropped. Upstream calls
+ * worker_alloc once per thread at process start; this crate calls it once per
+ * `shim_seed_batch` (per read chunk), so those prints would spam stderr on
+ * every batch.
+ *
+ * KEEP IN SYNC with `vendor/bwa-mem3/src/fastmap.cpp` on every vendor refresh:
+ * the buffer set must match exactly what `mem_kernel1_core` /
+ * `mem_kernel2_core` expect (the `worker_t` / `mem_cache` field layout comes
+ * from the vendored `bwamem.h`). There is no compile-time guard for this the
+ * way there is for the POD layout (bwa_shim_layout_assert.cpp) — the backstop
+ * is the real-index integration suite (align_smoke / concurrency /
+ * phase_split), so run it with `BWA_MEM3_RS_TEST_REF` set after any refresh.
+ * A cleaner long-term fix is to split these into a dependency-light TU in the
+ * fg-labs/bwa-mem3 fork and compile that instead of copying. */
+static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nthreads)
+{
+    assert(opt != NULL);
+    assert(nreads >= 0);
+    assert(nthreads > 0);
+
+    // Record the thread count on the worker so worker_free can validate the
+    // paired call and the per-thread loops can never walk past the slots
+    // populated here.
+    w.nthreads = nthreads;
+
+    int32_t memSize = nreads;
+
+    /* Mem allocation section for core kernels */
+    w.regs = NULL; w.chain_ar = NULL; w.seedBuf = NULL;
+
+    w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
+    w.chain_ar = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
+    w.seedBuf = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
+
+    assert(w.seedBuf  != NULL);
+    assert(w.regs     != NULL);
+    assert(w.chain_ar != NULL);
+
+    w.seedBufSize = BATCH_SIZE * AVG_SEEDS_PER_READ;
+
+    /* SWA mem allocation */
+    int64_t wsize = BATCH_SIZE * SEEDS_PER_READ;
+    for(int l=0; l<nthreads; l++)
+    {
+        w.mmc.seqBufLeftRef[l*CACHE_LINE]  = (uint8_t *)
+            _mm_malloc(wsize * MAX_SEQ_LEN_REF * sizeof(int8_t) + MAX_LINE_LEN, 64);
+        w.mmc.seqBufLeftQer[l*CACHE_LINE]  = (uint8_t *)
+            _mm_malloc(wsize * MAX_SEQ_LEN_QER * sizeof(int8_t) + MAX_LINE_LEN, 64);
+        w.mmc.seqBufRightRef[l*CACHE_LINE] = (uint8_t *)
+            _mm_malloc(wsize * MAX_SEQ_LEN_REF * sizeof(int8_t) + MAX_LINE_LEN, 64);
+        w.mmc.seqBufRightQer[l*CACHE_LINE] = (uint8_t *)
+            _mm_malloc(wsize * MAX_SEQ_LEN_QER * sizeof(int8_t) + MAX_LINE_LEN, 64);
+
+        w.mmc.wsize_buf_ref[l*CACHE_LINE] = wsize * MAX_SEQ_LEN_REF;
+        w.mmc.wsize_buf_qer[l*CACHE_LINE] = wsize * MAX_SEQ_LEN_QER;
+
+        assert(w.mmc.seqBufLeftRef[l*CACHE_LINE]  != NULL);
+        assert(w.mmc.seqBufLeftQer[l*CACHE_LINE]  != NULL);
+        assert(w.mmc.seqBufRightRef[l*CACHE_LINE] != NULL);
+        assert(w.mmc.seqBufRightQer[l*CACHE_LINE] != NULL);
+    }
+
+    for(int l=0; l<nthreads; l++) {
+        w.mmc.seqPairArrayAux[l]      = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
+        w.mmc.seqPairArrayLeft128[l]  = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
+        w.mmc.seqPairArrayRight128[l] = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
+        w.mmc.wsize[l] = wsize;
+
+        assert(w.mmc.seqPairArrayAux[l] != NULL);
+        assert(w.mmc.seqPairArrayLeft128[l] != NULL);
+        assert(w.mmc.seqPairArrayRight128[l] != NULL);
+    }
+
+    // SMEM buffers (matchArray / min_intv_ar / query_pos_ar / enc_qdb / rid)
+    // and the lockstep-batch slot buffers are sized from the observed max
+    // read length on each batch in mem_collect_smem; they're NULL here and
+    // grow on first use. `lim` is still a fixed BATCH_SIZE+32 allocation
+    // because its size does not depend on read length.
+    for (int l=0; l<nthreads; l++)
+    {
+        w.mmc.wsize_mem[l]     = 0;
+        w.mmc.wsize_mem_s[l]   = 0;
+        w.mmc.wsize_mem_r[l]   = 0;
+        w.mmc.wsize_qdb[l]     = 0;
+        w.mmc.matchArray[l]    = NULL;
+        w.mmc.min_intv_ar[l]   = NULL;
+        w.mmc.query_pos_ar[l]  = NULL;
+        w.mmc.enc_qdb[l]       = NULL;
+        w.mmc.rid[l]           = NULL;
+        w.mmc.lim[l]           = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
+
+        w.mmc.lockstep_prev[l]      = NULL;
+        w.mmc.lockstep_match_buf[l] = NULL;
+        w.mmc.lockstep_buf_cap[l]   = 0;
+    }
+}
+
+static void worker_free(worker_t &w, int32_t nthreads)
+{
+    assert(nthreads > 0);
+    // Catch mismatched alloc/free pairs before they drive out-of-bounds frees.
+    assert(w.nthreads == nthreads);
+
+    free(w.chain_ar);
+    free(w.regs);
+    free(w.seedBuf);
+
+    for(int l=0; l<nthreads; l++) {
+        _mm_free(w.mmc.seqBufLeftRef[l*CACHE_LINE]);
+        _mm_free(w.mmc.seqBufRightRef[l*CACHE_LINE]);
+        _mm_free(w.mmc.seqBufLeftQer[l*CACHE_LINE]);
+        _mm_free(w.mmc.seqBufRightQer[l*CACHE_LINE]);
+    }
+
+    for(int l=0; l<nthreads; l++) {
+        free(w.mmc.seqPairArrayAux[l]);
+        free(w.mmc.seqPairArrayLeft128[l]);
+        free(w.mmc.seqPairArrayRight128[l]);
+    }
+
+    // NULL-safe: SMEM buffers are now allocated lazily on first batch;
+    // workers that never ran a batch leave them as NULL. _mm_free / free
+    // are both well-defined on NULL.
+    for(int l=0; l<nthreads; l++) {
+        _mm_free(w.mmc.matchArray[l]);
+        free(w.mmc.min_intv_ar[l]);
+        free(w.mmc.query_pos_ar[l]);
+        free(w.mmc.enc_qdb[l]);
+        free(w.mmc.rid[l]);
+        _mm_free(w.mmc.lim[l]);
+
+        _mm_free(w.mmc.lockstep_prev[l]);
+        _mm_free(w.mmc.lockstep_match_buf[l]);
+    }
+}
 
 extern "C" {
 

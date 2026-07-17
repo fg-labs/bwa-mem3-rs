@@ -54,6 +54,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=shim/bwa_shim.cpp");
     println!("cargo:rerun-if-changed=shim/bwa_shim_align.cpp");
+    println!("cargo:rerun-if-changed=shim/bwa_shim_layout_assert.cpp");
     println!("cargo:rerun-if-changed=shim/bwa_shim.h");
     println!("cargo:rerun-if-changed=shim/bwa_shim_types.h");
     println!("cargo:rerun-if-changed=vendor/COMMIT");
@@ -169,10 +170,16 @@ fn main() {
         "fm_index_writer.cpp", // index builder
         "index_prelude.cpp",   // index builder helper
         "libsais_build.cpp",   // index builder (libsais)
+        "fastmap.cpp",         // CLI batch driver; see note below
     ];
-    // fastmap.cpp used to be excluded (CLI-side batch driver) but is now
-    // built to expose worker_alloc/worker_free. Its entry point is
-    // `main_mem`, not `main`, so no collision with the Rust test harness.
+    // fastmap.cpp is excluded because as of bwa-mem3 0.6.0 it pulls in the new
+    // fast_reader FASTQ path (libdeflate + zlib-ng), numa, and htslib that this
+    // crate does not vendor. The worker_alloc/worker_free it used to provide are
+    // now carried in shim/bwa_shim_align.cpp — see the rationale comment there.
+    //
+    // The new C reader TUs (fast_reader.c, fast_reader_bseq.c, fr_fastq.c) are
+    // not `.cpp`, so the *.cpp glob below never picks them up; they sit unused
+    // in the vendor tree.
     //
     // On x86_64 the kernel TUs are compiled separately per tier in 4a
     // (`KERNEL_TIERS_X86`); skip them here so the baseline build doesn't
@@ -197,6 +204,10 @@ fn main() {
 
     build.file(manifest.join("shim/bwa_shim.cpp"));
     build.file(manifest.join("shim/bwa_shim_align.cpp"));
+    // Symbol-free TU: static_asserts the POD mem_opt_t/mem_pestat_t layout
+    // against upstream's real bwamem.h so a future vendor refresh can't
+    // silently misalign the offsets Rust reads/writes (maintenance docs gotcha #2).
+    build.file(manifest.join("shim/bwa_shim_layout_assert.cpp"));
     build.include(manifest.join("shim"));
     build.include(&vendor_src);
 

@@ -43,7 +43,7 @@ Ownership layers:
 | `fg-labs/bwa-mem3` / `main` branch | Our integration fork of upstream bwa-mem3. Everything-we've-merged: Apple Silicon NEON, Linux-arm64 Makefile, drop-stat fix, future bwa-meth / XB / etc. |
 | `bwa-mem3-sys/vendor/bwa-mem3/` | Pristine snapshot of `fg-labs/bwa-mem3@main` at `vendor/COMMIT`. Never edit in place. Refresh via `scripts/refresh-bwa-mem3.sh`. |
 | `bwa-mem3-sys/patches/` | Numbered `.patch` files applied to the vendored source at build time. Goal state: empty (fixes landed in `main` instead). |
-| `bwa-mem3-sys/shim/` | Our C/C++ shim. `bwa_shim.h` is the public header bindgen consumes. `bwa_shim.cpp` uses our POD copies of `mem_opt_t` / `mem_pestat_t` from `bwa_shim_types.h`. `bwa_shim_align.cpp` includes upstream's real `bwamem.h` / `FMI_search.h` and bridges to `bwa_shim.cpp` via opaque pointers (layouts match; verified by bindgen layout-assertion tests). |
+| `bwa-mem3-sys/shim/` | Our C/C++ shim. `bwa_shim.h` is the public header bindgen consumes. `bwa_shim.cpp` uses our POD copies of `mem_opt_t` / `mem_pestat_t` from `bwa_shim_types.h`. `bwa_shim_align.cpp` includes upstream's real `bwamem.h` / `FMI_search.h` and bridges to `bwa_shim.cpp` via opaque pointers (layouts match; the POD-vs-upstream match is guarded at build time by `bwa_shim_layout_assert.cpp`, and bindgen's own tests check the Rust-vs-POD match). |
 | `bwa-mem3-rs/` | Safe Rust API: `BwaIndex`, `MemOpts`, `MemPeStat`, `ReadPair`, `Seeds`, `AlignmentBatch`, `Record`. Phase split: `seed_batch` → `extend_batch`. Convenience: `align_batch`. Pilot-only: `estimate_pestat`. |
 | `bwa-mem3-rs-cli/` | Minimal `bwa-rs mem` CLI. Reads paired FASTQ (gzip-aware), writes proper BGZF-BAM. |
 
@@ -55,7 +55,7 @@ Our shim delegates the paired-end decision to upstream's `mem_pair_resolve` (exp
 
 ### 2. `mem_opt_t` / `mem_pestat_t` layouts are mirrored in two places
 
-They're in `shim/bwa_shim_types.h` (what bindgen reads) and in upstream's `bwamem.h` (what `bwa_shim_align.cpp` includes). Both must stay byte-identical. A bindgen layout-assertion test (`bindgen_test_layout_mem_opt_t`) catches drift at build time. On `refresh-bwa-mem3.sh`, diff `vendor/bwa-mem3/src/bwamem.h` around lines 77–115 (`mem_opt_t`) and 172–176 (`mem_pestat_t`); update `shim/bwa_shim_types.h` if either changed.
+They're in `shim/bwa_shim_types.h` (what bindgen reads) and in upstream's `bwamem.h` (what `bwa_shim_align.cpp` includes). Both must stay byte-identical — the shim allocates the real struct via upstream's `mem_opt_init()`, so any field-order/size drift silently corrupts the offsets Rust reads/writes through the bindgen view. **`shim/bwa_shim_layout_assert.cpp` guards this**: it `#include`s the POD under renamed tags (`#define mem_opt_t pod_mem_opt_t`) and then the real `bwamem.h`, and `static_assert`s `offsetof`/`sizeof` field by field, so drift fails `cargo build`. (The bindgen `bindgen_test_layout_mem_opt_t` test only checks the Rust struct against the C compiler's view of the *POD copy*, **not** the POD against upstream — that gap is what the guard TU closes.) On `refresh-bwa-mem3.sh`, diff `vendor/bwa-mem3/src/bwamem.h` around lines 95–156 (`mem_opt_t`) and 239–243 (`mem_pestat_t`); if either changed, update `shim/bwa_shim_types.h` **and** the field list in `bwa_shim_layout_assert.cpp` to match.
 
 ### 3. macOS deployment target mismatch → SIGBUS at test-binary startup
 
@@ -83,14 +83,25 @@ bwa-mem3's internal `mem_aln_t.cigar` uses opcode table `MIDSH` (M=0 I=1 D=2 S=3
 - `bwtindex.cpp` — index builder (not our concern)
 - `bam_writer.cpp`, `meth_bam.cpp` — htslib-dependent; shim emits BAM directly
 - `fm_index_writer.cpp`, `index_prelude.cpp`, `libsais_build.cpp` — index builder
+- `fastmap.cpp` — CLI batch driver (see below)
+- `fast_reader.c`, `fast_reader_bseq.c`, `fr_fastq.c` — the 0.6.0 fast FASTQ
+  reader (libdeflate + zlib-ng). These are `.c`, and `build.rs` only globs
+  `src/*.cpp`, so they are never picked up; they sit unused in the vendor tree.
 
 The htslib- and libsais-dependent TUs would also fail to link: the
-refresh script prunes `ext/htslib`, `ext/libsais`, `ext/mimalloc`, and
-`ext/doctest` from the vendor tree. If a future refresh wants to
-re-enable any of them, restore the relevant submodule first (or
-`scripts/refresh-bwa-mem3.sh`'s `DROP_SUBTREES`).
+refresh script prunes `ext/htslib`, `ext/libsais`, `ext/mimalloc`,
+`ext/doctest`, and (as of 0.6.0) `ext/zlib-ng` from the vendor tree. If a
+future refresh wants to re-enable any of them, restore the relevant
+submodule first (or `scripts/refresh-bwa-mem3.sh`'s `DROP_SUBTREES`).
 
-`fastmap.cpp` is built (was previously excluded) so `libbwa-mem3.a` exports `worker_alloc` / `worker_free`. Its `main_mem` entry point doesn't clash with Rust's test harness.
+`fastmap.cpp` was compiled at 0.2.x purely to export `worker_alloc` /
+`worker_free`. As of bwa-mem3 0.6.0 it is transitively coupled to the new
+`fast_reader` FASTQ path (libdeflate + zlib-ng), `numa`, and htslib — none of
+which this crate vendors — so it is excluded again. We instead carry verbatim
+file-local copies of just `worker_alloc` / `worker_free` in
+`shim/bwa_shim_align.cpp`; **keep them in sync** with upstream's `fastmap.cpp`
+on every vendor refresh (the buffer set must match what `mem_kernel1_core` /
+`mem_kernel2_core` expect).
 
 `runsimd.cpp` is gone in bwa-mem3 v0.2.0 — the multi-binary launcher (`bwa-mem3.<tier>` companions) was replaced by single-binary SIMD dispatch in `simd_dispatch.cpp`. The build no longer needs to skip an unguarded `main()`.
 

@@ -94,6 +94,16 @@ typedef struct smem_struct
 #define SMEM_LOCKSTEP_N 16
 #endif
 
+/* Lockstep depth for the third-pass (bwtSeedStrategy) re-seeding, tuned
+ * separately from the phase-2 SMEM depth above. The third-pass lockstep is
+ * gated to arm64 at its call site (bwamem.cpp) because it only wins on non-SMT
+ * cores; N=8 is the measured whole-aligner optimum on Graviton4 (-1.7% vs the
+ * scalar third pass, -16.7% on the seeding stage). Set to 1 to fall back to the
+ * scalar third-pass path even on arm. */
+#ifndef BWTSEED_LOCKSTEP_N
+#define BWTSEED_LOCKSTEP_N 8
+#endif
+
 class FMI_search: public indexEle
 {
     public:
@@ -119,8 +129,15 @@ class FMI_search: public indexEle
      * fastmap reuses this so it doesn't have to re-attach for the ref string. */
     uint8_t *shm_attached_base()     const { return shm_base; }
 
-    int build_index();
-    void load_index();
+    /* emit_unpacked_ref defaults false: skip writing the unpacked `<prefix>.0123`.
+     * `mem` pac-fetches the original reference from `.pac`, so `.0123` is never
+     * read; pass true only to emit it for an external consumer (e.g. bwa-mem2). */
+    int build_index(bool emit_unpacked_ref = false);
+    /* load_pac=false skips loading the 2-bit packed reference (BNS only). D3
+     * --meth uses this for the SEED index: seeding needs the FM-index + bns
+     * (for the seed->original remap) but never the seed pac — extension/scoring
+     * runs against the ORIGINAL pac (meth_orig_pac). Saves ~1.6 GB on hg38. */
+    void load_index(bool load_pac = true);
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
@@ -142,18 +159,9 @@ class FMI_search: public indexEle
      * Writing past the pre-sized capacity is undefined behavior. The actual
      * number of SMEMs written is reported via *__numTotalSmem (or the
      * int64_t return value on bwtSeedStrategyAllPosOneThread). */
-    void getSMEMs(uint8_t *enc_qdb,
-                  int32_t numReads,
-                  int32_t batch_size,
-                  int32_t readlength,
-                  int32_t minSeedLengh,
-                  int32_t numthreads,
-                  SMEM *matchArray,
-                  int64_t *numTotalSmem);
-
     /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsOnePosOneThread(uint8_t *enc_qdb,
-                                 int16_t *query_pos_array,
+                                 int32_t *query_pos_array,
                                  int32_t *min_intv_array,
                                  int32_t *rid_array,
                                  int32_t numReads,
@@ -174,7 +182,7 @@ class FMI_search: public indexEle
      * buffers flushed by input-index cursor.
      * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
-                                          int16_t *query_pos_array,
+                                          int32_t *query_pos_array,
                                           int32_t *min_intv_array,
                                           int32_t *rid_array,
                                           int32_t numReads,
@@ -209,6 +217,21 @@ class FMI_search: public indexEle
                                            int32_t *query_cum_len_ar,
                                            int32_t minSeedLen,
                                            SMEM *matchArray);
+
+    /* Lockstep batched variant of bwtSeedStrategyAllPosOneThread. Processes
+     * BWTSEED_LOCKSTEP_N reads' forward-extension walks in slot-interleaved
+     * order so the CP_OCC cache-line misses from independent reads issue
+     * concurrently. Same SMEM emission order as the scalar (reads in input
+     * order; within a read, outer-x ascending). matchArray must hold at
+     * least numReads * max_readlength SMEMs. */
+    int64_t bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
+                                                    int32_t *max_intv_array,
+                                                    int32_t numReads,
+                                                    const bseq1_t *seq_,
+                                                    int32_t *query_cum_len_ar,
+                                                    int32_t minSeedLen,
+                                                    SMEM *matchArray,
+                                                    int32_t max_readlength);
         
     void sortSMEMs(SMEM *matchArray,
                    int64_t numTotalSmem[],
@@ -269,16 +292,51 @@ private:
         __attribute__((always_inline)) inline
         SMEM backwardExt(SMEM smem, uint8_t a) const
         {
-            uint8_t b;
-            int64_t k[4], l[4], s[4];
-            for (b = 0; b < 4; b++) {
-                int64_t sp = (int64_t)(smem.k);
-                int64_t ep = (int64_t)(smem.k) + (int64_t)(smem.s);
-                GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
-                GET_OCC(ep, b, occ_id_ep, y_ep, occ_ep, one_hot_bwt_str_c_ep, match_mask_ep);
-                k[b] = count[b] + occ_sp;
-                s[b] = occ_ep - occ_sp;
+            /* sp/ep and their checkpoint block + one-hot mask do not depend on
+             * the base b, so hoist them out of the per-base occ computation.
+             * Only k[a] and s[a] are consumed for the result, but all four s[b]
+             * feed the l cumulation below, so the full 4-lane occ is computed. */
+            const int64_t sp = (int64_t)smem.k;
+            const int64_t ep = (int64_t)smem.k + (int64_t)smem.s;
+            const CP_OCC &blk_sp = cp_occ[sp >> CP_SHIFT];
+            const CP_OCC &blk_ep = cp_occ[ep >> CP_SHIFT];
+            const uint64_t mask_sp = one_hot_mask_array[sp & CP_MASK];
+            const uint64_t mask_ep = one_hot_mask_array[ep & CP_MASK];
+
+            int64_t occ_sp[4], s[4], l[4];
+
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+            /* arm64 has no scalar popcount instruction, so the scalar GET_OCC
+             * path pays a GPR<->SIMD round-trip for every __builtin_popcountl
+             * (eight per call). Compute all four bases in-lane instead: AND the
+             * one-hot BWT words with the position mask, popcount each 64-bit
+             * lane (cnt + pairwise-add reduction), and add the checkpoint
+             * counts. Bit-identical to the scalar popcount, no cross-domain
+             * moves, one load per checkpoint block. */
+            const uint64x2_t msp = vdupq_n_u64(mask_sp);
+            const uint64x2_t mep = vdupq_n_u64(mask_ep);
+            #define BWA3_PC64(v) vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(vcntq_u8(vreinterpretq_u8_u64(v)))))
+            const uint64x2_t psp01 = BWA3_PC64(vandq_u64(vld1q_u64(&blk_sp.one_hot_bwt_str[0]), msp));
+            const uint64x2_t psp23 = BWA3_PC64(vandq_u64(vld1q_u64(&blk_sp.one_hot_bwt_str[2]), msp));
+            const uint64x2_t pep01 = BWA3_PC64(vandq_u64(vld1q_u64(&blk_ep.one_hot_bwt_str[0]), mep));
+            const uint64x2_t pep23 = BWA3_PC64(vandq_u64(vld1q_u64(&blk_ep.one_hot_bwt_str[2]), mep));
+            #undef BWA3_PC64
+            const uint64x2_t occ_sp01 = vaddq_u64(vld1q_u64((const uint64_t*)&blk_sp.cp_count[0]), psp01);
+            const uint64x2_t occ_sp23 = vaddq_u64(vld1q_u64((const uint64_t*)&blk_sp.cp_count[2]), psp23);
+            const uint64x2_t occ_ep01 = vaddq_u64(vld1q_u64((const uint64_t*)&blk_ep.cp_count[0]), pep01);
+            const uint64x2_t occ_ep23 = vaddq_u64(vld1q_u64((const uint64_t*)&blk_ep.cp_count[2]), pep23);
+            vst1q_u64((uint64_t*)&occ_sp[0], occ_sp01);
+            vst1q_u64((uint64_t*)&occ_sp[2], occ_sp23);
+            vst1q_u64((uint64_t*)&s[0], vsubq_u64(occ_ep01, occ_sp01));
+            vst1q_u64((uint64_t*)&s[2], vsubq_u64(occ_ep23, occ_sp23));
+#else
+            for (uint8_t b = 0; b < 4; b++) {
+                int64_t occ_s = blk_sp.cp_count[b] + _mm_countbits_64(blk_sp.one_hot_bwt_str[b] & mask_sp);
+                int64_t occ_e = blk_ep.cp_count[b] + _mm_countbits_64(blk_ep.one_hot_bwt_str[b] & mask_ep);
+                occ_sp[b] = occ_s;
+                s[b]      = occ_e - occ_s;
             }
+#endif
 
             int64_t sentinel_offset = 0;
             if ((smem.k <= sentinel_index) && ((smem.k + smem.s) > sentinel_index))
@@ -288,7 +346,7 @@ private:
             l[1] = l[2] + s[2];
             l[0] = l[1] + s[1];
 
-            smem.k = k[a];
+            smem.k = count[a] + occ_sp[a];
             smem.l = l[a];
             smem.s = s[a];
             return smem;
@@ -300,7 +358,7 @@ private:
     struct BatchSlot;
 
     void ls_init_slot(BatchSlot *s, int32_t input_idx,
-                      const int16_t *query_pos_array,
+                      const int32_t *query_pos_array,
                       const int32_t *min_intv_array,
                       const int32_t *rid_array,
                       const bseq1_t *seq_,
@@ -313,6 +371,20 @@ private:
     void ls_advance_backward_step(BatchSlot *s,
                                   const uint8_t *enc_qdb,
                                   int32_t minSeedLen);
+
+    // ----- Lockstep bwtSeed batching internals -----
+    struct BwtSeedSlot;
+
+    void bsd_init_slot(BwtSeedSlot *s, int32_t input_idx,
+                       const int32_t *max_intv_array,
+                       const bseq1_t *seq_,
+                       const int32_t *query_cum_len_ar,
+                       const uint8_t *enc_qdb);
+    void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
+    void bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s);
+    void bsd_advance_step(BwtSeedSlot *s,
+                          const uint8_t *enc_qdb,
+                          int32_t minSeedLen);
 };
 
 #endif
