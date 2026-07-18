@@ -51,6 +51,15 @@ fn check_index_files(prefix: &Path) -> Result<()> {
     }
 }
 
+/// Validate `prefix` as UTF-8 and convert it to a `CString` for the FFI.
+/// `what` names the argument for the error message (e.g. "prefix").
+fn prefix_to_cstring(prefix: &Path, what: &str) -> Result<CString> {
+    let s = prefix
+        .to_str()
+        .ok_or_else(|| Error::InvalidInput(format!("{what} must be valid UTF-8")))?;
+    Ok(CString::new(s)?)
+}
+
 /// Handle to a loaded bwa-mem3 reference index.
 ///
 /// The index is immutable after loading. Multiple threads may share a
@@ -95,10 +104,7 @@ impl BwaIndex {
             check_index_files(path)?;
         }
 
-        let s = path
-            .to_str()
-            .ok_or_else(|| Error::InvalidInput("prefix must be valid UTF-8".into()))?;
-        let c = CString::new(s)?;
+        let c = prefix_to_cstring(path, "prefix")?;
         let handle = unsafe { bwa_mem3_sys::bwa_shim_idx_load(c.as_ptr()) };
         if handle.is_null() {
             return Err(Error::IndexLoad {
@@ -107,6 +113,46 @@ impl BwaIndex {
             });
         }
         Ok(BwaIndex { handle })
+    }
+
+    /// Load a bisulfite (BS-seq) **dual index** for `--meth` alignment.
+    ///
+    /// `seed_prefix` is the converted seed index (`<ref>.meth`, built by
+    /// `bwa-mem3 index --meth`); `orig_prefix` is the un-converted original
+    /// reference (`<ref>`). Both stay resident: seeding runs against the
+    /// converted index, while chaining/extension/output run in original
+    /// coordinates. Align with a [`MemOpts`](crate::MemOpts) whose
+    /// [`set_meth`](crate::MemOpts::set_meth) is enabled; the emitted records
+    /// carry Bismark `XG`/`XR`/`XM` tags and original-reference coordinates, so
+    /// the contig accessors below report the original contigs.
+    pub fn load_meth(seed_prefix: impl AsRef<Path>, orig_prefix: impl AsRef<Path>) -> Result<Self> {
+        let seed = seed_prefix.as_ref();
+        let orig = orig_prefix.as_ref();
+
+        if !crate::shm::is_staged(seed).unwrap_or(false) {
+            check_index_files(seed)?;
+        }
+        check_index_files(orig)?;
+
+        let seed_c = prefix_to_cstring(seed, "seed prefix")?;
+        let orig_c = prefix_to_cstring(orig, "orig prefix")?;
+        let handle =
+            unsafe { bwa_mem3_sys::bwa_shim_idx_load_meth(seed_c.as_ptr(), orig_c.as_ptr()) };
+        if handle.is_null() {
+            return Err(Error::IndexLoad {
+                path: seed.to_owned(),
+                msg: shim_err("meth idx load").to_string(),
+            });
+        }
+        Ok(BwaIndex { handle })
+    }
+
+    /// Whether this index was loaded as a bisulfite dual index via
+    /// [`load_meth`](Self::load_meth). Aligning requires
+    /// [`MemOpts::meth`](crate::MemOpts::meth) to agree with this.
+    #[must_use]
+    pub fn is_meth(&self) -> bool {
+        unsafe { bwa_mem3_sys::bwa_shim_idx_is_meth(self.handle) != 0 }
     }
 
     #[must_use]

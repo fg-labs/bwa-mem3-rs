@@ -42,6 +42,10 @@ typedef struct {
 mem_opt_t *bwa_shim_opts_new(void);
 void              bwa_shim_opts_free(mem_opt_t *opts);
 
+/* D3 (--meth): (re)build the per-hypothesis bisulfite scoring matrices from the
+ * base matrix per opts->meth_scoring. Call after changing meth_scoring. */
+void              bwa_shim_opts_fill_meth_mat(mem_opt_t *opts);
+
 /* Set common single-integer fields; one function per semantically-distinct knob.
  * Returns 0 on success, non-zero if the key is unknown. */
 int bwa_shim_opts_set_int(mem_opt_t *opts, const char *key, int value);
@@ -51,6 +55,11 @@ mem_pestat_t *bwa_shim_pestat_zero(void);
 void                 bwa_shim_pestat_free(mem_pestat_t *pestat);
 
 BwaIndex *bwa_shim_idx_load(const char *prefix);
+/* D3 (--meth): load a dual index — `seed_prefix` = converted `<ref>.meth`,
+ * `orig_prefix` = un-converted `<ref>`. Use with meth_mode set on the opts. */
+BwaIndex *bwa_shim_idx_load_meth(const char *seed_prefix, const char *orig_prefix);
+/* Non-zero iff `idx` is a --meth dual index (loaded via bwa_shim_idx_load_meth). */
+int       bwa_shim_idx_is_meth(const BwaIndex *idx);
 void      bwa_shim_idx_free(BwaIndex *idx);
 size_t    bwa_shim_idx_n_contigs(const BwaIndex *idx);
 const char *bwa_shim_idx_contig_name(const BwaIndex *idx, size_t i);

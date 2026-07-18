@@ -50,7 +50,8 @@ typedef struct mem_opt_t {
     int mate_concordant_window;
     int est_insert_high;
     /* upstream type is `seed_order_t`, a plain (int-sized) enum in bwamem.h;
-     * mirrored as int for layout — the Rust API does not expose seed ordering. */
+     * mirrored as int for layout. The Rust API exposes it as the `SeedOrder`
+     * enum (bwa-mem3-rs `MemOpts::seed_order`). */
     int seed_emit_order;
     int min_chain_weight;
     int max_chain_extend;

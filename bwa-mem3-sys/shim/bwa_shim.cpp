@@ -41,6 +41,7 @@
  * in bwa_shim_align.cpp which includes upstream's real headers; here we only
  * need the shim_align_* bridge declarations. */
 mem_opt_t *mem_opt_init(void);  /* C++ linkage, matches bwamem.h */
+void mem_opt_fill_meth_mat(mem_opt_t *opt);  /* C++ linkage, matches bwamem.h */
 
 extern "C" {
     struct ShimReadPair {
@@ -54,6 +55,8 @@ extern "C" {
     struct ShimAlignOutput;
 
     void *shim_align_idx_load(const char *prefix);
+    void *shim_align_idx_load_meth(const char *seed_prefix, const char *orig_prefix);
+    int   shim_align_idx_is_meth(void *fmi);
     void  shim_align_idx_free(void *fmi);
     size_t shim_align_idx_n_contigs(void *fmi);
     const char *shim_align_idx_contig_name(void *fmi, size_t i);
@@ -206,6 +209,14 @@ extern "C" void bwa_shim_opts_free(mem_opt_t *opts) {
     if (opts) free(opts);
 }
 
+/* D3 (--meth): (re)build the per-hypothesis bisulfite scoring matrices
+ * (mat_ot / mat_ob) from `mat` per opt->meth_scoring. mem_opt_init already
+ * calls this once; Rust must call it again after changing meth_scoring so the
+ * meth matrices stay consistent (see MemOpts::set_meth / set_meth_scoring). */
+extern "C" void bwa_shim_opts_fill_meth_mat(mem_opt_t *opts) {
+    if (opts) mem_opt_fill_meth_mat(opts);
+}
+
 extern "C" int bwa_shim_opts_set_int(mem_opt_t *opts, const char *key, int value) {
     (void)opts; (void)key; (void)value;
     shim_set_err("bwa_shim_opts_set_int: deprecated; set fields directly via Rust");
@@ -250,6 +261,31 @@ extern "C" BwaIndex *bwa_shim_idx_load(const char *prefix) {
     return h;
 }
 
+/* D3 (--meth): load a dual index. `seed_prefix` is the converted seed index
+ * (`<ref>.meth`), `orig_prefix` the un-converted original reference (`<ref>`).
+ * Used with a mem_opt_t whose meth_mode is set. */
+extern "C" BwaIndex *bwa_shim_idx_load_meth(const char *seed_prefix,
+                                            const char *orig_prefix) {
+    shim_clear_err();
+    if (!seed_prefix || !orig_prefix) {
+        shim_set_err("null prefix");
+        return NULL;
+    }
+    BwaIndex *h = (BwaIndex *) calloc(1, sizeof(BwaIndex));
+    if (!h) {
+        shim_set_err("calloc failed");
+        return NULL;
+    }
+    h->fmi = shim_align_idx_load_meth(seed_prefix, orig_prefix);
+    if (!h->fmi) {
+        shim_set_err("meth dual-index load failed for seed '%s' / orig '%s'",
+                     seed_prefix, orig_prefix);
+        free(h);
+        return NULL;
+    }
+    return h;
+}
+
 extern "C" void bwa_shim_idx_free(BwaIndex *h) {
     if (!h) return;
     if (h->fmi) {
@@ -261,6 +297,12 @@ extern "C" void bwa_shim_idx_free(BwaIndex *h) {
 
 extern "C" size_t bwa_shim_idx_n_contigs(const BwaIndex *h) {
     return h ? shim_align_idx_n_contigs(h->fmi) : 0;
+}
+
+/* Non-zero iff `h` was loaded via bwa_shim_idx_load_meth (a --meth dual index).
+ * Callers reject a meth_mode/index mismatch before aligning. */
+extern "C" int bwa_shim_idx_is_meth(const BwaIndex *h) {
+    return (h && h->fmi) ? shim_align_idx_is_meth(h->fmi) : 0;
 }
 
 extern "C" const char *bwa_shim_idx_contig_name(const BwaIndex *h, size_t i) {

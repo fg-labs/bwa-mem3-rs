@@ -97,3 +97,37 @@ fn align_batch_returns_records() {
         assert_eq!(flag & 0x1, 0x1); // paired
     }
 }
+
+/// The footgun guard: enabling `--meth` on opts but aligning against a plain
+/// (non-meth) index must fail fast rather than silently emit garbage.
+#[test]
+fn meth_opts_against_non_meth_index_errors() {
+    let Some(prefix) = ref_prefix() else {
+        return;
+    };
+    let idx = BwaIndex::load(&prefix).expect("load index");
+    assert!(!idx.is_meth(), "test ref must be a plain (non-meth) index");
+
+    let mut opts = MemOpts::new().expect("opts");
+    opts.set_pe(true).set_meth(true);
+
+    let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+    let qual = vec![b'I'; seq.len()];
+    let pairs = vec![ReadPair {
+        name_r1: b"r",
+        seq_r1: seq,
+        qual_r1: Some(&qual),
+        name_r2: b"r",
+        seq_r2: seq,
+        qual_r2: Some(&qual),
+    }];
+
+    // (AlignmentBatch isn't Debug, so avoid expect_err's Debug bound.)
+    let Err(err) = align_batch(&idx, &opts, &pairs, None) else {
+        panic!("meth opts + non-meth index must error");
+    };
+    assert!(
+        err.to_string().contains("meth"),
+        "expected a meth mismatch error, got: {err}"
+    );
+}

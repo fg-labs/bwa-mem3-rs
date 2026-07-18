@@ -44,6 +44,12 @@ enum Cmd {
         /// Minimum seed length (`-k`).
         #[arg(short = 'k', long)]
         min_seed_len: Option<i32>,
+        /// Bisulfite (BS-seq) alignment (`--meth`). Requires a dual index built
+        /// with `bwa-mem3 index --meth`: `<prefix>` is the original reference
+        /// and `<prefix>.meth` the converted seed index. Emits Bismark
+        /// `XR`/`XG`/`XM` tags.
+        #[arg(long)]
+        meth: bool,
     },
     /// Manage indexes pinned in POSIX shared memory.
     Shm {
@@ -81,6 +87,7 @@ fn main() -> Result<()> {
             output,
             batch_size,
             min_seed_len,
+            meth,
         } => run_mem(
             &prefix,
             &r1,
@@ -88,6 +95,7 @@ fn main() -> Result<()> {
             output.as_deref(),
             batch_size,
             min_seed_len,
+            meth,
         ),
         Cmd::Shm { action } => run_shm(action),
     }
@@ -108,6 +116,7 @@ fn run_shm(action: ShmAction) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mem(
     prefix: &std::path::Path,
     r1_path: &std::path::Path,
@@ -115,10 +124,24 @@ fn run_mem(
     output: Option<&std::path::Path>,
     batch_size: usize,
     min_seed_len: Option<i32>,
+    meth: bool,
 ) -> Result<()> {
-    let idx = BwaIndex::load(prefix).with_context(|| format!("loading index {prefix:?}"))?;
+    // In --meth mode the seed index is `<prefix>.meth` and the original
+    // reference is `<prefix>` (built together by `bwa-mem3 index --meth`).
+    let idx = if meth {
+        let mut seed = prefix.as_os_str().to_owned();
+        seed.push(".meth");
+        let seed = std::path::PathBuf::from(seed);
+        BwaIndex::load_meth(&seed, prefix)
+            .with_context(|| format!("loading meth dual index {seed:?} / {prefix:?}"))?
+    } else {
+        BwaIndex::load(prefix).with_context(|| format!("loading index {prefix:?}"))?
+    };
     let mut opts = MemOpts::new()?;
     opts.set_pe(true);
+    if meth {
+        opts.set_meth(true);
+    }
     if let Some(k) = min_seed_len {
         opts.set_min_seed_len(k);
     }

@@ -24,5 +24,5 @@ pub use align::{
 };
 pub use error::{Error, Result};
 pub use index::BwaIndex;
-pub use opts::{MemOpts, MemPeStat, Mode, PeOrient, PeOrientation, SeedOrder};
+pub use opts::{MemOpts, MemPeStat, MethScoring, Mode, PeOrient, PeOrientation, SeedOrder};
 pub use xa::{parse_xa, AuxHit};

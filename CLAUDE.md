@@ -133,6 +133,59 @@ isn't wired up: the stub deliberately types `shm` as a `_Shm` instance while
 the runtime `shm` is a submodule, which stubtest would flag without an
 allowlist.)
 
+### 11. Bisulfite (`--meth`) is dual-coordinate
+
+`--meth` (D3) alignment needs a **dual index** built by `bwa-mem3 index --meth`:
+the converted, f/r-doubled seed FM-index (`<ref>.meth.*`) plus the original
+un-converted reference (`<ref>.*`). Load both via `BwaIndex::load_meth(seed,
+orig)` → `shim_align_idx_load_meth`; the shim keeps the original `bns`/`pac`
+and a second unpacked `ref_string` resident on `BwaShimIndex`. Seeding runs
+against the converted index; **everything after the seed→original remap in
+`mem_kernel1_core`/`mem_kernel2_core` runs in original coordinates** — insert
+size, pairing, `mem_reg2aln`, output rids, and the reported contigs
+(`shim_header_bns` returns the original `bns` so the BAM header matches the
+emitted rids). Per read the shim retains the unconverted bases in
+`bseq1_t.meth_orig_seq` and projects `seq` in place (R1 C→T, R2 G→A) before
+seeding; `mem_reg2aln` takes `meth_orig_seq` so NM/MD/CIGAR reflect the
+original read, and `append_bam_record` emits Bismark `XR:Z` (read conversion,
+from R1/R2), `XG:Z` (genome strand, from `mem_aln_t.meth_hypothesis`), and
+`XM:Z` (via upstream `meth_build_xm`, which is compiled — only `meth_bam.cpp`,
+the htslib writer, is excluded). All meth code is gated on `opt->meth_mode` /
+non-NULL `meth_orig_*`, so the non-meth path is unchanged. Output matches the
+CLI byte-for-byte on every record including secondaries/`XA:Z`
+(`bwa-mem3-rs-cli/tests/meth_e2e.rs` pins this), because `pair_and_emit`
+replicates `mem_reg2sam`'s XA folding (see gotcha #12).
+
+### 12. `pair_and_emit` folds secondaries into `XA:Z` like `mem_reg2sam`
+
+The shim emits records from the per-read alnreg list itself rather than calling
+upstream's `mem_reg2sam`, so it must reproduce that function's output policy:
+after `mem_pair_resolve` (which runs `mem_mark_primary_se`), `pair_and_emit`
+calls `mem_gen_alt` to build each read's `XA:Z` string and then, per alnreg,
+**skips** any region that is secondary (`ar->secondary >= 0`, folded into the
+primary's `XA:Z`), below `opt->T`, or below `drop_ratio` — emitting only
+primaries + supplementaries (2nd+ emitted region gets `0x800` and its MAPQ
+lowered to the primary's). Without this the shim emitted every surviving
+region, so multi-mapping reads got a record per hit instead of one record with
+an `XA:Z` tag — harmless for unique mappers but a large divergence on
+repetitive reads and on `--meth` (whose collapsed C/T scoring surfaces extra
+weak hits). `lists[k]` stays 1:1 with `a[k]` so the pairing indices (`z[k]`)
+and mate/SA logic are unaffected; a parallel `emit[k]` mask gates the append.
+
+One paired-branch subtlety the unified emission must reproduce: when
+`mem_pair` selects a non-top region (`z[k] != 0`), `mem_pair_resolve` promotes
+`a[k].a[z[k]]` (sets its `secondary` to `-2`) and runs the `secondary_all`
+switch, which reassigns the old SE-primary (region 0) into `z[k]`'s group —
+leaving it with `secondary < 0` but `secondary_all >= 0`. `mem_gen_alt` folds
+that region into `z[k]`'s `XA:Z`, and upstream `mem_sam_pe`'s paired block emits
+**only** `z[k]` as primary, never the switched-away region. Because our emit
+filter keys off `secondary` alone, the filter also drops any region with
+`secondary < 0 && secondary_all >= 0` on the paired branch; without it the shim
+would surface the old primary as an extra record and demote the `z[k]`
+pair-primary to a `0x800` supplementary. `cli_parity_pair_select.rs` pins this
+(two near-identical motif copies + a mate that anchors R1 to the lower-scoring
+copy, so `z[0] != 0`).
+
 ## Commit / PR conventions
 
 - Conventional Commits; sign with `-S`; see `CONTRIBUTING.md`.
