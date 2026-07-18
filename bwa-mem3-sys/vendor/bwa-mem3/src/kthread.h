@@ -74,6 +74,8 @@ struct kt_for_t;
 typedef struct {
 	struct kt_for_t *t;
 	long i;
+	double cpu_busy;   /* stage_prof: per-thread CLOCK_THREAD_CPUTIME seconds (--profile) */
+	double encode;     /* stage_prof: per-thread SAM/BAM-build CPU seconds */
 } ktf_worker_t;
 
 typedef struct kt_for_t {
@@ -87,4 +89,8 @@ typedef struct kt_for_t {
 
 void kt_pipeline(int n_threads, int (*func)(void*), void *shared_data, int n_steps);
 void kt_for(void (*func)(void*,int,int,int), void *data, int n);
+/* Tear down the persistent kt_for() worker pool (joins the worker threads).
+ * Call once after the last kt_for()/kt_pipeline() of a run; a no-op if the pool
+ * was never created. */
+void kt_pool_destroy(void);
 #endif

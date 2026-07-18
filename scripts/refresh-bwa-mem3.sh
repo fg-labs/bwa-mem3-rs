@@ -19,10 +19,12 @@ mkdir -p "$(dirname "$DST")"
 # allocator override (mimalloc), the unit-test harness (doctest), benches,
 # CI configs, or upstream's docs/scripts. Keep `ext/sse2neon` (headers we
 # compile against) and `ext/pdqsort` (the header-only sort dropped in at
-# bwamem.cpp sort sites).
+# bwamem.cpp sort sites). `ext/zlib-ng` (added in bwa-mem3 0.6.0) backs the
+# CLI's fast_reader FASTQ path (fast_reader.c), which we do not compile — the
+# Rust CLI reads FASTQ itself — so it is dropped alongside htslib/libsais.
 DROP_SUBTREES=(
     .github bench docs scripts
-    ext/htslib ext/libsais ext/mimalloc ext/doctest
+    ext/htslib ext/libsais ext/mimalloc ext/doctest ext/zlib-ng
 )
 
 if [ -n "$SRC" ]; then

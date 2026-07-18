@@ -93,7 +93,8 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev autoconf automake
+          sudo apt-get install -y build-essential zlib1g-dev libdeflate-dev \
+            autoconf automake
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
         with:

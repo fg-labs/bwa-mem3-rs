@@ -175,7 +175,7 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
             (long)reference_seq_len, (long)sentinel_index);
 }
 
-int FMI_search::build_index() {
+int FMI_search::build_index(bool emit_unpacked_ref) {
 
     char *prefix = file_name;
 
@@ -224,10 +224,11 @@ int FMI_search::build_index() {
         opts.max_memory_bytes = parse_ll(mm, "BWA_INDEX_MAX_MEMORY");
     if (const char* td = getenv("BWA_INDEX_TMPDIR"))
         opts.tmpdir           = td;
+    opts.emit_unpacked_ref = emit_unpacked_ref;
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
-void FMI_search::load_index()
+void FMI_search::load_index(bool load_pac)
 {
     /* Try the staged shm segment first. On hit, both the FMI internals
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
@@ -237,9 +238,11 @@ void FMI_search::load_index()
         uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len);
         if (shm_base_local != NULL) {
             load_index_from_shm(shm_base_local, shm_attach_len);
-            bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len);
-            fprintf(stderr, "* FMI+BNS+PAC attached from shm; "
-                    "skipping disk load.\n");
+            /* D3 --meth seed segment is staged bns_only: no PAC section, and
+             * idx->pac stays NULL (extension uses meth_orig_pac). */
+            bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len, load_pac);
+            fprintf(stderr, "* FMI+BNS%s attached from shm; "
+                    "skipping disk load.\n", load_pac ? "+PAC" : "");
             return;
         }
     }
@@ -271,7 +274,7 @@ void FMI_search::load_index()
     assert(reference_seq_len > 0);
     assert(reference_seq_len <= 0x7fffffffffL);
 
-    fprintf(stderr, "* Reference seq len for bi-index = %ld\n", reference_seq_len);
+    fprintf(stderr, "* Reference seq len for bi-index = %lld\n", (long long)reference_seq_len);
 
     // create checkpointed occ
     int64_t cp_occ_size = (reference_seq_len >> CP_SHIFT) + 1;
@@ -327,7 +330,7 @@ void FMI_search::load_index()
     sentinel_index = -1;
     #if SA_COMPRESSION
     err_fread_noeof(&sentinel_index, sizeof(int64_t), 1, cpstream);
-    fprintf(stderr, "* sentinel-index: %ld\n", sentinel_index);
+    fprintf(stderr, "* sentinel-index: %lld\n", (long long)sentinel_index);
     #endif
     fclose(cpstream);
 
@@ -348,25 +351,27 @@ void FMI_search::load_index()
         }
         #endif
     }
-    fprintf(stderr, "\nsentinel_index: %ld\n", x);    
+    fprintf(stderr, "\nsentinel_index: %lld\n", (long long)x);
     #endif
 
     fprintf(stderr, "* Count:\n");
     for(x = 0; x < 5; x++)
     {
-        fprintf(stderr, "%ld,\t%lu\n", x, (unsigned long)count[x]);
+        fprintf(stderr, "%lld,\t%lld\n", (long long)x, (long long)count[x]);
     }
     fprintf(stderr, "\n");  
 
     fprintf(stderr, "* Reading other elements of the index from files %s\n",
             ref_file_name);
-    bwa_idx_load_ele(ref_file_name, BWA_IDX_ALL);
+    /* D3 --meth: BNS only for the seed index (skip the ~1.6 GB seed pac). The
+     * seed bns drives the seed->original remap; extension uses meth_orig_pac. */
+    bwa_idx_load_ele(ref_file_name, load_pac ? BWA_IDX_ALL : BWA_IDX_BNS);
 
     fprintf(stderr, "* Done reading Index!!\n");
 }
 
 void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
-                                         int16_t *query_pos_array,
+                                         int32_t *query_pos_array,
                                          int32_t *min_intv_array,
                                          int32_t *rid_array,
                                          int32_t numReads,
@@ -592,13 +597,13 @@ struct FMI_search::BatchSlot {
     // Input identity — copied at init, never mutated thereafter.
     int32_t input_idx;           // index into the caller's input arrays
     int32_t rid;                 // rid_array[input_idx]
-    int16_t start_pos;           // query_pos_array[input_idx] (saved for bwd init)
+    int32_t start_pos;           // query_pos_array[input_idx] (saved for bwd init)
     int32_t min_intv;            // min_intv_array[input_idx]
     int32_t readlength;          // seq_[rid].l_seq
     int32_t offset;              // query_cum_len_ar[rid]
 
     // Output for query_pos_array[input_idx] write-back at flush time.
-    int16_t next_x;
+    int32_t next_x;
 
     // Walk state (mirrors scalar locals).
     SMEM smem;                   // current SA interval
@@ -653,7 +658,7 @@ void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
 //                      we match that (zero matches emitted, ready to flush).
 void FMI_search::ls_init_slot(BatchSlot *s,
                               int32_t input_idx,
-                              const int16_t *query_pos_array,
+                              const int32_t *query_pos_array,
                               const int32_t *min_intv_array,
                               const int32_t *rid_array,
                               const bseq1_t *seq_,
@@ -846,6 +851,206 @@ DONE:
 }
 // ===== End lockstep SMEM batching =====
 
+// ===== Lockstep bwtSeed batching =====
+// Per-slot state for the forward-only bwtSeed walk. Mirrors the locals of
+// the scalar bwtSeedStrategyAllPosOneThread inner-j loop, plus an outer-x
+// cursor. Each slot owns the entire scalar `while (x < readlength)` outer
+// loop — outer transitions are handled inline in bsd_advance_step (Heng
+// review action: don't burn a stepping-pass on outer-only housekeeping
+// when the inner-j loop is shallow, which is exactly bwtSeed's regime).
+//
+// match_buf[] is a per-slot accumulator flushed in input order; sized
+// by the driver from the batch's max_readlength.
+enum BwtSeedPhase : uint8_t {
+    BSD_FWD  = 0,  // in active inner-j extension (s->j is next j to step;
+                   // when s->j < 0 the next step does outer seek first)
+    BSD_DONE = 1,  // slot retired; match_buf ready for in-order flush
+};
+
+// Per-thread cache for the lockstep bwtSeed driver's match_buf[]. RAII
+// wrapper parallels LockstepSmemCache above; released at thread exit so
+// LSan stays quiet (issue #116 family). Tracked separately from the SMEM
+// cache because the access pattern is different (single buffer, not
+// prev/match pair) and the watermark can move independently.
+struct LockstepBwtSeedCache {
+    SMEM  *match    = nullptr;
+    size_t per_slot = 0;
+    ~LockstepBwtSeedCache() {
+        if (match != nullptr) _mm_free(match);
+    }
+};
+
+struct FMI_search::BwtSeedSlot {
+    int32_t input_idx;     // index into the caller's input arrays; doubles as smem.rid
+    int32_t max_intv;      // max_intv_array[input_idx] cached at init
+    int32_t readlength;    // seq_[input_idx].l_seq
+    int32_t offset;        // query_cum_len_ar[input_idx]
+
+    SMEM    smem;          // current SA interval; rid/m fixed at outer-x init
+    int32_t x;             // outer cursor: position of current smem's seed base
+    int32_t j;             // inner cursor: next j to step; j < 0 = need outer seek
+
+    BwtSeedPhase phase;
+    int32_t match_count;
+    bool    ready;
+
+    SMEM   *match_buf;     // -> thread-local cache slice, sized = max_readlength
+};
+
+// Same-slot T0 prefetch for the next inner-j step. The two CP_OCC blocks
+// the next backwardExt(smem, _) hits are at (smem.k >> CP_SHIFT) and
+// ((smem.k + smem.s) >> CP_SHIFT) — i.e. sp and ep. Matches the call
+// pattern in ls_advance_forward_step's tail prefetch.
+void FMI_search::bsd_prefetch_cp_occ(const BwtSeedSlot *s)
+{
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#else
+    (void)s;
+#endif
+}
+
+// Cross-slot T1 (L2) prefetch — same two-line target as T0 but at L2
+// hint, used in the driver's (s + N/2) % N lookahead to cover DRAM-class
+// latency when cp_occ spills out of L3.
+void FMI_search::bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s)
+{
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+#else
+    (void)s;
+#endif
+}
+
+// Initialize a fresh slot for the given input read. Scans forward from
+// x=0 for the first ACGT base (matching the scalar's outer while-loop
+// skipping non-ACGT) and either enters BSD_FWD with smem seeded, or jumps
+// straight to BSD_DONE when the read is entirely non-ACGT.
+void FMI_search::bsd_init_slot(BwtSeedSlot *s,
+                               int32_t input_idx,
+                               const int32_t *max_intv_array,
+                               const bseq1_t *seq_,
+                               const int32_t *query_cum_len_ar,
+                               const uint8_t *enc_qdb)
+{
+    s->input_idx   = input_idx;
+    s->max_intv    = max_intv_array[input_idx];
+    s->readlength  = seq_[input_idx].l_seq;
+    s->offset      = query_cum_len_ar[input_idx];
+    s->match_count = 0;
+    s->ready       = false;
+
+    int32_t x = 0;
+    while (x < s->readlength && enc_qdb[s->offset + x] >= 4) x++;
+    s->x = x;
+    if (x >= s->readlength) {
+        s->phase = BSD_DONE;
+        s->ready = true;
+        return;
+    }
+    uint8_t a = enc_qdb[s->offset + x];
+    s->smem.rid = (uint32_t)input_idx;
+    s->smem.m   = x;
+    s->smem.n   = x;
+    s->smem.k   = count[a];
+    s->smem.l   = count[3 - a];
+    s->smem.s   = count[a + 1] - count[a];
+    s->j        = x + 1;
+    s->phase    = BSD_FWD;
+}
+
+// Advance one slot by one unit of work. Always does at least one cp_occ
+// access per call when the slot is active, so the lockstep pipeline keeps
+// uniform per-pass memory parallelism (Heng action 2a — collapse outer
+// transition into the step function rather than burning a stepping-pass
+// on housekeeping).
+//
+// The semantics are identical to the scalar bwtSeedStrategyAllPosOneThread
+// inner-j body + outer-x advancement:
+//   for(j = x+1; j < readlength; j++) {
+//       next_x = j+1; a = enc_qdb[offset + j];
+//       if (a < 4) {
+//           SMEM newSmem = forward-ext(smem, 3-a); newSmem.n = j;
+//           smem = newSmem;
+//           if (s < max_intv && (n - m + 1) >= minSeedLen) {
+//               if (s > 0) emit smem;
+//               break;
+//           }
+//       } else { break; }
+//   }
+//   x = next_x;
+void FMI_search::bsd_advance_step(BwtSeedSlot *s,
+                                  const uint8_t *enc_qdb,
+                                  int32_t minSeedLen)
+{
+    // Outer seek: if j < 0 the slot just broke out of an inner-j extension
+    // and needs to (re-)init smem at the next ACGT x. Spin through non-ACGT
+    // bases inline (scalar does the same — at most O(N_run) here, and N runs
+    // are rare in Illumina data). Falls through to one inner-j step.
+    if (s->j < 0) {
+        while (s->x < s->readlength && enc_qdb[s->offset + s->x] >= 4) s->x++;
+        if (s->x >= s->readlength) {
+            s->phase = BSD_DONE;
+            s->ready = true;
+            return;
+        }
+        uint8_t a = enc_qdb[s->offset + s->x];
+        s->smem.rid = (uint32_t)s->input_idx;
+        s->smem.m   = s->x;
+        s->smem.n   = s->x;
+        s->smem.k   = count[a];
+        s->smem.l   = count[3 - a];
+        s->smem.s   = count[a + 1] - count[a];
+        s->j        = s->x + 1;
+        // Fall through to inner-j step.
+    }
+
+    // Inner-j step.
+    if (s->j >= s->readlength) {
+        // Scalar: inner for-loop exhausted; next_x stays at last iteration's
+        // j+1 = readlength. Setting x = readlength and j = -1 signals the
+        // next stepping pass to retire (the seek above will hit x >= L).
+        s->x = s->readlength;
+        s->j = -1;
+        return;
+    }
+
+    uint8_t a = enc_qdb[s->offset + s->j];
+    if (a >= 4) {
+        // Scalar: non-ACGT in inner-j sets next_x = j+1 and breaks.
+        s->x = s->j + 1;
+        s->j = -1;
+        return;
+    }
+
+    // Forward extension = backward extension on the BWT of the reverse
+    // complement: swap k <-> l around backwardExt(., 3-a) and swap back.
+    SMEM smem_ = s->smem;
+    smem_.k = s->smem.l;
+    smem_.l = s->smem.k;
+    SMEM newSmem_ = backwardExt(smem_, 3 - a);
+    SMEM newSmem  = newSmem_;
+    newSmem.k = newSmem_.l;
+    newSmem.l = newSmem_.k;
+    newSmem.n = s->j;
+
+    if ((newSmem.s < s->max_intv) && ((newSmem.n - newSmem.m + 1) >= minSeedLen)) {
+        if (newSmem.s > 0) {
+            s->match_buf[s->match_count++] = newSmem;
+        }
+        s->x = s->j + 1;
+        s->j = -1;
+        return;
+    }
+
+    s->smem = newSmem;
+    s->j++;
+    bsd_prefetch_cp_occ(s);
+}
+// ===== End lockstep bwtSeed batching =====
+
 void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          int32_t *min_intv_array,
                                          int32_t *rid_array,
@@ -858,7 +1063,9 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          SMEM *matchArray,
                                          int64_t *__numTotalSmem)
 {
-    int16_t *query_pos_array = (int16_t *)_mm_malloc(numReads * sizeof(int16_t), 64);
+    size_t query_pos_bytes = (size_t)numReads * sizeof(int32_t);
+    int32_t *query_pos_array = (int32_t *)_mm_malloc(query_pos_bytes, 64);
+    assert_not_null(query_pos_array, query_pos_bytes, query_pos_bytes);
 
     int32_t i;
     for(i = 0; i < numReads; i++)
@@ -916,7 +1123,7 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
 }
 
 void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
-                                                   int16_t *query_pos_array,
+                                                   int32_t *query_pos_array,
                                                    int32_t *min_intv_array,
                                                    int32_t *rid_array,
                                                    int32_t numReads,
@@ -1077,7 +1284,7 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
     for(i = 0; i < numReads; i++)
     {
         int readlength = seq_[i].l_seq;
-        int16_t x = 0;
+        int32_t x = 0;
         while(x < readlength)
         {
             int next_x = x + 1;
@@ -1150,202 +1357,112 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
     return numTotalSeed;
 }
 
-
-void FMI_search::getSMEMs(uint8_t *enc_qdb,
-        int32_t numReads,
-        int32_t batch_size,
-        int32_t readlength,
-        int32_t minSeedLen,
-        int32_t nthreads,
-        SMEM *matchArray,
-        int64_t *numTotalSmem)
+// Lockstep-batched bwtSeed driver. Drop-in for bwtSeedStrategyAllPosOneThread
+// — same input contract, same emission order (reads in input order; within
+// a read, outer-x ascending; at most one SMEM per outer x). The interleaving
+// runs BWTSEED_LOCKSTEP_N reads' forward-extension walks together so the
+// independent cp_occ cache-line misses issue concurrently into Zen 4's
+// load queue rather than serializing on per-read load latency.
+//
+// Structurally parallel to getSMEMsOnePosOneThread_lockstep above; see that
+// function's comments for the prefetch model (same-slot T0 inside the step
+// function + cross-slot T1 at (s + N/2) % N in the driver) and the hybrid
+// SoA per-slot/bulk-buffer layout rationale.
+int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
+                                                            int32_t *max_intv_array,
+                                                            int32_t numReads,
+                                                            const bseq1_t *seq_,
+                                                            int32_t *query_cum_len_ar,
+                                                            int32_t minSeedLen,
+                                                            SMEM *matchArray,
+                                                            int32_t max_readlength)
 {
-    const size_t smem_arr_bytes = (size_t)nthreads * (size_t)readlength * sizeof(SMEM);
-    SMEM *prevArray = (SMEM *)_mm_malloc(smem_arr_bytes, 64);
-    assert_not_null(prevArray, smem_arr_bytes, smem_arr_bytes);
-    SMEM *currArray = (SMEM *)_mm_malloc(smem_arr_bytes, 64);
-    assert_not_null(currArray, smem_arr_bytes, (size_t)2 * smem_arr_bytes);
+    if (numReads <= 0) return 0;
 
+    const int32_t N = BWTSEED_LOCKSTEP_N;
 
-// #pragma omp parallel num_threads(nthreads)
-    {
-        int tid = 0; //omp_get_thread_num();   // removed omp
-        numTotalSmem[tid] = 0;
-        SMEM *myPrevArray = prevArray + tid * readlength;
-        SMEM *myCurrArray = currArray + tid * readlength;
+    // Per-thread cache for match_buf[] slices. One pointer (no prev[]
+    // needed — bwtSeed has only a forward pass). Sized from max_readlength;
+    // scalar's worst-case emit is one SMEM per x ∈ [0, readlength) so the
+    // bound holds. Grown monotonically across calls.
+    BwtSeedSlot slots[BWTSEED_LOCKSTEP_N] = {};
+    static thread_local LockstepBwtSeedCache cache;
+    const size_t per_slot_smems = (size_t)max_readlength;
+    if (per_slot_smems > cache.per_slot) {
+        if (cache.match != nullptr) _mm_free(cache.match);
+        const size_t total_bytes = (size_t)N * per_slot_smems * sizeof(SMEM);
+        cache.match = (SMEM *)_mm_malloc(total_bytes, 64);
+        assert_not_null(cache.match, total_bytes, total_bytes);
+        cache.per_slot = per_slot_smems;
+    }
+    for (int32_t s = 0; s < N; s++) {
+        slots[s].match_buf = cache.match + (size_t)s * cache.per_slot;
+    }
 
-        int32_t perThreadQuota = (numReads + (nthreads - 1)) / nthreads;
-        int32_t first = tid * perThreadQuota;
-        int32_t last  = (tid + 1) * perThreadQuota;
-        if(last > numReads) last = numReads;
-        SMEM *myMatchArray = matchArray + first * readlength;
+    // Seed the first min(N, numReads) slots.
+    const int32_t initial = (numReads < N) ? numReads : N;
+    for (int32_t s = 0; s < initial; s++) {
+        bsd_init_slot(&slots[s], s, max_intv_array, seq_, query_cum_len_ar, enc_qdb);
+        if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
+    }
+    // Unused slots get input_idx = -1 so the flush pass skips them.
+    for (int32_t s = initial; s < N; s++) {
+        slots[s].phase     = BSD_DONE;
+        slots[s].ready     = false;
+        slots[s].input_idx = -1;
+    }
 
-        uint32_t i;
-        // Perform SMEM for original reads
-        for(i = first; i < last; i++)
-        {
-            int x = readlength - 1;
-            int numPrev = 0;
-            int numSmem = 0;
+    int32_t next_input   = initial;
+    int32_t flush_cursor = 0;
+    int64_t numTotalSeed = 0;
 
-            while (x >= 0)
-            {
-                // Forward search
-                SMEM smem;
-                smem.rid = i;
-                smem.m = x;
-                smem.n = x;
-                uint8_t a = enc_qdb[i * readlength + x];
-
-                if(a > 3)
-                {
-                    x--;
-                    continue;
-                }
-                smem.k = count[a];
-                smem.l = count[3 - a];
-                smem.s = count[a+1] - count[a];
-
-                int j;
-                for(j = x + 1; j < readlength; j++)
-                {
-                    a = enc_qdb[i * readlength + j];
-                    if(a < 4)
-                    {
-                        SMEM smem_ = smem;
-
-                        // Forward extension is backward extension with the BWT of reverse complement
-                        smem_.k = smem.l;
-                        smem_.l = smem.k;
-                        SMEM newSmem_ = backwardExt(smem_, 3 - a);
-                        SMEM newSmem = newSmem_;
-                        newSmem.k = newSmem_.l;
-                        newSmem.l = newSmem_.k;
-                        newSmem.n = j;
-
-                        if(newSmem.s != smem.s)
-                        {
-                            myPrevArray[numPrev] = smem;
-                            numPrev++;
-                        }
-                        smem = newSmem;
-                        if(newSmem.s == 0)
-                        {
-                            break;
-                        }
-                    }
-                    else
-                    {
-                        myPrevArray[numPrev] = smem;
-                        numPrev++;
-                        break;
-                    }
-                }
-                if(smem.s != 0)
-                {
-                    myPrevArray[numPrev++] = smem;
-                }
-
-                SMEM *curr, *prev;
-                prev = myPrevArray;
-                curr = myCurrArray;
-
-                int p;
-                for(p = 0; p < (numPrev/2); p++)
-                {
-                    SMEM temp = prev[p];
-                    prev[p] = prev[numPrev - p - 1];
-                    prev[numPrev - p - 1] = temp;
-                }
-
-                int next_x = x - 1;
-
-                // Backward search
-                int cur_j = readlength;
-                for(j = x - 1; j >= 0; j--)
-                {
-                    int numCurr = 0;
-                    int curr_s = -1;
-                    a = enc_qdb[i * readlength + j];
-                    //printf("a = %d\n", a);
-                    if(a > 3)
-                    {
-                        next_x = j - 1;
-                        break;
-                    }
-                    for(p = 0; p < numPrev; p++)
-                    {
-                        SMEM smem = prev[p];
-                        SMEM newSmem = backwardExt(smem, a);
-                        newSmem.m = j;
-
-                        if(newSmem.s == 0)
-                        {
-                            if((numCurr == 0) && (j < cur_j))
-                            {
-                                cur_j = j;
-                                if((smem.n - smem.m + 1) >= minSeedLen)
-                                    myMatchArray[numTotalSmem[tid] + numSmem++] = smem;
-                            }
-                        }
-                        if((newSmem.s != 0) && (newSmem.s != curr_s))
-                        {
-                            curr_s = newSmem.s;
-                            curr[numCurr++] = newSmem;
-                        }
-                    }
-                    SMEM *temp = prev;
-                    prev = curr;
-                    curr = temp;
-                    numPrev = numCurr;
-                    if(numCurr == 0)
-                    {
-                        next_x = j;
-                        break;
-                    }
-                    else
-                    {
-                        next_x = j - 1;
-                    }
-                }
-                if(numPrev != 0)
-                {
-                    SMEM smem = prev[0];
-                    if((smem.n - smem.m + 1) >= minSeedLen)
-                        myMatchArray[numTotalSmem[tid] + numSmem++] = smem;
-                    numPrev = 0;
-                }
-                x = next_x;
+    while (flush_cursor < numReads) {
+        // Stepping pass: advance each active slot by one unit of work.
+        for (int32_t s = 0; s < N; s++) {
+            if (slots[s].phase == BSD_FWD) {
+                bsd_advance_step(&slots[s], enc_qdb, minSeedLen);
             }
-            numTotalSmem[tid] += numSmem;
+            // Cross-slot T1 lookahead — same pattern as the SMEM lockstep's
+            // (s + N/2) % N L2 prefetch.
+            const int32_t s_la = (s + (N / 2)) % N;
+            if (slots[s_la].phase == BSD_FWD && slots[s_la].j >= 0) {
+                bsd_prefetch_cp_occ_t1(&slots[s_la]);
+            }
+        }
+
+        // Flush pass: emit retired slots in input order; recycle into the
+        // next pending read. Loop until no progress so a chain of newly
+        // retired slots at the cursor flushes in one pass.
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (int32_t s = 0; s < N; s++) {
+                if (slots[s].phase == BSD_DONE &&
+                    slots[s].ready &&
+                    slots[s].input_idx == flush_cursor) {
+                    for (int32_t m = 0; m < slots[s].match_count; m++) {
+                        matchArray[numTotalSeed++] = slots[s].match_buf[m];
+                    }
+                    flush_cursor++;
+
+                    if (next_input < numReads) {
+                        bsd_init_slot(&slots[s], next_input,
+                                      max_intv_array, seq_, query_cum_len_ar, enc_qdb);
+                        if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
+                        next_input++;
+                    } else {
+                        slots[s].input_idx = -1;
+                        slots[s].ready     = false;
+                    }
+                    progress = true;
+                }
+            }
         }
     }
 
-    _mm_free(prevArray);
-    _mm_free(currArray);
+    return numTotalSeed;
 }
 
-
-int compare_smem(const void *a, const void *b)
-{
-    SMEM *pa = (SMEM *)a;
-    SMEM *pb = (SMEM *)b;
-
-    if(pa->rid < pb->rid)
-        return -1;
-    if(pa->rid > pb->rid)
-        return 1;
-
-    if(pa->m < pb->m)
-        return -1;
-    if(pa->m > pb->m)
-        return 1;
-    if(pa->n > pb->n)
-        return -1;
-    if(pa->n < pb->n)
-        return 1;
-    return 0;
-}
 
 void FMI_search::sortSMEMs(SMEM *matchArray,
         int64_t numTotalSmem[],
@@ -1353,13 +1470,61 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
         int32_t readlength,
         int nthreads)
 {
+    /* The only property the caller needs from this sort is that every SMEM of a
+     * given read (rid) is contiguous and the reads appear in ascending rid
+     * order: mem_collect_smem then walks each rid block and re-sorts it with
+     * ks_introsort(mem_intv1) keyed purely on (m, n). The old qsort's secondary
+     * (m asc, n desc) ordering was therefore thrown away — and SMEMs that tie on
+     * (rid, m, n) are byte-identical (same read span => same SA interval), so the
+     * unstable re-sort's handling of them cannot depend on their incoming order.
+     *
+     * rid is a dense index in [0, numReads), so a counting sort by rid replaces
+     * the O(n log n) function-pointer qsort with an O(n + rid_range) pass. Buffers
+     * are call-local: FMI_search is shared across worker threads, so no member
+     * scratch may be used here. */
     int tid;
     int32_t perThreadQuota = (numReads + (nthreads - 1)) / nthreads;
     for(tid = 0; tid < nthreads; tid++)
     {
+        int64_t smem_count = numTotalSmem[tid];   /* scalar SMEM count; not the class `count[5]` array */
+        if (smem_count <= 1) continue;   /* 0 or 1 element is already sorted */
+
         int32_t first = tid * perThreadQuota;
-        SMEM *myMatchArray = matchArray + first * readlength;
-        qsort(myMatchArray, numTotalSmem[tid], sizeof(SMEM), compare_smem);
+        SMEM *myMatchArray = matchArray + (int64_t)first * readlength;
+
+        /* rid range actually present in this block (dense, but a per-thread
+         * block only holds its own reads, so offset by the observed minimum). */
+        uint32_t minRid = myMatchArray[0].rid, maxRid = myMatchArray[0].rid;
+        for (int64_t i = 1; i < smem_count; i++) {
+            uint32_t r = myMatchArray[i].rid;
+            if (r < minRid) minRid = r;
+            if (r > maxRid) maxRid = r;
+        }
+        int64_t range = (int64_t)maxRid - (int64_t)minRid + 1;
+
+        int64_t *cnt = (int64_t *) calloc((size_t)range, sizeof(int64_t));
+        SMEM    *tmp = (SMEM *) _mm_malloc((size_t)smem_count * sizeof(SMEM), 64);
+        if (cnt == NULL || tmp == NULL) {
+            fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
+            exit(EXIT_FAILURE);
+        }
+
+        for (int64_t i = 0; i < smem_count; i++)
+            cnt[myMatchArray[i].rid - minRid]++;
+
+        int64_t sum = 0;
+        for (int64_t r = 0; r < range; r++) { int64_t c = cnt[r]; cnt[r] = sum; sum += c; }
+
+        /* stable scatter: same-rid SMEMs keep their incoming relative order */
+        for (int64_t i = 0; i < smem_count; i++) {
+            int64_t b = (int64_t)myMatchArray[i].rid - minRid;
+            tmp[cnt[b]++] = myMatchArray[i];
+        }
+        /* tmp is a fresh allocation and cannot overlap myMatchArray */
+        memcpy(myMatchArray, tmp, (size_t)smem_count * sizeof(SMEM));
+
+        _mm_free(tmp);
+        free(cnt);
     }
 }
 
@@ -1585,24 +1750,59 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
     } // else
 }
 
+/* Thread-local scratch for the pos_ar/map_ar staging buffers below. These were
+ * two _mm_malloc/_mm_free per call, and this function runs once per read — so on
+ * a WGS run that is tens of millions of aligned-allocation round-trips. The pair
+ * is pure scratch (no state carried between calls), so a per-thread grow-only
+ * holder reused across reads removes the churn. FMI_search is shared across
+ * worker threads, hence thread_local (not a member). Freed on thread exit. */
+namespace {
+struct SaPrefetchScratch {
+    int64_t *pos = nullptr, *map = nullptr;
+    int64_t  cap = 0;
+    void ensure(int64_t n) {
+        if (n <= cap) return;
+        _mm_free(pos); _mm_free(map);
+        pos = (int64_t *) _mm_malloc((size_t)n * sizeof(int64_t), 64);
+        map = (int64_t *) _mm_malloc((size_t)n * sizeof(int64_t), 64);
+        cap = n;
+    }
+    ~SaPrefetchScratch() { _mm_free(pos); _mm_free(map); }
+};
+} // namespace
+
 void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                                          int64_t *coordCountArray, int64_t count,
                                          const int32_t max_occ, int tid, int64_t &id_)
 {
-    
+
     // uint32_t i;
-    int32_t totalCoordCount = 0;
-    int32_t mem_lim = 0, id = 0;
-    
+    // totalCoordCount and id (below) both count entries staged into the int64
+    // coordArray/pos_ar/map_ar buffers and are paired with the int64 mem_lim,
+    // so keep them int64 to avoid truncating the running offset.
+    int64_t totalCoordCount = 0;
+    // mem_lim is the exact number of entries the staging loop below writes:
+    // each SMEM contributes min(smem.s, max_occ) (the inner loop stops at
+    // c < max_occ). Summing min(s, max_occ) instead of the uncapped interval
+    // size s both right-sizes the pos_ar/map_ar allocation -- repetitive seeds
+    // have s up to the reference length but still write only max_occ entries --
+    // and keeps every term bounded by max_occ so the int64 sum cannot run away.
+    // id indexes those buffers and is paired with mem_lim, so it is int64 too.
+    int64_t mem_lim = 0, id = 0;
+
     for(int i = 0; i < count; i++)
     {
-        int32_t c = 0;
         SMEM smem = smemArray[i];
-        mem_lim += smem.s;
+        mem_lim += (smem.s > max_occ) ? max_occ : smem.s;
     }
 
-    int64_t *pos_ar = (int64_t *) _mm_malloc( mem_lim * sizeof(int64_t), 64);
-    int64_t *map_ar = (int64_t *) _mm_malloc( mem_lim * sizeof(int64_t), 64);
+    /* Reuse the per-thread staging buffers, grown to the high-water mem_lim.
+     * mem_lim == 0 leaves the pointers null, but the staging loop below writes
+     * nothing in that case (id stays 0), so they are never dereferenced. */
+    static thread_local SaPrefetchScratch t_sa;
+    t_sa.ensure(mem_lim);
+    int64_t *pos_ar = t_sa.pos;
+    int64_t *map_ar = t_sa.map;
 
     for(int i = 0; i < count; i++)
     {
@@ -1650,7 +1850,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         j++;
     }
         
-    int lim = j, all_quit = 0;
+    // all_quit counts up to id (int64); lim stays int (bounded by sa_batch_size).
+    int lim = j;
+    int64_t all_quit = 0;
     while (all_quit < id)
     {
         
@@ -1700,7 +1902,5 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             }
         }
     }
-    
-    _mm_free(pos_ar);
-    _mm_free(map_ar);
+    /* pos_ar/map_ar are the reused thread-local scratch — no free here. */
 }

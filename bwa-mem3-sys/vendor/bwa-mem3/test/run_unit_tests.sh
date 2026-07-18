@@ -28,10 +28,10 @@ ok()   { echo "OK:   $*"; }
 # against a mismatched source and flaked.
 [[ -s "$FIXTURES/synthetic_1mb.fa" ]] || fail "synthetic_1mb.fa fixture missing at $FIXTURES/synthetic_1mb.fa"
 
-# Build the phiX FMI index if not already present. Check all five artifacts
-# that `bwa-mem3 index` produces so a corrupt/partial prior run is re-indexed.
+# Build the phiX FMI index if not already present. Check all four artifacts
+# that `bwa-mem3 index` produces by default (no `.0123`: mem pac-fetches from
+# `.pac`) so a corrupt/partial prior run is re-indexed.
 if [[ ! -s "$FIXTURES/phix.fa.bwt.2bit.64" || \
-      ! -s "$FIXTURES/phix.fa.0123"        || \
       ! -s "$FIXTURES/phix.fa.amb"         || \
       ! -s "$FIXTURES/phix.fa.ann"         || \
       ! -s "$FIXTURES/phix.fa.pac" ]]; then
@@ -81,6 +81,13 @@ LINES="$(wc -l < "$FKSW" | tr -d ' ')"
 [[ "$LINES" -eq 3 ]] || fail "xeonbsw: expected 3 lines in fksw.txt, got $LINES"
 ok "xeonbsw ($LINES pair scores emitted)"
 
+# --- bandedswa_zdrop_eweight_test (z-drop gap-extend weighting parity) ------
+# Self-contained: generates tandem-repeat fixtures and compares getScores8 to
+# the scalar oracle at non-default gap-extend (e_del/e_ins != 1). Exits non-zero
+# on any score-field mismatch.
+(cd "$HERE" && ./bandedswa_zdrop_eweight_test >/dev/null 2>&1) || fail "bandedswa_zdrop_eweight_test (z-drop e_del/e_ins weighting)"
+ok "bandedswa_zdrop_eweight_test (z-drop gap-extend weighting parity)"
+
 # --- pg_cl_escape_test ----------------------------------------------------
 # Regression for issue #45 / upstream #293: tabs inside `-R` must not
 # bleed into the @PG CL: value. Uses the same phiX fixture as the rest
@@ -88,11 +95,40 @@ ok "xeonbsw ($LINES pair scores emitted)"
 "$HERE/pg_cl_escape_test.sh" "$BWAMEM3" "$FIXTURES" || fail "pg_cl_escape_test failed"
 ok "pg_cl_escape_test"
 
+# --- meth_rg_header_test --------------------------------------------------
+# A `-R` read group must be emitted as an @RG header line in --meth mode,
+# not just stamped as RG:Z on records (the default path always was). Guards
+# the malformed-BAM regression where --meth records referenced an undeclared
+# read group ID.
+"$HERE/meth_rg_header_test.sh" "$BWAMEM3" "$FIXTURES" || fail "meth_rg_header_test failed"
+ok "meth_rg_header_test"
+
+# --- meth_sidecar_enrich_test ---------------------------------------------
+# --meth must enrich its consolidated @SQ with the original reference's
+# identity tags (M5/UR/AS/SP) from that reference's .hdr/.dict sidecar
+# (matched by SN) and forward its @CO/@PG/@RG provenance, while never
+# consulting the c2t index's own sidecar.
+"$HERE/meth_sidecar_enrich_test.sh" "$BWAMEM3" "$FIXTURES" || fail "meth_sidecar_enrich_test failed"
+ok "meth_sidecar_enrich_test"
+
 # --- help_prescan_test ----------------------------------------------------
 # `mem --help` pre-scan must not match `--help` when it is the value of
 # an option that takes an argument (-R, -o, --set-as-failed, ...).
 "$HERE/help_prescan_test.sh" "$BWAMEM3" "$FIXTURES" || fail "help_prescan_test failed"
 ok "help_prescan_test"
+
+# --- fast_preset_test -----------------------------------------------------
+# --fast bundles the four characterized speed levers; explicit flags override;
+# default path stays clean. Asserts on the resolved-opts audit line.
+"$HERE/fast_preset_test.sh" "$BWAMEM3" "$FIXTURES" || fail "fast_preset_test failed"
+ok "fast_preset_test"
+
+# --- min_ext_len_safety_test ----------------------------------------------
+# The --min-ext-len short-seed filter must never empty a chain: an all-short
+# chain is left intact, so a huge --min-ext-len is a no-op (== default), not a
+# read-dropping cliff. Regression for the smoke-1M low-mappability collapse.
+"$HERE/min_ext_len_safety_test.sh" "$BWAMEM3" "$FIXTURES" || fail "min_ext_len_safety_test failed"
+ok "min_ext_len_safety_test"
 
 # --- smem_lockstep_parity_test --------------------------------------------
 OUT="$(cd "$HERE" && ./smem_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
@@ -101,6 +137,14 @@ CASES_TOTAL="$(echo "$OUT"  | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/
 [[ -n "$CASES_TOTAL" ]]              || fail "smem_lockstep_parity_test: no summary line"
 [[ "$CASES_PASSED" == "$CASES_TOTAL" ]] || fail "smem_lockstep_parity_test: $CASES_PASSED / $CASES_TOTAL cases passed"
 ok "smem_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
+
+# --- bwtseed_lockstep_parity_test -----------------------------------------
+OUT="$(cd "$HERE" && ./bwtseed_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
+CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"
+CASES_TOTAL="$(echo "$OUT"  | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/p')"
+[[ -n "$CASES_TOTAL" ]]              || fail "bwtseed_lockstep_parity_test: no summary line"
+[[ "$CASES_PASSED" == "$CASES_TOTAL" ]] || fail "bwtseed_lockstep_parity_test: $CASES_PASSED / $CASES_TOTAL cases passed"
+ok "bwtseed_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
 
 # --- long-read end-to-end (issue 44) --------------------------------------
 # Pre-fix, reads > 151 bp overran the per-thread SMEM buffer (segfault) and
@@ -117,6 +161,45 @@ for LEN_FQ in long_read_300bp long_read_1kbp long_read_3kbp; do
     [[ "$UNMAPPED" == "0" ]] || fail "bwa-mem3 mem ${LEN_FQ}.fq: $UNMAPPED unmapped record(s)"
     ok "bwa-mem3 mem ${LEN_FQ}.fq (all records mapped)"
 done
+
+
+# --- ultra-long-read crash regression (read length > INT16_MAX) -----------
+# Pre-fix, read positions in the SMEM seeding path were int16_t:
+# query_pos_array (FMI_search getSMEMsAllPos/OnePos/lockstep + caller's
+# mmc->query_pos_ar), BatchSlot.start_pos/next_x, and the walk index `x`
+# in bwtSeedStrategyAllPosOneThread. For a read longer than INT16_MAX
+# (32767) bp the position incremented past 32767 and wrapped negative, so
+# the re-seed loops (`while (x < readlength)` and the getSMEMsAllPos
+# do/while) never advanced past the wrap point. They emitted SMEMs without
+# bound until matchArray overran -> heap corruption / SIGSEGV. The
+# 300bp-3kbp cases above all stay under 32767 and never exposed it; phiX
+# (~5 kb) is too small to host the alignment, so use the checked-in 1 Mb
+# synthetic reference and a 40 kb read sliced from it.
+SYN="$FIXTURES/synthetic_1mb.fa"
+if [[ ! -s "$SYN.bwt.2bit.64" || ! -s "$SYN.amb" || \
+      ! -s "$SYN.ann"         || ! -s "$SYN.pac" ]]; then
+    "$BWAMEM3" index "$SYN" >/dev/null 2>&1 || fail "bwa-mem3 index on synthetic_1mb.fa failed"
+fi
+# Slice a 40 kb read (> 32767) from the middle of the reference so it maps
+# back cleanly. Derived at run time rather than committed as a fixture.
+ULTRALONG_FA="$(mktemp "$HERE/.ultralong_40kbp.XXXXXX.fa")"
+# Append to (don't replace) the EXIT trap installed earlier so the temp FASTA
+# is removed on early failure or in parallel runs, not just on success.
+trap 'rm -f "$OUT_FILE" "$FKSW" "$HEADER_OUT" "$ULTRALONG_FA"' EXIT
+awk 'NR==1 && /^>/ {next} {seq = seq $0}
+     END { print ">ultralong_40kbp"; print substr(seq, 100001, 40000) }' \
+    "$SYN" > "$ULTRALONG_FA"
+LR_LEN="$(awk 'NR==2 {print length($0)}' "$ULTRALONG_FA")"
+[[ "$LR_LEN" -gt 32767 ]] || fail "ultralong fixture is ${LR_LEN}bp, need > 32767 (INT16_MAX)"
+RAW="$("$BWAMEM3" mem "$SYN" "$ULTRALONG_FA" 2>/dev/null)" \
+    || fail "bwa-mem3 mem ultralong ${LR_LEN}bp: non-zero exit (int16 position-overflow regression)"
+OUT="$(printf '%s\n' "$RAW" | grep -v '^@' || true)"
+[[ -n "$OUT" ]] || fail "bwa-mem3 mem ultralong: no SAM records emitted"
+# The primary record (flag < 256, not 4=unmapped) must align.
+PRIMARY_MAPPED="$(echo "$OUT" | awk '$2 < 256 && $2 != 4 {c++} END {print c+0}')"
+[[ "$PRIMARY_MAPPED" -ge 1 ]] || fail "bwa-mem3 mem ultralong ${LR_LEN}bp: primary read unmapped"
+rm -f "$ULTRALONG_FA"   # cleaned here on success; EXIT trap covers early-failure paths
+ok "bwa-mem3 mem ultralong ${LR_LEN}bp (> 32767, mapped)"
 
 
 # --- interleaved -p mode regression --------------------------------------
