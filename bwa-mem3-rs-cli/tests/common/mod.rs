@@ -153,6 +153,40 @@ pub fn samtools_view(bam: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Aux tag keys that differ between the shim and upstream's SAM writer *by
+/// design* — the same asymmetries the doc comment on [`record_key_fields`]
+/// already calls out — so they must not surface in that function's `TAGS:`
+/// key-presence component. Add a key here, with a comment justifying it,
+/// rather than special-casing it inline.
+///
+/// - `MQ`: upstream emits `MQ:i:<mate mapq>` whenever a mate pointer is
+///   present (`bwamem.cpp`'s SAM writer); the shim never emits it. This is a
+///   deliberate, documented shim/upstream difference, not a regression.
+const DELIBERATELY_ASYMMETRIC_TAG_KEYS: &[&str] = &["MQ"];
+
+/// Extract the tag key from one aux field, requiring the SAM `TAG:TYPE:VALUE`
+/// shape (a 2-character tag, a 1-character type code, then the value, which
+/// may itself be empty for e.g. `XA:Z:`).
+///
+/// Validating rather than falling back to "the whole field is the key" is
+/// load-bearing for the parity comparison, not defensive tidiness: a
+/// truncated field reduces to a *plausible* key, and a bare `MQ` would reduce
+/// to the key `MQ` and then be dropped by
+/// [`DELIBERATELY_ASYMMETRIC_TAG_KEYS`] — so a corrupt record would compare
+/// equal to a clean one and the parity check would pass on it. Fail fast for
+/// the same reason the ≥11-column assert in [`record_key_fields`] does.
+fn aux_tag_key<'a>(field: &'a str, sam_line: &str) -> &'a str {
+    let mut parts = field.splitn(3, ':');
+    let (Some(key), Some(ty), Some(_value)) = (parts.next(), parts.next(), parts.next()) else {
+        panic!("malformed SAM aux field (want TAG:TYPE:VALUE): {field:?} in: {sam_line}");
+    };
+    assert!(
+        key.len() == 2 && ty.len() == 1,
+        "malformed SAM aux field (want a 2-char tag and 1-char type): {field:?} in: {sam_line}"
+    );
+    key
+}
+
 /// Reduce a SAM line to the fields that must match the reference aligner:
 /// qname, flag, rname, pos, mapq, cigar, and the `NM`/`MD`/`XG`/`XR`/`XM`/`XA`
 /// tags. These are the semantically meaningful fields the shim reproduces
@@ -161,19 +195,25 @@ pub fn samtools_view(bam: &Path) -> Vec<String> {
 /// from upstream's SAM writer) are excluded on purpose.
 ///
 /// The key also appends a sorted `TAGS:<key,key,...>` component listing every
-/// aux tag *key* present on the record, not just the six compared above.
-/// Without it, a record carrying an extra tag this reduction does not
-/// inspect (e.g. a newly-emitted upstream `XB`) would reduce to the same key
-/// as a record without it, so a vendor bump that starts emitting a new tag
-/// would pass every parity test unnoticed. Only the set of keys is compared —
-/// values of uncompared tags stay out of scope, and aux ordering stays
-/// unpinned, same as before.
+/// aux tag *key* present on the record, not just the six compared above,
+/// except for [`DELIBERATELY_ASYMMETRIC_TAG_KEYS`] (currently just `MQ`).
+/// Without the `TAGS:` component, a record carrying an extra tag this
+/// reduction does not inspect (e.g. a newly-emitted upstream `XB`) would
+/// reduce to the same key as a record without it, so a vendor bump that
+/// starts emitting a new tag would pass every parity test unnoticed. The
+/// exclusion list keeps that check from firing on asymmetries that are
+/// already known and intentional — `MQ` is emitted by upstream's SAM writer
+/// whenever a mate pointer is present but never by the shim, so without the
+/// exclusion every paired parity test would read as a mismatch. Only the set
+/// of keys is compared — values of uncompared tags stay out of scope, and
+/// aux ordering stays unpinned, same as before.
 ///
 /// Callers compare the returned keys as *sorted vectors* — preserving record
 /// multiplicity so a duplicated or missing record is caught, unlike a set.
 /// Panics on a malformed SAM line rather than silently dropping it: `samtools
 /// view` (no header) only ever emits ≥11-column records, so a short line is a
-/// real bug, not noise to hide.
+/// real bug, not noise to hide. [`aux_tag_key`] applies the same rule to each
+/// individual aux field.
 pub fn record_key_fields(sam_line: &str) -> String {
     let f: Vec<&str> = sam_line.split('\t').collect();
     assert!(
@@ -197,13 +237,19 @@ pub fn record_key_fields(sam_line: &str) -> String {
             xa = v;
         }
     }
-    // Sorted set of aux tag KEYS present on the record. The loop above only
-    // compares six tags by value; without this, a record that carries an
-    // extra tag we do not inspect (e.g. a newly-emitted upstream XB) reduces
-    // to the same key as one that does not, and every parity test passes
-    // through the change. Keys only — values of uncompared tags stay
-    // deliberately out of scope, and ordering stays unpinned.
-    let mut tag_keys: Vec<&str> = f[11..].iter().filter_map(|t| t.split(':').next()).collect();
+    // Sorted set of aux tag KEYS present on the record, minus the keys the
+    // shim and upstream disagree on by design (see
+    // DELIBERATELY_ASYMMETRIC_TAG_KEYS). The loop above only compares six
+    // tags by value; without this set, a record that carries an extra tag we
+    // do not inspect (e.g. a newly-emitted upstream XB) reduces to the same
+    // key as one that does not, and every parity test passes through the
+    // change. Keys only — values of uncompared tags stay deliberately out of
+    // scope, and ordering stays unpinned.
+    let mut tag_keys: Vec<&str> = f[11..]
+        .iter()
+        .map(|t| aux_tag_key(t, sam_line))
+        .filter(|k| !DELIBERATELY_ASYMMETRIC_TAG_KEYS.contains(k))
+        .collect();
     tag_keys.sort_unstable();
     format!(
         "{}\t{}\t{}\t{}\t{}\t{}\tNM:{nm}\tMD:{md}\tXG:{xg}\tXR:{xr}\tXM:{xm}\tXA:{xa}\tTAGS:{}",
