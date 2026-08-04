@@ -628,6 +628,15 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
         if (i < n_list) emit_sa_tag(&aux, &aux_len, &aux_cap, bns, list, n_list, which);
     }
     if (p->XA) aux_put_Z(&aux, &aux_len, &aux_cap, "XA", p->XA);
+    /* HN: total # of hits clustered with this primary under XA_drop_ratio
+     * (set by mem_gen_alt above). -1 is upstream's "not computed" sentinel
+     * (bwamem.h / bwamem.cpp's mem_reg2aln), so guard >= 0 exactly as
+     * upstream's generic SAM writer does (bwamem.cpp:2615). Also gate on
+     * !meth_mode: under --meth, mem_aln2sam short-circuits into
+     * meth_bam.cpp's meth_mem_aln_to_bam instead of that generic writer, and
+     * that function never emits HN — so upstream's real --meth output has no
+     * HN:i regardless of whether mem_gen_alt computed one. */
+    if (!opt->meth_mode && p->HN >= 0) aux_put_i(&aux, &aux_len, &aux_cap, "HN", p->HN);
 
     /* D3 (--meth) Bismark tags. XR:Z (read conversion) on every record; XG:Z
      * (genome strand) and XM:Z (per-base methylation call) on mapped records.
