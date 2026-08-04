@@ -115,6 +115,12 @@ flag_defines() {
 # which also missed seed_order_t entirely: none of its members
 # (SEED_ORDER_*) carry a MEM_ prefix, even though that enum is exactly what
 # opts.rs's SeedOrder mirrors.
+#
+# Known blind spot: the trigger is the bare word "enum" anywhere on a line,
+# not just at a declaration, so a future comment containing that word (e.g.
+# "// like a C enum") would open a spurious capture through to the next `;`.
+# Harmless today — this check is advisory, and no such comment exists in
+# bwamem.h now — but worth knowing if this section ever prints noise.
 enum_bodies() {
     mawk '
         /(^|[^a-zA-Z_])enum([^a-zA-Z_]|$)/ { in_enum = 1 }
@@ -246,6 +252,13 @@ check_structs() {
 # bindgen's allowlist_var("MEM_F_.*") reads our POD copy rather than upstream,
 # so a NEW upstream flag is invisible to both. This covers that direction, and
 # the same argument applies to enum values: opts.rs mirrors them by hand.
+#
+# A NEW flag needs edits in TWO files: `bwa_shim_types.h` (the #define block
+# bindgen reads), and, inside `bwa_shim_layout_assert.cpp`, THREE coordinated
+# edits — the `pod_flags::MEM_F_X_v` capture, its paired `#undef`, and the
+# `BWA_SHIM_CK_FLAG(MEM_F_X)` invocation. Miss the `#undef` and the assert
+# silently becomes a tautology (both sides read upstream's post-include
+# value) — see the capture-step comment in that file for why.
 check_flags_and_enums() {
     report_section "4. \`MEM_F_*\` flags and \`bwamem.h\` enums"
     local old new o n
@@ -265,12 +278,17 @@ check_flags_and_enums() {
         diff -u "$o" "$n" | tail -n +3 || true
         printf '```\n\n'
         # shellcheck disable=SC2016
-        printf 'Update all THREE mirrors: `shim/bwa_shim_types.h`,\n'
+        printf 'Update `shim/bwa_shim_types.h` (the #define block bindgen\n'
         # shellcheck disable=SC2016
-        printf '`shim/bwamem_flags_reinclude.h`, and the `BWA_SHIM_CK_FLAG`\n'
+        printf 'reads), then in `shim/bwa_shim_layout_assert.cpp` add all\n'
         # shellcheck disable=SC2016
-        printf 'list in `shim/bwa_shim_layout_assert.cpp`. A renumbered flag\n'
-        printf 'fails the build; a NEW flag does not, and also never reaches\n'
+        printf 'THREE of: the `pod_flags::MEM_F_X_v` capture, its paired\n'
+        # shellcheck disable=SC2016
+        printf '`#undef`, and the `BWA_SHIM_CK_FLAG(MEM_F_X)` invocation —\n'
+        # shellcheck disable=SC2016
+        printf 'miss the `#undef` and the assert silently becomes a\n'
+        printf 'tautology instead of catching a renumbered flag. A NEW flag\n'
+        printf 'never fails the build on its own, and also never reaches\n'
         printf 'Rust because bindgen reads the POD copy.\n\n'
     fi
     rm -f "$o" "$n"
