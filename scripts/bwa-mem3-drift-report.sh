@@ -110,8 +110,12 @@ check_build() {
         # couple of lines further down, indented under "--- stderr" as
         # `file:line:col: error: ...` — clang/g++'s mid-line form, which
         # ^error alone would never match, silently hiding the one line a
-        # human needs behind the useless wrapper.
-        grep -E '(^error|: error:|^warning: unused|  -->)' "$log" | head -40 || tail -40 "$log"
+        # human needs behind the useless wrapper. `ld:`/`Undefined symbols`
+        # catch the equivalent linker-error case (e.g. a renamed/removed
+        # exported symbol after a refresh); still not exhaustive of every
+        # compiler/linker's diagnostic format — that gap is tracked
+        # separately, not solved by this alternation.
+        grep -E '(^error|: error:|^warning: unused|  -->|ld:|^Undefined symbols)' "$log" | head -40 || tail -40 "$log"
         printf '```\n\n'
         printf 'Full log is in the workflow run artifacts.\n'
     fi

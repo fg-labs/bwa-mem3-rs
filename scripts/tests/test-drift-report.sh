@@ -75,15 +75,18 @@ absent "named extraction did not bleed into mem_pestat_t" "$out" "avg, std"
 # the second does not — that's how the stub tells the two calls apart.
 #
 # Case (b) — vendor dirty, nothing else dirty — is the regression test for
-# the missing `|| true` bug: `git status --porcelain | grep -v
-# 'bwa-mem3-sys/vendor/'` exits 1 when grep filters out every line (the
-# success case), which under `pipefail`/`set -e` aborted the whole script
-# before this branch's own `[ -n "$other_dirty" ]` check ever ran. Removing
-# the `|| true` at the `other_dirty=` assignment reproduces that: this test
-# then fails by never completing (the sourced script's `set -e` kills the
-# test process), rather than by a wrong exit code — confirmed by hand while
-# fixing the bug, not asserted here since a killed process can't run further
-# assertions in the same test file.
+# the missing `|| true` bug, and it CANNOT go through check_true/check_false:
+# bash suspends errexit for the ENTIRE call stack of a command used as an
+# if/while/until condition (or as either side of &&/||) — check_true's `if
+# "$@"; then` included. That makes a pipefail abort inside
+# assert_refreshed_tree's `other_dirty=` assignment unobservable through
+# check_true regardless of whether `|| true` is present, so a version of
+# this test that called `check_true assert_refreshed_tree` would pass on a
+# mutated script that dropped the `|| true` just as readily as on the fixed
+# one — verified by mutation, see the task report. Case (b) below instead
+# runs assert_refreshed_tree as a BARE statement inside a child `bash -c`
+# with errexit active, where an abort actually terminates the child and
+# shows up in its exit status.
 # Invoked indirectly by assert_refreshed_tree, which lives in the sourced
 # script — invisible to shellcheck here because of the `source=/dev/null`
 # directive above.
@@ -107,11 +110,20 @@ err="$(assert_refreshed_tree 2>&1 1>/dev/null)" || true
 check_false assert_refreshed_tree
 contains "clean tree: nothing-refreshed message" "$err" "nothing was refreshed"
 
-# (b) vendor dirty, nothing else dirty -> success. Regression test for the
-# missing `|| true`.
+# (b) vendor dirty, nothing else dirty -> success, with the abort this test
+# guards against actually observable. `export -f` (function) and `export`
+# (variables) make the stub visible to the separate `bash -c` process below —
+# a plain subshell wouldn't need this, but a freshly spawned bash does.
 STUB_VENDOR_STATUS=" M bwa-mem3-sys/vendor/bwa-mem3/foo.c"
 STUB_ALL_STATUS=" M bwa-mem3-sys/vendor/bwa-mem3/foo.c"
-check_true assert_refreshed_tree
+export -f git
+export STUB_VENDOR_STATUS STUB_ALL_STATUS here
+rc=0
+bash -c '
+    source "$here/../bwa-mem3-drift-report.sh"
+    assert_refreshed_tree
+' >/dev/null 2>&1 || rc=$?
+check "vendor-only-dirty tree: bare statement under errexit does not abort" "0" "$rc"
 
 # (c) vendor dirty, plus a non-vendor file dirty -> files-outside message.
 STUB_VENDOR_STATUS=" M bwa-mem3-sys/vendor/bwa-mem3/foo.c"
