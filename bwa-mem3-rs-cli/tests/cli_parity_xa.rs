@@ -55,6 +55,25 @@ fn cli_parity_xa_folding() {
         r1_reads.push((format!("x{i}"), r1));
         r2_reads.push((format!("x{i}"), r2));
     }
+
+    // One pair drawn from `rng` but never sliced out of `seq` — i.e. it isn't
+    // a substring of the reference the index was built from, unlike every
+    // other read above. This pins the shim's unmapped path (`fill_unmapped`
+    // in `bwa_shim_align.cpp`): the CLI never emits `HN:i` on an unmapped
+    // record, but the shim once did (HN:i:0, since fill_unmapped's calloc'd
+    // struct leaves `HN` at 0 rather than upstream's -1 sentinel) until that
+    // was fixed. Both mates unmapped, each independently, so this exercises
+    // `fill_unmapped` on both sides of the pair. Whether it actually fails to
+    // map is verified below, not assumed.
+    r1_reads.push((
+        "unmapped0".to_string(),
+        random_dna(&mut rng, read_len).into_bytes(),
+    ));
+    r2_reads.push((
+        "unmapped0".to_string(),
+        random_dna(&mut rng, read_len).into_bytes(),
+    ));
+
     let r1_fq = dir.join("r1.fq");
     let r2_fq = dir.join("r2.fq");
     common::write_fastq(&r1_fq, &r1_reads);
@@ -93,6 +112,42 @@ fn cli_parity_xa_folding() {
     assert!(
         xa_count > 0,
         "reference produced no XA:Z tags — test would not exercise XA folding"
+    );
+
+    // The unmapped-path pin must actually be exercised: verify (not assume)
+    // that the reference aligner emits both mates of "unmapped0" and reports
+    // each as unmapped (SAM flag bit 0x4). Assert the records *exist* first —
+    // counting only the mapped ones would pass vacuously if the pair never
+    // appeared at all (a renamed or dropped fixture), which is the same
+    // failure mode this block exists to rule out. A short random read can
+    // also align to a small reference by chance, which would silently unpin
+    // this case.
+    let unmapped0_flags: Vec<u32> = cli_lines
+        .iter()
+        .filter(|l| l.split('\t').next() == Some("unmapped0"))
+        .map(|l| l.split('\t').nth(1).unwrap().parse::<u32>().unwrap())
+        .collect();
+    assert_eq!(
+        unmapped0_flags.len(),
+        2,
+        "expected exactly two \"unmapped0\" records (one per mate) from the reference \
+         aligner, got flags {unmapped0_flags:?} — the unmapped-record pin below would \
+         be vacuous"
+    );
+    assert!(
+        unmapped0_flags.iter().all(|f| f & 0x4 != 0),
+        "expected \"unmapped0\" to be unmapped by the reference aligner on both mates \
+         (flags {unmapped0_flags:?}) — the HN:i-on-unmapped-record regression would go \
+         unpinned"
+    );
+    assert_eq!(
+        (
+            unmapped0_flags.iter().filter(|&&f| f & 0x40 != 0).count(),
+            unmapped0_flags.iter().filter(|&&f| f & 0x80 != 0).count(),
+        ),
+        (1, 1),
+        "expected one first-in-pair (0x40) and one second-in-pair (0x80) \"unmapped0\" \
+         record, got flags {unmapped0_flags:?} — both mates must exercise fill_unmapped"
     );
 
     // Sorted vectors (not sets): preserve record multiplicity so a duplicated

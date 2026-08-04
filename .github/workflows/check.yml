@@ -58,7 +58,10 @@ jobs:
     # via bwa-mem3, simulate paired reads, run `bwa-rs mem`, verify samtools
     # can parse the output and at least 2N records come back for N pairs —
     # and compare this crate's BAM output against the real bwa-mem3 CLI
-    # byte-for-byte (XA:Z folding, meth/--meth XR/XG/XM tags, flag parity).
+    # byte-for-byte (XA:Z folding, meth/--meth XR/XG/XM tags). flag_parity
+    # runs here too but only checks flag bits against hardcoded expectations
+    # after a bwa-mem3 `index`; it never invokes the CLI aligner, so it is
+    # not part of the byte-for-byte comparison.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -100,7 +103,11 @@ jobs:
       # build their own PhiX-scale index and need no large reference.
       # BWA_MEM3_RS_REQUIRE_TOOLS makes a missing tool fail rather than skip,
       # so this job cannot silently degrade into a no-op.
+      # --no-fail-fast: without it, a failure in one target (e.g.
+      # cli_parity_pair_select) stops the run before later targets execute,
+      # hiding whether a regression's scope is one target or several. Suite
+      # wall time is ~11s, so running every target every time costs nothing.
       - name: Run CLI test suite (e2e + byte-parity)
         env:
           BWA_MEM3_RS_REQUIRE_TOOLS: "1"
-        run: cargo test -p bwa-mem3-rs-cli -- --nocapture
+        run: cargo test -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
