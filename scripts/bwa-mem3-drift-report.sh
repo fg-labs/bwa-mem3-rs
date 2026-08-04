@@ -129,6 +129,33 @@ enum_bodies() {
     ' "$1" 2>/dev/null || true
 }
 
+# The definition of a C/C++ function, from its signature line to the first
+# column-0 closing brace. Good enough for upstream's style, which puts the
+# opening brace on its own line at column 0 and closes at column 0.
+#
+# The trigger requires the signature line ITSELF to start at column 0 (not
+# just be un-semicolon-terminated): upstream's call sites are indented, but a
+# multi-line call — one whose first physical line ends in a comma rather than
+# a semicolon, e.g.
+#   mem_reg2sam(w->opt, mem_aln_bns(w), mem_aln_pac(w), &w->seqs[i],
+#               &w->regs[i], 0, 0);
+# — satisfies the "contains name( and doesn't end in ;" test just as well as
+# a real definition. Without the column-0 requirement this hijacks the scan
+# on any call site that textually precedes the definition in the same file,
+# which is exactly what happens for mem_reg2sam and mem_mark_primary_se in
+# bwamem.cpp today (both are called, indented, earlier in the file than they
+# are defined) — verified against the vendored tree while writing this check.
+# A leading `#` is also excluded so a macro invocation of the same name
+# (`#define FOO(x) name(x)`) can't trigger it either.
+function_body() {
+    local file="$1" name="$2"
+    mawk -v name="$name" '
+        $0 ~ /^[^[:space:]#]/ && index($0, name "(") && !started && $0 !~ /;[[:space:]]*$/ { started = 1 }
+        started { print }
+        started && /^\}/ { exit }
+    ' "$file"
+}
+
 # --------------------------------------------------------------------------
 # Checks
 # --------------------------------------------------------------------------
@@ -314,6 +341,275 @@ check_flags_and_enums() {
     rm -f "$o" "$n" "$old" "$new"
 }
 
+# Upstream functions the shim calls or carries verbatim copies of. Format:
+# <function>:<upstream file>. Keep in sync when the shim adopts a new upstream
+# entry point — check 5 is the only thing watching these contracts.
+#
+# mem_gen_alt's definition lives in bwamem_extra.cpp, not bwamem.cpp (it is
+# only declared, across two lines, in bwamem.h) — verified against the
+# vendored tree; pointing this at the wrong file makes the check silently
+# report a real function as "NOT FOUND" on every run.
+UPSTREAM_CONTRACTS=(
+    "worker_alloc:src/fastmap.cpp"
+    "worker_free:src/fastmap.cpp"
+    "mem_kernel1_core:src/bwamem.cpp"
+    "mem_kernel2_core:src/bwamem.cpp"
+    "mem_pair_resolve:src/bwamem_pair.cpp"
+    "mem_gen_alt:src/bwamem_extra.cpp"
+    "mem_reg2aln:src/bwamem.cpp"
+    "mem_mark_primary_se:src/bwamem.cpp"
+    "mem_reg2sam:src/bwamem.cpp"
+    "mem_sam_pe:src/bwamem_pair.cpp"
+)
+
+# Check 5: contracts of upstream functions the shim calls or copies.
+#
+# A body diff alone is not enough. The shim passes specific arguments and
+# replicates specific output policy, so a change in what an argument MEANS is
+# silent even when the signature is unchanged — and a rename that makes it fail
+# to compile can hide a semantic change underneath.
+check_call_site_contracts() {
+    report_section "5. Upstream contracts the shim depends on"
+    printf 'The shim calls or carries copies of these. For each that changed,\n'
+    printf 'read the diff and then re-check the shim call sites listed under it\n'
+    printf '— a rename that breaks the build can hide a semantic change, and a\n'
+    printf 'changed argument meaning is silent even with an identical signature\n'
+    printf '(gotchas #8 and #12).\n\n'
+    local entry fn path old new o n changed=0
+    old="$(mktemp)"; new="$(mktemp)"
+    for entry in "${UPSTREAM_CONTRACTS[@]}"; do
+        fn="${entry%%:*}"
+        path="${entry#*:}"
+        old_file "$VENDOR/$path" > "$old"
+        new_file "$VENDOR/$path" > "$new"
+        o="$(mktemp)"; n="$(mktemp)"
+        function_body "$old" "$fn" > "$o"
+        function_body "$new" "$fn" > "$n"
+        if [ ! -s "$n" ]; then
+            changed=1
+            # Backticks below are literal markdown, not command substitution.
+            # shellcheck disable=SC2016
+            printf '### `%s` NOT FOUND in `%s`\n\n' "$fn" "$path"
+            printf 'It was renamed, moved, or removed upstream. Find where it\n'
+            # shellcheck disable=SC2016
+            printf 'went and update `UPSTREAM_CONTRACTS` in this script.\n\n'
+        elif ! diff -q "$o" "$n" >/dev/null; then
+            changed=1
+            # shellcheck disable=SC2016
+            printf '### `%s` changed (`%s`)\n\n```diff\n' "$fn" "$path"
+            diff -u "$o" "$n" | tail -n +3 || true
+            # shellcheck disable=SC2016
+            printf '```\n\nShim call sites:\n\n```\n'
+            grep -rn "$fn" "$REPO_ROOT/bwa-mem3-sys/shim/" || printf '(none found)\n'
+            printf '```\n\n'
+        fi
+        rm -f "$o" "$n"
+    done
+    rm -f "$old" "$new"
+    [ "$changed" -eq 0 ] && printf 'No change to any tracked contract.\n'
+    return 0
+}
+
+# Check 6: source inventory. A new .cpp is auto-globbed by build.rs and may
+# fail to link; a new .c is silently ignored (the glob is *.cpp only); a
+# skip_common entry that no longer exists upstream is a stale exclusion.
+check_source_inventory() {
+    report_section "6. Source inventory"
+    local o n
+    o="$(mktemp)"; n="$(mktemp)"
+    git -C "$REPO_ROOT" ls-tree --name-only "HEAD:$VENDOR/src" | grep -E '\.(c|cpp)$' | sort > "$o" || true
+    (cd "$VENDOR_ABS/src" && ls) | grep -E '\.(c|cpp)$' | sort > "$n" || true
+    if diff -q "$o" "$n" >/dev/null; then
+        printf 'No TUs added or removed.\n\n'
+    else
+        printf '```diff\n'
+        diff -u "$o" "$n" | tail -n +3 || true
+        printf '```\n\n'
+        # Backticks below are literal markdown, not command substitution.
+        # shellcheck disable=SC2016
+        printf 'A new `.cpp` is auto-globbed by `build.rs` and may fail to\n'
+        # shellcheck disable=SC2016
+        printf 'link — add it to `skip_common` if it is out of scope. A new\n'
+        # shellcheck disable=SC2016
+        printf '`.c` is silently ignored (the glob is `*.cpp` only), so it sits\n'
+        printf 'unused; that is usually fine but worth knowing.\n\n'
+    fi
+    rm -f "$o" "$n"
+
+    # shellcheck disable=SC2016
+    printf '### `skip_common` entries still present upstream\n\n'
+    local name
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        if [ -f "$VENDOR_ABS/src/$name" ]; then
+            # shellcheck disable=SC2016
+            printf -- '- `%s` — present\n' "$name"
+        else
+            # shellcheck disable=SC2016
+            printf -- '- `%s` — **GONE**: stale exclusion in `build.rs`\n' "$name"
+        fi
+    done < <(mawk '/let skip_common/,/\];/' "$REPO_ROOT/bwa-mem3-sys/build.rs" \
+                 | grep -oE '"[a-zA-Z_0-9]+\.cpp"' | tr -d '"')
+}
+
+# Check 7: upstream build dependencies. check.yml's e2e job and python.yml's
+# integration job build upstream from the FULL Makefile (htslib, fast_reader),
+# so they inherit upstream's whole dependency set even though this crate
+# compiles none of it. A new -lfoo breaks e2e with the cause buried in a log.
+check_dependencies() {
+    report_section "7. Upstream build dependencies"
+    local old new o n
+    old="$(mktemp)"; new="$(mktemp)"
+    old_file "$VENDOR/Makefile" > "$old"
+    new_file "$VENDOR/Makefile" > "$new"
+    o="$(mktemp)"; n="$(mktemp)"
+    grep -E '^\s*(LIBS|LDLIBS|LDFLAGS)\s*[+:]?=|pkg-config|\./configure' "$old" | sort -u > "$o" || true
+    grep -E '^\s*(LIBS|LDLIBS|LDFLAGS)\s*[+:]?=|pkg-config|\./configure' "$new" | sort -u > "$n" || true
+    if diff -q "$o" "$n" >/dev/null; then
+        # Backticks below are literal markdown, not command substitution.
+        # shellcheck disable=SC2016
+        printf 'No change to `LIBS` / `pkg-config` / `./configure`.\n'
+    else
+        printf '```diff\n'
+        diff -u "$o" "$n" | tail -n +3 || true
+        printf '```\n\n'
+        printf 'A new external library may need adding to the apt list in\n'
+        # shellcheck disable=SC2016
+        printf '`.github/workflows/check.yml` (e2e job) and\n'
+        # shellcheck disable=SC2016
+        printf '`.github/workflows/python.yml` (integration job). Not a\n'
+        # shellcheck disable=SC2016
+        printf 'mechanical mapping: `-lhts`/`-lz-ng` come from vendored\n'
+        # shellcheck disable=SC2016
+        printf 'submodules and `-lbwa` is upstream'"'"'s own archive.\n'
+    fi
+    rm -f "$o" "$n" "$old" "$new"
+}
+
+# Check 8: new mem_opt_t fields worth exposing on MemOpts.
+#
+# Filtered by trailing-comment triage, because most new fields are not user
+# options: 0.6.0 added est_insert_high (marked "runtime state (NOT a user
+# option)"), the derived mat_ot/mat_ob matrices, and bam_mode/bam_level (moot —
+# the shim emits BAM itself); v0.8.0 adds a non-settable `compat` pointer.
+check_new_opts() {
+    report_section "8. New \`mem_opt_t\` fields vs. the Rust API"
+    local old new o n field
+    old="$(mktemp)"; new="$(mktemp)"
+    old_file "$VENDOR/src/bwamem.h" > "$old"
+    new_file "$VENDOR/src/bwamem.h" > "$new"
+    o="$(mktemp)"; n="$(mktemp)"
+    struct_body "$old" mem_opt_t > "$o"
+    struct_body "$new" mem_opt_t > "$n"
+    local added
+    # `|| true`: diff exits 1 whenever the two struct bodies differ, which is
+    # the ordinary case this check exists to report — without the fallback,
+    # `set -o pipefail` would make that expected diff abort the whole script
+    # before `added` is ever inspected, even though grep/sed both succeed.
+    added="$(diff "$o" "$n" | grep '^>' | sed 's/^> //' || true)"
+    rm -f "$o" "$n" "$old" "$new"
+    if [ -z "$added" ]; then
+        printf 'No new fields.\n'
+        return 0
+    fi
+    printf 'New field declarations:\n\n'
+    while IFS= read -r field; do
+        [ -n "$field" ] || continue
+        case "$field" in
+            *"NOT a user option"*|*"runtime state"*|*derived*)
+                # Backticks below are literal markdown, not command substitution.
+                # shellcheck disable=SC2016
+                printf -- '- `%s` — skip (upstream marks it internal)\n' "$field" ;;
+            *)
+                local name
+                name="$(printf '%s' "$field" | sed 's/;.*//' | mawk '{print $NF}' | tr -d '*')"
+                if grep -q "$name" "$REPO_ROOT/bwa-mem3-rs/src/opts.rs" 2>/dev/null; then
+                    # shellcheck disable=SC2016
+                    printf -- '- `%s` — already referenced in `opts.rs`\n' "$field"
+                else
+                    # shellcheck disable=SC2016
+                    printf -- '- `%s` — **consider exposing** on `MemOpts`\n' "$field"
+                fi ;;
+        esac
+    done <<< "$added"
+    printf '\nExposing a field is optional and separable from the refresh —\n'
+    printf 'file it as follow-up rather than growing this PR.\n'
+}
+
+# Check 9: an auto-generated re-vendoring commit must not drop attribution.
+#
+# ext/pdqsort carries no standalone license file — its MIT-style notice is
+# embedded in the header comment of pdqsort.h itself (verified against the
+# vendored tree) — so that is the path checked, not a license.txt that has
+# never existed and would report a false "MISSING" on every single run.
+check_licences() {
+    report_section "9. Vendored licences"
+    local p
+    for p in "LICENSE" "ext/sse2neon/LICENSE" "ext/pdqsort/pdqsort.h"; do
+        if [ -e "$VENDOR_ABS/$p" ]; then
+            if [ "$(old_file "$VENDOR/$p")" = "$(new_file "$VENDOR/$p")" ]; then
+                # Backticks below are literal markdown, not command substitution.
+                # shellcheck disable=SC2016
+                printf -- '- `%s` — present, unchanged\n' "$p"
+            else
+                # shellcheck disable=SC2016
+                printf -- '- `%s` — present, **CHANGED**: read the new terms\n' "$p"
+            fi
+        else
+            # shellcheck disable=SC2016
+            printf -- '- `%s` — **MISSING**: attribution lost, do not merge\n' "$p"
+        fi
+    done
+}
+
+# Check 10: what actually changed upstream, per release.
+check_release_notes() {
+    report_section "10. Upstream release notes"
+    local tags t
+    tags="${MISSED_TAGS:-}"
+    if [ -z "$tags" ]; then
+        printf '(no tag list supplied via MISSED_TAGS)\n'
+        return 0
+    fi
+    # shellcheck disable=SC2086 # deliberate word-splitting: MISSED_TAGS is a
+    # space-separated list of tag names, not a single path or token.
+    for t in $tags; do
+        printf '### %s\n\n' "$t"
+        gh api "repos/fg-labs/bwa-mem3/releases/tags/$t" --jq '.body' 2>/dev/null \
+            | sed 's/^/> /' || printf '> (release notes unavailable)\n'
+        printf '\n'
+    done
+}
+
+# Check 11: what CI structurally cannot verify.
+print_manual_checklist() {
+    report_section "11. Manual checklist (CI cannot do these)"
+    cat <<'EOF'
+Green CI is necessary but **not sufficient**. Before merging:
+
+- [ ] Byte-parity against a real index. The PhiX-scale parity targets run in
+      CI, but the library-level ones need a large reference:
+      `BWA_MEM3_RS_TEST_REF=/path/to/hg38.fa cargo test --workspace`
+      covers `align_smoke`, `cli_parity`, `concurrency`, `phase_split`, and
+      `shm_lifecycle`.
+- [ ] `bwa-mem3-py` (gotcha #10). It is outside the cargo workspace, so
+      nothing in CI compiles it. If any `mem_opt_t` field or enum changed,
+      check `bwa-mem3-py/src/lib.rs` **and** the hand-written stub
+      `bwa-mem3-py/python/bwa_mem3/_bwa_mem3.pyi` — mypy only checks the stub
+      for self-consistency and never imports the `.so`, so drift is silent.
+- [ ] `shim/bwa_shim_types.h`'s `MEM_F_*` `#define` block, and the three
+      coordinated edits in `shim/bwa_shim_layout_assert.cpp` (the
+      `pod_flags::MEM_F_X_v` capture, its paired `#undef`, and the
+      `BWA_SHIM_CK_FLAG(MEM_F_X)` invocation), match upstream (check 4 above
+      diffs it, but confirm you acted on it).
+- [ ] `worker_alloc` / `worker_free` copies in `bwa_shim_align.cpp` still
+      match upstream's, **including the buffer sizing**, not just field names.
+- [ ] Commits are signed (`-S`). The bot's commit is not.
+- [ ] Squash the bot commit together with your adaptation commits into a
+      logical history before merging.
+EOF
+}
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -355,6 +651,13 @@ main() {
     check_build
     check_structs
     check_flags_and_enums
+    check_call_site_contracts
+    check_source_inventory
+    check_dependencies
+    check_new_opts
+    check_licences
+    check_release_notes
+    print_manual_checklist
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
