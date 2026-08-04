@@ -664,5 +664,117 @@ REPO_ROOT="$orig_repo_root"
 VENDOR="$orig_vendor"
 VENDOR_ABS="$orig_vendor_abs"
 
+# --------------------------------------------------------------------------
+# check_build / format_build_failure: the worklist section must surface a
+# real diagnostic no matter its shape, not just the shapes a pattern
+# anticipated. format_build_failure is check_build's body, split out
+# specifically so it can be exercised here against fixture logs without
+# actually running `cargo ci-build` (see its doc comment in the sourced
+# script). This is a regression suite for a real bug the v0.2.2 -> v0.6.0
+# replay (scripts/tests/drift-report-replay.sh) found: the old filter
+# matched `^error` against cargo's own generic wrapper line on EVERY
+# build-script failure, which made the `|| tail -40` fallback that would
+# have shown the real diagnostic never fire.
+# --------------------------------------------------------------------------
+
+# --- the REAL failure the replay found, trimmed to the load-bearing lines
+# (the full log is ~500 lines with machine-specific tmp paths; this keeps
+# the exact diagnostic text captured from that run: fastmap.cpp:47:10:
+# fatal error: 'version.h' file not found, wrapped in cargo's generic
+# "failed to run custom build command" line the way a real `cargo build`
+# failure actually shapes it) ---
+cat > "$tmp/fatal_error.log" <<'EOF'
+   Compiling bwa-mem3-sys v0.1.1 (/repo/bwa-mem3-sys)
+warning: bwa-mem3-sys@0.1.1: /repo/target/debug/build/bwa-mem3-sys-abc/out/build/bwa-mem3/src/fastmap.cpp:47:10: fatal error: 'version.h' file not found
+warning: bwa-mem3-sys@0.1.1: #include "version.h"
+warning: bwa-mem3-sys@0.1.1:          ^~~~~~~~~~~
+warning: bwa-mem3-sys@0.1.1: 1 error generated.
+error: failed to run custom build command for `bwa-mem3-sys v0.1.1 (/repo/bwa-mem3-sys)`
+
+Caused by:
+  process didn't exit successfully: `/repo/target/debug/build/bwa-mem3-sys-abc/build-script-build` (exit status: 101)
+  --- stderr
+  cargo:warning=/repo/target/debug/build/bwa-mem3-sys-abc/out/build/bwa-mem3/src/fastmap.cpp:47:10: fatal error: 'version.h' file not found
+  cargo:warning=   47 | #include "version.h"
+  cargo:warning=      |          ^~~~~~~~~~~
+  cargo:warning=1 error generated.
+  error occurred in cc-rs: command did not execute successfully
+EOF
+out="$(format_build_failure "$tmp/fatal_error.log" 101)"
+contains "format_build_failure: the real captured fatal-error line is surfaced" "$out" "fatal error: 'version.h' file not found"
+contains "format_build_failure: fatal error is caught by the filter itself (belt-and-braces)" "$out" "Lines matching known error patterns"
+
+# --- synthetic: rustc E0308 with a `-->` pointer line ---
+cat > "$tmp/rustc.log" <<'EOF'
+   Compiling bwa-mem3-rs v0.1.1
+error[E0308]: mismatched types
+  --> bwa-mem3-rs/src/opts.rs:42:9
+   |
+42 |     42
+   |     ^^ expected struct, found integer
+EOF
+out="$(format_build_failure "$tmp/rustc.log" 101)"
+contains "format_build_failure: rustc E0308 diagnostic is surfaced" "$out" "E0308"
+contains "format_build_failure: rustc's --> pointer line is surfaced" "$out" "opts.rs:42:9"
+
+# --- synthetic: clang's plain (non-fatal) ": error:" behind a cargo wrapper ---
+cat > "$tmp/clang.log" <<'EOF'
+error: failed to run custom build command for bwa-mem3-sys
+  --- stderr
+  cargo:warning=bwamem.cpp:123:5: error: use of undeclared identifier "foo"
+EOF
+out="$(format_build_failure "$tmp/clang.log" 101)"
+contains "format_build_failure: clang's ': error:' diagnostic is surfaced" "$out" "use of undeclared identifier"
+
+# --- synthetic: a linker error ---
+cat > "$tmp/ld.log" <<'EOF'
+error: failed to run custom build command for bwa-mem3-sys
+  = note: Undefined symbols for architecture arm64:
+  "_mem_matesw", referenced from:
+  ld: symbol(s) not found for architecture arm64
+EOF
+out="$(format_build_failure "$tmp/ld.log" 101)"
+contains "format_build_failure: linker 'Undefined symbols' is surfaced" "$out" "Undefined symbols"
+contains "format_build_failure: linker 'ld:' line is surfaced" "$out" "symbol(s) not found"
+
+# --- synthetic: a failure whose only content matches NO known pattern ---
+# This is what the structural fix exists for: the filtered-hits section
+# says so honestly, and the unconditional raw tail still shows the actual
+# failure text regardless.
+cat > "$tmp/nomatch.log" <<'EOF'
+   Compiling bwa-mem3-sys v0.1.1
+some completely unrecognized failure shape
+the build tool gave up for reasons unknown
+EOF
+out="$(format_build_failure "$tmp/nomatch.log" 1)"
+contains "format_build_failure: no-pattern-match case says so" "$out" "No line matched a known error pattern"
+contains "format_build_failure: no-pattern-match case still shows the raw failure via the tail" "$out" "gave up for reasons unknown"
+
+# MUTATION (expected red): reproduce the ORIGINAL single-shot
+# `grep ... | head -40 || tail -40` body (no unconditional tail, and no
+# `fatal error:` in the pattern) against the real fatal-error fixture above,
+# and confirm the diagnostic that fix exists to surface is actually missing —
+# because cargo's own wrapper line matches `^error` and satisfies grep, the
+# `|| tail -40` fallback that would have shown it never runs. This is the
+# exact bug scripts/tests/drift-report-replay.sh found against the real
+# v0.2.2 -> v0.6.0 bump.
+# Invoked only here; invisible to shellcheck via the source=/dev/null
+# directive at the top of this file.
+# shellcheck disable=SC2329
+format_build_failure_original_buggy() {
+    local log="$1" build_status="$2"
+    printf 'Build FAILED (exit %s). These errors are the worklist:\n\n' "$build_status"
+    printf '```\n'
+    grep -E '(^error|: error:|^warning: unused|  -->|ld:|^Undefined symbols)' "$log" | head -40 || tail -40 "$log"
+    printf '```\n\n'
+}
+out_unfixed="$(format_build_failure_original_buggy "$tmp/fatal_error.log" 101)"
+absent "MUTATION (expected red): original single-shot filter loses the real fatal-error diagnostic" "$out_unfixed" "fatal error"
+contains "MUTATION baseline: original filter still shows the useless generic wrapper line" "$out_unfixed" "failed to run custom build command"
+
+# The FIXED format_build_failure, same fixture, must not lose it (green).
+out_fixed="$(format_build_failure "$tmp/fatal_error.log" 101)"
+contains "format_build_failure (fixed): real fatal-error diagnostic is present where the mutation lost it" "$out_fixed" "fatal error: 'version.h' file not found"
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

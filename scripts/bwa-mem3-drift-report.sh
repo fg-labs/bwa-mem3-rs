@@ -160,6 +160,57 @@ function_body() {
 # Checks
 # --------------------------------------------------------------------------
 
+# Formats the "Build FAILED" body for a given log file and exit status. Split
+# out from check_build so scripts/tests/test-drift-report.sh can exercise the
+# filtering/tail logic against fixture logs without actually running
+# `cargo ci-build` — the thing under test here is the report's OUTPUT SHAPE,
+# not whether this checkout currently builds.
+format_build_failure() {
+    local log="$1" status="$2"
+    printf 'Build FAILED (exit %s).\n\n' "$status"
+    # Two sections below, not one filtered dump. A pattern list is never
+    # exhaustive — this exact line was already widened twice (first for
+    # `: error:`, then for `ld:`/`Undefined symbols`) and STILL missed
+    # clang's `fatal error:` on a real historical bump (the v0.2.2 ->
+    # v0.6.0 replay in scripts/tests/drift-report-replay.sh caught it: the
+    # actual failure was `fastmap.cpp:47:10: fatal error: 'version.h' file
+    # not found`). The real defect was never the pattern; it was treating
+    # "grep found a hit" as "the report is complete" — cargo's own wrapper
+    # line ("error: failed to run custom build command...") matches
+    # `^error` on EVERY build-script failure, so the old single-shot
+    # `grep ... || tail -40` fallback never reached the tail once the
+    # filter had ANY hit, even when that hit was the wrapper line telling
+    # the human nothing. So: print the filtered hits (if any) as a targeted
+    # worklist, then UNCONDITIONALLY print a raw tail too, so a diagnostic
+    # shaped like nothing on the list below is still visible. `fatal
+    # error:` is added to the pattern as belt-and-braces, not as the fix —
+    # the fix is that this section no longer depends on the pattern being
+    # complete.
+    local hits
+    # `|| true` INSIDE the substitution, not chained after it: grep exits 1
+    # when nothing matches, and under `set -o pipefail` that would make the
+    # bare assignment abort the whole script via `set -e` before
+    # `[ -n "$hits" ]` below ever runs.
+    hits="$(grep -E '(^error|: (fatal )?error:|^warning: unused|  -->|ld:|^Undefined symbols)' "$log" | head -40 || true)"
+    if [ -n "$hits" ]; then
+        printf 'Lines matching known error patterns:\n\n```\n'
+        printf '%s\n' "$hits"
+        printf '```\n\n'
+    else
+        printf 'No line matched a known error pattern.\n\n'
+    fi
+    # Deliberately unconditional, and deliberately NOT deduped against the
+    # filtered hits above: the two sections answer different questions
+    # (targeted-by-pattern vs. "the actual end of the log, in case the
+    # filter missed it"), and reliably detecting the overlap is more
+    # machinery than the handful of possibly-repeated lines it would save.
+    # Accept the overlap; the label says what this section is.
+    printf 'Last 40 lines of the raw log (may repeat lines already shown above):\n\n```\n'
+    tail -40 "$log"
+    printf '```\n\n'
+    printf 'Full log is in the workflow run artifacts.\n'
+}
+
 # Check 1 (primary): does the refreshed tree still build?
 check_build() {
     report_section "1. Build (\`cargo ci-build\`)"
@@ -171,22 +222,7 @@ check_build() {
         printf 'Builds clean. Note this proves compilation only — it does not\n'
         printf 'prove byte-parity with the CLI. See the manual checklist below.\n'
     else
-        printf 'Build FAILED (exit %s). These errors are the worklist:\n\n' "$status"
-        printf '```\n'
-        # `: error:` (unanchored) alongside the anchored `^error`: cargo's own
-        # "failed to run custom build command" wrapper matches ^error, but the
-        # actual C/C++ diagnostic that matters after a vendor refresh is a
-        # couple of lines further down, indented under "--- stderr" as
-        # `file:line:col: error: ...` — clang/g++'s mid-line form, which
-        # ^error alone would never match, silently hiding the one line a
-        # human needs behind the useless wrapper. `ld:`/`Undefined symbols`
-        # catch the equivalent linker-error case (e.g. a renamed/removed
-        # exported symbol after a refresh); still not exhaustive of every
-        # compiler/linker's diagnostic format — that gap is tracked
-        # separately, not solved by this alternation.
-        grep -E '(^error|: error:|^warning: unused|  -->|ld:|^Undefined symbols)' "$log" | head -40 || tail -40 "$log"
-        printf '```\n\n'
-        printf 'Full log is in the workflow run artifacts.\n'
+        format_build_failure "$log" "$status"
     fi
     rm -f "$log"
 }
