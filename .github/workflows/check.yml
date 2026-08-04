@@ -53,6 +53,20 @@ jobs:
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
       - run: cargo ci-lint
 
+  scripts:
+    # The vendor-bump automation is bash, so unit-test it like anything else.
+    # shellcheck runs alongside: these scripts push branches and open PRs, so
+    # an unquoted expansion is not a cosmetic problem.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: shellcheck
+        run: shellcheck scripts/*.sh scripts/tests/*.sh
+      - name: Script unit tests
+        run: bash scripts/tests/run-all.sh
+
   e2e:
     # End-to-end regression plus the byte-parity suite: build the PhiX index
     # via bwa-mem3, simulate paired reads, run `bwa-rs mem`, verify samtools
