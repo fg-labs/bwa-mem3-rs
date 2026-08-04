@@ -353,7 +353,12 @@ cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/keep.cpp" <<'EOF'
 void keep_fn() {}
 EOF
 cat > "$fixture/bwa-mem3-sys/shim/dummy.cpp" <<'EOF'
-void call_it() { foo(3, 4); }
+// See gotcha #12 for how foo's return value is used downstream.
+void call_it()
+{
+    foo(3,
+        4);
+}
 EOF
 cat > "$fixture/bwa-mem3-sys/build.rs" <<'EOF'
 fn main() {
@@ -411,6 +416,28 @@ out="$(check_call_site_contracts)"
 contains "check 5: changed contract is flagged" "$out" "\`foo\` changed"
 contains "check 5: changed contract shows the diff" "$out" "added_marker"
 contains "check 5: changed contract lists the shim call site" "$out" "dummy.cpp"
+
+# --- check 5: call-site listing keeps a multi-line call's full argument
+# list, shows repo-relative paths, and drops a paren-less prose mention ---
+# This is the review-flagged gap: a bare first-line grep match previously
+# showed only "foo(3," and hid the "4);" continuation line entirely, which
+# is exactly what happened on the real tree for mem_kernel1_core /
+# mem_kernel2_core / mem_pair_resolve / mem_reg2aln (all called across
+# several lines in bwa_shim_align.cpp -- verified separately, see the task
+# report). The fixture's dummy.cpp above is the minimal repro: a two-line
+# call plus a comment that mentions "foo" without an adjacent "(".
+contains "check 5: multi-line call site keeps the second argument line" "$out" "4);"
+absent "check 5: paren-less prose mention of the function name is excluded" "$out" "foo's return value"
+absent "check 5: call-site paths are repo-relative, not $fixture's absolute prefix" "$out" "$fixture"
+
+# MUTATION (expected red): reproduce the ORIGINAL bare `grep -rn "$fn"` (no
+# -A, no paren anchor, no path-stripping) against this exact fixture and
+# confirm it fails both of the properties above -- it truncates the
+# multi-line call to its first line only, AND it surfaces the paren-less
+# comment as a false "call site".
+out_unfixed="$(grep -rn "foo" "$fixture/bwa-mem3-sys/shim/" || printf '(none found)\n')"
+absent "MUTATION (expected red): unfixed grep truncates the multi-line call, missing the second argument line" "$out_unfixed" "4);"
+contains "MUTATION (expected red): unfixed grep surfaces the paren-less prose mention as a call site" "$out_unfixed" "foo's return value"
 
 # --- check 5: a real change must not abort main()'s remaining checks ---
 # check_call_site_contracts's last statement is `[ "$changed" -eq 0 ] &&
@@ -474,6 +501,71 @@ out_narrow="$(mawk '/let skip_common/,/\];/' "$fixture/bwa-mem3-sys/build.rs" \
 absent "MUTATION (expected red): narrow regex silently misses the uppercase entry" "$out_narrow" "FMI_search2.cpp"
 absent "MUTATION (expected red): narrow regex silently misses the digit-bearing entry" "$out_narrow" "reader_v2.cpp"
 contains "MUTATION baseline: narrow regex still matches the plain lowercase entry" "$out_narrow" "stale_tool.cpp"
+
+# --- check 6: a stale extraction pattern must be loud, not silent ---
+# Review-flagged gap: build.rs already declares a sibling list in a
+# different style (`const KERNEL_SRCS: &[&str] = &[...]`), so a plausible
+# future rename of skip_common to a `const` binding is not hypothetical.
+# Without a guard, a pattern that stops matching prints the section header
+# and then NOTHING AT ALL -- exit 0, no warning -- reading as "no stale
+# exclusions" when the truth is "the extraction itself is broken." That is
+# the exact failure mode this check exists to prevent.
+cp "$fixture/bwa-mem3-sys/build.rs" "$tmp/build.rs.let-style"
+
+# First: confirm the WIDENED anchor (shipped fix) copes with a rename to
+# `const SKIP_COMMON` gracefully, with no warning needed.
+cat > "$fixture/bwa-mem3-sys/build.rs" <<'EOF'
+fn main() {
+    const SKIP_COMMON: &[&str] = &[
+        "foo.cpp",
+        "stale_tool.cpp",
+    ];
+}
+EOF
+out="$(check_source_inventory)"
+contains "check 6: a renamed skip_common binding (const SKIP_COMMON) is still matched" "$out" "\`foo.cpp\` — present"
+contains "check 6: a renamed binding's stale entry is still matched too" "$out" "\`stale_tool.cpp\` — **GONE**"
+absent "check 6: a renamed binding the widened anchor DOES match does not warn" "$out" "Extraction matched nothing"
+
+# Second: a rename the widened anchor can't anticipate either (e.g. neither
+# `let`/`const skip_common` nor `SKIP_COMMON`) must trigger the loud warning
+# instead of silently printing nothing.
+cat > "$fixture/bwa-mem3-sys/build.rs" <<'EOF'
+fn main() {
+    static UNANTICIPATED_RENAME: &[&str] = &[
+        "foo.cpp",
+    ];
+}
+EOF
+out="$(check_source_inventory)"
+contains "check 6: an anchor-defeating rename triggers the loud warning, not silence" "$out" "Extraction matched nothing"
+
+# MUTATION (expected red): reproduce the ORIGINAL, unwidened `/let
+# skip_common/` anchor (no guard) against the const-SKIP_COMMON fixture from
+# above and confirm it goes silent -- exactly the reviewer's demonstration.
+cat > "$fixture/bwa-mem3-sys/build.rs" <<'EOF'
+fn main() {
+    const SKIP_COMMON: &[&str] = &[
+        "foo.cpp",
+        "stale_tool.cpp",
+    ];
+}
+EOF
+check_source_inventory_original_anchor() {
+    local entries
+    entries="$(mawk '/let skip_common/,/\];/' "$fixture/bwa-mem3-sys/build.rs" \
+                 | grep -oE '"[a-zA-Z_0-9]+\.cpp"' | tr -d '"' || true)"
+    if [ -z "$entries" ]; then
+        printf 'nothing printed after the header (exit 0, no warning)\n'
+    else
+        printf 'entries=[%s]\n' "$entries"
+    fi
+}
+out_stale="$(check_source_inventory_original_anchor)"
+contains "MUTATION (expected red): original /let skip_common/ anchor goes silent on a renamed const binding" "$out_stale" "nothing printed after the header"
+
+# Restore the fixture's build.rs to its normal let-style form for the tests below.
+cp "$tmp/build.rs.let-style" "$fixture/bwa-mem3-sys/build.rs"
 
 # --- check 6: a newly-added .cpp not yet tracked at HEAD is reported ---
 cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/new_dep.cpp" <<'EOF'

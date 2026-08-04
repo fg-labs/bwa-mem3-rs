@@ -400,7 +400,23 @@ check_call_site_contracts() {
             diff -u "$o" "$n" | tail -n +3 || true
             # shellcheck disable=SC2016
             printf '```\n\nShim call sites:\n\n```\n'
-            grep -rn "$fn" "$REPO_ROOT/bwa-mem3-sys/shim/" || printf '(none found)\n'
+            # -A3: a bare first-line match hides the argument list for every
+            # multi-line call — verified against the real tree, where
+            # mem_kernel1_core/mem_kernel2_core/mem_pair_resolve/mem_reg2aln
+            # are all called across several lines, so a human previously saw
+            # only e.g. "mem_kernel1_core(s->w.fmi, s->w.opt," and had to open
+            # the file to see the rest. The pattern requires "(" (optionally
+            # preceded by whitespace) right after the name so prose mentions
+            # in comments (e.g. "matching mem_reg2sam's...", "mirrors
+            # mem_sam_pe's...", never followed by "(") drop out — every real
+            # call site in the shim today is written as `name(` or `name (`,
+            # so this does not risk missing one; if a future call site is
+            # ever split across a name-then-newline-then-"(" shape, this
+            # would miss it and this comment's claim would need revisiting.
+            # Paths are shown repo-relative, not as $REPO_ROOT's absolute path.
+            grep -rn -A3 -E "${fn}[[:space:]]*\\(" "$REPO_ROOT/bwa-mem3-sys/shim/" 2>/dev/null \
+                | sed "s|^$REPO_ROOT/||" \
+                || printf '(no direct call site in shim/ -- see gotcha #12 if this\nfunction is mirrored rather than called directly)\n'
             printf '```\n\n'
         fi
         rm -f "$o" "$n"
@@ -417,7 +433,10 @@ check_source_inventory() {
     report_section "6. Source inventory"
     local o n
     o="$(mktemp)"; n="$(mktemp)"
-    git -C "$REPO_ROOT" ls-tree --name-only "HEAD:$VENDOR/src" | grep -E '\.(c|cpp)$' | sort > "$o" || true
+    # 2>/dev/null: a first-ever-vendored src/ (no HEAD:$VENDOR/src to show)
+    # makes git print a raw "fatal: Not a valid object name" to stderr, which
+    # would otherwise land in the middle of the markdown report.
+    git -C "$REPO_ROOT" ls-tree --name-only "HEAD:$VENDOR/src" 2>/dev/null | grep -E '\.(c|cpp)$' | sort > "$o" || true
     (cd "$VENDOR_ABS/src" && ls) | grep -E '\.(c|cpp)$' | sort > "$n" || true
     if diff -q "$o" "$n" >/dev/null; then
         printf 'No TUs added or removed.\n\n'
@@ -438,7 +457,28 @@ check_source_inventory() {
 
     # shellcheck disable=SC2016
     printf '### `skip_common` entries still present upstream\n\n'
-    local name
+    # Extracted into a variable (rather than piped straight into the while
+    # loop's process substitution) so an empty result is itself detectable.
+    # Anchored on `(let|const)[[:space:]]+skip_common|SKIP_COMMON` rather
+    # than just `let skip_common`: build.rs already declares a sibling list
+    # in a different style (`const KERNEL_SRCS: &[&str] = &[...]`), so a
+    # plausible future rename of skip_common to a `const` (or to
+    # SCREAMING_CASE, matching that sibling) would make the narrower anchor
+    # match nothing. Without this guard, a stale pattern here used to fail
+    # silently: the section header would print, then nothing at all, exit 0
+    # -- reading as "no stale exclusions" when it was actually "the
+    # extraction itself is broken." That is the one failure mode this check
+    # exists to prevent, so a stale pattern must be loud, not silent.
+    local name entries
+    entries="$(mawk '/(let|const)[[:space:]]+skip_common|SKIP_COMMON/,/\];/' "$REPO_ROOT/bwa-mem3-sys/build.rs" \
+                 | grep -oE '"[a-zA-Z_0-9]+\.cpp"' | tr -d '"' || true)"
+    if [ -z "$entries" ]; then
+        printf 'Extraction matched nothing -- the skip_common pattern in\n'
+        printf 'check_source_inventory (scripts/bwa-mem3-drift-report.sh) is\n'
+        printf 'stale relative to build.rs. Update the mawk anchor to match\n'
+        printf 'however skip_common is declared now, then re-run this report.\n'
+        return 0
+    fi
     while IFS= read -r name; do
         [ -n "$name" ] || continue
         if [ -f "$VENDOR_ABS/src/$name" ]; then
@@ -448,8 +488,7 @@ check_source_inventory() {
             # shellcheck disable=SC2016
             printf -- '- `%s` — **GONE**: stale exclusion in `build.rs`\n' "$name"
         fi
-    done < <(mawk '/let skip_common/,/\];/' "$REPO_ROOT/bwa-mem3-sys/build.rs" \
-                 | grep -oE '"[a-zA-Z_0-9]+\.cpp"' | tr -d '"')
+    done <<< "$entries"
 }
 
 # Check 7: upstream build dependencies. check.yml's e2e job and python.yml's
@@ -463,8 +502,16 @@ check_dependencies() {
     old_file "$VENDOR/Makefile" > "$old"
     new_file "$VENDOR/Makefile" > "$new"
     o="$(mktemp)"; n="$(mktemp)"
-    grep -E '^\s*(LIBS|LDLIBS|LDFLAGS)\s*[+:]?=|pkg-config|\./configure' "$old" | sort -u > "$o" || true
-    grep -E '^\s*(LIBS|LDLIBS|LDFLAGS)\s*[+:]?=|pkg-config|\./configure' "$new" | sort -u > "$n" || true
+    # The anchor covers indirect dependency variables, not just LIBS/LDLIBS/
+    # LDFLAGS themselves: LIBS_EXTRA, LIBSAIS_OPENMP_LIBS, and
+    # MIMALLOC_LDFLAGS are all real Makefile variables (verified against the
+    # vendored tree) that feed into LIBS/LDFLAGS via `LIBS += $(LIBS_EXTRA)`
+    # -- an aggregate line like that does not change when the variable IT
+    # REFERENCES gains a new -lfoo, so anchoring on the exact names LIBS/
+    # LDLIBS/LDFLAGS alone would miss exactly the kind of new dependency this
+    # check exists to catch.
+    grep -E '^\s*[A-Za-z_]*(LIBS|LDLIBS|LDFLAGS)[A-Za-z_]*\s*[+:]?=|pkg-config|\./configure' "$old" | sort -u > "$o" || true
+    grep -E '^\s*[A-Za-z_]*(LIBS|LDLIBS|LDFLAGS)[A-Za-z_]*\s*[+:]?=|pkg-config|\./configure' "$new" | sort -u > "$n" || true
     if diff -q "$o" "$n" >/dev/null; then
         # Backticks below are literal markdown, not command substitution.
         # shellcheck disable=SC2016
@@ -523,13 +570,32 @@ check_new_opts() {
             *)
                 local name
                 name="$(printf '%s' "$field" | sed 's/;.*//' | mawk '{print $NF}' | tr -d '*')"
-                if grep -q "$name" "$REPO_ROOT/bwa-mem3-rs/src/opts.rs" 2>/dev/null; then
-                    # shellcheck disable=SC2016
-                    printf -- '- `%s` — already referenced in `opts.rs`\n' "$field"
-                else
-                    # shellcheck disable=SC2016
-                    printf -- '- `%s` — **consider exposing** on `MemOpts`\n' "$field"
-                fi ;;
+                case "$name" in
+                    ''|/*)
+                        # Nothing usable to check: an empty extraction (a
+                        # whitespace-only or comment-only field line) or a
+                        # name starting with "/" (a stray comment fragment
+                        # picked up as the last token). Either way, don't
+                        # feed it to grep -- flag for a human instead of
+                        # guessing.
+                        # shellcheck disable=SC2016
+                        printf -- '- `%s` — could not extract a field name; check manually\n' "$field" ;;
+                    *)
+                        # -F (fixed-string): $name is used as a literal
+                        # identifier, not a regex. An added array field like
+                        # `int mat_ot[25];` extracts as `mat_ot[25]`, which
+                        # plain grep parses as "mat_ot" followed by one
+                        # character from the class {2,5} -- silently matching
+                        # an unrelated `mat_ot2` in opts.rs and misreporting
+                        # "already referenced". -F treats it literally.
+                        if grep -qF "$name" "$REPO_ROOT/bwa-mem3-rs/src/opts.rs" 2>/dev/null; then
+                            # shellcheck disable=SC2016
+                            printf -- '- `%s` — already referenced in `opts.rs`\n' "$field"
+                        else
+                            # shellcheck disable=SC2016
+                            printf -- '- `%s` — **consider exposing** on `MemOpts`\n' "$field"
+                        fi ;;
+                esac ;;
         esac
     done <<< "$added"
     printf '\nExposing a field is optional and separable from the refresh —\n'
