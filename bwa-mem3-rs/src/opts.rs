@@ -34,16 +34,27 @@ pub enum SeedOrder {
     MostAbsorb = 4,
 }
 
-impl SeedOrder {
-    /// Map the raw `seed_order_t` value to a [`SeedOrder`], falling back to
-    /// [`SeedOrder::Off`] for any value bwa-mem3 does not define.
-    fn from_raw(v: i32) -> Self {
+impl TryFrom<i32> for SeedOrder {
+    type Error = crate::Error;
+
+    /// Map the raw `seed_order_t` value to a [`SeedOrder`].
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) for
+    /// a value bwa-mem3 does not define. This deliberately does *not* fall
+    /// back to [`SeedOrder::Off`]: a silent fallback made a new upstream mode
+    /// read back as the default, which is indistinguishable from a
+    /// byte-identical baseline run.
+    fn try_from(v: i32) -> std::result::Result<Self, Self::Error> {
         match v {
-            1 => SeedOrder::GlobalLongest,
-            2 => SeedOrder::LocalLongest,
-            3 => SeedOrder::AbsorbCount,
-            4 => SeedOrder::MostAbsorb,
-            _ => SeedOrder::Off,
+            0 => Ok(SeedOrder::Off),
+            1 => Ok(SeedOrder::GlobalLongest),
+            2 => Ok(SeedOrder::LocalLongest),
+            3 => Ok(SeedOrder::AbsorbCount),
+            4 => Ok(SeedOrder::MostAbsorb),
+            other => Err(crate::Error::UnrecognizedEnum {
+                kind: "seed_emit_order",
+                value: other,
+            }),
         }
     }
 }
@@ -61,13 +72,23 @@ pub enum MethScoring {
     Genomic = 1,
 }
 
-impl MethScoring {
-    /// Map the raw `mem_meth_scoring` value to a [`MethScoring`], falling back
-    /// to [`MethScoring::Collapsed`] (the default) for undefined values.
-    fn from_raw(v: i32) -> Self {
+impl TryFrom<i32> for MethScoring {
+    type Error = crate::Error;
+
+    /// Map the raw `mem_meth_scoring` value to a [`MethScoring`].
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) for
+    /// a value bwa-mem3 does not define. bwa-mem3 v0.8.0 adds
+    /// `MEM_METH_SCORING_NEUTRAL = 2`, which previously read back as
+    /// [`MethScoring::Collapsed`].
+    fn try_from(v: i32) -> std::result::Result<Self, Self::Error> {
         match v {
-            1 => MethScoring::Genomic,
-            _ => MethScoring::Collapsed,
+            0 => Ok(MethScoring::Collapsed),
+            1 => Ok(MethScoring::Genomic),
+            other => Err(crate::Error::UnrecognizedEnum {
+                kind: "meth_scoring",
+                value: other,
+            }),
         }
     }
 }
@@ -369,9 +390,14 @@ impl MemOpts {
 
     /// Seed emission order (`--seed-order`). [`SeedOrder::Off`] (the default)
     /// is byte-identical to the baseline.
-    #[must_use]
-    pub fn seed_order(&self) -> SeedOrder {
-        SeedOrder::from_raw(unsafe { (*self.handle).seed_emit_order })
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) if
+    /// the vendored bwa-mem3 reports a mode this crate does not know, rather
+    /// than silently reporting the default.
+    pub fn seed_order(&self) -> Result<SeedOrder> {
+        SeedOrder::try_from(unsafe { (*self.handle).seed_emit_order })
     }
     pub fn set_seed_order(&mut self, order: SeedOrder) -> &mut Self {
         unsafe {
@@ -416,9 +442,15 @@ impl MemOpts {
         }
         self
     }
-    #[must_use]
-    pub fn meth_scoring(&self) -> MethScoring {
-        MethScoring::from_raw(unsafe { (*self.handle).meth_scoring })
+    /// Bisulfite scoring mode (`--meth-scoring`); only meaningful under
+    /// [`set_meth(true)`](Self::set_meth).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) if
+    /// the vendored bwa-mem3 reports a mode this crate does not know.
+    pub fn meth_scoring(&self) -> Result<MethScoring> {
+        MethScoring::try_from(unsafe { (*self.handle).meth_scoring })
     }
 
     /// bwameth.py-style longest-`M` chimera QC heuristic (`--meth-chimera-qc`);
@@ -583,7 +615,7 @@ mod tests {
         assert!(!o.smem_dedup());
         assert!(!o.skip_contained_ext());
         assert_eq!(o.band_start(), 0);
-        assert_eq!(o.seed_order(), SeedOrder::Off);
+        assert_eq!(o.seed_order().unwrap(), SeedOrder::Off);
     }
 
     #[test]
@@ -602,7 +634,7 @@ mod tests {
         assert!(o.smem_dedup());
         assert!(o.skip_contained_ext());
         assert_eq!(o.band_start(), 20);
-        assert_eq!(o.seed_order(), SeedOrder::MostAbsorb);
+        assert_eq!(o.seed_order().unwrap(), SeedOrder::MostAbsorb);
     }
 
     #[test]
@@ -616,7 +648,7 @@ mod tests {
             SeedOrder::MostAbsorb,
         ] {
             o.set_seed_order(order);
-            assert_eq!(o.seed_order(), order);
+            assert_eq!(o.seed_order().unwrap(), order);
         }
     }
 
@@ -625,16 +657,16 @@ mod tests {
         let mut o = MemOpts::new().unwrap();
         // Defaults: meth off, collapsed scoring.
         assert!(!o.meth());
-        assert_eq!(o.meth_scoring(), MethScoring::Collapsed);
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
         assert!(!o.meth_chimera_qc());
         o.set_meth(true)
             .set_meth_scoring(MethScoring::Genomic)
             .set_meth_chimera_qc(true);
         assert!(o.meth());
-        assert_eq!(o.meth_scoring(), MethScoring::Genomic);
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Genomic);
         assert!(o.meth_chimera_qc());
         o.set_meth_scoring(MethScoring::Collapsed);
-        assert_eq!(o.meth_scoring(), MethScoring::Collapsed);
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
         o.set_meth(false);
         assert!(!o.meth());
     }
@@ -688,5 +720,46 @@ mod tests {
             },
         );
         assert_eq!(p.orientation(PeOrientation::Fr).low, 0);
+    }
+
+    #[test]
+    fn known_seed_order_values_convert() {
+        assert_eq!(SeedOrder::try_from(0).unwrap(), SeedOrder::Off);
+        assert_eq!(SeedOrder::try_from(4).unwrap(), SeedOrder::MostAbsorb);
+    }
+
+    #[test]
+    fn unknown_seed_order_value_is_an_error_not_off() {
+        // Upstream adding a 6th mode must not silently read back as Off.
+        let err = SeedOrder::try_from(5).unwrap_err();
+        assert!(
+            err.to_string().contains('5'),
+            "error must name the unrecognized value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn known_meth_scoring_values_convert() {
+        assert_eq!(MethScoring::try_from(0).unwrap(), MethScoring::Collapsed);
+        assert_eq!(MethScoring::try_from(1).unwrap(), MethScoring::Genomic);
+    }
+
+    #[test]
+    fn unknown_meth_scoring_value_is_an_error_not_collapsed() {
+        // bwa-mem3 v0.8.0 adds MEM_METH_SCORING_NEUTRAL = 2. Before this
+        // change it read back as Collapsed.
+        let err = MethScoring::try_from(2).unwrap_err();
+        assert!(
+            err.to_string().contains('2'),
+            "error must name the unrecognized value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn round_trip_through_the_raw_discriminant() {
+        for v in [0, 1, 2, 3, 4] {
+            let order = SeedOrder::try_from(v).unwrap();
+            assert_eq!(order as i32, v, "discriminant must round-trip");
+        }
     }
 }

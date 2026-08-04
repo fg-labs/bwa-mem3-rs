@@ -20,6 +20,14 @@ pub enum Error {
 
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
+
+    /// An option field held a value this crate does not recognize — almost
+    /// always because the vendored bwa-mem3 gained a new enum variant that the
+    /// Rust mirror in `opts.rs` has not been taught yet.
+    #[error(
+        "unrecognized {kind} value {value} from bwa-mem3 (vendored upstream added a variant?)"
+    )]
+    UnrecognizedEnum { kind: &'static str, value: i32 },
 }
 
 impl From<std::ffi::NulError> for Error {
