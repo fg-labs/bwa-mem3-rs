@@ -87,6 +87,42 @@ struct_body() {
     ' "$file"
 }
 
+# `NAME VALUE` for every MEM_F_* define in a file, sorted by name so a diff is
+# insensitive to declaration order. Sorting is safe here specifically because
+# each #define is an independent macro — unlike enum members (see
+# enum_bodies below), nothing about a flag's meaning depends on where among
+# its siblings it is declared.
+flag_defines() {
+    grep -E '^\s*#define\s+MEM_F_[A-Z0-9_]+\s+' "$1" 2>/dev/null \
+        | mawk '{ print $2, $3 }' | sort || true
+}
+
+# Every enum declaration in a header, verbatim and in source order.
+#
+# bwamem.h uses BOTH shapes: a single-line named form
+# (`enum mem_meth_scoring { A = 0, B = 1 };`) and a multi-line anonymous
+# `typedef` form (`typedef enum {\n ... \n} seed_order_t;`). Triggers on the
+# bare word `enum` (word-bounded by hand since mawk has no `\b`) and closes on
+# the first `;` seen after that — which ends a single-line enum immediately
+# and an anonymous typedef enum at its `} name;` line — without hardcoding
+# either enum's name, so a brand-new enum is picked up for free.
+#
+# Deliberately does NOT sort (contrast flag_defines above): an enum member
+# with no explicit `= N` takes its value from its position among its
+# siblings, so reordering members silently renumbers every unlabeled one
+# after the moved member — a real semantic change a sorted, order-blind diff
+# would hide. An earlier draft of this check used a `MEM_[A-Z_]+\s*=` grep,
+# which also missed seed_order_t entirely: none of its members
+# (SEED_ORDER_*) carry a MEM_ prefix, even though that enum is exactly what
+# opts.rs's SeedOrder mirrors.
+enum_bodies() {
+    mawk '
+        /(^|[^a-zA-Z_])enum([^a-zA-Z_]|$)/ { in_enum = 1 }
+        in_enum { print }
+        in_enum && /;/ { in_enum = 0 }
+    ' "$1" 2>/dev/null || true
+}
+
 # --------------------------------------------------------------------------
 # Checks
 # --------------------------------------------------------------------------
@@ -164,6 +200,102 @@ check_gitmodules() {
     printf 'Then re-run the workflow.\n'
 }
 
+# Check 3: mem_opt_t / mem_pestat_t body drift.
+#
+# Advisory only: shim/bwa_shim_layout_assert.cpp already static_asserts every
+# field offset against upstream, so real drift fails `cargo build` with a
+# precise message. This just names the fields up front so the human knows what
+# they are walking into.
+check_structs() {
+    report_section "3. \`mem_opt_t\` / \`mem_pestat_t\` layout"
+    local old new o n s
+    old="$(mktemp)"; new="$(mktemp)"
+    old_file "$VENDOR/src/bwamem.h" > "$old"
+    new_file "$VENDOR/src/bwamem.h" > "$new"
+    local any=0
+    for s in mem_opt_t mem_pestat_t; do
+        o="$(mktemp)"; n="$(mktemp)"
+        struct_body "$old" "$s" > "$o"
+        struct_body "$new" "$s" > "$n"
+        if ! diff -q "$o" "$n" >/dev/null; then
+            any=1
+            # Backticks below are literal markdown, not command substitution.
+            # shellcheck disable=SC2016
+            printf '### `%s` changed\n\n```diff\n' "$s"
+            diff -u "$o" "$n" | tail -n +3 || true
+            printf '```\n\n'
+        fi
+        rm -f "$o" "$n"
+    done
+    rm -f "$old" "$new"
+    if [ "$any" -eq 0 ]; then
+        printf 'No change.\n'
+    else
+        # shellcheck disable=SC2016
+        printf 'Update `bwa-mem3-sys/shim/bwa_shim_types.h` and the field list\n'
+        # shellcheck disable=SC2016
+        printf 'in `shim/bwa_shim_layout_assert.cpp` to match. The layout\n'
+        printf 'assertions will fail the build until you do — that is the real\n'
+        printf 'guard; this section is just the heads-up (gotcha #2).\n'
+    fi
+}
+
+# Check 4: flag and enum SET drift.
+#
+# Per-flag static_asserts cannot see a flag that does not yet exist, and
+# bindgen's allowlist_var("MEM_F_.*") reads our POD copy rather than upstream,
+# so a NEW upstream flag is invisible to both. This covers that direction, and
+# the same argument applies to enum values: opts.rs mirrors them by hand.
+check_flags_and_enums() {
+    report_section "4. \`MEM_F_*\` flags and \`bwamem.h\` enums"
+    local old new o n
+    old="$(mktemp)"; new="$(mktemp)"
+    old_file "$VENDOR/src/bwamem.h" > "$old"
+    new_file "$VENDOR/src/bwamem.h" > "$new"
+
+    o="$(mktemp)"; n="$(mktemp)"
+    flag_defines "$old" > "$o"
+    flag_defines "$new" > "$n"
+    if diff -q "$o" "$n" >/dev/null; then
+        printf 'Flag set unchanged.\n\n'
+    else
+        # Backticks below are literal markdown, not command substitution.
+        # shellcheck disable=SC2016
+        printf '### `MEM_F_*` set changed\n\n```diff\n'
+        diff -u "$o" "$n" | tail -n +3 || true
+        printf '```\n\n'
+        # shellcheck disable=SC2016
+        printf 'Update all THREE mirrors: `shim/bwa_shim_types.h`,\n'
+        # shellcheck disable=SC2016
+        printf '`shim/bwamem_flags_reinclude.h`, and the `BWA_SHIM_CK_FLAG`\n'
+        # shellcheck disable=SC2016
+        printf 'list in `shim/bwa_shim_layout_assert.cpp`. A renumbered flag\n'
+        printf 'fails the build; a NEW flag does not, and also never reaches\n'
+        printf 'Rust because bindgen reads the POD copy.\n\n'
+    fi
+    rm -f "$o" "$n"
+
+    o="$(mktemp)"; n="$(mktemp)"
+    enum_bodies "$old" > "$o"
+    enum_bodies "$new" > "$n"
+    if diff -q "$o" "$n" >/dev/null; then
+        printf 'Enum values unchanged.\n'
+    else
+        printf '### Enum values changed\n\n```diff\n'
+        diff -u "$o" "$n" | tail -n +3 || true
+        printf '```\n\n'
+        # shellcheck disable=SC2016
+        printf 'Check the hand-written mirrors in `bwa-mem3-rs/src/opts.rs`\n'
+        # shellcheck disable=SC2016
+        printf '(`SeedOrder`, `MethScoring`). Their `TryFrom<i32>` returns\n'
+        # shellcheck disable=SC2016
+        printf '`Error::UnrecognizedEnum` for an unknown value, so a new\n'
+        printf 'variant surfaces at runtime rather than mis-mapping — but the\n'
+        printf 'mirror still needs teaching, and any new enum needs one too.\n'
+    fi
+    rm -f "$o" "$n" "$old" "$new"
+}
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -203,6 +335,8 @@ main() {
     printf '# bwa-mem3 vendor refresh — drift report\n'
     check_gitmodules
     check_build
+    check_structs
+    check_flags_and_enums
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

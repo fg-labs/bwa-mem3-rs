@@ -135,5 +135,70 @@ contains "extra dirty file: names the offending path" "$err" "Cargo.toml"
 
 unset -f git
 
+# --- flag_defines: extracts MEM_F_* name/value pairs ---
+cat > "$tmp/flags.h" <<'EOF'
+/* MEM_F_* flag bits (from bwamem.h). */
+#define MEM_F_PE             0x2
+#define MEM_F_NOPAIRING      0x4
+#define SOMETHING_ELSE       0x8
+EOF
+out="$(flag_defines "$tmp/flags.h")"
+check "flag_defines extracts pairs" "MEM_F_NOPAIRING 0x4
+MEM_F_PE 0x2" "$out"
+absent "flag_defines ignores unrelated defines" "$out" "SOMETHING_ELSE"
+
+# --- enum_bodies: extracts full enum declarations, single- and multi-line ---
+# Modeled on bwamem.h's actual two enum shapes: a single-line named `enum
+# mem_meth_scoring { ... };` and a multi-line anonymous `typedef enum { ... }
+# seed_order_t;`. A grep keyed on a `MEM_` prefix (an earlier draft of this
+# check) would silently miss seed_order_t entirely — none of its members
+# (SEED_ORDER_*) start with MEM_ — which is exactly the enum opts.rs's
+# SeedOrder mirrors, so that gap would defeat the check's own stated purpose.
+cat > "$tmp/mixed.h" <<'EOF'
+typedef struct mem_opt_t {
+    int a;
+} mem_opt_t;
+
+enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1 };
+
+typedef enum {
+    SEED_ORDER_OFF = 0,
+    SEED_ORDER_GLOBAL_LONGEST
+} seed_order_t;
+
+typedef struct {
+    int low;
+} mem_pestat_t;
+EOF
+out="$(enum_bodies "$tmp/mixed.h")"
+contains "enum_bodies finds the single-line named enum" "$out" "MEM_METH_SCORING_GENOMIC"
+contains "enum_bodies finds the multi-line anonymous typedef enum" "$out" "SEED_ORDER_GLOBAL_LONGEST"
+contains "enum_bodies finds the multi-line enum's typedef name" "$out" "seed_order_t"
+absent "enum_bodies does not leak a preceding struct's fields" "$out" "int a;"
+absent "enum_bodies does not leak a following struct's fields" "$out" "int low;"
+
+# --- enum_bodies: member ORDER is preserved, not sorted ---
+# Enum members without an explicit `= N` take their value from position, so
+# unlike flag_defines (independent #define macros — order-insensitive by
+# construction), sorting an enum's member lines would hide a reorder that
+# silently renumbers every unlabeled member after it. Two files with the same
+# two members in opposite order must come back as two DIFFERENT exact strings.
+cat > "$tmp/enumA.h" <<'EOF'
+typedef enum {
+    SEED_ORDER_OFF = 0,
+    SEED_ORDER_GLOBAL_LONGEST = 1
+} seed_order_t;
+EOF
+cat > "$tmp/enumB.h" <<'EOF'
+typedef enum {
+    SEED_ORDER_GLOBAL_LONGEST = 1,
+    SEED_ORDER_OFF = 0
+} seed_order_t;
+EOF
+out="$(enum_bodies "$tmp/enumA.h")"
+check "enum_bodies output A keeps source order" "$(printf 'typedef enum {\n    SEED_ORDER_OFF = 0,\n    SEED_ORDER_GLOBAL_LONGEST = 1\n} seed_order_t;')" "$out"
+out="$(enum_bodies "$tmp/enumB.h")"
+check "enum_bodies output B keeps source order (reordered vs A)" "$(printf 'typedef enum {\n    SEED_ORDER_GLOBAL_LONGEST = 1,\n    SEED_ORDER_OFF = 0\n} seed_order_t;')" "$out"
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
