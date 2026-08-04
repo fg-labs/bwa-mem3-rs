@@ -43,11 +43,38 @@ new_file() {
     cat "$REPO_ROOT/$1" 2>/dev/null || true
 }
 
-# Submodule paths present in the new .gitmodules but not the old one.
+# The pruned-subtree paths from scripts/vendor-drop-subtrees.txt, one per
+# line, parsed exactly the way refresh-bwa-mem3.sh parses the same file
+# (strip a trailing comment, strip all whitespace, drop empty lines) so the
+# two scripts cannot disagree about what "already pruned" means. Deliberately
+# not a second hardcoded copy of the list — see the file's own header comment
+# on why. Fails loudly (not silently) if the file is missing: a missing list
+# here would silently un-gate every future submodule addition rather than
+# just failing the refresh, which is the opposite of what this gate is for.
+drop_subtrees() {
+    local list="$REPO_ROOT/scripts/vendor-drop-subtrees.txt"
+    [ -f "$list" ] || { echo "ERROR: missing $list" >&2; exit 1; }
+    local line
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        line="$(printf '%s' "$line" | tr -d '[:space:]')"
+        [ -n "$line" ] && printf '%s\n' "$line"
+    done < "$list"
+}
+
+# Submodule paths present in the new .gitmodules but not the old one, MINUS
+# anything scripts/vendor-drop-subtrees.txt already prunes.
 #
 # A new submodule means refresh-bwa-mem3.sh could not know to prune it, so the
 # clone kept it and a commit would carry its whole source tree. The caller uses
 # this to gate PR creation.
+#
+# The MINUS half exists because refresh-bwa-mem3.sh prunes the pruned
+# submodule's *subtree* but leaves .gitmodules itself fully tracked (it never
+# edits it) — so a submodule that is already on the drop list still shows up
+# as "new" here on every single future refresh, forever. Without this filter
+# the documented remedy ("add it to vendor-drop-subtrees.txt and re-dispatch")
+# would have zero effect: the gate would still fire on the very next run.
 #
 # Extracts the path value directly with grep -oE rather than trimming
 # whitespace afterward with `tr -d '[:space:]'`: that would delete the
@@ -57,10 +84,13 @@ new_file() {
 # (macOS) does not expand and silently leaves as a literal "s".
 gitmodules_new_submodules() {
     local old="$1" new="$2"
-    local old_paths new_paths
+    local old_paths new_paths added dropped
     old_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$old" 2>/dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
     new_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$new" 2>/dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
-    comm -13 <(printf '%s\n' "$old_paths") <(printf '%s\n' "$new_paths") | grep -v '^$' || true
+    added="$(comm -13 <(printf '%s\n' "$old_paths") <(printf '%s\n' "$new_paths") | grep -v '^$' || true)"
+    [ -n "$added" ] || return 0
+    dropped="$(drop_subtrees | sort -u)"
+    comm -23 <(printf '%s\n' "$added" | sort -u) <(printf '%s\n' "$dropped") | grep -v '^$' || true
 }
 
 # The body of a C struct typedef, handling BOTH shapes upstream uses:

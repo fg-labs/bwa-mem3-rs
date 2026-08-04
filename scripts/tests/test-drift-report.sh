@@ -52,6 +52,103 @@ printf '[submodule "ext/a"]\n\tpath = ext/a\n[submodule "ext/c"]\n\tpath = ext/c
 out="$(gitmodules_new_submodules "$tmp/old2" "$tmp/new2")"
 check "two new submodules detected, not glued into one token" "$(printf 'ext/c\next/d')" "$out"
 
+# --------------------------------------------------------------------------
+# check_gitmodules / gitmodules_new_submodules: the NEW_SUBMODULE gate must
+# be filterable through scripts/vendor-drop-subtrees.txt (I-2).
+#
+# refresh-bwa-mem3.sh prunes a dropped submodule's SUBTREE but never edits
+# .gitmodules itself (it is never told to), so a path already on the drop
+# list still shows up as "added" on every future refresh unless
+# gitmodules_new_submodules filters it back out. Without the filter, the
+# documented remedy ("add it to vendor-drop-subtrees.txt and re-dispatch")
+# has zero effect: the gate fires again on the very next run, forever.
+#
+# A stubbed `git` (same technique as the assert_refreshed_tree tests above)
+# stands in for `git show HEAD:...` so this needs no real git repo.
+# REPO_ROOT/VENDOR/VENDOR_ABS are pointed at a scratch dir so nothing here
+# touches the real bwa-mem3-sys/vendor tree; restored afterward.
+# --------------------------------------------------------------------------
+gm_scratch="$tmp/gitmodules-fixture"
+mkdir -p "$gm_scratch/bwa-mem3-sys/vendor/bwa-mem3" "$gm_scratch/scripts"
+printf '# fixture prune list\next/htslib\next/mimalloc\n' > "$gm_scratch/scripts/vendor-drop-subtrees.txt"
+
+save_repo_root="$REPO_ROOT"; save_vendor="$VENDOR"; save_vendor_abs="$VENDOR_ABS"
+REPO_ROOT="$gm_scratch"
+VENDOR="bwa-mem3-sys/vendor/bwa-mem3"
+VENDOR_ABS="$REPO_ROOT/$VENDOR"
+
+STUB_GITMODULES_OLD='[submodule "ext/kept"]
+	path = ext/kept
+'
+# Invoked indirectly by old_file (called from check_gitmodules), which lives
+# in the sourced script — invisible to shellcheck here, same as the
+# assert_refreshed_tree stub above. Loops over "$@" rather than assuming
+# positional args, because the real call is `git -C "$REPO_ROOT" show
+# "HEAD:$path"` — "show" is $3, not $1.
+# shellcheck disable=SC2329
+git() {
+    local arg
+    for arg in "$@"; do
+        if [ "$arg" = "HEAD:$VENDOR/.gitmodules" ]; then
+            printf '%s' "$STUB_GITMODULES_OLD"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# (A) a path ALREADY on the drop list must NOT trip the gate.
+cat > "$VENDOR_ABS/.gitmodules" <<'EOF'
+[submodule "ext/kept"]
+	path = ext/kept
+[submodule "ext/htslib"]
+	path = ext/htslib
+EOF
+out="$(check_gitmodules)"
+absent "I-2: a newly-added submodule already on the drop list does not trip NEW_SUBMODULE" "$out" "NEW_SUBMODULE"
+contains "I-2: ...and check_gitmodules reports no new submodules instead" "$out" "No new submodules."
+
+# MUTATION (expected red): reproduce the ORIGINAL gitmodules_new_submodules
+# (no filtering through vendor-drop-subtrees.txt at all) against the exact
+# same old/new .gitmodules from case (A), and confirm it WOULD wrongly report
+# ext/htslib as new. This is the real bug I-2 fixes: without the filter, the
+# gate could never be cleared, because refresh-bwa-mem3.sh leaves .gitmodules
+# fully tracked even after pruning the submodule's subtree.
+gitmodules_new_submodules_unfiltered_buggy() {
+    local old="$1" new="$2"
+    local old_paths new_paths
+    old_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$old" 2>/dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
+    new_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$new" 2>/dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
+    comm -13 <(printf '%s\n' "$old_paths") <(printf '%s\n' "$new_paths") | grep -v '^$' || true
+}
+printf '%s' "$STUB_GITMODULES_OLD" > "$tmp/gm-old-a"
+out_unfixed="$(gitmodules_new_submodules_unfiltered_buggy "$tmp/gm-old-a" "$VENDOR_ABS/.gitmodules")"
+contains "MUTATION (expected red): the ORIGINAL unfiltered helper wrongly reports an already-pruned submodule as new" "$out_unfixed" "ext/htslib"
+
+# (B) a path NOT on the drop list must still trip the gate.
+cat > "$VENDOR_ABS/.gitmodules" <<'EOF'
+[submodule "ext/kept"]
+	path = ext/kept
+[submodule "ext/newthing"]
+	path = ext/newthing
+EOF
+out="$(check_gitmodules)"
+contains "I-2: a newly-added submodule NOT on the drop list still trips NEW_SUBMODULE" "$out" "NEW_SUBMODULE"
+contains "I-2: ...and names the offending path" "$out" "ext/newthing"
+
+# MUTATION (expected red): an over-eager "fix" that suppresses EVERY added
+# submodule (not just ones actually on the drop list) would also pass case
+# (A) above, but must fail case (B) — confirming the shipped filter actually
+# discriminates by path rather than just blanket-silencing the gate.
+gitmodules_new_submodules_overfiltered_buggy() {
+    return 0
+}
+out_overfiltered="$(gitmodules_new_submodules_overfiltered_buggy "$tmp/gm-old-a" "$VENDOR_ABS/.gitmodules")"
+check "MUTATION (expected red): a blanket-empty filter would ALSO silence the NOT-pruned case, unlike the real fix (see case B above)" "" "$out_overfiltered"
+
+unset -f git
+REPO_ROOT="$save_repo_root"; VENDOR="$save_vendor"; VENDOR_ABS="$save_vendor_abs"
+
 # --- struct_body: anonymous typedef must extract (mem_pestat_t's shape) ---
 cat > "$tmp/hdr.h" <<'EOF'
 typedef struct mem_opt_t {
