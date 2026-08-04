@@ -104,7 +104,14 @@ check_build() {
     else
         printf 'Build FAILED (exit %s). These errors are the worklist:\n\n' "$status"
         printf '```\n'
-        grep -E '^(error|warning: unused|  -->)' "$log" | head -40 || tail -40 "$log"
+        # `: error:` (unanchored) alongside the anchored `^error`: cargo's own
+        # "failed to run custom build command" wrapper matches ^error, but the
+        # actual C/C++ diagnostic that matters after a vendor refresh is a
+        # couple of lines further down, indented under "--- stderr" as
+        # `file:line:col: error: ...` — clang/g++'s mid-line form, which
+        # ^error alone would never match, silently hiding the one line a
+        # human needs behind the useless wrapper.
+        grep -E '(^error|: error:|^warning: unused|  -->)' "$log" | head -40 || tail -40 "$log"
         printf '```\n\n'
         printf 'Full log is in the workflow run artifacts.\n'
     fi
@@ -126,7 +133,13 @@ check_gitmodules() {
         printf 'No new submodules.\n'
         return 0
     fi
-    # First line is the machine-readable marker the workflow greps for.
+    # NEW_SUBMODULE is the machine-readable marker the workflow greps for to
+    # gate PR creation. It is NOT the first line of the report or even of
+    # this check's own output — report_section above already emitted the
+    # "## 2. Submodules" heading. Consumers must match it anchored against
+    # the whole report (`grep -qE '^NEW_SUBMODULE$'`), never by position
+    # (e.g. `head -1`), since a bare-line anchor can't collide with prose or
+    # pasted compiler output and doesn't break if a check is inserted earlier.
     printf 'NEW_SUBMODULE\n\n'
     printf 'Upstream added submodule(s) this refresh could not know to prune:\n\n'
     # Backticks below are literal markdown code-formatting, not command
@@ -168,7 +181,11 @@ assert_refreshed_tree() {
         echo "       BEFORE committing (the 'before' side is git HEAD)." >&2
         return 1
     fi
-    other_dirty="$(git -C "$REPO_ROOT" status --porcelain | grep -v 'bwa-mem3-sys/vendor/' | head -1)"
+    # `|| true`: grep -v exits 1 when EVERY line is filtered out, which is
+    # exactly the success case (only bwa-mem3-sys/vendor/ is dirty) — under
+    # `pipefail` that would otherwise abort the whole script via `set -e`
+    # before the `[ -n "$other_dirty" ]` check below ever runs.
+    other_dirty="$(git -C "$REPO_ROOT" status --porcelain | grep -v 'bwa-mem3-sys/vendor/' | head -1 || true)"
     if [ -n "$other_dirty" ]; then
         echo "ERROR: files outside bwa-mem3-sys/vendor/ are dirty: $other_dirty" >&2
         echo "       Commit or stash them so the report reflects the refresh alone." >&2
