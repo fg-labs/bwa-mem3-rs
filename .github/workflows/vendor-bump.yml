@@ -328,6 +328,34 @@ jobs:
             /tmp/refresh.log
           if-no-files-found: warn
 
+      # GitHub caps issue and PR bodies at 65536 characters; exceeding it
+      # fails the create call outright (no PR on the gated/failed-refresh
+      # path, an orphaned issue on the normal path). #5 (up to ten tracked
+      # function diffs) plus #10 (per-tag release notes) can plausibly push a
+      # two-release bump over that on their own. Cap well below the limit
+      # (not right up against it) to leave headroom for the PR body's own
+      # preamble text (title recap, tracking-issue link, pushed-sha marker),
+      # which is appended AFTER this file's content in "Commit, push, and
+      # open the draft PR" below. The artifact uploaded above already has
+      # the untruncated report, so this is a truncate-with-a-pointer, not a
+      # loss of information.
+      - name: Cap the report to GitHub's body-size limit
+        if: steps.detect.outputs.needs_bump == 'true' && steps.existing.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          body_limit=60000
+          if [ "$(wc -c < /tmp/report.md)" -gt "$body_limit" ]; then
+            head -c "$body_limit" /tmp/report.md > /tmp/report-body.md
+            {
+              printf '\n\n...\n\n'
+              printf '**Report truncated at %d characters** — GitHub caps issue/PR ' "$body_limit"
+              printf 'bodies at 65536. The full report is in the "drift-report" artifact '
+              printf 'for this workflow run (see the "Upload the report and logs" step above).\n'
+            } >> /tmp/report-body.md
+          else
+            cp /tmp/report.md /tmp/report-body.md
+          fi
+
       # Runs for BOTH safety-valve cases (a failed refresh, and a
       # NEW_SUBMODULE gate) as well as the normal path: those two cases are
       # documented in CONTRIBUTING.md as "produce an issue but no PR", so
@@ -344,7 +372,7 @@ jobs:
         run: |
           set -euo pipefail
           title="${{ steps.existing.outputs.title }}"
-          url="$(gh issue create --title "$title" --body-file /tmp/report.md)"
+          url="$(gh issue create --title "$title" --body-file /tmp/report-body.md)"
           num="$(printf '%s' "$url" | grep -oE '[0-9]+$')"
           echo "number=$num" >> "$GITHUB_OUTPUT"
 
@@ -400,7 +428,7 @@ jobs:
             echo
             echo "<!-- vendor-bump:pushed-sha=$pushed -->"
             echo
-            cat /tmp/report.md
+            cat /tmp/report-body.md
           } > /tmp/pr-body.md
 
           gh pr create --draft --title "chore(vendor): refresh bwa-mem3 to $tag" \
