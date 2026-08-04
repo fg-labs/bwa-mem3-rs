@@ -79,6 +79,12 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
 
+      # `mawk`, `jq`, `gh`, and `comm` (coreutils) are not listed here: `gh`
+      # and `jq` ship preinstalled on GitHub-hosted runners, `comm` is part
+      # of coreutils, and `mawk` -- which the drift report invokes directly,
+      # not via `awk` -- is Ubuntu/Debian's default `awk` provider and is
+      # present on a bare `ubuntu:24.04` image with no extra install
+      # (verified separately); `ubuntu-latest` carries it too.
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev rsync
 
