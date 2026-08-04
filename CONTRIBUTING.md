@@ -132,7 +132,11 @@ to open (e.g. a permissions gap on the bot's GitHub App), the run ends there —
 no branch is pushed and no PR is opened, so a broken issue never leaves an
 orphaned PR behind.
 
-The two scripts run locally too, and need authenticated `gh` plus `jq`:
+These scripts run locally too, and need authenticated `gh` plus `jq`,
+`mawk`, `rsync`, and `comm` (the last is part of coreutils on every platform
+this project supports, so it needs no separate install). `mawk` ships as
+Ubuntu/Debian's default `awk` provider but is not preinstalled on macOS;
+install it there via `brew install mawk`.
 
 ```bash
 scripts/bwa-mem3-latest-release.sh              # what is new upstream?
