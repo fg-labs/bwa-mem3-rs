@@ -23,7 +23,11 @@
 set -euo pipefail
 
 UPSTREAM_REPO="fg-labs/bwa-mem3"
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# BASH_SOURCE, not $0: when the test suite `source`s this file, $0 stays the
+# *sourcing* script's path (scripts/tests/test-latest-release.sh), which would
+# resolve REPO_ROOT one directory too shallow and point COMMIT_FILE/VERSION_TXT
+# at paths that don't exist.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMMIT_FILE="$REPO_ROOT/bwa-mem3-sys/vendor/COMMIT"
 VERSION_TXT="$REPO_ROOT/bwa-mem3-sys/vendor/bwa-mem3/version.txt"
 
@@ -59,13 +63,33 @@ version_gt() {
 # Never uses a release's target_commitish: upstream's v0.2.0 reports "main",
 # and a mutable ref in vendor/COMMIT would make the snapshot
 # non-reproducible (check.yml uses that value as a fetch refspec).
+#
+# Returns non-zero on ANY failure — a failed `gh api` call (network blip, rate
+# limit) as well as a malformed response — and always prints an ERROR to
+# stderr first. `gh`'s own stderr is left unredirected (not merged into the
+# captured stdout) so a transport failure's diagnostic still surfaces without
+# risking corrupting the JSON we feed to jq on an otherwise-successful call.
+#
+# Callers (vendored_version's reverse-lookup loop) must treat a non-zero
+# return as "could not determine," never as "did not match": those are
+# different facts, and collapsing them is exactly what misreports a
+# transient API failure as an upstream retag.
 resolve_tag_sha() {
-    local tag="$1" json type sha
-    json="$(gh api "repos/$UPSTREAM_REPO/git/ref/tags/$tag")"
+    local tag="$1" json type sha rc=0
+    json="$(gh api "repos/$UPSTREAM_REPO/git/ref/tags/$tag")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "ERROR: gh api call failed resolving tag $tag (exit $rc)" >&2
+        return 1
+    fi
     type="$(printf '%s' "$json" | jq -r '.object.type')"
     sha="$(printf '%s' "$json" | jq -r '.object.sha')"
     if [ "$type" = "tag" ]; then
-        sha="$(gh api "repos/$UPSTREAM_REPO/git/tags/$sha" --jq '.object.sha')"
+        rc=0
+        sha="$(gh api "repos/$UPSTREAM_REPO/git/tags/$sha" --jq '.object.sha')" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "ERROR: gh api call failed dereferencing annotated tag $tag (exit $rc)" >&2
+            return 1
+        fi
     fi
     if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
         echo "ERROR: tag $tag did not resolve to a 40-hex sha (got '$sha')" >&2
@@ -87,9 +111,16 @@ release_tags() {
 # Reverse-looks-up vendor/COMMIT in the release list rather than trusting a
 # marker file (vendor/bwa-mem3/version.txt): that also catches an upstream
 # RETAG, where version.txt still says 0.6.0 but v0.6.0 now points somewhere
-# else. Prints nothing (and returns non-zero) if no release tag matches.
+# else. Prints nothing on failure; the exit code tells callers which failure:
+#   0  matched — the tag is printed
+#   1  every tag resolved successfully but none matched (genuine retag/absence)
+#   2  resolve_tag_sha failed for some tag before a match was confirmed —
+#      indeterminate, NOT evidence of a retag. A failed lookup for the
+#      matching tag is indistinguishable from "this tag doesn't match" unless
+#      we check resolve_tag_sha's own exit status rather than just comparing
+#      its (possibly empty, on failure) output.
 vendored_version() {
-    local tags="${1:-}" current_sha t
+    local tags="${1:-}" current_sha t resolved rc
     [ -f "$COMMIT_FILE" ] || { echo "ERROR: missing $COMMIT_FILE" >&2; return 1; }
     current_sha="$(tr -d '[:space:]' < "$COMMIT_FILE")"
 
@@ -97,7 +128,13 @@ vendored_version() {
     [ -n "$tags" ] || { echo "ERROR: no releases found for $UPSTREAM_REPO" >&2; return 1; }
 
     while IFS= read -r t; do
-        if [ "$(resolve_tag_sha "$t")" = "$current_sha" ]; then
+        rc=0
+        resolved="$(resolve_tag_sha "$t")" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "ERROR: could not resolve tag $t while checking vendor/COMMIT; giving up rather than risk a false retag report." >&2
+            return 2
+        fi
+        if [ "$resolved" = "$current_sha" ]; then
             printf '%s' "$t"
             return 0
         fi
@@ -125,8 +162,18 @@ main() {
     # Reverse-look-up vendor/COMMIT in the release list. Stronger than reading
     # a version marker out of the tree: it also catches an upstream RETAG,
     # where version.txt still says 0.6.0 but v0.6.0 now points somewhere else.
-    local current_version=""
-    if ! current_version="$(vendored_version "$tags")"; then
+    local current_version="" vendored_rc=0
+    current_version="$(vendored_version "$tags")" || vendored_rc=$?
+    if [ "$vendored_rc" -eq 2 ]; then
+        # An API/transport failure part-way through the lookup — NOT evidence
+        # of a retag. Reporting this as "matches no release tag" would send a
+        # nightly run's reader chasing a retag that never happened; the fix is
+        # to retry, not to bump.
+        echo "ERROR: GitHub API call failed while checking vendor/COMMIT against release tags." >&2
+        echo "       This is a transport/API failure, not evidence that upstream retagged" >&2
+        echo "       or deleted a release. Retry." >&2
+        exit 1
+    elif [ "$vendored_rc" -ne 0 ]; then
         local marker="unknown"
         [ -f "$VERSION_TXT" ] && marker="$(tr -d '[:space:]' < "$VERSION_TXT")"
         echo "ERROR: vendor/COMMIT ($current_sha) matches no release tag." >&2
