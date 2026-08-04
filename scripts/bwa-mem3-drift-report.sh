@@ -241,9 +241,9 @@ format_build_failure() {
     printf 'Full log is in the workflow run artifacts.\n'
 }
 
-# Check 1 (primary): does the refreshed tree still build?
+# Check 2 (primary): does the refreshed tree still build?
 check_build() {
-    report_section "1. Build (\`cargo ci-build\`)"
+    report_section "2. Build (\`cargo ci-build\`)"
     local log status
     log="$(mktemp)"
     status=0
@@ -257,7 +257,7 @@ check_build() {
     rm -f "$log"
 }
 
-# Check 2 (hard gate): a new submodule makes a refresh commit wrong.
+# Check 1 (hard gate): a new submodule makes a refresh commit wrong.
 check_gitmodules() {
     local old new
     old="$(mktemp)"; new="$(mktemp)"
@@ -267,7 +267,7 @@ check_gitmodules() {
     added="$(gitmodules_new_submodules "$old" "$new")"
     rm -f "$old" "$new"
 
-    report_section "2. Submodules (\`.gitmodules\`)"
+    report_section "1. Submodules (\`.gitmodules\`)"
     if [ -z "$added" ]; then
         printf 'No new submodules.\n'
         return 0
@@ -275,7 +275,7 @@ check_gitmodules() {
     # NEW_SUBMODULE is the machine-readable marker the workflow greps for to
     # gate PR creation. It is NOT the first line of the report or even of
     # this check's own output — report_section above already emitted the
-    # "## 2. Submodules" heading. Consumers must match it anchored against
+    # "## 1. Submodules" heading. Consumers must match it anchored against
     # the whole report (`grep -qE '^NEW_SUBMODULE$'`), never by position
     # (e.g. `head -1`), since a bare-line anchor can't collide with prose or
     # pasted compiler output and doesn't break if a check is inserted earlier.
@@ -776,19 +776,91 @@ assert_refreshed_tree() {
     return 0
 }
 
+# A ~5-line lede printed before the numbered sections, so a human opening a
+# two-release bump (potentially thousands of lines once #5's function diffs
+# and #10's release notes stack up) gets the verdict first instead of having
+# to read linearly to find it. Takes each check's ALREADY-CAPTURED output as
+# an argument (main buffers every check before printing anything, precisely
+# so this can exist) rather than re-running any check a second time.
+#
+# Detection is by grepping for the literal "nothing changed" sentence each
+# check prints on its own no-drift path — e.g. check_structs's "No change."
+# — rather than adding a second reporting channel (return codes, globals) to
+# every check function just for this. That keeps the checks themselves as the
+# single source of truth for their own text; this function only reads it.
+print_summary() {
+    local gitmodules_out="$1" build_out="$2" structs_out="$3" flags_out="$4" \
+        contracts_out="$5" inventory_out="$6" deps_out="$7" newopts_out="$8" \
+        licences_out="$9"
+
+    local gate="not tripped" build_status="passed"
+    grep -q '^NEW_SUBMODULE$' <<< "$gitmodules_out" && gate="**TRIPPED** — no PR will be opened"
+    grep -q '^Builds clean\.' <<< "$build_out" || build_status="**FAILED**"
+
+    local drifted=()
+    grep -qF 'No change.' <<< "$structs_out" || drifted+=("struct layout (§3)")
+    grep -q '^### ' <<< "$flags_out" && drifted+=("flags/enums (§4)")
+    grep -qF 'No change to any tracked contract.' <<< "$contracts_out" || drifted+=("upstream contracts (§5)")
+    { grep -qF 'GONE' <<< "$inventory_out" || ! grep -qF 'No TUs added or removed.' <<< "$inventory_out"; } \
+        && drifted+=("source inventory (§6)")
+    # Backticks below are literal markdown, not command substitution.
+    # shellcheck disable=SC2016
+    grep -qF 'No change to `LIBS`' <<< "$deps_out" || drifted+=("build deps (§7)")
+    grep -qF 'No new fields.' <<< "$newopts_out" || drifted+=("new mem_opt_t fields (§8)")
+    grep -qE 'CHANGED|MISSING' <<< "$licences_out" && drifted+=("licences (§9)")
+
+    report_section "Summary"
+    # shellcheck disable=SC2016
+    printf -- '- Gate (`NEW_SUBMODULE`): %s\n' "$gate"
+    # shellcheck disable=SC2016
+    printf -- '- Build (`cargo ci-build`): %s\n' "$build_status"
+    if [ "${#drifted[@]}" -eq 0 ]; then
+        printf -- '- Drift: none of §3–§9 report a change.\n'
+    else
+        local joined
+        joined="$(printf '%s, ' "${drifted[@]}")"
+        joined="${joined%, }"
+        printf -- '- Drift (%d/7): %s.\n' "${#drifted[@]}" "$joined"
+    fi
+    printf -- "- Green CI is **not sufficient** — §11's manual checklist is not run by CI\n"
+    printf '  and sits last, after potentially thousands of diff lines below; do not skip it.\n'
+}
+
 main() {
     assert_refreshed_tree
+
+    # Every check runs and is captured BEFORE anything is printed, so
+    # print_summary (above) can report on all of them without re-running any
+    # check a second time. Capturing via command substitution is safe here:
+    # every check function's last statement exits 0 on its own (verified
+    # against each one), so a captured assignment cannot trip `set -e`
+    # spuriously the way an un-guarded `diff`/`grep` mid-function could.
+    local gitmodules_out build_out structs_out flags_out contracts_out
+    local inventory_out deps_out newopts_out licences_out release_out
+    gitmodules_out="$(check_gitmodules)"
+    build_out="$(check_build)"
+    structs_out="$(check_structs)"
+    flags_out="$(check_flags_and_enums)"
+    contracts_out="$(check_call_site_contracts)"
+    inventory_out="$(check_source_inventory)"
+    deps_out="$(check_dependencies)"
+    newopts_out="$(check_new_opts)"
+    licences_out="$(check_licences)"
+    release_out="$(check_release_notes)"
+
     printf '# bwa-mem3 vendor refresh — drift report\n'
-    check_gitmodules
-    check_build
-    check_structs
-    check_flags_and_enums
-    check_call_site_contracts
-    check_source_inventory
-    check_dependencies
-    check_new_opts
-    check_licences
-    check_release_notes
+    print_summary "$gitmodules_out" "$build_out" "$structs_out" "$flags_out" \
+        "$contracts_out" "$inventory_out" "$deps_out" "$newopts_out" "$licences_out"
+    printf '%s\n' "$gitmodules_out"
+    printf '%s\n' "$build_out"
+    printf '%s\n' "$structs_out"
+    printf '%s\n' "$flags_out"
+    printf '%s\n' "$contracts_out"
+    printf '%s\n' "$inventory_out"
+    printf '%s\n' "$deps_out"
+    printf '%s\n' "$newopts_out"
+    printf '%s\n' "$licences_out"
+    printf '%s\n' "$release_out"
     print_manual_checklist
 }
 
