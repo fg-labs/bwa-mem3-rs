@@ -108,11 +108,18 @@ jobs:
         id: detect
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Interpolated into a variable rather than the `run:` script text
+          # directly: an `${{ inputs.tag }}` expression pasted verbatim into
+          # the shell is attacker-controlled text splicing into a script,
+          # not a quoted value. Only repo-write users can dispatch this
+          # workflow (low impact here), but `env:` + `"$TAG"` is the correct
+          # pattern regardless.
+          TAG: ${{ inputs.tag }}
         run: |
           set -uo pipefail
           args=()
-          if [ -n "${{ inputs.tag }}" ]; then
-            args+=(--tag "${{ inputs.tag }}")
+          if [ -n "$TAG" ]; then
+            args+=(--tag "$TAG")
           fi
           scripts/bwa-mem3-latest-release.sh "${args[@]}" 2> /tmp/detect.stderr
           rc=$?
