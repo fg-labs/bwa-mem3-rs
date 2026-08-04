@@ -8,24 +8,41 @@
 set -euo pipefail
 HASH="${1:?usage: refresh-bwa-mem3.sh <commit-hash> [source-path]}"
 SRC="${2:-}"
+
+# A release's target_commitish is not necessarily a commit sha — upstream's
+# v0.2.0 release reports "main". Writing that into vendor/COMMIT would give a
+# mutable, non-reproducible marker, and check.yml uses that value as a fetch
+# refspec, so the e2e job would build a different upstream than we vendor.
+case "$HASH" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+        if [ "${#HASH}" -ne 40 ] || [ -n "$(printf '%s' "$HASH" | tr -d '0-9a-f')" ]; then
+            echo "ERROR: HASH must be a full 40-hex commit sha, got: $HASH" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "ERROR: HASH must be a full 40-hex commit sha, got: $HASH" >&2
+        exit 1
+        ;;
+esac
+
 REPO_URL="https://github.com/fg-labs/bwa-mem3.git"
 DST="bwa-mem3-sys/vendor/bwa-mem3"
 
 rm -rf "$DST"
 mkdir -p "$(dirname "$DST")"
 
-# Vendor-only subtrees: dropped to keep the snapshot small. We don't compile
-# the upstream CLI's BAM writer (htslib), the index builder (libsais), the
-# allocator override (mimalloc), the unit-test harness (doctest), benches,
-# CI configs, or upstream's docs/scripts. Keep `ext/sse2neon` (headers we
-# compile against) and `ext/pdqsort` (the header-only sort dropped in at
-# bwamem.cpp sort sites). `ext/zlib-ng` (added in bwa-mem3 0.6.0) backs the
-# CLI's fast_reader FASTQ path (fast_reader.c), which we do not compile — the
-# Rust CLI reads FASTQ itself — so it is dropped alongside htslib/libsais.
-DROP_SUBTREES=(
-    .github bench docs scripts
-    ext/htslib ext/libsais ext/mimalloc ext/doctest ext/zlib-ng
-)
+# Subtrees to prune, read from the shared list so the drift report and this
+# script cannot disagree about what a pruned tree looks like.
+DROP_LIST="$(dirname "$0")/vendor-drop-subtrees.txt"
+[ -f "$DROP_LIST" ] || { echo "ERROR: missing $DROP_LIST" >&2; exit 1; }
+DROP_SUBTREES=()
+while IFS= read -r line; do
+    line="${line%%#*}"                       # strip comments
+    line="$(printf '%s' "$line" | tr -d '[:space:]')"
+    [ -n "$line" ] && DROP_SUBTREES+=("$line")
+done < "$DROP_LIST"
+[ "${#DROP_SUBTREES[@]}" -gt 0 ] || { echo "ERROR: $DROP_LIST has no entries" >&2; exit 1; }
 
 if [ -n "$SRC" ]; then
     # Copy from a local working tree at the given hash (submodules initialized).
@@ -51,6 +68,11 @@ if [ -n "$SRC" ]; then
 else
     git clone --recurse-submodules "$REPO_URL" "$DST"
     git -C "$DST" checkout "$HASH"
+    actual=$(git -C "$DST" rev-parse HEAD)
+    if [ "$actual" != "$HASH" ]; then
+        echo "ERROR: clone HEAD is $actual, not $HASH" >&2
+        exit 1
+    fi
     git -C "$DST" submodule update --init --recursive
     find "$DST" -name '.git' -print0 | xargs -0 rm -rf
     # Strip nested .github dirs (e.g. ext/sse2neon/.github); the loop
