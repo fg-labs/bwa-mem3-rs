@@ -1,0 +1,372 @@
+name: Vendor bump
+
+# Nightly check for a new fg-labs/bwa-mem3 release. On finding one, refresh
+# the vendored snapshot, build it, and open a tracking issue plus a draft PR
+# whose drift report is the worklist for finishing the adaptation. The PR is
+# EXPECTED to fail CI -- a vendor bump needs shim and build.rs adaptation
+# that no tool can do unattended.
+#
+# Note GitHub disables scheduled workflows after 60 days of repo inactivity,
+# which is exactly when a bump notice matters most. workflow_dispatch is the
+# fallback; re-enable the schedule from the Actions tab if that happens.
+on:
+  schedule:
+    # 09:17 UTC. Off the hour so we are not in the thundering herd.
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Force a specific release tag (e.g. v0.8.0). Implies force.'
+        required: false
+        type: string
+      dry_run:
+        description: 'Compute and print the report; create nothing.'
+        required: false
+        default: false
+        type: boolean
+
+# One at a time: a manual dispatch must not race the cron.
+concurrency:
+  group: vendor-bump
+  cancel-in-progress: false
+
+# Read by default; the job elevates only what it needs. Note these govern
+# GITHUB_TOKEN, not the App token that actually does the writes below.
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: fg-labs/bwa-mem3
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      # NOTE on issues:write: job `permissions:` only govern GITHUB_TOKEN.
+      # The write below actually happens with the fg-labs-bot App token, so
+      # whether it can create an issue depends on the App's INSTALLATION
+      # permissions, which are configured on github.com and not visible from
+      # here. The installation was confirmed to hold read/write on code,
+      # issues, pull requests, and workflows across all repositories; the
+      # `permission-*` inputs below both narrow the token to the three this
+      # job uses and turn any future revocation into a failure at token
+      # creation rather than mid-run. Even if one were somehow lost, "File
+      # the tracking issue" below fails loudly (the job goes red, gh's
+      # permission error is in the log and step summary), and -- because the
+      # draft-PR step explicitly requires that step to have succeeded -- no
+      # branch is pushed and no PR is opened. The run ends coherent either
+      # way: either both the issue and the PR exist, or neither does.
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.FG_LABS_BOT_APP_ID }}
+          private-key: ${{ secrets.FG_LABS_BOT_PRIVATE_KEY }}
+          # Without these the token carries every permission the installation
+          # happens to hold. Naming the three this job actually uses keeps the
+          # blast radius to them, and turns a missing installation permission
+          # into a loud failure at token creation rather than a confusing 403
+          # in the middle of a run that has already pushed a branch.
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev rsync
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+        with:
+          # Do not write a cache entry from a branch carrying unreviewed
+          # upstream C++. Reading the shared cache is fine.
+          save-if: false
+
+      # scripts/bwa-mem3-latest-release.sh exits 1 for BOTH a genuine
+      # no-match (upstream retagged/deleted the vendored release) and an
+      # indeterminate API/transport failure (rate limit mid-lookup); the
+      # distinction lives only in the script's own stderr wording, not in
+      # the exit code. Rather than re-parse that wording here (brittle: it
+      # would silently stop working if the script's message ever changes),
+      # treat any nonzero exit as one "investigate" case and forward the
+      # script's own stderr verbatim -- it already states plainly when a
+      # failure is transient ("...Retry.") versus a real retag, so nothing
+      # is lost by not re-deriving that ourselves. This step never fails on
+      # its own (`set -uo pipefail`, no `-e`, explicit `rc` capture) so the
+      # next step can decide what to do with a nonzero rc; it also covers
+      # release_tags()'s bare `set -e` abort on a `gh api` failure, which
+      # has no framing of its own -- our wrapper supplies the framing that
+      # path is missing.
+      - name: Detect a newer release
+        id: detect
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -uo pipefail
+          args=()
+          if [ -n "${{ inputs.tag }}" ]; then
+            args+=(--tag "${{ inputs.tag }}")
+          fi
+          scripts/bwa-mem3-latest-release.sh "${args[@]}" 2> /tmp/detect.stderr
+          rc=$?
+          cat /tmp/detect.stderr >&2
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # Deliberately fails the job (red run) -- a detection failure needs a
+      # human to look, and a red run is the normal way that happens. What
+      # this step exists to prevent is a SILENT red run: a bare `gh` exit
+      # code with no framing. See the rationale on "Detect a newer release"
+      # above for why we forward the script's stderr rather than
+      # re-interpreting it.
+      - name: Report a detection failure
+        if: steps.detect.outputs.rc != '0'
+        run: |
+          {
+            echo "\`scripts/bwa-mem3-latest-release.sh\` exited ${{ steps.detect.outputs.rc }};"
+            echo "could not determine whether a bump is needed."
+            echo
+            echo "This can be a transient GitHub API failure (rate limiting) just as"
+            echo "easily as a genuine problem (upstream retagged or deleted the"
+            echo "vendored release) -- do not read a red run here as confirmation of"
+            echo "either on its own. The script's own diagnostic, if any, is below."
+            echo
+            echo '```'
+            cat /tmp/detect.stderr
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      # Gated on `rc == '0'` in addition to `needs_bump`: on a detection
+      # failure, scripts/bwa-mem3-latest-release.sh never reaches the point
+      # where it writes step outputs, so `needs_bump` is empty -- which
+      # would ALSO satisfy `!= 'true'` and make this step misreport a failed
+      # detection as "current". `rc == '0'` is what tells the two apart. A
+      # custom `if:` on a step is not implicitly ANDed with `success()`, so
+      # this cannot rely on "Report a detection failure" having failed the
+      # job -- it has to check for that explicitly.
+      - name: Nothing to do
+        if: steps.detect.outputs.rc == '0' && steps.detect.outputs.needs_bump != 'true'
+        run: |
+          echo "Vendored ${{ steps.detect.outputs.current_version }} is current." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Everything below is conditional on a bump being needed, which -- per
+      # the comment above -- is only ever 'true' after a successful
+      # detection.
+      - name: Check for an existing PR
+        id: existing
+        if: steps.detect.outputs.needs_bump == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          branch="vendor-bump/bwa-mem3-${{ steps.detect.outputs.latest_version }}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          # --state all, deliberately: a CLOSED-unmerged PR means a human
+          # declined this release. With the default --state open we would
+          # recreate it every single night.
+          found="$(gh pr list --head "$branch" --state all --json number,state \
+                     --jq '.[0] | select(.) | "\(.number):\(.state)"')"
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+          if [ -n "$found" ] && [ "${{ inputs.tag }}" = "" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "PR already exists for $branch ($found); nothing to do." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Refresh the vendored snapshot
+        id: refresh
+        if: steps.detect.outputs.needs_bump == 'true' && steps.existing.outputs.skip != 'true'
+        run: |
+          set -uo pipefail
+          if ! scripts/refresh-bwa-mem3.sh "${{ steps.detect.outputs.latest_sha }}" \
+                 > /tmp/refresh.log 2>&1; then
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            # Do not fail the step: a crashed refresh must still file an
+            # issue with the reason. -DMATE_SORT=0 vanishing (gotcha #1) is
+            # the loudest failure in the system and must not become a red
+            # log with nothing to act on.
+            exit 0
+          fi
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+
+      - name: Generate the drift report
+        id: report
+        if: steps.detect.outputs.needs_bump == 'true' && steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          MISSED_TAGS: ${{ steps.detect.outputs.missed_tags }}
+        run: |
+          set -uo pipefail
+          if [ "${{ steps.refresh.outputs.failed }}" = "true" ]; then
+            {
+              echo "# bwa-mem3 vendor refresh -- FAILED"
+              echo
+              echo "\`scripts/refresh-bwa-mem3.sh ${{ steps.detect.outputs.latest_sha }}\` exited non-zero."
+              echo
+              echo '```'
+              tail -40 /tmp/refresh.log
+              echo '```'
+            } > /tmp/report.md
+          else
+            scripts/bwa-mem3-drift-report.sh > /tmp/report.md 2>&1 || true
+          fi
+          cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
+          # Anchored whole-report match, not a positional check: the
+          # NEW_SUBMODULE marker is emitted by check_gitmodules, whose own
+          # section heading prints first, so the marker lands a few lines
+          # in -- a `head -N` or first-line check breaks the moment an
+          # earlier check's output grows by even one line.
+          if grep -qE '^NEW_SUBMODULE$' /tmp/report.md; then
+            echo "gated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload the report and logs
+        if: steps.detect.outputs.needs_bump == 'true' && steps.existing.outputs.skip != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: drift-report
+          path: |
+            /tmp/report.md
+            /tmp/refresh.log
+          if-no-files-found: warn
+
+      # Runs for BOTH safety-valve cases (a failed refresh, and a
+      # NEW_SUBMODULE gate) as well as the normal path: those two cases are
+      # documented in CONTRIBUTING.md as "produce an issue but no PR", so
+      # this step deliberately does not check `report.outputs.gated` or
+      # `refresh.outputs.failed`.
+      - name: File the tracking issue
+        id: issue
+        if: |
+          steps.detect.outputs.needs_bump == 'true' &&
+          steps.existing.outputs.skip != 'true' &&
+          inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          title="Update vendored bwa-mem3 to ${{ steps.detect.outputs.latest_version }}"
+          url="$(gh issue create --title "$title" --body-file /tmp/report.md)"
+          num="$(printf '%s' "$url" | grep -oE '[0-9]+$')"
+          echo "number=$num" >> "$GITHUB_OUTPUT"
+
+      # `steps.issue.outcome == 'success'` is load-bearing, not decorative:
+      # a step's own custom `if:` is never implicitly ANDed with success() of
+      # earlier steps, so without this check a failed (e.g. permission-
+      # denied) issue-creation step would NOT stop this one from running --
+      # leaving a pushed branch and an open PR with no tracking issue behind
+      # it. Requiring success() here means a failed issue creation leaves
+      # nothing pushed at all: a loud, red, but coherent run.
+      - name: Commit, push, and open the draft PR
+        id: pr
+        if: |
+          steps.detect.outputs.needs_bump == 'true' &&
+          steps.existing.outputs.skip != 'true' &&
+          steps.report.outputs.gated != 'true' &&
+          steps.refresh.outputs.failed != 'true' &&
+          steps.issue.outcome == 'success' &&
+          inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.detect.outputs.latest_version }}"
+          sha="${{ steps.detect.outputs.latest_sha }}"
+          branch="${{ steps.existing.outputs.branch }}"
+
+          # A bare runner has neither of these set. The noreply address has to
+          # be built from the BOT USER id, which is a different number from the
+          # App id: GitHub attributes a commit by matching <id>+<login> against
+          # the account, so FG_LABS_BOT_APP_ID here would leave every vendor
+          # bump showing as an unattributed author. Resolved from the login
+          # rather than hardcoded so reinstalling or renaming the App cannot
+          # silently reintroduce a stale number.
+          bot_user_id="$(gh api "/users/fg-labs-bot%5Bbot%5D" --jq .id)"
+          git config user.name "fg-labs-bot[bot]"
+          git config user.email "${bot_user_id}+fg-labs-bot[bot]@users.noreply.github.com"
+
+          git checkout -b "$branch"
+          git add bwa-mem3-sys/vendor
+          git commit -m "chore(vendor): refresh bwa-mem3 to $tag (${sha:0:8})"
+          git push -u origin "$branch"
+          pushed="$(git rev-parse HEAD)"
+
+          {
+            echo "Mechanical refresh of the vendored bwa-mem3 snapshot to \`$tag\` (\`${sha:0:8}\`)."
+            echo
+            echo "**This PR is expected to fail CI.** A vendor bump needs shim and \`build.rs\` adaptation; the drift report below is the worklist. Push your fixes onto this branch."
+            echo
+            echo "Tracking issue: #${{ steps.issue.outputs.number }}"
+            echo
+            echo "Green CI here is necessary but **not sufficient** -- see the manual checklist at the end of the report."
+            echo
+            echo "<!-- vendor-bump:pushed-sha=$pushed -->"
+            echo
+            cat /tmp/report.md
+          } > /tmp/pr-body.md
+
+          gh pr create --draft --title "chore(vendor): refresh bwa-mem3 to $tag" \
+            --body-file /tmp/pr-body.md --head "$branch"
+          echo "pushed_sha=$pushed" >> "$GITHUB_OUTPUT"
+
+      # Runs LAST, and only once the replacement PR exists: deciding this
+      # earlier left retitled PRs pointing at branches that were never
+      # updated whenever the submodule gate (or a refresh failure) stopped
+      # the run before a new PR was opened.
+      - name: Supersede older bump PRs
+        if: steps.pr.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          new_branch="${{ steps.existing.outputs.branch }}"
+          gh pr list --state open --search 'head:vendor-bump/bwa-mem3-' \
+            --json number,headRefName,body --jq '.[] | @base64' \
+          | while read -r row; do
+              decode() { echo "$row" | base64 -d | jq -r "$1"; }
+              num="$(decode .number)"
+              head_ref="$(decode .headRefName)"
+              body="$(decode .body)"
+              [ "$head_ref" = "$new_branch" ] && continue
+
+              # Trust a recorded marker, not commit authorship: an App
+              # token's commits report .author == null whenever the
+              # committer email does not map to an account, which would
+              # make every branch look human-touched and defeat superseding
+              # entirely. Close rather than force-update: force-updating an
+              # existing branch would orphan any inline review comments a
+              # human already left on its (discarded) commits.
+              marker="$(printf '%s' "$body" | grep -oE 'vendor-bump:pushed-sha=[0-9a-f]{40}' | head -1 | cut -d= -f2 || true)"
+              actual="$(gh api "repos/${{ github.repository }}/git/ref/heads/$head_ref" --jq '.object.sha' 2>/dev/null || true)"
+
+              # Three distinguishable states, and only one of them justifies
+              # asserting a human touched the branch. The `|| true` above
+              # swallows a 404 and a transient API failure alike, so an empty
+              # `actual` is an absence of evidence, not evidence of commits --
+              # claiming otherwise sends a maintainer to inspect a branch that
+              # may have nothing on it. An absent marker is the same problem
+              # from the other side (a PR body predating the marker).
+              if [ -z "$actual" ]; then
+                gh pr comment "$num" --body "A newer bump PR exists for \`${{ steps.detect.outputs.latest_version }}\`. Could not read this branch's head -- it was deleted, or the API call failed -- so this PR is left open without judging whether it carries commits beyond the bot's."
+              elif [ -z "$marker" ]; then
+                gh pr comment "$num" --body "A newer bump PR exists for \`${{ steps.detect.outputs.latest_version }}\`. This PR body records no \`vendor-bump:pushed-sha\` marker, so whether the branch carries commits beyond the bot's cannot be determined; leaving it open."
+              elif [ "$marker" = "$actual" ]; then
+                gh pr comment "$num" --body "Superseded by the newer bump for \`${{ steps.detect.outputs.latest_version }}\`. No commits were pushed to this branch beyond the bot's, so closing."
+                gh pr close "$num"
+              else
+                gh pr comment "$num" --body "A newer bump PR exists for \`${{ steps.detect.outputs.latest_version }}\`. Leaving this open because the branch has commits beyond the bot's."
+              fi
+            done

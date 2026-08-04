@@ -93,6 +93,53 @@ our integration branch tracking upstream `bwa-mem2/bwa-mem2` with:
   collides with libc on macOS).
 - Future: bwa-meth support, XB tag, etc.
 
+### Automated bump PRs
+
+A nightly workflow (`.github/workflows/vendor-bump.yml`) watches
+[`fg-labs/bwa-mem3`](https://github.com/fg-labs/bwa-mem3) for new releases. On
+finding one it refreshes the snapshot, builds it, and opens a tracking issue
+plus a **draft PR**. That PR is expected to fail CI — a bump needs shim and
+`build.rs` adaptation. Its drift report is the worklist: compiler errors,
+`mem_opt_t` field changes, flag and enum set changes, contract changes in the
+upstream functions the shim calls, new TUs, dependency changes, and a manual
+checklist of what CI cannot verify.
+
+Normal flow: push your adaptation commits onto the bot's branch, squash into a
+logical history, sign, and mark ready for review.
+
+To bump off-schedule, or to a specific release, dispatch it manually:
+
+```bash
+gh workflow run vendor-bump.yml -f tag=v0.8.0
+gh workflow run vendor-bump.yml -f tag=v0.8.0 -f dry_run=true   # report only
+```
+
+Passing `-f tag=` implies **force**: it is the deliberate bypass of the
+tracking-issue dedup, so an already-open issue for that release no longer stops
+the run. It does *not* bypass an existing PR or branch — if
+`vendor-bump/bwa-mem3-<version>` already exists, the run fails immediately and
+creates nothing, because reusing that branch would either fail as a
+non-fast-forward push or require force-pushing over commits that may already
+carry review comments. Close the PR and delete the branch first, then
+re-dispatch. A cron tick never sets `tag`, so only a human can reach this path.
+
+Two cases produce an issue but no PR: a refresh that fails outright (e.g.
+upstream dropped `-DMATE_SORT=0`), and upstream adding an `ext/` submodule the
+refresh could not know to prune — committing then would vendor the whole
+subtree. For the latter, add it to `scripts/vendor-drop-subtrees.txt` and
+re-dispatch. A third case produces neither: if the tracking issue itself fails
+to open (e.g. a permissions gap on the bot's GitHub App), the run ends there —
+no branch is pushed and no PR is opened, so a broken issue never leaves an
+orphaned PR behind.
+
+The two scripts run locally too, and need authenticated `gh` plus `jq`:
+
+```bash
+scripts/bwa-mem3-latest-release.sh              # what is new upstream?
+scripts/refresh-bwa-mem3.sh <40-hex-sha>        # then, in a dirty tree:
+scripts/bwa-mem3-drift-report.sh                # ...the worklist
+```
+
 To refresh the vendored snapshot to a new `main` tip:
 
 ```bash
