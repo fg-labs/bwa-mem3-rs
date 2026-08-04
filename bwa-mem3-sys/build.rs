@@ -64,8 +64,11 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_dir = out.join("build");
 
-    // 1. Verify MATE_SORT=0 default in vendored Makefile (shim semantics depend on it).
-    let makefile_path = manifest.join("vendor/bwa-mem3/Makefile");
+    // 1. Verify MATE_SORT=0 default in vendored Makefile (shim semantics depend on it),
+    // and warn about any other -D define upstream's Makefile grows that build.rs
+    // neither mirrors nor explicitly waives.
+    let vendor_root = manifest.join("vendor/bwa-mem3");
+    let makefile_path = vendor_root.join("Makefile");
     let makefile = fs::read_to_string(&makefile_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {}", makefile_path.display(), e));
     assert!(
@@ -74,6 +77,7 @@ fn main() {
             .any(|l| l.contains("CPPFLAGS") && l.contains("-DMATE_SORT=0")),
         "vendored bwa-mem3 Makefile must retain `-DMATE_SORT=0` default; shim pairing logic depends on it",
     );
+    report_unmirrored_makefile_defines(&vendor_root);
 
     // 2. Copy vendor -> OUT_DIR/build (idempotent; vendor tree is never mutated in place).
     if build_dir.exists() {
@@ -280,6 +284,203 @@ fn apply_simd_flags(build: &mut cc::Build) {
     }
 }
 
+/// Every `-DNAME[=VALUE]` token in a Makefile's text, conditional blocks
+/// included. Deliberately line-oriented and blind to `ifeq` nesting: we want
+/// the union of every define upstream can pass, because `build.rs` has to
+/// decide about each one whether it mirrors it, deliberately omits it, or has
+/// simply never noticed it. Trims a stray leading/trailing `"`: upstream
+/// forwards flags through a recursive `$(MAKE)` call as a single quoted shell
+/// argument (e.g. `EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT"`), and a
+/// whitespace split leaves the closing quote glued to the last flag. No
+/// legitimate `-D` value in this Makefile is itself a quoted string, so the
+/// trim never eats a real character.
+fn extract_makefile_defines(makefile: &str) -> Vec<String> {
+    let mut out: Vec<String> = makefile
+        .lines()
+        .flat_map(str::split_whitespace)
+        .filter_map(|tok| tok.strip_prefix("-D"))
+        .map(|def| def.trim_matches('"').to_owned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Defines upstream's Makefile passes that this crate deliberately does not.
+/// Each entry needs a reason, because an unexplained omission is
+/// indistinguishable from an oversight.
+const DEFINES_DELIBERATELY_OMITTED: &[(&str, &str)] = &[
+    (
+        "LIBSAIS_OPENMP",
+        "libsais is pruned from the vendor tree (refresh-bwa-mem3.sh DROP_SUBTREES); \
+         the index builder it belongs to is out of scope",
+    ),
+    (
+        "CACHE_LINE_BYTES",
+        "no mirror in build.rs -- see the tracking issue; changing it is a perf change \
+         needing its own benchmark",
+    ),
+    (
+        "DISABLE_BATCHED_MATESW",
+        "upstream sets this only for the proto-neon-kswv CI's on/off A/B test of the \
+         batched mate-rescue SW port, never for a normal build",
+    ),
+    (
+        "KERNEL_VARIANT",
+        "set per tier by build.rs itself (KERNEL_TIERS_X86), not copied from the Makefile",
+    ),
+    (
+        "APPLE_SILICON",
+        "every use site ORs it with __aarch64__ / __ARM_NEON (compiler-builtin macros, \
+         always true on this target), and simd_compat.h self-defines it under the same \
+         condition; mirroring it in build.rs would be a no-op",
+    ),
+    (
+        "USE_MIMALLOC",
+        "only read by main.cpp, which build.rs excludes entirely (CLI entry point, out \
+         of scope)",
+    ),
+    (
+        "BWAMEM3_TESTING",
+        "an opt-in hook in simd_dispatch.cpp for upstream's own regression tooling \
+         (TESTING_BUILD=1); off by default upstream, which build.rs matches by never \
+         setting it",
+    ),
+    (
+        "STAGE_PROF",
+        "opt-in profiling instrumentation (`make STAGE_PROF=1`); the default upstream \
+         build, which build.rs mirrors, leaves it unset so the hooks compile to no-ops",
+    ),
+    (
+        "DISABLE_OUTPUT",
+        "only read by fastmap.cpp, which build.rs excludes entirely (CLI batch driver, \
+         out of scope); used by the PGO profile-build target's compute-only binary",
+    ),
+    (
+        "MI_BUILD_SHARED",
+        "a CMake cache variable for configuring ext/mimalloc's own cmake project, not a \
+         compiler define for bwa-mem3 sources; mimalloc is pruned from the vendor tree",
+    ),
+    (
+        "MI_BUILD_STATIC",
+        "ditto (ext/mimalloc CMake configure flag; mimalloc is pruned from the vendor tree)",
+    ),
+    (
+        "MI_BUILD_OBJECT",
+        "ditto (ext/mimalloc CMake configure flag; mimalloc is pruned from the vendor tree)",
+    ),
+    (
+        "MI_BUILD_TESTS",
+        "ditto (ext/mimalloc CMake configure flag; mimalloc is pruned from the vendor tree)",
+    ),
+    (
+        "MI_OVERRIDE",
+        "ditto (ext/mimalloc CMake configure flag; mimalloc is pruned from the vendor tree)",
+    ),
+    (
+        "CMAKE_BUILD_TYPE",
+        "a CMake cache variable shared by the ext/mimalloc and ext/zlib-ng cmake \
+         sub-builds, not a compiler define for bwa-mem3 sources; both dependencies are \
+         pruned from the vendor tree",
+    ),
+    (
+        "BUILD_SHARED_LIBS",
+        "a CMake cache variable for configuring ext/zlib-ng's own cmake project, not a \
+         compiler define for bwa-mem3 sources; zlib-ng is pruned from the vendor tree",
+    ),
+    (
+        "ZLIB_COMPAT",
+        "ditto (ext/zlib-ng CMake configure flag; zlib-ng is pruned from the vendor tree)",
+    ),
+    (
+        "ZLIB_ENABLE_TESTS",
+        "ditto (ext/zlib-ng CMake configure flag; zlib-ng is pruned from the vendor tree)",
+    ),
+    (
+        "ZLIBNG_ENABLE_TESTS",
+        "ditto (ext/zlib-ng CMake configure flag; zlib-ng is pruned from the vendor tree)",
+    ),
+    (
+        "WITH_GTEST",
+        "ditto (ext/zlib-ng CMake configure flag; zlib-ng is pruned from the vendor tree)",
+    ),
+    (
+        "CMAKE_POSITION_INDEPENDENT_CODE",
+        "ditto (ext/zlib-ng CMake configure flag; zlib-ng is pruned from the vendor tree)",
+    ),
+];
+
+/// Warn (do not fail) when upstream's Makefile grows a `-D` this crate neither
+/// mirrors nor explicitly waives, or changes the *value* of one this crate
+/// does mirror. A hard panic would be wrong here: the honest answer for a new
+/// define is usually "a human must decide", and failing the build of an
+/// otherwise-working refresh helps nobody. `cargo build` surfaces
+/// `cargo:warning=` lines prominently, and the vendor-bump drift report
+/// re-reports them.
+fn report_unmirrored_makefile_defines(vendor_root: &Path) {
+    let makefile = vendor_root.join("Makefile");
+    let Ok(text) = fs::read_to_string(&makefile) else {
+        println!(
+            "cargo:warning=could not read {} to check define drift",
+            makefile.display()
+        );
+        return;
+    };
+    // Names build.rs mirrors via a `.define()` call somewhere in this file,
+    // paired with the value it compiles with: ENABLE_PREFETCH/V17/MATE_SORT
+    // are the constant trio baked into every compile (main's steps 4a/4b);
+    // the six SSE feature macros are reproduced one-for-one by
+    // apply_simd_flags's aarch64 branch, which mirrors upstream's
+    // SSE2NEON_FLAGS bridge.
+    //
+    // The value is carried here, not just the name, because a name-only
+    // comparison passes an upstream flip of `-DV17=1` to `-DV17=0` as
+    // "mirrored" while build.rs goes on compiling with the old value — the
+    // exact silent divergence this check exists to surface. `ENABLE_PREFETCH`
+    // is recorded as "1" because a bare `-DNAME` is what both the
+    // preprocessor and `cc`'s `.define(name, None)` treat as 1.
+    let mirrored = [
+        ("ENABLE_PREFETCH", "1"),
+        ("V17", "1"),
+        ("MATE_SORT", "0"),
+        ("__SSE__", "1"),
+        ("__SSE2__", "1"),
+        ("__SSE3__", "1"),
+        ("__SSSE3__", "1"),
+        ("__SSE4_1__", "1"),
+        ("__SSE4_2__", "1"),
+    ];
+    for def in extract_makefile_defines(&text) {
+        let (name, value) = canonical_define(&def);
+        if let Some((_, mirrored_value)) = mirrored.iter().find(|(n, _)| *n == name) {
+            if value != *mirrored_value {
+                println!(
+                    "cargo:warning=vendored Makefile now passes -D{def}, but build.rs \
+                     compiles with {name}={mirrored_value}; update the .define() call \
+                     and this list together, or waive the difference in \
+                     DEFINES_DELIBERATELY_OMITTED"
+                );
+            }
+            continue;
+        }
+        if DEFINES_DELIBERATELY_OMITTED.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        println!(
+            "cargo:warning=vendored Makefile passes -D{def} which build.rs \
+             neither mirrors nor waives; decide and add it to build.rs's \
+             .define() calls or to DEFINES_DELIBERATELY_OMITTED"
+        );
+    }
+}
+
+/// Split one extracted `-D` body into `(name, value)`, giving a valueless
+/// define the `1` the preprocessor gives it — so `-DV17` and `-DV17=1` compare
+/// equal, and a mirrored define's value can be checked at all.
+fn canonical_define(def: &str) -> (&str, &str) {
+    def.split_once('=').unwrap_or((def, "1"))
+}
+
 fn copy_dir(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
@@ -292,6 +493,96 @@ fn copy_dir(src: &Path, dst: &Path) {
         } else {
             fs::copy(&from, &to).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_define, extract_makefile_defines};
+
+    /// A Makefile excerpt in upstream's shape: unconditional CPPFLAGS plus the
+    /// arch-conditional blocks that build.rs mirrors by hand.
+    const MAKEFILE: &str = "\
+CPPFLAGS+= -DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 -DLIBSAIS_OPENMP
+ifeq ($(arch),arm64)
+\tSSE2NEON_FLAGS= -D__SSE2NEON_H -DSSE2NEON_SUPPRESS_WARNINGS
+\tCPPFLAGS+= -DCACHE_LINE_BYTES=128
+endif
+";
+
+    #[test]
+    fn extracts_unconditional_defines() {
+        let d = extract_makefile_defines(MAKEFILE);
+        assert!(d.contains(&"ENABLE_PREFETCH".to_string()));
+        assert!(d.contains(&"V17=1".to_string()));
+        assert!(d.contains(&"MATE_SORT=0".to_string()));
+    }
+
+    #[test]
+    fn extracts_conditional_defines_too() {
+        let d = extract_makefile_defines(MAKEFILE);
+        assert!(
+            d.contains(&"CACHE_LINE_BYTES=128".to_string()),
+            "arch-conditional defines must be extracted; they are the ones \
+             build.rs mirrors by hand"
+        );
+        assert!(d.contains(&"__SSE2NEON_H".to_string()));
+    }
+
+    #[test]
+    fn ignores_non_define_flags() {
+        let d = extract_makefile_defines("CPPFLAGS+= -O3 -Wall -DFOO=1\n");
+        assert_eq!(d, vec!["FOO=1".to_string()]);
+    }
+
+    /// Regression test for a real false positive found in the vendored
+    /// Makefile (v0.8.0-ish, commit a887e36): line 943 forwards
+    /// `EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT"` to a recursive
+    /// `$(MAKE)` invocation. A naive whitespace split glues the closing quote
+    /// to the flag, producing the bogus name `DISABLE_OUTPUT"` that no waiver
+    /// entry could ever match by name.
+    #[test]
+    fn strips_quote_artifacts_from_forwarded_flags() {
+        let d = extract_makefile_defines(
+            "\t$(MAKE) EXTRA_CXXFLAGS=\"$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT\" CXX=\"$(CXX)\" all\n",
+        );
+        assert!(d.contains(&"DISABLE_OUTPUT".to_string()));
+    }
+
+    #[test]
+    fn a_valueless_define_canonicalizes_to_one() {
+        // `-DENABLE_PREFETCH` and `-DENABLE_PREFETCH=1` must compare equal, or
+        // the mirrored-value check reports drift on an unchanged Makefile.
+        assert_eq!(
+            canonical_define("ENABLE_PREFETCH"),
+            ("ENABLE_PREFETCH", "1")
+        );
+        assert_eq!(
+            canonical_define("ENABLE_PREFETCH=1"),
+            ("ENABLE_PREFETCH", "1")
+        );
+    }
+
+    #[test]
+    fn a_changed_value_is_visible_to_the_mirror_check() {
+        // The case a name-only comparison misses: upstream flipping V17 or
+        // MATE_SORT while build.rs keeps compiling with the old value.
+        assert_eq!(canonical_define("V17=0"), ("V17", "0"));
+        assert_eq!(canonical_define("MATE_SORT=1"), ("MATE_SORT", "1"));
+    }
+
+    #[test]
+    fn only_the_first_equals_splits_name_from_value() {
+        // `-DKERNEL_VARIANT=_avx2` and make-variable forwards like
+        // `-DX=$(Y)` must keep their full value rather than being truncated.
+        assert_eq!(
+            canonical_define("KERNEL_VARIANT=_avx2"),
+            ("KERNEL_VARIANT", "_avx2")
+        );
+        assert_eq!(
+            canonical_define("DISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)"),
+            ("DISABLE_BATCHED_MATESW", "$(DISABLE_BATCHED_MATESW)")
+        );
     }
 }
 
