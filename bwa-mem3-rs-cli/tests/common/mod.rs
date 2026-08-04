@@ -160,6 +160,15 @@ pub fn samtools_view(bam: &Path) -> Vec<String> {
 /// (which deliberately omits `MQ:i` and places the Bismark tags differently
 /// from upstream's SAM writer) are excluded on purpose.
 ///
+/// The key also appends a sorted `TAGS:<key,key,...>` component listing every
+/// aux tag *key* present on the record, not just the six compared above.
+/// Without it, a record carrying an extra tag this reduction does not
+/// inspect (e.g. a newly-emitted upstream `XB`) would reduce to the same key
+/// as a record without it, so a vendor bump that starts emitting a new tag
+/// would pass every parity test unnoticed. Only the set of keys is compared —
+/// values of uncompared tags stay out of scope, and aux ordering stays
+/// unpinned, same as before.
+///
 /// Callers compare the returned keys as *sorted vectors* — preserving record
 /// multiplicity so a duplicated or missing record is caught, unlike a set.
 /// Panics on a malformed SAM line rather than silently dropping it: `samtools
@@ -188,9 +197,23 @@ pub fn record_key_fields(sam_line: &str) -> String {
             xa = v;
         }
     }
+    // Sorted set of aux tag KEYS present on the record. The loop above only
+    // compares six tags by value; without this, a record that carries an
+    // extra tag we do not inspect (e.g. a newly-emitted upstream XB) reduces
+    // to the same key as one that does not, and every parity test passes
+    // through the change. Keys only — values of uncompared tags stay
+    // deliberately out of scope, and ordering stays unpinned.
+    let mut tag_keys: Vec<&str> = f[11..].iter().filter_map(|t| t.split(':').next()).collect();
+    tag_keys.sort_unstable();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\tNM:{nm}\tMD:{md}\tXG:{xg}\tXR:{xr}\tXM:{xm}\tXA:{xa}",
-        f[0], f[1], f[2], f[3], f[4], f[5]
+        "{}\t{}\t{}\t{}\t{}\t{}\tNM:{nm}\tMD:{md}\tXG:{xg}\tXR:{xr}\tXM:{xm}\tXA:{xa}\tTAGS:{}",
+        f[0],
+        f[1],
+        f[2],
+        f[3],
+        f[4],
+        f[5],
+        tag_keys.join(",")
     )
 }
 
