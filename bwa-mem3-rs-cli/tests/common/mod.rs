@@ -31,6 +31,48 @@ pub fn have_samtools() -> bool {
     Command::new("samtools").arg("--version").output().is_ok()
 }
 
+/// True when the caller has declared that `bwa-mem3` and `samtools` MUST be
+/// present — set by the CI job that installs them. Turns a silent skip into a
+/// hard failure so a broken CI environment cannot masquerade as a passing run.
+///
+/// Deliberately NOT `CI`: `cargo ci-test` runs these very targets in a job
+/// that has no `bwa-mem3`, so gating on `CI` would fail the build job on every
+/// platform. `CI` is also set by `act`, many container images, and direnv.
+fn tools_required() -> bool {
+    std::env::var_os("BWA_MEM3_RS_REQUIRE_TOOLS").is_some()
+}
+
+/// Locate `bwa-mem3`, panicking instead of returning `None` when
+/// [`tools_required`] holds. Use this in place of [`find_bwa_mem3`] in tests
+/// whose whole purpose is comparing against the reference aligner.
+pub fn require_bwa_mem3() -> Option<String> {
+    match find_bwa_mem3() {
+        Some(p) => Some(p),
+        None if tools_required() => panic!(
+            "BWA_MEM3_RS_REQUIRE_TOOLS is set but bwa-mem3 was not found; \
+             set BWA_MEM3_BIN or install it on PATH"
+        ),
+        None => {
+            eprintln!("skip: bwa-mem3 not on PATH (set BWA_MEM3_BIN)");
+            None
+        }
+    }
+}
+
+/// Check for `samtools`, panicking instead of returning `false` when
+/// [`tools_required`] holds.
+pub fn require_samtools() -> bool {
+    if have_samtools() {
+        return true;
+    }
+    assert!(
+        !tools_required(),
+        "BWA_MEM3_RS_REQUIRE_TOOLS is set but samtools was not found on PATH"
+    );
+    eprintln!("skip: samtools not on PATH");
+    false
+}
+
 pub fn cli_bin() -> PathBuf {
     std::env::var("CARGO_BIN_EXE_bwa-rs").map_or_else(
         |_| PathBuf::from(env!("CARGO_BIN_EXE_bwa-rs")),
