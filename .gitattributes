@@ -1,0 +1,9 @@
+# Mark the vendored bwa-mem3 snapshot as generated AND vendored so GitHub
+# collapses it by default in pull-request diffs and excludes it from language
+# statistics. A vendor-bump PR touches hundreds of these files; the reviewable
+# content is always the shim, build.rs, and the scripts alongside them.
+#
+# linguist-vendored as well as linguist-generated: the two control different
+# things (stats vs. diff collapsing) and we want both.
+bwa-mem3-sys/vendor/** linguist-generated=true
+bwa-mem3-sys/vendor/** linguist-vendored=true

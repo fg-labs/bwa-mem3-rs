@@ -84,6 +84,10 @@ else
     done
 fi
 
+# Upstream's own .gitattributes would let a future upstream linguist-* rule
+# override the root .gitattributes that collapses this tree in PR diffs.
+rm -f "$DST/.gitattributes"
+
 # Record the commit; used by build.rs as a sanity marker.
 echo "$HASH" > bwa-mem3-sys/vendor/COMMIT
 
