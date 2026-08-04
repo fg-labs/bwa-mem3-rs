@@ -168,24 +168,102 @@ jobs:
       # Everything below is conditional on a bump being needed, which -- per
       # the comment above -- is only ever 'true' after a successful
       # detection.
-      - name: Check for an existing PR
+      # Dedups on BOTH the PR and the tracking issue -- the PR-only check
+      # this step used to do left a gap: the two documented "issue but no
+      # PR" paths (the NEW_SUBMODULE gate, and a refresh that fails outright)
+      # leave `found` empty forever, since no PR is ever pushed on either
+      # path. Every unattended nightly retry (same latest tag, still no PR)
+      # would then refile an identical issue -- indefinitely, since nothing
+      # about that state ever changes on its own. The issue-title lookup
+      # below closes that gap by matching the exact title the "File the
+      # tracking issue" step generates.
+      - name: Check for an existing PR or issue
         id: existing
         if: steps.detect.outputs.needs_bump == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           branch="vendor-bump/bwa-mem3-${{ steps.detect.outputs.latest_version }}"
+          # Exported, not recomputed at the issue-creation site: the dedup
+          # lookup below matches on this exact string, so two independent
+          # copies that drift apart would silently refile the same issue on
+          # every nightly tick.
+          title="Update vendored bwa-mem3 to ${{ steps.detect.outputs.latest_version }}"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
           # --state all, deliberately: a CLOSED-unmerged PR means a human
           # declined this release. With the default --state open we would
           # recreate it every single night.
           found="$(gh pr list --head "$branch" --state all --json number,state \
                      --jq '.[0] | select(.) | "\(.number):\(.state)"')"
           echo "found=$found" >> "$GITHUB_OUTPUT"
-          if [ -n "$found" ] && [ "${{ inputs.tag }}" = "" ]; then
+
+          # Fail CLOSED toward "skip creation", not open toward "create
+          # another one": a missed tracking issue is a human noticing a
+          # quiet run and re-dispatching by hand (recoverable in seconds); a
+          # nightly loop of identical issues is the exact bug this lookup
+          # exists to close. So if the lookup itself errors (e.g. a
+          # transient API failure), assume an issue already exists rather
+          # than assume it doesn't.
+          #
+          # No `--search` narrowing: GitHub's issue search does token/fuzzy
+          # matching even with quotes, which risks a false NEGATIVE (missing
+          # the real issue, and thus filing a duplicate anyway) in exchange
+          # for a cheaper query. Listing all open issues and matching the
+          # title exactly client-side (below) is the safer trade at this
+          # repo's issue volume.
+          issue_titles=""
+          if ! issue_titles="$(gh issue list --state open --limit 100 \
+                     --json title --jq '.[].title' \
+                     2>/tmp/issue-lookup.stderr)"; then
+            echo "::warning::gh issue list failed; treating as if an open tracking issue already exists, to avoid a duplicate-issue loop. See the step log for the lookup's stderr." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            cat /tmp/issue-lookup.stderr
+            issue_titles="$title"
+          fi
+          issue_exists=false
+          if grep -qFx "$title" <<< "$issue_titles"; then
+            issue_exists=true
+          fi
+
+          # `--tag` ("Implies force" per its own input description) is the
+          # one deliberate bypass: a human recovering from either dedup case
+          # -- an unresolved tracking issue, or (see the collision check
+          # below) an existing PR/branch -- re-dispatches with the tag
+          # explicitly to say "yes, retry this one anyway." An unattended
+          # cron tick never sets `inputs.tag`, so it can never hit this
+          # bypass; only a human explicitly typing `-f tag=...` can.
+          if [ -n "$TAG" ]; then
+            if [ -n "$found" ]; then
+              # Reusing or force-pushing the existing branch risks orphaning
+              # any review comments left on its commits (the same concern
+              # "Supersede older bump PRs" below avoids by closing rather
+              # than force-updating) -- and pushing fresh history to it
+              # without force would just fail as a non-fast-forward push
+              # further down. Fail here, loudly and early, instead of
+              # producing a duplicate issue and then a failed push.
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              {
+                echo "A PR/branch already exists for $branch ($found)."
+                echo "Force-dispatching --tag=$TAG here would either fail to push"
+                echo "(non-fast-forward) or require force-pushing over it, orphaning"
+                echo "any review comments on its commits. Close PR $found and delete"
+                echo "branch $branch first, then re-dispatch. Nothing was created or"
+                echo "pushed by this run."
+              } | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$found" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "PR already exists for $branch ($found); nothing to do." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          elif [ "$issue_exists" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "An open tracking issue already exists (\"$title\"); nothing to do. Close it and re-dispatch with -f tag=... to force a retry." \
               | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -265,7 +343,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          title="Update vendored bwa-mem3 to ${{ steps.detect.outputs.latest_version }}"
+          title="${{ steps.existing.outputs.title }}"
           url="$(gh issue create --title "$title" --body-file /tmp/report.md)"
           num="$(printf '%s' "$url" | grep -oE '[0-9]+$')"
           echo "number=$num" >> "$GITHUB_OUTPUT"
