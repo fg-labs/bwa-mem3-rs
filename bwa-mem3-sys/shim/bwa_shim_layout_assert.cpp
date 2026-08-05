@@ -25,6 +25,64 @@
 #undef mem_opt_t
 #undef mem_pestat_t
 
+/* ---------------------------------------------------------------------------
+ * MEM_F_* bit mirror — capture step.
+ *
+ * `bwa_shim_types.h` hardcodes the flag bits and bindgen's
+ * `allowlist_var("MEM_F_.*")` reads that POD copy, never upstream — so a
+ * renumbered flag would silently corrupt `opt->flag` with no signal on either
+ * side (maintenance docs gotcha #2, extended).
+ *
+ * The struct-tag rename trick above does NOT work for macros: they have one
+ * namespace and no rename mechanism, so `#define MEM_F_PE POD_MEM_F_PE`
+ * before including the POD merely redefines MEM_F_PE and leaves one value,
+ * making any comparison a tautology.
+ *
+ * This capture MUST happen here, before `#include "bwamem.h"` below. That
+ * include defines its own MEM_F_* macros; since bwa_shim_types.h already
+ * defined them above, the preprocessor's "last definition wins" redefinition
+ * rule means bwamem.h's value silently replaces the POD's from this point
+ * forward (with a -Wmacro-redefined warning if they differ, but otherwise no
+ * signal). Capturing *after* that include — which is where the struct
+ * static_asserts below sit — would therefore compare upstream's value
+ * against itself, not against the POD's: a tautology, verified by compiling
+ * that exact ordering with a deliberately wrong MEM_F_PE and observing no
+ * error. Capturing here, before the clobber, is the only ordering that
+ * actually reads the POD's value.
+ *
+ * Note this cannot detect a NEW upstream flag — there is no assert for a
+ * name you do not know about. `scripts/bwa-mem3-drift-report.sh` compares
+ * the flag *set* on a vendor refresh to cover that direction.
+ *
+ * Do not add -Wno-macro-redefined to the warning-silencing list in build.rs:
+ * until this guard existed, that warning was the only drift signal at all.
+ * ------------------------------------------------------------------------- */
+namespace pod_flags {
+constexpr int MEM_F_PE_v = MEM_F_PE;
+constexpr int MEM_F_NOPAIRING_v = MEM_F_NOPAIRING;
+constexpr int MEM_F_ALL_v = MEM_F_ALL;
+constexpr int MEM_F_NO_MULTI_v = MEM_F_NO_MULTI;
+constexpr int MEM_F_NO_RESCUE_v = MEM_F_NO_RESCUE;
+constexpr int MEM_F_REF_HDR_v = MEM_F_REF_HDR;
+constexpr int MEM_F_SOFTCLIP_v = MEM_F_SOFTCLIP;
+constexpr int MEM_F_SMARTPE_v = MEM_F_SMARTPE;
+constexpr int MEM_F_PRIMARY5_v = MEM_F_PRIMARY5;
+constexpr int MEM_F_KEEP_SUPP_MAPQ_v = MEM_F_KEEP_SUPP_MAPQ;
+constexpr int MEM_F_XB_v = MEM_F_XB;
+} // namespace pod_flags
+
+#undef MEM_F_PE
+#undef MEM_F_NOPAIRING
+#undef MEM_F_ALL
+#undef MEM_F_NO_MULTI
+#undef MEM_F_NO_RESCUE
+#undef MEM_F_REF_HDR
+#undef MEM_F_SOFTCLIP
+#undef MEM_F_SMARTPE
+#undef MEM_F_PRIMARY5
+#undef MEM_F_KEEP_SUPP_MAPQ
+#undef MEM_F_XB
+
 #include "bwamem.h"
 
 #define BWA_SHIM_CK(real, pod, field)                            \
@@ -92,3 +150,26 @@ BWA_SHIM_CK_PES(failed);
 BWA_SHIM_CK_PES(avg);
 BWA_SHIM_CK_PES(std);
 static_assert(sizeof(mem_pestat_t) == sizeof(pod_mem_pestat_t), "mem_pestat_t size drift");
+
+/* MEM_F_* bit mirror — comparison step. `bwamem.h` above has already
+ * (re)defined every MEM_F_* macro to its real value (the #undef block
+ * before that include made the redefinition clean rather than clobbering),
+ * so `f` below reads upstream's value while `pod_flags::f##_v` holds what
+ * was captured from the POD before the clobber. See the capture-step
+ * comment above `#include "bwamem.h"` for why the capture has to happen
+ * there and not here. */
+#define BWA_SHIM_CK_FLAG(f)                            \
+    static_assert(pod_flags::f##_v == f,               \
+                  "MEM_F_* drift: " #f " differs from upstream bwamem.h")
+
+BWA_SHIM_CK_FLAG(MEM_F_PE);
+BWA_SHIM_CK_FLAG(MEM_F_NOPAIRING);
+BWA_SHIM_CK_FLAG(MEM_F_ALL);
+BWA_SHIM_CK_FLAG(MEM_F_NO_MULTI);
+BWA_SHIM_CK_FLAG(MEM_F_NO_RESCUE);
+BWA_SHIM_CK_FLAG(MEM_F_REF_HDR);
+BWA_SHIM_CK_FLAG(MEM_F_SOFTCLIP);
+BWA_SHIM_CK_FLAG(MEM_F_SMARTPE);
+BWA_SHIM_CK_FLAG(MEM_F_PRIMARY5);
+BWA_SHIM_CK_FLAG(MEM_F_KEEP_SUPP_MAPQ);
+BWA_SHIM_CK_FLAG(MEM_F_XB);

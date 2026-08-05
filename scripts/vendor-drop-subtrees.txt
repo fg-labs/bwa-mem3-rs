@@ -1,0 +1,28 @@
+# Subtrees pruned from the vendored bwa-mem3 snapshot, one path per line.
+#
+# Read by scripts/refresh-bwa-mem3.sh and scripts/bwa-mem3-drift-report.sh.
+# Keep it a single source of truth: the drift report has to prune exactly what
+# the refresh prunes, and a second hardcoded copy would be one more piece of
+# hand-mirrored state to maintain.
+#
+# We don't compile the upstream CLI's BAM writer (htslib), the index builder
+# (libsais), the allocator override (mimalloc), the unit-test harness
+# (doctest), the fast FASTQ reader's compression backend (zlib-ng), benches,
+# CI configs, upstream docs/scripts, or upstream's own test suite.
+#
+# KEPT deliberately: ext/sse2neon (headers we compile against — note it is a
+# git submodule, so it is absent from the parent tree in the GitHub API) and
+# ext/pdqsort (header-only sort dropped in at bwamem.cpp sort sites). Unlike
+# the ext/ entries below, ext/doctest and ext/pdqsort are plain in-tree
+# directories rather than submodules; the distinction does not matter for
+# pruning but does for anything reading .gitmodules.
+.github
+bench
+docs
+scripts
+test
+ext/htslib
+ext/libsais
+ext/mimalloc
+ext/doctest
+ext/zlib-ng

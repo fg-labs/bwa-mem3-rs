@@ -55,7 +55,7 @@ Our shim delegates the paired-end decision to upstream's `mem_pair_resolve` (exp
 
 ### 2. `mem_opt_t` / `mem_pestat_t` layouts are mirrored in two places
 
-They're in `shim/bwa_shim_types.h` (what bindgen reads) and in upstream's `bwamem.h` (what `bwa_shim_align.cpp` includes). Both must stay byte-identical — the shim allocates the real struct via upstream's `mem_opt_init()`, so any field-order/size drift silently corrupts the offsets Rust reads/writes through the bindgen view. **`shim/bwa_shim_layout_assert.cpp` guards this**: it `#include`s the POD under renamed tags (`#define mem_opt_t pod_mem_opt_t`) and then the real `bwamem.h`, and `static_assert`s `offsetof`/`sizeof` field by field, so drift fails `cargo build`. (The bindgen `bindgen_test_layout_mem_opt_t` test only checks the Rust struct against the C compiler's view of the *POD copy*, **not** the POD against upstream — that gap is what the guard TU closes.) On `refresh-bwa-mem3.sh`, diff `vendor/bwa-mem3/src/bwamem.h` around lines 95–156 (`mem_opt_t`) and 239–243 (`mem_pestat_t`); if either changed, update `shim/bwa_shim_types.h` **and** the field list in `bwa_shim_layout_assert.cpp` to match.
+They're in `shim/bwa_shim_types.h` (what bindgen reads) and in upstream's `bwamem.h` (what `bwa_shim_align.cpp` includes). Both must stay byte-identical — the shim allocates the real struct via upstream's `mem_opt_init()`, so any field-order/size drift silently corrupts the offsets Rust reads/writes through the bindgen view. **`shim/bwa_shim_layout_assert.cpp` guards this**: it `#include`s the POD under renamed tags (`#define mem_opt_t pod_mem_opt_t`) and then the real `bwamem.h`, and `static_assert`s `offsetof`/`sizeof` field by field, so drift fails `cargo build`. (The bindgen `bindgen_test_layout_mem_opt_t` test only checks the Rust struct against the C compiler's view of the *POD copy*, **not** the POD against upstream — that gap is what the guard TU closes.) The same TU also `static_assert`s the `MEM_F_*` flag *values* the POD hardcodes against upstream's, since bindgen's `allowlist_var("MEM_F_.*")` reads only the POD and would never notice a renumbered flag on its own. On `refresh-bwa-mem3.sh`, diff `vendor/bwa-mem3/src/bwamem.h` around lines 95–156 (`mem_opt_t`) and 239–243 (`mem_pestat_t`); if either changed, update `shim/bwa_shim_types.h` **and** the field list in `bwa_shim_layout_assert.cpp` to match.
 
 ### 3. macOS deployment target mismatch → SIGBUS at test-binary startup
 
@@ -88,11 +88,14 @@ bwa-mem3's internal `mem_aln_t.cigar` uses opcode table `MIDSH` (M=0 I=1 D=2 S=3
   reader (libdeflate + zlib-ng). These are `.c`, and `build.rs` only globs
   `src/*.cpp`, so they are never picked up; they sit unused in the vendor tree.
 
-The htslib- and libsais-dependent TUs would also fail to link: the
-refresh script prunes `ext/htslib`, `ext/libsais`, `ext/mimalloc`,
-`ext/doctest`, and (as of 0.6.0) `ext/zlib-ng` from the vendor tree. If a
-future refresh wants to re-enable any of them, restore the relevant
-submodule first (or `scripts/refresh-bwa-mem3.sh`'s `DROP_SUBTREES`).
+The htslib- and libsais-dependent TUs would also fail to link:
+`scripts/vendor-drop-subtrees.txt` (the shared pruning list read by both
+`refresh-bwa-mem3.sh` and `bwa-mem3-drift-report.sh`) prunes `ext/htslib`,
+`ext/libsais`, `ext/mimalloc`, `ext/doctest`, and (as of 0.6.0) `ext/zlib-ng`
+from the vendor tree — along with upstream's own `test/` suite, which is
+vendored-in-principle but never compiled. If a future refresh wants to
+re-enable any of them, restore the relevant submodule first (or edit the
+shared list).
 
 `fastmap.cpp` was compiled at 0.2.x purely to export `worker_alloc` /
 `worker_free`. As of bwa-mem3 0.6.0 it is transitively coupled to the new
