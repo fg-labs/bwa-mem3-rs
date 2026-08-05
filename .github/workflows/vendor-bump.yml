@@ -351,11 +351,31 @@ jobs:
           set -euo pipefail
           body_limit=60000
           if [ "$(wc -c < /tmp/report.md)" -gt "$body_limit" ]; then
-            head -c "$body_limit" /tmp/report.md > /tmp/report-body.md
+            # head -c cuts at a byte offset, and the report is full of
+            # multibyte characters (§, —, →), so the cut can land mid-character
+            # and hand `gh api` invalid UTF-8 -- failing the create call for a
+            # reason that has nothing to do with the bump. iconv -c drops the
+            # incomplete trailing sequence.
+            #
+            # iconv exits 1 when it drops one, even under -c, and that is the
+            # expected case here -- so its status is ignored and the result is
+            # checked instead, rather than letting `set -e` turn a successful
+            # truncation into a failed run.
+            head -c "$body_limit" /tmp/report.md \
+              | iconv -c -f UTF-8 -t UTF-8 > /tmp/report-body.md || true
+            if [ ! -s /tmp/report-body.md ]; then
+              echo "truncating the report produced an empty body" >&2
+              exit 1
+            fi
             {
               printf '\n\n...\n\n'
-              printf '**Report truncated at %d characters** — GitHub caps issue/PR ' "$body_limit"
-              printf 'bodies at 65536. The full report is in the "drift-report" artifact '
+              # Bytes, not characters: wc -c and head -c both count bytes,
+              # while GitHub's 65536 cap is on characters. Multibyte content
+              # (the report uses §, —, →) makes the byte count the larger of
+              # the two, so capping on bytes is conservative in the safe
+              # direction — but the label has to say what was measured.
+              printf '**Report truncated at %d bytes** — GitHub caps issue/PR ' "$body_limit"
+              printf 'bodies at 65536 characters. The full report is in the "drift-report" artifact '
               printf 'for this workflow run (see the "Upload the report and logs" step above).\n'
             } >> /tmp/report-body.md
           else
