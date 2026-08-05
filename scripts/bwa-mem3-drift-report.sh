@@ -31,6 +31,30 @@ VENDOR_ABS="$REPO_ROOT/$VENDOR"
 # Helpers
 # --------------------------------------------------------------------------
 
+# One private directory for every temp file this script allocates, released by
+# the EXIT trap on ANY exit path — including the one that actually happens in
+# practice: check_build shells out to a multi-minute `cargo ci-build`, and
+# main() runs each check inside a command substitution, so a Ctrl-C lands
+# mid-capture with several temp files allocated and the per-function `rm -f`
+# at the tail of that check never reached. The eager `rm -f` calls are kept as
+# well, so a long run releases files as it goes rather than only at exit.
+#
+# A directory, deliberately, rather than an array of file paths: every caller
+# invokes mktemp_tracked as `x="$(mktemp_tracked)"`, and a command
+# substitution runs in a SUBSHELL — so `ARRAY+=(...)` inside the function
+# would mutate a copy that is discarded on return, leaving the parent's array
+# empty and the trap removing nothing. TMPDIR_SELF is assigned once here at
+# top level, so the trap closes over a path that is correct no matter how many
+# subshells deep the allocation happened.
+TMPDIR_SELF="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_SELF"' EXIT INT TERM
+
+# mktemp, inside this script's auto-cleaned directory. Use instead of bare
+# `mktemp` so an interrupted run leaks nothing.
+mktemp_tracked() {
+    mktemp "$TMPDIR_SELF/drift.XXXXXX"
+}
+
 report_section() { printf '\n## %s\n\n' "$1"; }
 
 # The committed (pre-refresh) content of a vendored path, or empty if it is new.
@@ -48,9 +72,15 @@ new_file() {
 # (strip a trailing comment, strip all whitespace, drop empty lines) so the
 # two scripts cannot disagree about what "already pruned" means. Deliberately
 # not a second hardcoded copy of the list — see the file's own header comment
-# on why. Fails loudly (not silently) if the file is missing: a missing list
-# here would silently un-gate every future submodule addition rather than
-# just failing the refresh, which is the opposite of what this gate is for.
+# on why.
+#
+# A missing list file writes an ERROR to stderr and the caller then sees an
+# empty drop set, so every added path stays in `added` and the gate FIRES.
+# That is the safe direction (a refresh is blocked, not silently un-gated),
+# but note the `exit 1` below does NOT propagate: bash does not honour
+# `errexit` for a failing bare assignment inside a command substitution, and
+# every caller of this function runs it as `$(drop_subtrees ...)`. Do not
+# rely on it to abort the script.
 drop_subtrees() {
     local list="$REPO_ROOT/scripts/vendor-drop-subtrees.txt"
     [ -f "$list" ] || { echo "ERROR: missing $list" >&2; exit 1; }
@@ -123,7 +153,7 @@ struct_body() {
 # enum_bodies below), nothing about a flag's meaning depends on where among
 # its siblings it is declared.
 flag_defines() {
-    grep -E '^\s*#define\s+MEM_F_[A-Z0-9_]+\s+' "$1" 2>/dev/null \
+    grep -E '^[[:space:]]*#define[[:space:]]+MEM_F_[A-Z0-9_]+[[:space:]]+' "$1" 2>/dev/null \
         | mawk '{ print $2, $3 }' | sort || true
 }
 
@@ -245,7 +275,7 @@ format_build_failure() {
 check_build() {
     report_section "2. Build (\`cargo ci-build\`)"
     local log status
-    log="$(mktemp)"
+    log="$(mktemp_tracked)"
     status=0
     (cd "$REPO_ROOT" && cargo ci-build) > "$log" 2>&1 || status=$?
     if [ "$status" -eq 0 ]; then
@@ -260,7 +290,7 @@ check_build() {
 # Check 1 (hard gate): a new submodule makes a refresh commit wrong.
 check_gitmodules() {
     local old new
-    old="$(mktemp)"; new="$(mktemp)"
+    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
     old_file "$VENDOR/.gitmodules" > "$old"
     new_file "$VENDOR/.gitmodules" > "$new"
     local added
@@ -308,12 +338,12 @@ check_gitmodules() {
 check_structs() {
     report_section "3. \`mem_opt_t\` / \`mem_pestat_t\` layout"
     local old new o n s
-    old="$(mktemp)"; new="$(mktemp)"
+    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
     old_file "$VENDOR/src/bwamem.h" > "$old"
     new_file "$VENDOR/src/bwamem.h" > "$new"
     local any=0
     for s in mem_opt_t mem_pestat_t; do
-        o="$(mktemp)"; n="$(mktemp)"
+        o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
         struct_body "$old" "$s" > "$o"
         struct_body "$new" "$s" > "$n"
         if ! diff -q "$o" "$n" >/dev/null; then
@@ -355,11 +385,11 @@ check_structs() {
 check_flags_and_enums() {
     report_section "4. \`MEM_F_*\` flags and \`bwamem.h\` enums"
     local old new o n
-    old="$(mktemp)"; new="$(mktemp)"
+    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
     old_file "$VENDOR/src/bwamem.h" > "$old"
     new_file "$VENDOR/src/bwamem.h" > "$new"
 
-    o="$(mktemp)"; n="$(mktemp)"
+    o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
     flag_defines "$old" > "$o"
     flag_defines "$new" > "$n"
     if diff -q "$o" "$n" >/dev/null; then
@@ -386,7 +416,7 @@ check_flags_and_enums() {
     fi
     rm -f "$o" "$n"
 
-    o="$(mktemp)"; n="$(mktemp)"
+    o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
     enum_bodies "$old" > "$o"
     enum_bodies "$new" > "$n"
     if diff -q "$o" "$n" >/dev/null; then
@@ -442,13 +472,13 @@ check_call_site_contracts() {
     printf 'changed argument meaning is silent even with an identical signature\n'
     printf '(gotchas #8 and #12).\n\n'
     local entry fn path old new o n changed=0
-    old="$(mktemp)"; new="$(mktemp)"
+    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
     for entry in "${UPSTREAM_CONTRACTS[@]}"; do
         fn="${entry%%:*}"
         path="${entry#*:}"
         old_file "$VENDOR/$path" > "$old"
         new_file "$VENDOR/$path" > "$new"
-        o="$(mktemp)"; n="$(mktemp)"
+        o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
         function_body "$old" "$fn" > "$o"
         function_body "$new" "$fn" > "$n"
         if [ ! -s "$n" ]; then
@@ -498,7 +528,7 @@ check_call_site_contracts() {
 check_source_inventory() {
     report_section "6. Source inventory"
     local o n
-    o="$(mktemp)"; n="$(mktemp)"
+    o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
     # 2>/dev/null: a first-ever-vendored src/ (no HEAD:$VENDOR/src to show)
     # makes git print a raw "fatal: Not a valid object name" to stderr, which
     # would otherwise land in the middle of the markdown report.
@@ -564,10 +594,10 @@ check_source_inventory() {
 check_dependencies() {
     report_section "7. Upstream build dependencies"
     local old new o n
-    old="$(mktemp)"; new="$(mktemp)"
+    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
     old_file "$VENDOR/Makefile" > "$old"
     new_file "$VENDOR/Makefile" > "$new"
-    o="$(mktemp)"; n="$(mktemp)"
+    o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
     # The anchor covers indirect dependency variables, not just LIBS/LDLIBS/
     # LDFLAGS themselves: LIBS_EXTRA, LIBSAIS_OPENMP_LIBS, and
     # MIMALLOC_LDFLAGS are all real Makefile variables (verified against the
@@ -576,8 +606,8 @@ check_dependencies() {
     # REFERENCES gains a new -lfoo, so anchoring on the exact names LIBS/
     # LDLIBS/LDFLAGS alone would miss exactly the kind of new dependency this
     # check exists to catch.
-    grep -E '^\s*[A-Za-z_]*(LIBS|LDLIBS|LDFLAGS)[A-Za-z_]*\s*[+:]?=|pkg-config|\./configure' "$old" | sort -u > "$o" || true
-    grep -E '^\s*[A-Za-z_]*(LIBS|LDLIBS|LDFLAGS)[A-Za-z_]*\s*[+:]?=|pkg-config|\./configure' "$new" | sort -u > "$n" || true
+    grep -E '^[[:space:]]*[A-Za-z_]*(LIBS|LDLIBS|LDFLAGS)[A-Za-z_]*[[:space:]]*[+:]?=|pkg-config|\./configure' "$old" | sort -u > "$o" || true
+    grep -E '^[[:space:]]*[A-Za-z_]*(LIBS|LDLIBS|LDFLAGS)[A-Za-z_]*[[:space:]]*[+:]?=|pkg-config|\./configure' "$new" | sort -u > "$n" || true
     if diff -q "$o" "$n" >/dev/null; then
         # Backticks below are literal markdown, not command substitution.
         # shellcheck disable=SC2016
@@ -608,10 +638,10 @@ check_dependencies() {
 check_new_opts() {
     report_section "8. New \`mem_opt_t\` fields vs. the Rust API"
     local old new o n field
-    old="$(mktemp)"; new="$(mktemp)"
+    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
     old_file "$VENDOR/src/bwamem.h" > "$old"
     new_file "$VENDOR/src/bwamem.h" > "$new"
-    o="$(mktemp)"; n="$(mktemp)"
+    o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
     struct_body "$old" mem_opt_t > "$o"
     struct_body "$new" mem_opt_t > "$n"
     local added
