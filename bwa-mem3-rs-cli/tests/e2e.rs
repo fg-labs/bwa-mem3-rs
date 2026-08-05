@@ -13,12 +13,10 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn phix_e2e_roundtrip() {
-    let Some(bwa) = common::find_bwa_mem3() else {
-        eprintln!("skip: bwa-mem3 not on PATH (set BWA_MEM3_BIN)");
+    let Some(bwa) = common::require_bwa_mem3() else {
         return;
     };
-    if !common::have_samtools() {
-        eprintln!("skip: samtools not on PATH");
+    if !common::require_samtools() {
         return;
     }
 

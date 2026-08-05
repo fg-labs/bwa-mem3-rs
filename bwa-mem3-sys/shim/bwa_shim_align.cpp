@@ -628,6 +628,21 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
         if (i < n_list) emit_sa_tag(&aux, &aux_len, &aux_cap, bns, list, n_list, which);
     }
     if (p->XA) aux_put_Z(&aux, &aux_len, &aux_cap, "XA", p->XA);
+    /* HN: total # of hits clustered with this primary under XA_drop_ratio
+     * (set by mem_gen_alt above). -1 is upstream's "not computed" sentinel
+     * (bwamem.h / bwamem.cpp's mem_reg2aln), so guard >= 0 exactly as
+     * upstream's generic SAM writer does (bwamem.cpp:2615). Also gate on
+     * !meth_mode: under --meth, mem_aln2sam short-circuits into
+     * meth_bam.cpp's meth_mem_aln_to_bam instead of that generic writer, and
+     * that function never emits HN — so upstream's real --meth output has no
+     * HN:i regardless of whether mem_gen_alt computed one. The guard is
+     * `!meth_mode`, not "check the SAM writer specifically", because
+     * mem_aln2sam's meth branch returns before reaching either non-meth
+     * writer (bwamem.cpp:2423-2447): plain SAM (bwamem.cpp:2615) AND
+     * --bam-mode's writer (bam_writer.cpp:464-466) both emit HN under the
+     * identical `HN >= 0` predicate, so !meth_mode alone is the exact
+     * condition, not merely a sufficient one. */
+    if (!opt->meth_mode && p->HN >= 0) aux_put_i(&aux, &aux_len, &aux_cap, "HN", p->HN);
 
     /* D3 (--meth) Bismark tags. XR:Z (read conversion) on every record; XG:Z
      * (genome strand) and XM:Z (per-base methylation call) on mapped records.
@@ -916,7 +931,29 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
     mem_pair_resolve(opt, bns, pac, pes, (uint64_t)pair_idx,
                      s, a, n_pri, z, q_se, &extra_flag, &paired);
 
-    /* Build a synthetic unmapped mem_aln_t in `dst[0]` (a single-record list). */
+    /* Build a synthetic unmapped mem_aln_t in `dst[0]` (a single-record list).
+     * upstream's own unmapped record (mem_reg2aln, bwamem.cpp:2632-2645)
+     * comes from `memset(&a, 0, sizeof(mem_aln_t))` followed by an
+     * immediate early return for `ar == 0`, EXCEPT for two fields it
+     * explicitly overwrites first: `a.HN = -1` and `a.meth_hypothesis = -1`
+     * (bwamem.cpp:2640-2641) — both writer-side sentinels, since 0 is a
+     * valid non-sentinel value for either. Every other field, including
+     * `score` and `sub`, is left at the memset default of 0 (not -1). Two
+     * consequences that must be mirrored exactly, not inferred from "what
+     * looks like a sane default":
+     *   - HN and meth_hypothesis here MUST be -1, matching upstream's
+     *     explicit overwrite. Leaving them at calloc's 0 previously leaked
+     *     HN:i:0 onto unmapped records, which the CLI never emits (see
+     *     append_bam_record's `p->HN >= 0` guard below); meth_hypothesis
+     *     has no emission effect today (XG/XM are gated on `p->rid >= 0`,
+     *     never true here) but is set for the same reason so this lambda
+     *     doesn't silently drift from upstream again.
+     *   - score and sub here MUST be 0, matching upstream's memset (NOT the
+     *     -1 sentinel append_bam_record's `p->score >= 0` / `p->sub >= 0`
+     *     guards use to suppress AS:i/XS:i elsewhere): the CLI's own
+     *     unmapped records carry AS:i:0 and XS:i:0 for exactly this reason,
+     *     confirmed against a real `bwa-mem3 mem` run on a read that fails
+     *     to map (see the `unmapped0` fixture in `cli_parity_xa.rs`). */
     auto fill_unmapped = [](mem_aln_t *dst) {
         dst[0].rid = -1;
         dst[0].pos = -1;
@@ -925,8 +962,10 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
         dst[0].cigar = nullptr;
         dst[0].mapq = 0;
         dst[0].NM = 0;
-        dst[0].score = -1;
-        dst[0].sub = -1;
+        dst[0].score = 0;
+        dst[0].sub = 0;
+        dst[0].HN = -1;
+        dst[0].meth_hypothesis = -1;
     };
 
     /* Convert each side's regions to mem_aln_t arrays for emission and mark
