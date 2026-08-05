@@ -577,6 +577,9 @@ unsafe impl Sync for MemPeStat {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests match on the variant; a module-level import would be
+    // dead in a non-test build and trip clippy's -D unused-imports.
+    use crate::error::Error;
 
     #[test]
     fn construct_defaults() {
@@ -731,10 +734,22 @@ mod tests {
     #[test]
     fn unknown_seed_order_value_is_an_error_not_off() {
         // Upstream adding a 6th mode must not silently read back as Off.
+        //
+        // Matched on the variant, not on the rendered string: `Error` has six
+        // variants, so a regression returning `InvalidOpts("bad value 5")` —
+        // or an `IndexLoad` whose path merely contains the character '5' —
+        // would satisfy a `to_string().contains('5')` assertion. `kind` is
+        // asserted too, so a copy-paste swap with `meth_scoring` fails here.
         let err = SeedOrder::try_from(5).unwrap_err();
         assert!(
-            err.to_string().contains('5'),
-            "error must name the unrecognized value, got: {err}"
+            matches!(
+                err,
+                Error::UnrecognizedEnum {
+                    kind: "seed_emit_order",
+                    value: 5
+                }
+            ),
+            "expected UnrecognizedEnum{{ kind: \"seed_emit_order\", value: 5 }}, got: {err:?}"
         );
     }
 
@@ -747,11 +762,18 @@ mod tests {
     #[test]
     fn unknown_meth_scoring_value_is_an_error_not_collapsed() {
         // bwa-mem3 v0.8.0 adds MEM_METH_SCORING_NEUTRAL = 2. Before this
-        // change it read back as Collapsed.
+        // change it read back as Collapsed. Variant-matched for the same
+        // reason as the seed-order test above.
         let err = MethScoring::try_from(2).unwrap_err();
         assert!(
-            err.to_string().contains('2'),
-            "error must name the unrecognized value, got: {err}"
+            matches!(
+                err,
+                Error::UnrecognizedEnum {
+                    kind: "meth_scoring",
+                    value: 2
+                }
+            ),
+            "expected UnrecognizedEnum{{ kind: \"meth_scoring\", value: 2 }}, got: {err:?}"
         );
     }
 

@@ -126,8 +126,16 @@ fn meth_opts_against_non_meth_index_errors() {
     let Err(err) = align_batch(&idx, &opts, &pairs, None) else {
         panic!("meth opts + non-meth index must error");
     };
+    // Matched on the variant, not just a substring: `Error` has six variants,
+    // and several carry free-form strings that could incidentally contain
+    // "meth" (an `IndexLoad` whose path does, for instance), so a bare
+    // `contains` would not distinguish the guard firing from an unrelated
+    // failure on the same call.
+    let bwa_mem3_rs::Error::InvalidInput(msg) = &err else {
+        panic!("expected Error::InvalidInput from the meth-mismatch guard, got: {err:?}");
+    };
     assert!(
-        err.to_string().contains("meth"),
-        "expected a meth mismatch error, got: {err}"
+        msg.contains("--meth enabled but the index is not a meth dual index"),
+        "expected the opts-meth/plain-index message, got: {msg}"
     );
 }
