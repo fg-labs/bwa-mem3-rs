@@ -85,7 +85,10 @@ STUB_GITMODULES_OLD='[submodule "ext/kept"]
 # assert_refreshed_tree stub above. Loops over "$@" rather than assuming
 # positional args, because the real call is `git -C "$REPO_ROOT" show
 # "HEAD:$path"` — "show" is $3, not $1.
-# shellcheck disable=SC2329
+# SC2317 is what shellcheck < 0.10 (e.g. Ubuntu noble's 0.9.0, which CI
+# installs from apt) reports for the same thing SC2329 covers in >= 0.10;
+# both are listed so the suite is clean on either version.
+# shellcheck disable=SC2317,SC2329
 git() {
     local arg
     for arg in "$@"; do
@@ -190,8 +193,8 @@ absent "named extraction did not bleed into mem_pestat_t" "$out" "avg, std"
 # shows up in its exit status.
 # Invoked indirectly by assert_refreshed_tree, which lives in the sourced
 # script — invisible to shellcheck here because of the `source=/dev/null`
-# directive above.
-# shellcheck disable=SC2329
+# directive above. See the SC2317/SC2329 note on the first git() stub.
+# shellcheck disable=SC2317,SC2329
 git() {
     local arg
     for arg in "$@"; do

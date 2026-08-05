@@ -63,7 +63,14 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: shellcheck
-        run: shellcheck scripts/*.sh scripts/tests/*.sh
+        # The version is logged because the runner's apt shellcheck lags the
+        # one most developers have locally (noble ships 0.9.0), and the two
+        # spell some checks differently — e.g. an indirectly-invoked stub is
+        # SC2317 before 0.10 and SC2329 after. A finding that reproduces only
+        # here is almost always that skew.
+        run: |
+          shellcheck --version
+          shellcheck scripts/*.sh scripts/tests/*.sh
       - name: Script unit tests
         run: bash scripts/tests/run-all.sh
 

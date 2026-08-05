@@ -55,7 +55,9 @@ fixture_tags=$'v0.3.0\nv0.2.0\nv0.1.0'
 
 # Invoked indirectly by vendored_version, which lives in the sourced script —
 # invisible to shellcheck here because of the `source=/dev/null` directive above.
-# shellcheck disable=SC2329
+# SC2317 is what shellcheck < 0.10 (Ubuntu noble ships 0.9.0, which CI installs
+# from apt) reports for the same thing SC2329 covers in >= 0.10.
+# shellcheck disable=SC2317,SC2329
 resolve_tag_sha() {
     case "$1" in
         v0.3.0) printf '%s' "3333333333333333333333333333333333333333" ;;
