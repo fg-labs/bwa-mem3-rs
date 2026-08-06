@@ -1,5 +1,10 @@
 [alias]
-ci-build = "build --workspace --all-targets --locked"
+# bwa-mem3-py (the pyo3 extension) is a workspace member but is excluded from
+# the build/test/lint aliases: `--workspace` includes every member and ignores
+# `default-members`, so it must be dropped explicitly to keep the pure-Rust CI
+# from needing a Python interpreter. It is built and tested via maturin in the
+# Python workflow instead. (`fmt --all` is fine -- formatting needs no build.)
+ci-build = "build --workspace --exclude bwa-mem3-py --all-targets --locked"
 ci-fmt = "fmt --all -- --check"
-ci-lint = "clippy --workspace --all-targets -- -D warnings"
-ci-test = "test --workspace --locked"
+ci-lint = "clippy --workspace --exclude bwa-mem3-py --all-targets -- -D warnings"
+ci-test = "test --workspace --exclude bwa-mem3-py --locked"
