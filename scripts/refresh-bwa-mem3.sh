@@ -40,6 +40,9 @@ DROP_SUBTREES=()
 while IFS= read -r line; do
     line="${line%%#*}"                       # strip comments
     line="$(printf '%s' "$line" | tr -d '[:space:]')"
+    # Normalised identically to drop_subtrees() in bwa-mem3-drift-report.sh --
+    # see the note there on why a trailing slash is load-bearing for the gate.
+    while [ "${line%/}" != "$line" ]; do line="${line%/}"; done
     [ -n "$line" ] && DROP_SUBTREES+=("$line")
 done < "$DROP_LIST"
 [ "${#DROP_SUBTREES[@]}" -gt 0 ] || { echo "ERROR: $DROP_LIST has no entries" >&2; exit 1; }

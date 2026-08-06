@@ -949,5 +949,49 @@ out_unfixed="$(grep -E '(^error|: (fatal )?error:)' "$tmp/dup_ansi.log" | head -
 check "MUTATION (expected red): unfixed filter shows 4 lines for 2 distinct errors" \
     "4" "$(printf '%s\n' "$out_unfixed" | grep -c "error: no member")"
 
+# --------------------------------------------------------------------------
+# drop_subtrees: a trailing slash must not defeat the gate filter (#31 item 3).
+# refresh-bwa-mem3.sh uses the entries as path PREFIXES, which tolerates
+# "ext/foo/", while the gate filter compares them by string equality, which
+# does not -- so one stray slash silently un-prunes a submodule and the gate
+# can never be cleared.
+# --------------------------------------------------------------------------
+slash_scratch="$tmp/slash-fixture"
+mkdir -p "$slash_scratch/scripts"
+printf 'ext/htslib/\next/mimalloc\n' > "$slash_scratch/scripts/vendor-drop-subtrees.txt"
+save_root_slash="$REPO_ROOT"
+REPO_ROOT="$slash_scratch"
+out="$(drop_subtrees)"
+REPO_ROOT="$save_root_slash"
+check "drop_subtrees: a trailing slash is normalised away" \
+    "$(printf 'ext/htslib\next/mimalloc')" "$out"
+
+# ...and end to end through the gate filter: a slashed entry must still
+# suppress the submodule it names.
+gm_slash="$tmp/gitmodules-slash"
+mkdir -p "$gm_slash/bwa-mem3-sys/vendor/bwa-mem3" "$gm_slash/scripts"
+printf 'ext/htslib/\n' > "$gm_slash/scripts/vendor-drop-subtrees.txt"
+printf '[submodule "ext/kept"]\n\tpath = ext/kept\n' > "$tmp/gm-old-slash"
+printf '[submodule "ext/kept"]\n\tpath = ext/kept\n[submodule "ext/htslib"]\n\tpath = ext/htslib\n' \
+    > "$tmp/gm-new-slash"
+save_root_slash="$REPO_ROOT"
+REPO_ROOT="$gm_slash"
+out="$(gitmodules_new_submodules "$tmp/gm-old-slash" "$tmp/gm-new-slash")"
+REPO_ROOT="$save_root_slash"
+check "gate filter: a slashed drop-list entry still suppresses its submodule" "" "$out"
+
+# --------------------------------------------------------------------------
+# print_summary must not report "no drift" when check 6 reports itself broken
+# (#31 item 2). Check 6 prints "Extraction matched nothing" AND still prints
+# "No TUs added or removed.", so the pre-fix condition read as clean.
+# --------------------------------------------------------------------------
+broken_inv="$(printf '## 6. Source inventory\n\nNo TUs added or removed.\n\nExtraction matched nothing -- the skip_common pattern in\ncheck_source_inventory is stale relative to build.rs.\n')"
+out="$(print_summary "no new submodules" "Builds clean." "No change." "" \
+    "No change to any tracked contract." "$broken_inv" \
+    "No change to \`LIBS\`" "No new fields." "")"
+contains "summary: a broken check 6 is reported as drift, not silence" \
+    "$out" "source inventory (§6)"
+absent "summary: ...so the no-drift lede is not printed" "$out" "none of §3–§9 report a change"
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

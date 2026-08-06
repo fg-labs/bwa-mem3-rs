@@ -126,8 +126,14 @@ re-dispatch. A cron tick never sets `tag`, so only a human can reach this path.
 Two cases produce an issue but no PR: a refresh that fails outright (e.g.
 upstream dropped `-DMATE_SORT=0`), and upstream adding an `ext/` submodule the
 refresh could not know to prune — committing then would vendor the whole
-subtree. For the latter, add it to `scripts/vendor-drop-subtrees.txt` and
-re-dispatch. A third case produces neither: if the tracking issue itself fails
+subtree. For the latter, add it to `scripts/vendor-drop-subtrees.txt` (write
+entries without a trailing slash — that is the canonical form, though both
+readers normalize one away, so a stray slash is tolerated) and re-dispatch.
+A *bare* re-dispatch will now skip, because the tracking issue
+from the gated run is still open and the dedup treats that as "already filed":
+either close that issue first, or re-dispatch with `-f tag=` to force past it.
+
+A third case produces neither: if the tracking issue itself fails
 to open (e.g. a permissions gap on the bot's GitHub App), the run ends there —
 no branch is pushed and no PR is opened, so a broken issue never leaves an
 orphaned PR behind.
