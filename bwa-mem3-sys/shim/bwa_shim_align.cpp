@@ -594,6 +594,36 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
     int n_cigar = p->n_cigar;
     int ref_len = cigar_ref_len(n_cigar, p->cigar);
 
+    /* Upstream's mem_aln2sam prologue (bwamem.cpp:2457-2462), reproduced here
+     * on LOCAL copies exactly as it does with ptmp/mtmp: for a half-mapped
+     * pair the unmapped record is rewritten to carry its mate's placement, and
+     * the mapped record's mate fields are rewritten to carry its own.
+     *
+     * Operating on copies is load-bearing, not stylistic. Mutating lists[k]
+     * would leave the rewrite visible when the OTHER record of the pair is
+     * emitted, and the second copy branch would then see a mate that already
+     * looks mapped -- reporting both records as placed.
+     *
+     * This is more than byte-parity: giving the unmapped record its mate's
+     * coordinates is what keeps the pair adjacent under coordinate sort, which
+     * most downstream tools rely on.
+     *
+     * 0x4/0x8 are deliberately NOT recomputed here. pair_and_emit already set
+     * them from the ORIGINAL rids, which matches upstream's ordering: it
+     * derives those two before the copy and 0x10/0x20 after it. */
+    int32_t eff_rid    = p->rid;
+    int64_t eff_pos    = p->pos;
+    int     eff_is_rev = p->is_rev;
+    int32_t mate_rid    = m ? m->rid : -1;
+    int64_t mate_pos    = m ? m->pos : 0;
+    int     mate_is_rev = m ? m->is_rev : 0;
+    if (eff_rid < 0 && m && mate_rid >= 0) {          /* copy mate to alignment */
+        eff_rid = mate_rid; eff_pos = mate_pos; eff_is_rev = mate_is_rev;
+    }
+    if (m && mate_rid < 0 && eff_rid >= 0) {          /* copy alignment to mate */
+        mate_rid = eff_rid; mate_pos = eff_pos; mate_is_rev = eff_is_rev;
+    }
+
     /* Emitted-SEQ range: hard-clipped (H) ends are dropped for supplementary
      * records, so the emitted sequence is a subset of s->seq. Computed up front
      * because the --meth XM:Z tag below needs it. bwa-mem3 H opcode = 4 (not 5
@@ -725,16 +755,17 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
     uint32_t bs32 = (uint32_t) block_size;
     memcpy(w, &bs32, 4); w += 4;
 
-    int32_t ref_id = p->rid;
+    int32_t ref_id = eff_rid;
     memcpy(w, &ref_id, 4); w += 4;
-    int32_t pos32 = (int32_t) p->pos;
+    int32_t pos32 = (int32_t) eff_pos;
     memcpy(w, &pos32, 4); w += 4;
 
     *w++ = (uint8_t) l_read_name;
     *w++ = (uint8_t) p->mapq;
 
-    uint16_t bin = (ref_id < 0 || ref_len == 0) ? 4680
-                                                : reg2bin((int)p->pos, (int)p->pos + ref_len);
+    uint16_t bin = (ref_id < 0 || ref_len == 0)
+                       ? 4680
+                       : reg2bin((int)eff_pos, (int)eff_pos + ref_len);
     memcpy(w, &bin, 2); w += 2;
 
     uint16_t nc = (uint16_t) n_cigar;
@@ -746,14 +777,21 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
      * Keeping the marker at 0x10000 internally (not 0x100) is deliberate: it
      * lets emit_sa_tag still list NO_MULTI splits in SA:Z (its skip test is
      * `flag & 0x100`), matching upstream. */
-    uint16_t flag16 = (uint16_t)((p->flag & 0xffff) | ((p->flag & 0x10000) ? 0x100 : 0));
+    /* 0x10/0x20 are recomputed from the POST-copy strands (upstream derives
+     * them after the rewrite above), so an unmapped record placed at its
+     * mate's coordinates inherits that mate's strand. Clearing first matters:
+     * pair_and_emit set them from the raw values. */
+    uint32_t flag_raw = (p->flag & ~(uint32_t)(0x10 | 0x20));
+    if (eff_is_rev)       flag_raw |= 0x10;
+    if (m && mate_is_rev) flag_raw |= 0x20;
+    uint16_t flag16 = (uint16_t)((flag_raw & 0xffff) | ((flag_raw & 0x10000) ? 0x100 : 0));
     memcpy(w, &flag16, 2); w += 2;
 
     int32_t ls = emit_len;
     memcpy(w, &ls, 4); w += 4;
 
-    int32_t mtid = m ? m->rid  : -1;
-    int32_t mpos = m ? (int32_t) m->pos : -1;
+    int32_t mtid = m ? mate_rid : -1;
+    int32_t mpos = m ? (int32_t) mate_pos : -1;
     int32_t tlen = m ? compute_tlen(p, ref_len, m, cigar_ref_len(m->n_cigar, m->cigar)) : 0;
     memcpy(w, &mtid, 4); w += 4;
     memcpy(w, &mpos, 4); w += 4;
