@@ -220,6 +220,26 @@ function_body() {
 # Checks
 # --------------------------------------------------------------------------
 
+# Removes the ANSI colour sequences cargo writes even when its output is not a
+# terminal. They survive into the markdown fence and render as literal `[1m[33m`
+# noise in an issue body (15 lines of the v0.8.0 dry-run report carried them).
+# Presentational only -- it changes no text a reader acts on.
+strip_ansi() {
+    mawk '{ gsub(/\033\[[0-9;]*[a-zA-Z]/, ""); print }'
+}
+
+# Collapses the two forms cargo prints every build-script diagnostic in --
+# `warning: <pkg>@<ver>: <text>` (its own rendering) and `cargo:warning=<text>`
+# (the raw directive) -- to the bare text, so the two become byte-identical and
+# a later dedupe can drop one. On the v0.8.0 dry run this was the difference
+# between 36 filtered lines and 15 distinct errors, i.e. the `head` budget below
+# was spending 58% of itself on duplicates.
+strip_cargo_warning_prefix() {
+    mawk '{ sub(/^[[:space:]]*cargo:warning=/, "");
+            sub(/^[[:space:]]*warning: [A-Za-z0-9_.-]+@[0-9][^:]*: /, "");
+            print }'
+}
+
 # Formats the "Build FAILED" body for a given log file and exit status. Split
 # out from check_build so scripts/tests/test-drift-report.sh can exercise the
 # filtering/tail logic against fixture logs without actually running
@@ -251,7 +271,13 @@ format_build_failure() {
     # when nothing matches, and under `set -o pipefail` that would make the
     # bare assignment abort the whole script via `set -e` before
     # `[ -n "$hits" ]` below ever runs.
-    hits="$(grep -E '(^error|: (fatal )?error:|^warning: unused|  -->|ld:|^Undefined symbols)' "$log" | head -40 || true)"
+    # Normalise and dedupe BEFORE `head`, so the 40-line budget is spent on
+    # distinct diagnostics. `mawk '!seen[$0]++'` keeps first-occurrence order
+    # rather than sorting: for a worklist, the order the compiler reported
+    # errors in is the order to work through them.
+    hits="$(strip_ansi < "$log" \
+        | grep -E '(^error|: (fatal )?error:|^warning: unused|  -->|ld:|^Undefined symbols)' \
+        | strip_cargo_warning_prefix | mawk '!seen[$0]++' | head -40 || true)"
     if [ -n "$hits" ]; then
         printf 'Lines matching known error patterns:\n\n```\n'
         printf '%s\n' "$hits"
@@ -265,8 +291,11 @@ format_build_failure() {
     # filter missed it"), and reliably detecting the overlap is more
     # machinery than the handful of possibly-repeated lines it would save.
     # Accept the overlap; the label says what this section is.
+    # Colour codes are stripped here too, but nothing else is: this section's
+    # value is being the unfiltered end of the log, so the cargo-prefix
+    # collapsing and dedupe applied above deliberately do NOT run on it.
     printf 'Last 40 lines of the raw log (may repeat lines already shown above):\n\n```\n'
-    tail -40 "$log"
+    tail -40 "$log" | strip_ansi
     printf '```\n\n'
     printf 'Full log is in the workflow run artifacts.\n'
 }
@@ -280,7 +309,7 @@ check_build() {
     (cd "$REPO_ROOT" && cargo ci-build) > "$log" 2>&1 || status=$?
     if [ "$status" -eq 0 ]; then
         printf 'Builds clean. Note this proves compilation only — it does not\n'
-        printf 'prove byte-parity with the CLI. See the manual checklist below.\n'
+        printf 'prove byte-parity with the CLI. See the manual checklist above.\n'
     else
         format_build_failure "$log" "$status"
     fi
@@ -656,8 +685,28 @@ check_new_opts() {
         return 0
     fi
     printf 'New field declarations:\n\n'
+    local skipped_comments=0
     while IFS= read -r field; do
-        [ -n "$field" ] || continue
+        # Counted, not silently skipped: a blank added line is non-declaration
+        # text like any other, and the tally below claims to cover all of it.
+        [ -n "$field" ] || { skipped_comments=$((skipped_comments + 1)); continue; }
+        # Drop comment lines before classifying. The diff yields every added
+        # line of the struct body, and mem_opt_t carries multi-line block
+        # comments -- v0.8.0's meth-scoring note alone runs ~20 lines. Their
+        # continuation lines end with a plausible last token ("frees",
+        # "mismatches"), so they survive the name extraction below and get a
+        # verdict attached: on the v0.8.0 dry run that buried 9 real fields
+        # under 34 comment lines. A declaration always ends in `;`, and never
+        # begins with a comment marker.
+        case "${field#"${field%%[![:space:]]*}"}" in
+            # A leading literal `*` covers both a block-comment continuation
+            # line and its closing `*/`.
+            '*'*|'/*'*|'//'*) skipped_comments=$((skipped_comments + 1)); continue ;;
+        esac
+        case "$field" in
+            *';'*) ;;
+            *) skipped_comments=$((skipped_comments + 1)); continue ;;
+        esac
         case "$field" in
             *"NOT a user option"*|*"runtime state"*|*derived*)
                 # Backticks below are literal markdown, not command substitution.
@@ -694,6 +743,13 @@ check_new_opts() {
                 esac ;;
         esac
     done <<< "$added"
+    # Report the count rather than dropping them silently: a reader who knows
+    # the struct gained a doc comment should be able to tell "filtered" from
+    # "the check missed them".
+    if [ "$skipped_comments" -gt 0 ]; then
+        printf '\n(%d added line(s) skipped as comment or non-declaration text.)\n' \
+            "$skipped_comments"
+    fi
     printf '\nExposing a field is optional and separable from the refresh —\n'
     printf 'file it as follow-up rather than growing this PR.\n'
 }
@@ -745,7 +801,7 @@ check_release_notes() {
 
 # Check 11: what CI structurally cannot verify.
 print_manual_checklist() {
-    report_section "11. Manual checklist (CI cannot do these)"
+    report_section "Manual checklist (CI cannot do these)"
     cat <<'EOF'
 Green CI is necessary but **not sufficient**. Before merging:
 
@@ -762,7 +818,7 @@ Green CI is necessary but **not sufficient**. Before merging:
 - [ ] `shim/bwa_shim_types.h`'s `MEM_F_*` `#define` block, and the three
       coordinated edits in `shim/bwa_shim_layout_assert.cpp` (the
       `pod_flags::MEM_F_X_v` capture, its paired `#undef`, and the
-      `BWA_SHIM_CK_FLAG(MEM_F_X)` invocation), match upstream (check 4 above
+      `BWA_SHIM_CK_FLAG(MEM_F_X)` invocation), match upstream (check 4 below
       diffs it, but confirm you acted on it).
 - [ ] `worker_alloc` / `worker_free` copies in `bwa_shim_align.cpp` still
       match upstream's, **including the buffer sizing**, not just field names.
@@ -852,8 +908,8 @@ print_summary() {
         joined="${joined%, }"
         printf -- '- Drift (%d/7): %s.\n' "${#drifted[@]}" "$joined"
     fi
-    printf -- "- Green CI is **not sufficient** — §11's manual checklist is not run by CI\n"
-    printf '  and sits last, after potentially thousands of diff lines below; do not skip it.\n'
+    printf -- '- Green CI is **not sufficient** — the manual checklist immediately\n'
+    printf -- '  below is not run by CI; do not skip it.\n'
 }
 
 main() {
@@ -881,6 +937,13 @@ main() {
     printf '# bwa-mem3 vendor refresh — drift report\n'
     print_summary "$gitmodules_out" "$build_out" "$structs_out" "$flags_out" \
         "$contracts_out" "$inventory_out" "$deps_out" "$newopts_out" "$licences_out"
+    # Immediately after the summary, NOT last: the report can exceed the
+    # 60000-byte cap the workflow applies to an issue/PR body (the v0.8.0 dry
+    # run came to 86862 bytes), and truncation takes the tail. Printed last,
+    # the one section CI cannot substitute for was the first thing cut, while
+    # the summary above still told the reader to go and read it. Everything
+    # below this point is diff detail that survives being trimmed.
+    print_manual_checklist
     printf '%s\n' "$gitmodules_out"
     printf '%s\n' "$build_out"
     printf '%s\n' "$structs_out"
@@ -891,7 +954,6 @@ main() {
     printf '%s\n' "$newopts_out"
     printf '%s\n' "$licences_out"
     printf '%s\n' "$release_out"
-    print_manual_checklist
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
