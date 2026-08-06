@@ -1,9 +1,18 @@
 [workspace]
 resolver = "2"
-members = ["bwa-mem3-sys", "bwa-mem3-rs", "bwa-mem3-rs-cli"]
+# bwa-mem3-py is a member so it inherits the shared workspace version and
+# release-plz bumps it in lockstep with the crates -- the wheel's version comes
+# from its crate version (pyproject declares it `dynamic`), so a py crate
+# outside the workspace silently falls behind every release and then fails to
+# resolve the moment a MINOR bump lands (`^0.1.1` tolerates 0.1.x forever).
+# It is kept out of `default-members`, and excluded from the `--workspace` ci-*
+# aliases in .cargo/config.toml, so the pure-Rust CI never builds the pyo3
+# extension -- maturin builds it explicitly from the bwa-mem3-py/ directory.
+members = ["bwa-mem3-sys", "bwa-mem3-rs", "bwa-mem3-rs-cli", "bwa-mem3-py"]
+default-members = ["bwa-mem3-sys", "bwa-mem3-rs", "bwa-mem3-rs-cli"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"

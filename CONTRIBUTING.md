@@ -124,9 +124,16 @@ entries from conventional commits. Merging the release PR triggers the
    wheels (Linux x86_64 / aarch64, macOS arm64) and uploads them to PyPI via
    Trusted Publishing.
 
-Currently `bwa-mem3-py` is outside the cargo workspace and not driven by
-release-plz; bump its version manually in `bwa-mem3-py/Cargo.toml` and
-`bwa-mem3-py/pixi.toml` to match the workspace before merging the release PR.
+`bwa-mem3-py` is a workspace member that inherits `[workspace.package].version`,
+so release-plz bumps it with the rest and no manual step is needed at release
+time. It is deliberately excluded from `default-members` and from the `ci-*`
+aliases in `.cargo/config.toml`, so the pure-Rust checks never need a Python
+interpreter; maturin builds it from `bwa-mem3-py/` in the Python workflow. Its
+dependency on `bwa-mem3-rs` is path-only for the same reason -- a `version`
+requirement there is used only when publishing to crates.io, and the crate is
+`publish = false`. Because it is now in the workspace, the publish workflow's
+"Verify lockstep workspace versions" gate covers it too, which it could not do
+while the crate sat outside.
 
 ### PyPI Trusted Publishing (one-time setup)
 
