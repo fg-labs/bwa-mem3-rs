@@ -80,7 +80,7 @@ else
     # both via the un-anchored `--exclude='.github'` above.
     find "$DST" -name '.github' -type d -print0 | xargs -0 rm -rf
     for sub in "${DROP_SUBTREES[@]}"; do
-        rm -rf "$DST/$sub"
+        rm -rf "${DST:?}/$sub"
     done
 fi
 

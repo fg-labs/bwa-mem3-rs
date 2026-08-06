@@ -312,7 +312,7 @@ fn extract_makefile_defines(makefile: &str) -> Vec<String> {
 const DEFINES_DELIBERATELY_OMITTED: &[(&str, &str)] = &[
     (
         "LIBSAIS_OPENMP",
-        "libsais is pruned from the vendor tree (refresh-bwa-mem3.sh DROP_SUBTREES); \
+        "libsais is pruned from the vendor tree (scripts/vendor-drop-subtrees.txt); \
          the index builder it belongs to is out of scope",
     ),
     (
@@ -496,6 +496,15 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+// `cargo test` never runs this: `build.rs` is a build script, not a test
+// target, so `cfg(test)` here never activates via `cargo test`/`cargo
+// ci-test`, and `cargo ci-lint --all-targets` does not compile it either —
+// it can rot silently while reading as coverage. Run it directly: build
+// once (`cargo build -p bwa-mem3-sys`) so `bindgen`/`cc` are compiled, find
+// the exact `rustc ... build.rs` invocation cargo used via `cargo build -p
+// bwa-mem3-sys -v` (after `touch build.rs` to force a rebuild), then re-run
+// that same command with `--test` swapped in for `--crate-type bin
+// --emit=dep-info,link` and execute the resulting binary.
 #[cfg(test)]
 mod tests {
     use super::{canonical_define, extract_makefile_defines};

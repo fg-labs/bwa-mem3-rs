@@ -784,4 +784,15 @@ mod tests {
             assert_eq!(order as i32, v, "discriminant must round-trip");
         }
     }
+
+    #[test]
+    fn meth_scoring_round_trips_through_the_raw_discriminant() {
+        // The setters depend on `m as i32` round-tripping through
+        // TryFrom<i32> back to the same variant — mirrors SeedOrder's
+        // round-trip test above, which caught the same class of bug there.
+        for v in [0, 1] {
+            let scoring = MethScoring::try_from(v).unwrap();
+            assert_eq!(scoring as i32, v, "discriminant must round-trip");
+        }
+    }
 }
