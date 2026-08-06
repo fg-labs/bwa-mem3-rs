@@ -77,10 +77,17 @@ new_file() {
 # A missing list file writes an ERROR to stderr and the caller then sees an
 # empty drop set, so every added path stays in `added` and the gate FIRES.
 # That is the safe direction (a refresh is blocked, not silently un-gated),
-# but note the `exit 1` below does NOT propagate: bash does not honour
-# `errexit` for a failing bare assignment inside a command substitution, and
-# every caller of this function runs it as `$(drop_subtrees ...)`. Do not
-# rely on it to abort the script.
+# but the `exit 1` below does NOT abort the script the way it reads: bash does
+# not honour `errexit` for a failing bare assignment inside a command
+# substitution, and every caller runs this as `$(drop_subtrees ...)`. It exits
+# the SUBSHELL only. Do not rely on it to stop the run.
+#
+# Trailing slashes are stripped because the two readers of this file USE it
+# differently even though they parse it identically: refresh-bwa-mem3.sh treats
+# entries as path prefixes (`rm -rf "$DST/$sub"`), which tolerates `ext/foo/`,
+# while the gate filter here compares them by string equality, which does not.
+# Without this, one trailing slash silently un-filters a pruned submodule and
+# the gate can never be cleared.
 drop_subtrees() {
     local list="$REPO_ROOT/scripts/vendor-drop-subtrees.txt"
     [ -f "$list" ] || { echo "ERROR: missing $list" >&2; exit 1; }
@@ -88,6 +95,7 @@ drop_subtrees() {
     while IFS= read -r line; do
         line="${line%%#*}"
         line="$(printf '%s' "$line" | tr -d '[:space:]')"
+        while [ "${line%/}" != "$line" ]; do line="${line%/}"; done
         [ -n "$line" ] && printf '%s\n' "$line"
     done < "$list"
 }
@@ -887,7 +895,13 @@ print_summary() {
     grep -qF 'No change.' <<< "$structs_out" || drifted+=("struct layout (§3)")
     grep -q '^### ' <<< "$flags_out" && drifted+=("flags/enums (§4)")
     grep -qF 'No change to any tracked contract.' <<< "$contracts_out" || drifted+=("upstream contracts (§5)")
-    { grep -qF 'GONE' <<< "$inventory_out" || ! grep -qF 'No TUs added or removed.' <<< "$inventory_out"; } \
+    # `Extraction matched nothing` is check 6 reporting that its own
+    # skip_common anchor has gone stale against build.rs. It still prints
+    # "No TUs added or removed." on that path, so without this clause the
+    # summary claims no drift while §6 says the check is broken.
+    { grep -qF 'GONE' <<< "$inventory_out" \
+        || grep -qF 'Extraction matched nothing' <<< "$inventory_out" \
+        || ! grep -qF 'No TUs added or removed.' <<< "$inventory_out"; } \
         && drifted+=("source inventory (§6)")
     # Backticks below are literal markdown, not command substitution.
     # shellcheck disable=SC2016

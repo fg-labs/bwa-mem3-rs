@@ -221,9 +221,15 @@ jobs:
           # for a cheaper query. Listing all open issues and matching the
           # title exactly client-side (below) is the safer trade at this
           # repo's issue volume.
+          # Paginated, not `--limit N`: a fixed limit is a silent FALSE
+          # NEGATIVE once the repo has more open issues than the limit -- it
+          # misses the real tracking issue and files a duplicate, which is the
+          # exact loop this lookup exists to prevent. The REST endpoint returns
+          # PRs alongside issues, so pull_request-bearing entries are dropped.
           issue_titles=""
-          if ! issue_titles="$(gh issue list --state open --limit 100 \
-                     --json title --jq '.[].title' \
+          if ! issue_titles="$(gh api --paginate \
+                     "repos/${{ github.repository }}/issues?state=open&per_page=100" \
+                     --jq '.[] | select(.pull_request == null) | .title' \
                      2>/tmp/issue-lookup.stderr)"; then
             echo "::warning::gh issue list failed; treating as if an open tracking issue already exists, to avoid a duplicate-issue loop. See the step log for the lookup's stderr." \
               | tee -a "$GITHUB_STEP_SUMMARY"
@@ -277,7 +283,9 @@ jobs:
 
       - name: Refresh the vendored snapshot
         id: refresh
-        if: steps.detect.outputs.needs_bump == 'true' && steps.existing.outputs.skip != 'true'
+        if: steps.detect.outputs.needs_bump == 'true' &&
+          steps.existing.outcome == 'success' &&
+          steps.existing.outputs.skip != 'true'
         run: |
           set -uo pipefail
           if ! scripts/refresh-bwa-mem3.sh "${{ steps.detect.outputs.latest_sha }}" \
@@ -293,7 +301,9 @@ jobs:
 
       - name: Generate the drift report
         id: report
-        if: steps.detect.outputs.needs_bump == 'true' && steps.existing.outputs.skip != 'true'
+        if: steps.detect.outputs.needs_bump == 'true' &&
+          steps.existing.outcome == 'success' &&
+          steps.existing.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           MISSED_TAGS: ${{ steps.detect.outputs.missed_tags }}
@@ -310,7 +320,8 @@ jobs:
               echo '```'
             } > /tmp/report.md
           else
-            scripts/bwa-mem3-drift-report.sh > /tmp/report.md 2>&1 || true
+            report_rc=0
+            scripts/bwa-mem3-drift-report.sh > /tmp/report.md 2>&1 || report_rc=$?
           fi
           cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
           # Anchored whole-report match, not a positional check: the
@@ -318,14 +329,53 @@ jobs:
           # section heading prints first, so the marker lands a few lines
           # in -- a `head -N` or first-line check breaks the moment an
           # earlier check's output grows by even one line.
-          if grep -qE '^NEW_SUBMODULE$' /tmp/report.md; then
+          # Fail CLOSED before the marker test. Every check's output is
+          # captured into a variable and printed at the end, so a mid-report
+          # abort yields ZERO output rather than a partial report -- and
+          # grepping an empty file for the marker finds nothing, computes
+          # `gated=false`, and opens a PR with the submodule gate never
+          # enforced. A non-zero exit means misuse (nothing refreshed,
+          # unrelated files dirty), which is equally not a basis for opening
+          # anything. The report script exits 0 on every ordinary outcome,
+          # including a failed build, so neither branch fires on real drift.
+          if [ "${report_rc:-0}" -ne 0 ] || [ ! -s /tmp/report.md ]; then
+            {
+              echo "::error::the drift report exited ${report_rc:-0} or produced no"
+              echo "output, so the NEW_SUBMODULE gate could not be evaluated."
+              echo "Gating this run: nothing will be pushed or opened."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            # The tracking issue is filed from this file (by way of the cap
+            # step's /tmp/report-body.md), and on this branch it is empty or
+            # unusable -- in the `! -s` case, without the append below, the
+            # cap step's `cp` would hand `gh issue create` a zero-byte body.
+            # That issue still blocks unattended retries through the dedup,
+            # so it has to carry the reason it exists; otherwise the next
+            # tick skips on an issue that says nothing and the only
+            # diagnostic is a step summary nobody is looking at. Appended
+            # AFTER the `cat` above, so the step summary gets this text once
+            # (via the tee) rather than twice.
+            {
+              echo
+              echo "## The drift report could not be generated"
+              echo
+              echo "\`scripts/bwa-mem3-drift-report.sh\` exited ${report_rc:-0} or produced"
+              echo "no output, so the \`NEW_SUBMODULE\` gate could not be evaluated."
+              echo "Nothing was pushed and no PR was opened."
+              echo
+              echo "Re-dispatch once the refresh is fixed. The job log for this run has"
+              echo "the failure, and the drift-report artifact carries the refresh log."
+            } >> /tmp/report.md
+            echo "gated=true" >> "$GITHUB_OUTPUT"
+          elif grep -qE '^NEW_SUBMODULE$' /tmp/report.md; then
             echo "gated=true" >> "$GITHUB_OUTPUT"
           else
             echo "gated=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload the report and logs
-        if: steps.detect.outputs.needs_bump == 'true' && steps.existing.outputs.skip != 'true'
+        if: steps.detect.outputs.needs_bump == 'true' &&
+          steps.existing.outcome == 'success' &&
+          steps.existing.outputs.skip != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: drift-report
@@ -346,7 +396,9 @@ jobs:
       # the untruncated report, so this is a truncate-with-a-pointer, not a
       # loss of information.
       - name: Cap the report to GitHub's body-size limit
-        if: steps.detect.outputs.needs_bump == 'true' && steps.existing.outputs.skip != 'true'
+        if: steps.detect.outputs.needs_bump == 'true' &&
+          steps.existing.outcome == 'success' &&
+          steps.existing.outputs.skip != 'true'
         run: |
           set -euo pipefail
           body_limit=60000
@@ -391,6 +443,7 @@ jobs:
         id: issue
         if: |
           steps.detect.outputs.needs_bump == 'true' &&
+          steps.existing.outcome == 'success' &&
           steps.existing.outputs.skip != 'true' &&
           inputs.dry_run != true
         env:
@@ -413,6 +466,7 @@ jobs:
         id: pr
         if: |
           steps.detect.outputs.needs_bump == 'true' &&
+          steps.existing.outcome == 'success' &&
           steps.existing.outputs.skip != 'true' &&
           steps.report.outputs.gated != 'true' &&
           steps.refresh.outputs.failed != 'true' &&
