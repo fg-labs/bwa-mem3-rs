@@ -691,6 +691,49 @@ contains "check 8: field already referenced in opts.rs says already referenced" 
 contains "check 8: unreferenced new field is flagged for exposure" "$out" "new_score"
 contains "check 8: unreferenced new field says consider exposing" "$out" "consider exposing"
 
+# --- check 8: block-comment lines are not reported as fields ---
+# Regression for the v0.8.0 dry run, where mem_opt_t gained a ~20-line block
+# comment and check 8 listed 43 "new field declarations" of which only 9 were
+# declarations. A continuation line ends with a plausible last token ("frees",
+# "mismatches"), so it survived the name extraction and got a verdict attached,
+# burying the real fields.
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" <<'EOF'
+typedef struct mem_opt_t {
+    int w;
+    /* Multi-line note about the scoring matrix:
+     * ACGT order A,C,G,T,N). Each frees the conversion cell -- mat_ot frees
+     *   NEUTRAL: that cell alone is freed, to 0 (tolerated, not rewarded)
+     */
+    int rescue_kmer; // consider
+
+    // a single-line comment that is also not a field
+} mem_opt_t;
+EOF
+out="$(check_new_opts)"
+contains "check 8: a real field beside a block comment is still reported" "$out" "rescue_kmer"
+absent "check 8: block-comment continuation lines are not listed as fields" "$out" "Each frees the conversion cell"
+absent "check 8: block-comment continuation lines get no verdict" "$out" "tolerated, not rewarded"
+absent "check 8: a single-line comment is not listed as a field" "$out" "also not a field"
+contains "check 8: skipped comment lines are counted, not silently dropped" "$out" "skipped as comment or non-declaration text"
+# Exact count, not just presence: the fixture adds six non-declaration lines --
+# the `/*` opener, two ` *` continuations, the ` */` closer, a blank line, and
+# the `//` comment. The blank one is what an earlier revision skipped without
+# counting, so the total is what pins that fix.
+check "check 8: every skipped line is counted, including the blank one" \
+    "1" "$(printf '%s' "$out" | grep -c '(6 added line(s) skipped as comment or non-declaration text.)')"
+
+# Restore the triage fixture: the next block snapshots bwamem.h into
+# $tmp/bwamem_with_new_fields.h, and the mutation test further down asserts on
+# `new_score` from that snapshot.
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" <<'EOF'
+typedef struct mem_opt_t {
+    int w;
+    int existing_field; // consider
+    int internal_state; // NOT a user option
+    double new_score; // consider
+} mem_opt_t;
+EOF
+
 # --- check 8: no new fields -> trivial "no new fields" message ---
 cp "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" "$tmp/bwamem_with_new_fields.h"
 cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" <<'EOF'
@@ -875,6 +918,36 @@ contains "MUTATION baseline: original filter still shows the useless generic wra
 # The FIXED format_build_failure, same fixture, must not lose it (green).
 out_fixed="$(format_build_failure "$tmp/fatal_error.log" 101)"
 contains "format_build_failure (fixed): real fatal-error diagnostic is present where the mutation lost it" "$out_fixed" "fatal error: 'version.h' file not found"
+
+# --------------------------------------------------------------------------
+# format_build_failure: cargo prints every build-script diagnostic TWICE (its
+# own `warning: <pkg>@<ver>: <text>` rendering and the raw `cargo:warning=`
+# directive) and colours both. On the v0.8.0 dry run the filtered excerpt was
+# 36 lines covering 15 distinct errors, so the 40-line cap was spending 58% of
+# itself on duplicates, and 15 lines carried ANSI escapes that render as
+# literal `[1m[33m` inside the markdown fence.
+# --------------------------------------------------------------------------
+esc=$'\033'
+cat > "$tmp/dup_ansi.log" <<EOF
+${esc}[1m${esc}[33mwarning${esc}[0m: bwa-mem3-sys@0.2.0: /w/shim/a.cpp:65:22: error: no member named 'chain_ar'
+${esc}[1m${esc}[33mwarning${esc}[0m: bwa-mem3-sys@0.2.0: /w/shim/a.cpp:68:7: error: no member named 'seedBuf'
+  cargo:warning=/w/shim/a.cpp:65:22: error: no member named 'chain_ar'
+  cargo:warning=/w/shim/a.cpp:68:7: error: no member named 'seedBuf'
+EOF
+out="$(format_build_failure "$tmp/dup_ansi.log" 101)"
+
+check "format_build_failure: the two cargo forms collapse to one line each" \
+    "2" "$(printf '%s' "$out" | mawk '/^Lines matching/,/^Last 40 lines/' | grep -c "error: no member")"
+absent "format_build_failure: no ANSI escapes survive into the report" "$out" "$esc"
+contains "format_build_failure: the first distinct error is kept" "$out" "no member named 'chain_ar'"
+contains "format_build_failure: the second distinct error is kept" "$out" "no member named 'seedBuf'"
+
+# MUTATION (expected red): the ORIGINAL single grep, with neither the prefix
+# collapse nor the dedupe, must show all four lines for two real errors --
+# confirming the fix above is load-bearing rather than cosmetic.
+out_unfixed="$(grep -E '(^error|: (fatal )?error:)' "$tmp/dup_ansi.log" | head -40)"
+check "MUTATION (expected red): unfixed filter shows 4 lines for 2 distinct errors" \
+    "4" "$(printf '%s\n' "$out_unfixed" | grep -c "error: no member")"
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

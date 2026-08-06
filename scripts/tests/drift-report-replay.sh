@@ -144,6 +144,30 @@ expect "reports an upstream contract change"      '^### `mem_kernel1_core` (chan
 # Unconditional by design: this one asserts the checklist section is present at
 # all, not that a particular finding fired.
 expect "includes the manual checklist"            "Manual checklist"
+
+# Ordering, not just presence: the workflow caps an issue/PR body at 60000
+# bytes and truncation takes the tail, while a real report runs well past that
+# (86862 bytes on the v0.8.0 dry run). Printed after the diffs, the one section
+# CI cannot substitute for is the first thing cut -- so assert it precedes them.
+# Compared by position rather than against the byte cap directly, because a
+# smaller replay report would satisfy a byte-offset check trivially.
+# Anchored on the emitted HEADING, not a bare "Manual checklist" substring:
+# the summary also mentions the checklist in prose, so an unanchored match is
+# one capitalisation away from asserting the position of the wrong line.
+# Both boundaries are checked -- summary < checklist < section 1 -- so the
+# assertion pins the actual placement rather than just "somewhere early".
+summary_line="$(grep -n '^## Summary$' "$report" | head -1 | cut -d: -f1)"
+checklist_line="$(grep -n '^## Manual checklist' "$report" | head -1 | cut -d: -f1)"
+first_check_line="$(grep -n '^## 1\.' "$report" | head -1 | cut -d: -f1)"
+if [ -n "$summary_line" ] && [ -n "$checklist_line" ] && [ -n "$first_check_line" ] \
+   && [ "$summary_line" -lt "$checklist_line" ] \
+   && [ "$checklist_line" -lt "$first_check_line" ]; then
+    pass=$((pass + 1))
+    echo "  ok: manual checklist sits between the summary and section 1 (survives body truncation)"
+else
+    fail=$((fail + 1))
+    echo "  FAIL: expected summary < checklist < section 1, got ${summary_line:-?} / ${checklist_line:-?} / ${first_check_line:-?} — truncation would drop the checklist" >&2
+fi
 expect "includes release notes for a missed tag"  "v0.5.0"
 
 echo "=== Synthetic prune: removing a needed header must fail the build check ==="
