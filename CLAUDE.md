@@ -245,6 +245,31 @@ policy (`mem_proper_pair_extra_flag`, `mem_opt_apply_meth_defaults`,
 policy is a twin that drifts, and upstream factors these out precisely because
 its own twins drifted.
 
+### 14. `XA:Z` sub-entry ORDER can differ from the CLI on tied hits
+
+Byte-parity against the CLI holds for the `XA:Z` *set*, not always its order. On
+a 2,000-pair hg38 fixture: 26 of 27 `XA`-bearing records byte-identical, 1 with
+the same five entries in a different order, 0 with a different set. The two
+swapped entries had equal NM.
+
+This is upstream's, not ours. With the default `alnreg_sort_fast == 0` the
+surviving alnreg set "is defined by the *permutation* klib's unstable introsort
+happens to produce" (`bwamem.cpp:560-575`), and upstream measured that sort
+tying on ~0.98% of calls over 186M regions. When the comparator sees a tie the
+resulting order is not determined by the input alone, so two processes linking
+the same `mem_gen_alt` can legitimately disagree.
+
+Practical consequences:
+
+- A parity assertion over `XA:Z` must compare the entry **set**, not the string,
+  unless the fixture is known tie-free. The PhiX-scale suites happen to be, which
+  is why they compare strings and pass.
+- Do not "fix" this in the shim. The regions, coordinates, CIGARs and NMs all
+  match; only the order of equal-NM entries moves.
+- `opt->alnreg_sort_fast` (v0.9.0, `--fast`) swaps in a strict-total-order
+  comparator plus pdqsort, which makes the order deterministic — but it is a
+  different, non-bwa-mem2-compatible surviving set, so it is not a parity fix.
+
 ## Commit / PR conventions
 
 - Conventional Commits; sign with `-S`; see `CONTRIBUTING.md`.
