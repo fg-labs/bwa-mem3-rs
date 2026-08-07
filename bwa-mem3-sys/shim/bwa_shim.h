@@ -71,6 +71,22 @@ int bwa_shim_opts_set_int(mem_opt_t *opts, const char *key, int value);
  * compat table; do not free it. */
 const char *bwa_shim_compat_hd_line(const mem_opt_t *opts);
 
+/* Apply bwa-mem3's bwameth-compatibility defaults for `--meth`, then refill the
+ * scoring matrices (the bundle can change `b`, so they would otherwise be
+ * stale).
+ *
+ * Wraps upstream's `mem_opt_apply_meth_defaults`, so the constants scale with
+ * the match score `a` exactly as upstream scales them.
+ *
+ * Ordering is not symmetric across the knobs involved:
+ *   - `a` (`-A`) is an INPUT -- the constants are expressed in units of it --
+ *     so set it BEFORE calling. So is `meth_scoring`: the `-B` branch keys off
+ *     the resolved mode.
+ *   - `b`/`T`/`pen_clip5`/`pen_clip3`/`pen_unpaired` (`-B`/`-T`/`-L`/`-U`) are
+ *     OVERWRITTEN, because upstream's "user set this" mask is passed empty, so
+ *     set any of those AFTER or they are silently clobbered. */
+void bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts);
+
 /* PE-stats lifecycle. `pestat_zero` returns a zeroed 4-orientation array. */
 mem_pestat_t *bwa_shim_pestat_zero(void);
 void                 bwa_shim_pestat_free(mem_pestat_t *pestat);

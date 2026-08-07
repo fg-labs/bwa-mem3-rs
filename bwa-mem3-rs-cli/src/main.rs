@@ -9,7 +9,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bwa_mem3_rs::{align_batch, shm, BwaIndex, MemOpts, MethScoring, ReadPair};
+use bwa_mem3_rs::{align_batch, shm, BwaIndex, MemOpts, ReadPair};
 use clap::{Parser, Subcommand};
 use flate2::read::MultiGzDecoder;
 use noodles_bgzf as bgzf;
@@ -119,46 +119,31 @@ fn run_shm(action: ShmAction) -> Result<()> {
 /// Apply the bwameth-compatibility defaults `bwa-mem3 mem --meth` applies,
 /// so `bwa-rs mem --meth` is a drop-in for it.
 ///
-/// Mirrors `fastmap.cpp:1513-1527` in the vendored source. This lives in
-/// the CLI, not in `MemOpts::set_meth`, because that is where upstream
-/// puts it: `fastmap.cpp` IS bwa-mem3's CLI, and a library setter that
-/// silently rewrote `T` and three penalties would be a surprising thing
-/// for a `set_meth(true)` call to do. Library callers wanting CLI parity
-/// should apply the same block.
-///
-/// Upstream guards each knob with `if (!opt0.<knob>)` — apply the default
-/// only when the user did not pass the corresponding flag. That guard is
-/// vacuous here because `bwa-rs mem` exposes none of these as options
-/// (only `-k`, which is not in the bundle), so there is no user value to
-/// preserve. **If any of `-T`, `-B`, `-U`, or `-L` is ever added to the
-/// CLI, the matching default below must become conditional on it**, or the
-/// flag will be silently ignored under `--meth`.
+/// Delegates to [`MemOpts::apply_meth_defaults`], which calls bwa-mem3's own
+/// `mem_opt_apply_meth_defaults`. This used to be a hand-ported copy of the
+/// bundle, and it had already drifted: upstream scales every constant by the
+/// match score `a` (bwameth quotes them at `a == 1`), and the copy applied them
+/// flat, so `--meth` with a non-default `-A` silently discarded it. Upstream
+/// factored the bundle into a callable helper precisely so out-of-tree callers
+/// would stop replicating it — see gotcha #13.
 ///
 /// `-C` (`copy_comment`) is part of upstream's bundle but is deliberately
 /// omitted: it is a field on `fastmap.cpp`'s local worker struct, not on
 /// `mem_opt_t`, and it only governs FASTQ comment passthrough, which this
 /// crate never populates (`copy_pairs_to_seqs` leaves `bseq1_t::comment`
 /// null). Nothing to mirror.
+///
+/// Upstream guards each knob with `if (!opt0.<knob>)` — apply the default only
+/// when the user did not pass the corresponding flag. The helper is told
+/// nothing was set, which is correct here because `bwa-rs mem` exposes none of
+/// them as options (only `-k`, which is not in the bundle).
+///
+/// **If any of these is ever added to the CLI**, note the ordering is not the
+/// same for all of them: `-A` must be applied *before* this call (the bundle's
+/// constants scale by it), while `-T`, `-B`, `-U`, and `-L` must be applied
+/// *after* it or they will be silently overwritten under `--meth`.
 fn apply_meth_defaults(opts: &mut MemOpts) {
-    opts.set_clip_penalty(10, 10); // bwameth -L 10,10
-    opts.set_unpaired_penalty(100); // bwameth -U 100
-    opts.set_minimum_score(40); // bwameth -T 40
-    opts.set_mark_split_secondary(true); // -M
-
-    // COLLAPSED only, matching upstream (bwamem.cpp:511-515): its lenient -B 2
-    // pairs with the two-cell matrix, while GENOMIC and NEUTRAL are both
-    // variant-aware and deliberately keep bwa's default -B, because their
-    // mirror cell must stay a real mismatch. This is the one mode-dependent
-    // knob in the bundle.
-    //
-    // An `Err` falls through for the same reason it would be wrong to guess:
-    // it means the vendored bwa-mem3 reports a scoring mode this crate does
-    // not map, and applying bwameth's -B 2 to unknown semantics is a guess.
-    // `MethScoring::try_from` errors rather than defaulting precisely so that
-    // case stays visible instead of silently reading as COLLAPSED.
-    if matches!(opts.meth_scoring(), Ok(MethScoring::Collapsed)) {
-        opts.set_mismatch_penalty(2);
-    }
+    opts.apply_meth_defaults();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -352,6 +337,7 @@ fn _ensure_read_trait_in_scope<R: Read>(_: R) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bwa_mem3_rs::MethScoring;
 
     /// Pins every knob in the `--meth` bundle against upstream's list at
     /// `fastmap.cpp:1513-1527`.
@@ -375,6 +361,46 @@ mod tests {
             opts.mismatch_penalty(),
             2,
             "bwameth -B 2 under the default COLLAPSED scoring"
+        );
+    }
+
+    /// The regression that motivated calling upstream's helper instead of
+    /// replicating the bundle.
+    ///
+    /// bwameth quotes its constants at bwa's default match score (`a == 1`),
+    /// and upstream scales each by `opt->a` — every one of these options is
+    /// expressed in units of the match score, and bwa's `update_a()` scales the
+    /// non-meth defaults the same way. The hand-ported copy applied them flat,
+    /// so `--meth` with a non-default `-A` left `T` at 40 while the alignment
+    /// scores it gates had been multiplied.
+    ///
+    /// `a = 3` rather than 2 on purpose: at `a = 2` the scaled `-B 2` lands on
+    /// 4, which is also bwa's default `b`, so the assertion could not tell a
+    /// scaled value from an unchanged one.
+    #[test]
+    fn meth_defaults_scale_with_the_match_score() {
+        let mut opts = MemOpts::new().unwrap();
+        opts.set_meth(true);
+        // Before the call: `a` is an input the constants are scaled by.
+        opts.set_match_score(3);
+        apply_meth_defaults(&mut opts);
+
+        assert_eq!(opts.minimum_score(), 120, "bwameth -T 40, scaled by a=3");
+        assert_eq!(
+            opts.clip_penalty(),
+            (30, 30),
+            "bwameth -L 10,10, scaled by a=3"
+        );
+        assert_eq!(
+            opts.unpaired_penalty(),
+            300,
+            "bwameth -U 100, scaled by a=3"
+        );
+        assert_eq!(
+            opts.mismatch_penalty(),
+            6,
+            "bwameth -B 2 under COLLAPSED, scaled by a=3 (default b is 4, so \
+             an unscaled result would read 2 and a stale one 4)"
         );
     }
 

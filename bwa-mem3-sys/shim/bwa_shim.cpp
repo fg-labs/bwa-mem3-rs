@@ -71,6 +71,11 @@ extern "C" {
      * real struct are asserted layout-identical at build time, so passing the
      * POD pointer through is sound. */
     const char *shim_compat_hd_line(const mem_opt_t *opts);
+    /* Calls upstream's mem_opt_apply_meth_defaults, which has C++ linkage
+     * (bwamem.h declares it outside any extern "C" block -- see gotcha #5), so
+     * it can only be reached from bwa_shim_align.cpp where the real header is
+     * included. */
+    void shim_opts_apply_meth_defaults(mem_opt_t *opts);
 
     struct ShimSeeds;
 
@@ -221,6 +226,10 @@ extern "C" void bwa_shim_opts_free(mem_opt_t *opts) {
 
 extern "C" const char *bwa_shim_compat_hd_line(const mem_opt_t *opts) {
     return shim_compat_hd_line(opts);
+}
+
+extern "C" void bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts) {
+    if (opts) shim_opts_apply_meth_defaults(opts);
 }
 
 /* D3 (--meth): (re)build the per-hypothesis bisulfite scoring matrices

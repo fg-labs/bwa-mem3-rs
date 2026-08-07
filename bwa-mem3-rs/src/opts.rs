@@ -140,6 +140,43 @@ impl MemOpts {
         unsafe { std::ffi::CStr::from_ptr(p) }.to_str().ok()
     }
 
+    /// Apply bwa-mem3's bwameth-compatibility defaults for `--meth`, as
+    /// `bwa-mem3 mem --meth` applies them: `-L 10,10`, `-U 100`, `-T 40`, `-M`,
+    /// and (COLLAPSED scoring only) `-B 2`.
+    ///
+    /// Each constant is **scaled by the match score** `a`, because bwameth
+    /// quotes them at bwa's default `a == 1` and bwa scales every other
+    /// score-derived default the same way. Applying them flat would silently
+    /// discard a non-default match score: `--meth` with `-A 2` would leave the
+    /// minimum score at 40 while the alignment scores it gates had doubled. At
+    /// the default `a == 1` the scaling is a no-op.
+    ///
+    /// This calls bwa-mem3's own `mem_opt_apply_meth_defaults` rather than
+    /// reproducing the bundle, so it cannot drift from upstream, and it refills
+    /// the scoring matrices afterwards (the COLLAPSED branch can change `b`).
+    ///
+    /// # Ordering
+    ///
+    /// The knobs involved are not symmetric, so the order matters in both
+    /// directions:
+    ///
+    /// **Set before** — these are *inputs*:
+    /// - [`set_match_score`](Self::set_match_score), since every constant is
+    ///   expressed in units of it;
+    /// - [`set_meth_scoring`](Self::set_meth_scoring), since the `-B 2` branch
+    ///   keys off the resolved mode.
+    ///
+    /// **Set after** — these are *overwritten*, because upstream's "the user
+    /// set this" mask is passed empty:
+    /// [`set_mismatch_penalty`](Self::set_mismatch_penalty),
+    /// [`set_minimum_score`](Self::set_minimum_score),
+    /// [`set_clip_penalty`](Self::set_clip_penalty),
+    /// [`set_unpaired_penalty`](Self::set_unpaired_penalty).
+    pub fn apply_meth_defaults(&mut self) -> &mut Self {
+        unsafe { sys::bwa_shim_opts_apply_meth_defaults(self.handle) };
+        self
+    }
+
     /// Apply a bwa-mem3 `-x` preset on top of current values.
     #[must_use]
     pub fn with_mode(self, mode: Mode) -> Self {
