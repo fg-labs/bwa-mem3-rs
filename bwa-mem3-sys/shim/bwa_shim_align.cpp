@@ -593,18 +593,43 @@ static void emit_mc_tag(uint8_t **buf, size_t *len, size_t *cap,
     buf_append(buf, len, cap, &zero, 1);
 }
 
-/* Compute tlen between two aligned mem_aln_t. */
+/* Compute TLEN between two aligned mem_aln_t, mirroring upstream's SAM writer
+ * (bwamem.cpp:2532-2539).
+ *
+ * Upstream takes each mate's OUTERMOST coordinate in its own direction -- the
+ * leftmost base on the forward strand, the rightmost on the reverse -- and
+ * signs the difference by which comes first, with a unit nudge that makes the
+ * two mates' values exact negations of each other:
+ *
+ *     p0   = pos + (is_rev ? rlen - 1 : 0)
+ *     tlen = -(p0 - p1 + sgn(p0 - p1))
+ *
+ * This is NOT the span between the pair's outer edges, which is what this
+ * function used to return. The two agree on a canonical FR pair -- all any
+ * fixture produced -- and diverge everywhere else. On a fully-overlapping
+ * pair the span's `a_begin <= b_begin` sign test is true for BOTH mates, so
+ * both got a positive TLEN and the pair violated the SAM requirement that
+ * they sum to zero; on a contained pair the span reports the outer length
+ * rather than the insert.
+ *
+ * `a_ref_len`/`b_ref_len` come from cigar_ref_len(), which sums the same M/D
+ * opcodes as upstream's get_rlen() (bwamem.cpp:2768-2777).
+ *
+ * Returns 0 when either mate is unplaced, the two are on different contigs,
+ * or either lacks a CIGAR. That last guard is upstream's `m->n_cigar == 0 ||
+ * p->n_cigar == 0` and is what zeroes TLEN on a half-mapped pair: upstream
+ * reaches it because its mate-coordinate rewrite sets `n_cigar = 0` on the
+ * copied side, while this runs on the pre-rewrite mem_aln_t, where the same
+ * pair is caught one line earlier by `rid < 0`. Both guards are kept so the
+ * result matches on either path. */
 static int32_t compute_tlen(const mem_aln_t *a, int a_ref_len,
                             const mem_aln_t *b, int b_ref_len) {
     if (!a || !b || a->rid < 0 || b->rid < 0 || a->rid != b->rid) return 0;
-    int64_t a_begin = a->pos;
-    int64_t b_begin = b->pos;
-    int64_t a_end = a->pos + a_ref_len;
-    int64_t b_end = b->pos + b_ref_len;
-    int64_t begin = a_begin < b_begin ? a_begin : b_begin;
-    int64_t end   = a_end   > b_end   ? a_end   : b_end;
-    int64_t tlen  = end - begin;
-    return a_begin <= b_begin ? (int32_t)tlen : -(int32_t)tlen;
+    if (a->n_cigar == 0 || b->n_cigar == 0) return 0;
+    int64_t p0 = a->pos + (a->is_rev ? (int64_t) a_ref_len - 1 : 0);
+    int64_t p1 = b->pos + (b->is_rev ? (int64_t) b_ref_len - 1 : 0);
+    int64_t nudge = (p0 > p1) ? 1 : (p0 < p1 ? -1 : 0);
+    return (int32_t) -(p0 - p1 + nudge);
 }
 
 /* Append one packed BAM record to `out`'s buffer. `opt`/`pac`/`is_r2` are used
