@@ -70,6 +70,12 @@ pub enum MethScoring {
     /// mismatch, so genuine variants still score as mismatches (variant-aware,
     /// truthful NM/MD).
     Genomic = 1,
+    /// Like [`Genomic`](Self::Genomic), but the conversion cell scores `0` —
+    /// tolerated rather than rewarded. Added in bwa-mem3 v0.9.0 and made the
+    /// automatic default for TAPS chemistry, where conversions are ~20-30×
+    /// rarer than under em-seq so a full match over-credits spurious C→T
+    /// alignments.
+    Neutral = 2,
 }
 
 impl TryFrom<i32> for MethScoring {
@@ -78,13 +84,15 @@ impl TryFrom<i32> for MethScoring {
     /// Map the raw `mem_meth_scoring` value to a [`MethScoring`].
     ///
     /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) for
-    /// a value bwa-mem3 does not define. bwa-mem3 v0.8.0 adds
-    /// `MEM_METH_SCORING_NEUTRAL = 2`, which previously read back as
-    /// [`MethScoring::Collapsed`].
+    /// a value bwa-mem3 does not define. This deliberately does not fall back
+    /// to a default: a silent fallback is what made
+    /// `MEM_METH_SCORING_NEUTRAL = 2` read back as
+    /// [`MethScoring::Collapsed`] before it was mapped here.
     fn try_from(v: i32) -> std::result::Result<Self, Self::Error> {
         match v {
             0 => Ok(MethScoring::Collapsed),
             1 => Ok(MethScoring::Genomic),
+            2 => Ok(MethScoring::Neutral),
             other => Err(crate::Error::UnrecognizedEnum {
                 kind: "meth_scoring",
                 value: other,
@@ -106,6 +114,30 @@ impl MemOpts {
             return Err(shim_err("opts_new"));
         }
         Ok(MemOpts { handle })
+    }
+
+    /// The `@HD` header line the active output-compatibility target calls for
+    /// (no trailing newline), or `None` when that target emits no `@HD`.
+    ///
+    /// A caller writing its own SAM/BAM header should use this instead of a
+    /// literal. bwa-mem3's `compat_target_t` is the single place that decides
+    /// output shaping, and upstream folded three hand-written `@HD` literals
+    /// into it after they drifted apart (fg-labs/bwa-mem3#288); a fourth
+    /// literal here would reintroduce exactly that. This crate's own CLI got it
+    /// wrong before this accessor existed, emitting `@HD VN:1.6 SO:unknown`
+    /// against the reference `@HD VN:1.5 SO:unsorted GO:query`.
+    ///
+    /// The default target (`off`, bwa-mem3's native output) emits one; that is
+    /// the only target reachable today, since this crate exposes no `--compat`
+    /// selector.
+    pub fn compat_hd_line(&self) -> Option<&str> {
+        let p = unsafe { sys::bwa_shim_compat_hd_line(self.handle) };
+        if p.is_null() {
+            return None;
+        }
+        // Static storage owned by bwa-mem3's compat table; valid for the
+        // process lifetime, so borrowing it for `&self` is sound.
+        unsafe { std::ffi::CStr::from_ptr(p) }.to_str().ok()
     }
 
     /// Apply a bwa-mem3 `-x` preset on top of current values.
@@ -884,20 +916,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_meth_scoring_value_is_an_error_not_collapsed() {
-        // bwa-mem3 v0.8.0 adds MEM_METH_SCORING_NEUTRAL = 2. Before this
-        // change it read back as Collapsed. Variant-matched for the same
-        // reason as the seed-order test above.
-        let err = MethScoring::try_from(2).unwrap_err();
+    fn neutral_meth_scoring_maps_to_its_own_variant() {
+        // bwa-mem3 v0.9.0 uses MEM_METH_SCORING_NEUTRAL = 2 as the automatic
+        // default for TAPS chemistry, so it is a value the vendored library
+        // really produces. Before it was mapped it read back as Collapsed,
+        // which silently mis-described the scoring in use.
+        assert_eq!(MethScoring::try_from(2).unwrap(), MethScoring::Neutral);
+    }
+
+    #[test]
+    fn unknown_meth_scoring_value_is_an_error_not_a_fallback() {
+        // The guarantee is that an unrecognized value ERRORS rather than
+        // collapsing to a default -- checked at a value bwa-mem3 does not
+        // define, so this keeps testing the guarantee as upstream adds modes.
+        let err = MethScoring::try_from(3).unwrap_err();
         assert!(
             matches!(
                 err,
                 Error::UnrecognizedEnum {
                     kind: "meth_scoring",
-                    value: 2
+                    value: 3
                 }
             ),
-            "expected UnrecognizedEnum{{ kind: \"meth_scoring\", value: 2 }}, got: {err:?}"
+            "expected UnrecognizedEnum{{ kind: \"meth_scoring\", value: 3 }}, got: {err:?}"
         );
     }
 

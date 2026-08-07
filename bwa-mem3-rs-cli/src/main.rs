@@ -144,14 +144,18 @@ fn apply_meth_defaults(opts: &mut MemOpts) {
     opts.set_unpaired_penalty(100); // bwameth -U 100
     opts.set_minimum_score(40); // bwameth -T 40
     opts.set_mark_split_secondary(true); // -M
-                                         // COLLAPSED is the default scoring mode and the bwameth drop-in; its
-                                         // lenient -B 2 pairs with the two-cell matrix. GENOMIC deliberately
-                                         // keeps bwa's -B 4 (variant-aware), so this is mode-dependent —
-                                         // the only knob in the bundle that is.
-                                         // An `Err` here means the vendored bwa-mem3 reports a scoring mode this
-                                         // crate does not know (v0.8.0 adds NEUTRAL). Skipping the COLLAPSED
-                                         // default is the right response: applying bwameth's lenient -B 2 to an
-                                         // unrecognised mode would be a guess about semantics we do not have.
+
+    // COLLAPSED only, matching upstream (bwamem.cpp:511-515): its lenient -B 2
+    // pairs with the two-cell matrix, while GENOMIC and NEUTRAL are both
+    // variant-aware and deliberately keep bwa's default -B, because their
+    // mirror cell must stay a real mismatch. This is the one mode-dependent
+    // knob in the bundle.
+    //
+    // An `Err` falls through for the same reason it would be wrong to guess:
+    // it means the vendored bwa-mem3 reports a scoring mode this crate does
+    // not map, and applying bwameth's -B 2 to unknown semantics is a guess.
+    // `MethScoring::try_from` errors rather than defaulting precisely so that
+    // case stays visible instead of silently reading as COLLAPSED.
     if matches!(opts.meth_scoring(), Ok(MethScoring::Collapsed)) {
         opts.set_mismatch_penalty(2);
     }
@@ -199,7 +203,7 @@ fn run_mem(
     };
     let mut bgzf_writer = bgzf::io::Writer::new(out);
 
-    write_bam_header(&mut bgzf_writer, &idx)?;
+    write_bam_header(&mut bgzf_writer, &idx, &opts)?;
 
     // Buffers: we accumulate full Record structures so lifetime-free
     // ownership is easy. Each inner Vec holds name + seq + qual.
@@ -287,10 +291,29 @@ fn open_fastq(path: &std::path::Path) -> Result<Box<dyn BufRead>> {
 
 /// Emit a minimal BAM header: magic + l_text + @HD + @SQ lines +
 /// n_ref + per-ref (l_name + name + NUL + l_ref).
-fn write_bam_header<W: Write>(w: &mut W, idx: &BwaIndex) -> Result<()> {
+///
+/// # Compat-target coverage
+///
+/// `compat_target_t` (bwa-mem3 v0.9.0) has five output-shaping switches. This
+/// writer honors `emit_hd` / `hd_line` via [`MemOpts::compat_hd_line`]; the
+/// record emitter honors `emit_mq` and `emit_hn`. The fifth, `read_sidecar`,
+/// is **deliberately not implemented**: it makes bwa-mem3 load an optional
+/// `<prefix>.hdr` / `<baseprefix>.dict` alongside the index and merge its
+/// richer `@SQ` (`M5`/`AS`/`UR`/`SP`) plus any `@CO`/`@RG` into the header
+/// (`bwa_load_hdr_from_index`, bwa.cpp:987). That is header *provenance*
+/// metadata, not alignment output — every record this crate emits is
+/// unaffected — and a partial merge that got lh3/bwa#348's precedence rules
+/// subtly wrong would be worse than a header that is honestly minimal. So:
+/// with a sidecar present next to the index, this header is a strict subset of
+/// what `bwa-mem3 mem` would write. Records still match byte for byte.
+fn write_bam_header<W: Write>(w: &mut W, idx: &BwaIndex, opts: &MemOpts) -> Result<()> {
     // Build the SAM header text.
     let mut text = String::new();
-    text.push_str("@HD\tVN:1.6\tSO:unknown\n");
+    // From the compat target, never a literal: see MemOpts::compat_hd_line.
+    if let Some(hd) = opts.compat_hd_line() {
+        text.push_str(hd);
+        text.push('\n');
+    }
     for (name, len) in idx.contigs() {
         text.push_str(&format!("@SQ\tSN:{name}\tLN:{len}\n"));
     }

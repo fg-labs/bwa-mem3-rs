@@ -21,6 +21,8 @@
 
 #include "bwa.h"
 #include "bwamem.h"
+#include "compat_target.h"  /* compat_target_t::emit_hn — see the HN gate below */
+#include "utils.h"          /* xassert — survives NDEBUG, unlike assert */
 #include "FMI_search.h"
 #include "meth_xm.h"   /* meth_build_xm — D3 (--meth) XM:Z tag */
 
@@ -54,6 +56,12 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
     assert(nreads >= 0);
     assert(nthreads > 0);
 
+    /* Mirrors upstream's clamp (fastmap.cpp:280): the assert above compiles out
+     * under NDEBUG, and kt_for makes the same input safe by clamping rather
+     * than refusing. Ours does not size anything from nthreads except the mmc
+     * loops below, but agreeing with upstream costs nothing. */
+    if (nthreads < 1) nthreads = 1;
+
     // Record the thread count on the worker so worker_free can validate the
     // paired call and the per-thread loops can never walk past the slots
     // populated here.
@@ -62,20 +70,71 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
     int32_t memSize = nreads;
 
     /* Mem allocation section for core kernels */
-    w.regs = NULL; w.chain_ar = NULL; w.seedBuf = NULL;
+    w.regs = NULL; w.chain_scratch = NULL; w.seed_scratch = NULL;
+    /* Vestigial in v0.9.0 (see the note below); zero them so worker_free and
+     * any future upstream code cannot act on an indeterminate pointer. */
+    w.auxSeedBuf = NULL; w.auxSeedBufSize = 0;
 
-    w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
-    w.chain_ar = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
-    w.seedBuf = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
+    /* Every allocation in this block is sized from memSize (see the divergence
+     * note below), so a zero-read batch makes all three zero-size requests --
+     * and calloc(0, n) / malloc(0) are both permitted to return NULL. The
+     * xasserts deliberately do NOT compile out under NDEBUG, so without this
+     * guard an empty batch would abort a *release* build on any allocator that
+     * takes that option.
+     *
+     * Upstream guards only `regs` (fastmap.cpp:303-307); its other two are
+     * nthreads-sized and so never zero. Ours keeps the nreads sizing, so the
+     * guard has to cover all three.
+     *
+     * Leaving them NULL is a valid state, as it is upstream: the seeding and
+     * extension loops are bounded by n_seqs and never run, and worker_free is
+     * NULL-safe (free(NULL) is a no-op). */
+    if (memSize > 0) {
+        w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
 
-    assert(w.seedBuf  != NULL);
-    assert(w.regs     != NULL);
-    assert(w.chain_ar != NULL);
+    /* DELIBERATE DIVERGENCE from upstream's v0.9.0 worker_alloc, which sizes
+     * these as `nthreads * BATCH_SIZE` and indexes them by `tid`.
+     *
+     * Upstream could shrink them because it fused its two kt_for passes into
+     * `worker_bwt_aln`: with seeding and extension on the same reads in one
+     * work item, chains are dead the moment the item ends, so a per-thread
+     * window suffices. It renamed `chain_ar`/`seedBuf` to `chain_scratch`/
+     * `seed_scratch` precisely so out-of-tree callers still doing
+     * `w.chain_ar + seq_id` would fail to compile instead of running off the
+     * end (fastmap.cpp:309-334, bwamem.h:481-485).
+     *
+     * This crate IS such a caller, by design: its public API is the phase
+     * split (`seed_batch` -> `extend_batch`), which is exactly the barrier
+     * upstream removed, so chains and their seeds MUST survive between the two
+     * calls for every read in the batch. We therefore keep the pre-0.9.0
+     * nreads sizing and seq_id indexing. The kernels take both arrays as
+     * parameters and index them [0, nseq), and `tid` is used only for `mmc`,
+     * so a caller-owned per-read array remains valid.
+     *
+     * Do NOT "fix" the field names to `auxSeedBuf`/`auxSeedBufSize` as the
+     * compiler's did-you-mean suggests: those are vestigial worker_t members
+     * that nothing allocates (every real `auxSeedBuf` upstream is a local in
+     * test_and_merge, bwamem.cpp:894). Taking that suggestion compiles and
+     * then dereferences an unallocated pointer. */
+        w.chain_scratch = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
+        w.seed_scratch  = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
 
-    w.seedBufSize = BATCH_SIZE * AVG_SEEDS_PER_READ;
+        /* xassert, not assert: these are ALLOCATION failures, and plain assert
+         * compiles out under NDEBUG -- turning an OOM into a null deref in
+         * exactly the build most likely to be memory-pressured. Upstream made
+         * the same switch in v0.9.0's worker_alloc (fastmap.cpp:306, :341-342).
+         * The argument preconditions above stay `assert`: those are programmer
+         * errors, not runtime conditions. */
+        xassert(w.seed_scratch  != NULL, "out of memory: w.seed_scratch");
+        xassert(w.regs          != NULL, "out of memory: w.regs");
+        xassert(w.chain_scratch != NULL, "out of memory: w.chain_scratch");
+    }
 
-    /* SWA mem allocation */
-    int64_t wsize = BATCH_SIZE * SEEDS_PER_READ;
+    w.seed_scratch_size = BATCH_SIZE * AVG_SEEDS_PER_READ;
+
+    /* SWA mem allocation. NOTE the basis changed in v0.9.0: upstream now sizes
+     * this from AVG_SEEDS_PER_READ, not SEEDS_PER_READ (fastmap.cpp:380). */
+    int64_t wsize = BATCH_SIZE * AVG_SEEDS_PER_READ;
     for(int l=0; l<nthreads; l++)
     {
         w.mmc.seqBufLeftRef[l*CACHE_LINE]  = (uint8_t *)
@@ -90,10 +149,10 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
         w.mmc.wsize_buf_ref[l*CACHE_LINE] = wsize * MAX_SEQ_LEN_REF;
         w.mmc.wsize_buf_qer[l*CACHE_LINE] = wsize * MAX_SEQ_LEN_QER;
 
-        assert(w.mmc.seqBufLeftRef[l*CACHE_LINE]  != NULL);
-        assert(w.mmc.seqBufLeftQer[l*CACHE_LINE]  != NULL);
-        assert(w.mmc.seqBufRightRef[l*CACHE_LINE] != NULL);
-        assert(w.mmc.seqBufRightQer[l*CACHE_LINE] != NULL);
+        xassert(w.mmc.seqBufLeftRef[l*CACHE_LINE]  != NULL, "out of memory: seqBufLeftRef");
+        xassert(w.mmc.seqBufLeftQer[l*CACHE_LINE]  != NULL, "out of memory: seqBufLeftQer");
+        xassert(w.mmc.seqBufRightRef[l*CACHE_LINE] != NULL, "out of memory: seqBufRightRef");
+        xassert(w.mmc.seqBufRightQer[l*CACHE_LINE] != NULL, "out of memory: seqBufRightQer");
     }
 
     for(int l=0; l<nthreads; l++) {
@@ -102,9 +161,9 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
         w.mmc.seqPairArrayRight128[l] = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.wsize[l] = wsize;
 
-        assert(w.mmc.seqPairArrayAux[l] != NULL);
-        assert(w.mmc.seqPairArrayLeft128[l] != NULL);
-        assert(w.mmc.seqPairArrayRight128[l] != NULL);
+        xassert(w.mmc.seqPairArrayAux[l] != NULL, "out of memory: seqPairArrayAux");
+        xassert(w.mmc.seqPairArrayLeft128[l] != NULL, "out of memory: seqPairArrayLeft128");
+        xassert(w.mmc.seqPairArrayRight128[l] != NULL, "out of memory: seqPairArrayRight128");
     }
 
     // SMEM buffers (matchArray / min_intv_ar / query_pos_ar / enc_qdb / rid)
@@ -137,9 +196,9 @@ static void worker_free(worker_t &w, int32_t nthreads)
     // Catch mismatched alloc/free pairs before they drive out-of-bounds frees.
     assert(w.nthreads == nthreads);
 
-    free(w.chain_ar);
+    free(w.chain_scratch);
     free(w.regs);
-    free(w.seedBuf);
+    free(w.seed_scratch);
 
     for(int l=0; l<nthreads; l++) {
         _mm_free(w.mmc.seqBufLeftRef[l*CACHE_LINE]);
@@ -335,11 +394,35 @@ int64_t shim_align_idx_contig_len(void *opaque, size_t i) {
     return shim_header_bns(opaque)->anns[i].len;
 }
 
+/* The @HD line the selected compat target wants, or NULL when it suppresses
+ * @HD entirely (bwa-mem2 emits none; see compat_target.cpp).
+ *
+ * This must be read from the target rather than spelled out by the caller.
+ * Upstream consolidated three hardcoded @HD literals into the single
+ * BWAMEM3_DEFAULT_HD_LINE macro precisely because they had drifted apart
+ * (fg-labs/bwa-mem3#288: the SAM-text writer said "VN:1.5 SO:unsorted
+ * GO:query" while the BAM writers said "VN:1.6 SO:unsorted"), so a fourth
+ * literal living in this crate's Rust header writer would recreate the bug
+ * upstream just finished fixing -- and it did: bwa-rs emitted
+ * "@HD VN:1.6 SO:unknown" against the CLI's "@HD VN:1.5 SO:unsorted GO:query".
+ *
+ * `compat` is set by mem_opt_init, but it is a pointer on a struct callers can
+ * memset, so it is NULL-checked like the emit_mq / emit_hn gates. */
+const char *shim_compat_hd_line(const mem_opt_t *opt) {
+    if (opt == NULL || opt->compat == NULL || !opt->compat->emit_hd) return NULL;
+    return opt->compat->hd_line;
+}
+
 /* ------------------ Helpers ------------------ */
 
 static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
                                    int meth_mode) {
     int nseqs = (int)(2 * n_pairs);
+    /* NULL is an ALLOCATION FAILURE only when nseqs > 0. calloc(0, n) may
+     * legally return NULL, so on an empty batch a NULL return here means "no
+     * reads", not "out of memory" -- the caller distinguishes the two on
+     * n_pairs. Downstream is NULL-safe either way: every loop over the array is
+     * bounded by n_seqs, and free_seqs() returns early on NULL. */
     bseq1_t *seqs = (bseq1_t *) calloc(nseqs, sizeof(bseq1_t));
     if (!seqs) return nullptr;
     for (size_t i = 0; i < n_pairs; ++i) {
@@ -375,6 +458,18 @@ static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
              * CIGAR/NM/MD and the XM call string. Same orientation as seq. */
             if (meth_mode) {
                 s->meth_orig_seq = strdup(s->seq);
+                /* v0.9.0: read-number chemistry, consumed by the seed filter in
+                 * meth_seed_to_orig (bwamem.cpp:1878-1881), which drops any seed
+                 * whose genomic strand does not match the read's. R1 = OT = 1,
+                 * R2 = OB = 0, exactly as upstream's ingest sets it
+                 * (fastmap.cpp:820).
+                 *
+                 * Leaving it unset is NOT inert: the field is zero from the
+                 * calloc, and 0 is the VALID value for OB, so the filter runs
+                 * and silently discards every R1 seed. The filter only
+                 * self-disables at < 0. That presented as exactly half the
+                 * reads unmapped -- every R1, no R2. */
+                s->meth_base_ot = (k == 0) ? 1 : 0;
                 char from = (k == 0) ? 'C' : 'G';
                 char to   = (k == 0) ? 'T' : 'A';
                 for (int j = 0; j < s->l_seq; ++j) {
@@ -715,6 +810,18 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
         aux_put_Z(&aux, &aux_len, &aux_cap, "MD", md);
     }
     if (m && m->n_cigar) emit_mc_tag(&aux, &aux_len, &aux_cap, opt, m, which);
+    /* MQ: the mate's MAPQ. Gated on `m` alone -- NOT `m->n_cigar` like MC:Z
+     * above -- so it is emitted even when the mate is unmapped, matching
+     * upstream exactly (bwamem.cpp:3484, bam_writer.cpp:395, meth_bam.cpp:585,
+     * which all use `m && opt->compat->emit_mq`). Emitted here, between MC and
+     * AS, because this crate's aux order mirrors upstream's write order.
+     *
+     * Not a bwa-mem3 invention: bwa emits MQ (bwamem.c:935, lh3/bwa#330) and
+     * bwa-mem2 does not, having forked at 0.7.17 before that landed -- hence
+     * the compat switch, whose default target (COMPAT_TARGET_OFF) sets
+     * emit_mq = 1. */
+    if (m && opt->compat != NULL && opt->compat->emit_mq)
+        aux_put_i(&aux, &aux_len, &aux_cap, "MQ", m->mapq);
     if (p->score >= 0) aux_put_i(&aux, &aux_len, &aux_cap, "AS", p->score);
     if (p->sub >= 0)   aux_put_i(&aux, &aux_len, &aux_cap, "XS", p->sub);
     if (bwa_rg_id[0])  aux_put_Z(&aux, &aux_len, &aux_cap, "RG", bwa_rg_id);
@@ -728,19 +835,21 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
     if (p->XA) aux_put_Z(&aux, &aux_len, &aux_cap, "XA", p->XA);
     /* HN: total # of hits clustered with this primary under XA_drop_ratio
      * (set by mem_gen_alt above). -1 is upstream's "not computed" sentinel
-     * (bwamem.h / bwamem.cpp's mem_reg2aln), so guard >= 0 exactly as
-     * upstream's generic SAM writer does (bwamem.cpp:2615). Also gate on
-     * !meth_mode: under --meth, mem_aln2sam short-circuits into
-     * meth_bam.cpp's meth_mem_aln_to_bam instead of that generic writer, and
-     * that function never emits HN — so upstream's real --meth output has no
-     * HN:i regardless of whether mem_gen_alt computed one. The guard is
-     * `!meth_mode`, not "check the SAM writer specifically", because
-     * mem_aln2sam's meth branch returns before reaching either non-meth
-     * writer (bwamem.cpp:2423-2447): plain SAM (bwamem.cpp:2615) AND
-     * --bam-mode's writer (bam_writer.cpp:464-466) both emit HN under the
-     * identical `HN >= 0` predicate, so !meth_mode alone is the exact
-     * condition, not merely a sufficient one. */
-    if (!opt->meth_mode && p->HN >= 0) aux_put_i(&aux, &aux_len, &aux_cap, "HN", p->HN);
+     * (bwamem.h / bwamem.cpp's mem_reg2aln), so guard >= 0.
+     *
+     * v0.9.0 replaced the old `!meth_mode` condition. That condition existed
+     * because upstream's --meth writer (meth_bam.cpp) never emitted HN, so
+     * suppressing it was how we matched the CLI. As of v0.9.0 BOTH writers
+     * emit it under a compat-target switch -- meth_bam.cpp:663 and
+     * bam_writer.cpp:458 use the identical `p.HN >= 0 && opt->compat->emit_hn`
+     * -- and COMPAT_TARGET_OFF (the default, "bwa-mem3's native output") sets
+     * emit_hn = 1. Keeping the old gate left HN off every --meth record while
+     * the CLI emitted it.
+     *
+     * `compat` is set by mem_opt_init, but it is a pointer on a struct callers
+     * can memset, so it is NULL-checked rather than trusted. */
+    if (p->HN >= 0 && opt->compat != NULL && opt->compat->emit_hn)
+        aux_put_i(&aux, &aux_len, &aux_cap, "HN", p->HN);
 
     /* D3 (--meth) Bismark tags. XR:Z (read conversion) on every record; XG:Z
      * (genome strand) and XM:Z (per-base methylation call) on mapped records.
@@ -770,8 +879,16 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
                     for (int i = 0; i < n_cigar; ++i)
                         bam_cig[i] = bwa_cigar_to_bam(
                             bwa_apply_clip_mode(p->cigar[i], opt, p->is_alt, which));
+                    /* v0.9.0 added the chemistry selector. It flips only the
+                     * methylated/unmethylated polarity of the call, never the
+                     * CpG/CHG/CHH context classification, and comes off
+                     * mem_opt_t exactly as upstream's own writer sources it
+                     * (meth_bam.cpp:526). mem_opt_init defaults it to
+                     * METH_CHEM_EMSEQ, so this is unchanged behavior unless a
+                     * caller sets it. */
                     char *xm = meth_build_xm(bns, pac, p->rid, (int64_t)p->pos,
-                                             is_top, bam_cig, n_cigar, seq_text, emit_len);
+                                             is_top, bam_cig, n_cigar, seq_text, emit_len,
+                                             (meth_chem_t) opt->meth_chem);
                     if (xm) aux_put_Z(&aux, &aux_len, &aux_cap, "XM", xm);
                 }
                 free(seq_text);
@@ -925,7 +1042,10 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
     s->fmi  = fmi;
     s->n_seqs = (int)(2 * n_pairs);
     s->seqs = copy_pairs_to_seqs(pairs, n_pairs, opts->meth_mode);
-    if (!s->seqs) { free(s); return nullptr; }
+    /* `n_pairs > 0` qualifies the check: for an empty batch a NULL return is
+     * the allocator's prerogative on a zero-size request, not a failure, and
+     * reporting it as one would turn "align nothing" into a spurious error. */
+    if (!s->seqs && n_pairs > 0) { free(s); return nullptr; }
 
     /* D3 (--meth): borrow the original-coordinate handles from the index. NULL
      * outside --meth (or if a non-meth index was loaded), in which case the
@@ -962,15 +1082,26 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
     for (int seq_id = 0; seq_id < s->n_seqs; seq_id += BATCH_SIZE) {
         int batch_size = s->n_seqs - seq_id;
         if (batch_size > BATCH_SIZE) batch_size = BATCH_SIZE;
-        int seedBufSz = s->w.seedBufSize;
+        /* Upstream v0.9.0 dropped this tail adjustment (bwamem.cpp's worker_bwt)
+         * because its per-thread window has no remainder to grant. Ours does --
+         * the buffer really is nreads-sized (see worker_alloc) -- so the grant
+         * is still well-defined, and keeping it preserves this crate's
+         * pre-0.9.0 behavior exactly. Upstream documents the difference as
+         * output-dead either way: on overflow chain_add_one_seed falls back to
+         * calloc and flags the chain, which only the capacity-growth ladder
+         * reads, so a chain's contents are unchanged. */
+        int seedBufSz = s->w.seed_scratch_size;
         if (batch_size < BATCH_SIZE) {
             seedBufSz = (memSize - seq_id) * AVG_SEEDS_PER_READ;
         }
         mem_kernel1_core(s->w.fmi, s->w.opt,
                          s->w.seqs + seq_id,
                          batch_size,
-                         s->w.chain_ar + seq_id,
-                         s->w.seedBuf + (size_t)seq_id * AVG_SEEDS_PER_READ,
+                         /* seq_id-indexed, NOT `+ tid * BATCH_SIZE`: this
+                          * crate keeps the per-read arrays the phase split
+                          * needs (see worker_alloc). */
+                         s->w.chain_scratch + seq_id,
+                         s->w.seed_scratch + (size_t)seq_id * AVG_SEEDS_PER_READ,
                          seedBufSz,
                          &s->w.mmc,
                          0 /* tid */,
@@ -981,9 +1112,9 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
 
 void shim_seeds_free(ShimSeeds *s) {
     if (!s) return;
-    if (s->w.chain_ar) {
+    if (s->w.chain_scratch) {
         /* chains allocated by mem_kernel1_core; their inner seed arrays live in
-         * w.seedBuf which alloc_worker owns. No extra freeing needed here. */
+         * w.seed_scratch which worker_alloc owns. No extra freeing needed here. */
     }
     free_seqs(s->seqs, s->n_seqs);
     /* s->ref_string is borrowed from BwaShimIndex; do not free. */
@@ -1020,7 +1151,7 @@ static void run_se_extension(ShimSeeds *s) {
                          s->w.seqs + seq_id,
                          s->w.regs + seq_id,
                          batch_size,
-                         s->w.chain_ar + seq_id,
+                         s->w.chain_scratch + seq_id,
                          &s->w.mmc,
                          s->w.ref_string,
                          0 /* tid */,
@@ -1106,7 +1237,18 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
             continue;
         }
         if (!(opt->flag & MEM_F_ALL))
-            XA[k] = mem_gen_alt(opt, bns, pac, &a[k], s[k].l_seq, s[k].seq, &HN[k]);
+            /* v0.9.0 added the trailing `meth_orig_query`, which mem_gen_alt
+             * forwards to mem_reg2aln for every XA sub-entry so they regenerate
+             * under the same NM/MD policy as the primary record. It DEFAULTS TO
+             * NULL, so omitting it compiles and silently keeps the legacy
+             * regen: each XA sub-entry is then scored against the PROJECTED
+             * (C->T / G->A) read, and its NM counts every bisulfite conversion.
+             * That showed up as `XA:Z:phix,+1201,100M,20;` where the CLI emits
+             * `...,0;`. Pass it exactly as upstream does (bwamem.cpp:3237);
+             * s[k].meth_orig_seq is NULL outside --meth, which selects the same
+             * legacy behavior the non-meth path always had. */
+            XA[k] = mem_gen_alt(opt, bns, pac, &a[k], s[k].l_seq, s[k].seq, &HN[k],
+                                s[k].meth_orig_seq);
         lists[k] = (mem_aln_t *) calloc(a[k].n, sizeof(mem_aln_t));
         emit[k] = (bool *) malloc(a[k].n * sizeof(bool));
         n_lists[k] = (int)a[k].n;
@@ -1185,18 +1327,24 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
     }
 
     /* No-pairing branch 0x2 decision (mirrors mem_sam_pe's post-resolve block):
-     * when mem_pair_resolve didn't take the paired branch, check the top
-     * region of each side via mem_infer_dir and OR 0x2 into extra_flag if
-     * the inferred distance falls within pes[dir].low..high. */
+     * when mem_pair_resolve didn't take the paired branch, decide the
+     * proper-pair bit from the two sides' regions.
+     *
+     * v0.9.0 factored this out of mem_sam_pe into mem_proper_pair_extra_flag
+     * explicitly so "this block and its verbatim twin cannot drift apart"
+     * (bwamem_pair.cpp:352-357). This shim was a THIRD twin, so call the one
+     * definition rather than keep replicating it.
+     *
+     * It also settles which region the bit derives from: v0.9.0 restored the
+     * top-scoring a[0] as the default and made the emitted a[which] opt-in via
+     * --proper-pair-from-emitted. Our previous hand-rolled copy used a[0] and so
+     * already matched the new default -- but only by coincidence, and it could
+     * not honour the option at all. */
     if (!paired && (opt->flag & MEM_F_PE) && !(opt->flag & MEM_F_NOPAIRING)
         && a[0].n > 0 && a[1].n > 0
         && n_lists[0] > 0 && n_lists[1] > 0
         && lists[0][0].rid >= 0 && lists[0][0].rid == lists[1][0].rid) {
-        int64_t dist;
-        int dir = mem_infer_dir(bns->l_pac, a[0].a[0].rb, a[1].a[0].rb, &dist);
-        if (!pes[dir].failed && dist >= pes[dir].low && dist <= pes[dir].high) {
-            extra_flag |= 0x2;
-        }
+        extra_flag |= mem_proper_pair_extra_flag(opt, bns->l_pac, a, z, pes);
     }
 
     /* Apply extra_flag (0x1 paired + optional 0x2 proper-pair) to every

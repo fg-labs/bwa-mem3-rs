@@ -65,6 +65,12 @@ extern "C" {
     size_t shim_align_idx_n_contigs(void *fmi);
     const char *shim_align_idx_contig_name(void *fmi, size_t i);
     int64_t shim_align_idx_contig_len(void *fmi, size_t i);
+    /* Reads opt->compat, which is an opaque `const void *` in our POD view of
+     * mem_opt_t (bwa_shim_types.h) -- only bwa_shim_align.cpp, which includes
+     * upstream's real compat_target.h, can dereference it. The POD and the
+     * real struct are asserted layout-identical at build time, so passing the
+     * POD pointer through is sound. */
+    const char *shim_compat_hd_line(const mem_opt_t *opts);
 
     struct ShimSeeds;
 
@@ -211,6 +217,10 @@ extern "C" mem_opt_t *bwa_shim_opts_new(void) {
 
 extern "C" void bwa_shim_opts_free(mem_opt_t *opts) {
     if (opts) free(opts);
+}
+
+extern "C" const char *bwa_shim_compat_hd_line(const mem_opt_t *opts) {
+    return shim_compat_hd_line(opts);
 }
 
 /* D3 (--meth): (re)build the per-hypothesis bisulfite scoring matrices

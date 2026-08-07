@@ -29,13 +29,18 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "bwamem.h"
+#include "meth_xm.h"   /* meth_chem_t for the --meth chemistry default */
 #include "FMI_search.h"
 #include "smem_dedup.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
 #include "u8vec_scratch.h"
+#include "kvec.h"          /* kvec_t/kv_push/kv_resize used directly below */
 #include "pdqsort_wrap.h"
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
+#include <strings.h>       /* strcasecmp in mem_opt_parse_meth_tags */
+#include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock */
+#include <string>          /* BWAMEM3_DUMP_PAIRS per-batch row buffer */
 
 #include "sam_encode.h"
 #include "stage_prof.h"
@@ -64,6 +69,18 @@ extern uint64_t tprof[LIM_R][LIM_C];
 
 #define chain_cmp(a, b) (((b).pos < (a).pos) - ((a).pos < (b).pos))
 KBTREE_INIT(chn, mem_chain_t, chain_cmp)
+
+/* chain_cmp orders chains by .pos ONLY, so chains that share a .pos are a tie
+ * whose resolution is left to the kbtree's internal structure. klib derives the
+ * B-tree node fan-out from sizeof(mem_chain_t) (kbtree.h), so changing that size
+ * changes which chain kb_getp returns at a tie, which regroups seeds and silently
+ * moves default (non-meth) output. This guard fails the build if mem_chain_t ever
+ * grows again — repack new fields into the existing bitfield word (see bwamem.h),
+ * do not append. 48 B is upstream bwa-mem2's size; keeping it preserves bwa-mem2
+ * chaining parity. */
+static_assert(sizeof(mem_chain_t) == 48,
+              "sizeof(mem_chain_t) feeds klib kbtree node fan-out; changing it moves default "
+              "output at chain_cmp .pos ties. Repack fields into the bitfield word, don't append.");
 
 #define intv_lt1(a, b) ((((uint64_t)(a).m) <<32 | ((uint64_t)(a).n)) < (((uint64_t)(b).m) <<32 | ((uint64_t)(b).n)))  // trial
 KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
@@ -105,17 +122,20 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  *     as a diagonal offset d = j - i in [-w, +w], which fits signed int8
  *     only for w <= 127. The default opt->w = 100 qualifies; wide-band
  *     retries (w doubling to 200/400/800) do NOT and fall back to 16-bit.
- *   - zdrop + maxStep <= 253      : keeps the re-baseline window non-empty,
- *     REBASE_HI = 255 - maxStep > REBASE_KEEP = zdrop + 1. The DP body AND the
- *     h0-prefix column/row seed (smithWaterman*_8 setup) are both unsigned-
- *     saturating [0,255], so the seeded byte h0' = min(h0, REBASE_KEEP) only
- *     needs to fit a uint8. maxStep is the largest per-step score increment,
+ *   - zdrop + maxStep <= 253      : zdrop is broadcast into the DP as a byte
+ *     (_mm256_set1_epi8), so it must fit one, and the maxStep headroom keeps the
+ *     z-drop comparison from wrapping at the top of the range. The DP body AND
+ *     the h0-prefix column/row seed (smithWaterman*_8 setup) are both unsigned-
+ *     saturating [0,255], and the seed is the raw h0 clamped to uint8 (the old
+ *     min(h0, zdrop+1) prefix clamp went away with the re-baseline floor).
+ *     maxStep is the largest per-step score increment,
  *     max(w_match, w_ambig, 1) = max(opt->a, 1).
- *   - h0 <= zdrop + 1             : keeps the initial floor B0 = max(0, h0 -
- *     REBASE_KEEP) == 0, so the seed score does not itself force a re-baseline.
  *   - h0 + min(len1,len2)*a < 255 - maxStep : the MAX ATTAINABLE score (seed
- *     plus an all-match diagonal over the shorter sequence) stays below REBASE_HI,
- *     so the running row max never reaches it and re-baseline never fires.
+ *     plus an all-match diagonal over the shorter sequence) stays below the byte
+ *     ceiling, so no row max can ever reach it. This is also what bounds h0
+ *     itself, which is why there is no separate h0 gate: the former
+ *     h0 <= zdrop + 1 condition existed to zero the removed re-baseline floor
+ *     and was dropped in EXT-4 (see bsw8_envelope_ok below).
  *
  * NOTE: minval (= h0 + min(len)*a) is still used by sortPairsLenExt as the
  * counting-sort bin index (hist[minval]) and must stay < MAX_SEQ_LEN8 there for
@@ -123,13 +143,17 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  * decision. Pairs failing this envelope fall through to the existing 16-bit
  * (then scalar) buckets exactly as before. */
 #define BSW8_MAX_W 127                 /* max band: diagonal offset d=j-i must fit signed int8 */
-#define BSW8_MAX_ZDROP_STEP 253        /* keep the re-baseline window non-empty:
-                                          REBASE_HI=255-max_step > REBASE_KEEP=zdrop+1, i.e.
-                                          zdrop+max_step <= 253. The DP body AND the h0-prefix
-                                          column/row seed in the 8-bit wrappers are both
-                                          unsigned-saturating [0,255], so the seed byte
-                                          min(h0,REBASE_KEEP) just needs to fit a uint8.
-                                          See smithWaterman128_8 re-baseline + h0-prefix seed. */
+#define BSW8_MAX_ZDROP_STEP 253        /* zdrop is broadcast into the DP as a byte
+                                          (_mm256_set1_epi8), so it must fit one, and the
+                                          max_step headroom keeps the z-drop comparison from
+                                          wrapping: zdrop+max_step <= 253. The DP body AND the
+                                          h0-prefix column/row seed in the 8-bit wrappers are
+                                          both unsigned-saturating [0,255], and the seed is the
+                                          raw h0 clamped to uint8. NOTE: the 253 value dates from
+                                          the re-baseline era, where it also kept
+                                          255-max_step > zdrop+1; with re-baseline gone that
+                                          second role is moot, so this bound is now conservative
+                                          rather than tight. See smithWaterman128_8 h0-prefix seed. */
 
 static inline int bsw8_envelope_ok(int len1, int len2, int w,
                                    int score_a, int zdrop, int h0)
@@ -152,9 +176,10 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
     int64_t max_step = score_a > 1 ? (int64_t)score_a : 1;   /* max(w_match, w_ambig, 1) */
     int64_t shorter  = len1 < len2 ? (int64_t)len1 : (int64_t)len2;
     /* Max attainable SW score: seed h0 plus an all-match diagonal over the
-     * shorter sequence. Must stay strictly below REBASE_HI = 255 - max_step so
-     * the running row max never triggers a (lossy) re-baseline; combined with
-     * h0 <= zdrop+1 (B0 == 0) the kernel runs as an exact unsigned [0,255] SW. */
+     * shorter sequence. Must stay strictly below the byte ceiling 255 - max_step
+     * so no row max can ever reach it; that alone makes the kernel an exact
+     * unsigned [0,255] SW, and since h0 <= max_score it also bounds the seed
+     * byte, so no separate h0 gate is needed. */
     int64_t max_score = (int64_t)h0 + shorter * (int64_t)score_a;
     return len1 < MAX_SEQ_LEN8 && len2 < MAX_SEQ_LEN8 &&
            /* target (rows, len1) >= query (cols, len2). The re-baseline 8-bit
@@ -170,8 +195,85 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
            len1 >= len2 &&
            w <= BSW8_MAX_W &&
            zdrop + max_step <= BSW8_MAX_ZDROP_STEP &&
-           h0 <= zdrop + 1 &&
+           /* EXT-4: the former `h0 <= zdrop + 1` gate has been dropped. It was
+            * introduced to force the per-lane re-baseline floor B0 = max(0, h0 -
+            * (zdrop+1)) to zero; that re-baseline machinery was removed (the 8-bit
+            * DP is now a plain unsigned [0,255] SW), so h0's only remaining
+            * constraint is that the seed byte fit a uint8 — guaranteed by the
+            * max_score bound below (h0 <= max_score < 255 - max_step). A second,
+            * subtler role — bounding the seed against the z-drop horizon so a
+            * high-h0 lane does not z-drop before its row max builds up — was fixed
+            * in the kernel by #273 (correct 8-bit z-drop/seed clamp at high seed
+            * scores). getScores8 is now byte-identical to scalarBandedSWA across
+            * the newly-admitted h0 > zdrop+1 region for the default, moderate, and
+            * harsh scoring sweeps (see test/bandedswa_high_h0_zdrop_test.cpp).
+            * Admitting these pairs moves ~7.41% of Illumina extension pairs from
+            * the 8-lane 16-bit tier to the 16-lane 8-bit tier. */
            max_score < 255 - max_step;
+}
+
+/* ---------------------------------------------------------------------------
+ * BWAMEM3_DUMP_PAIRS=<path>: record the extension pairs handed to the banded-SW
+ * batch, one TSV row per SeqPair: len1, len2, h0, w, tier (8 | 16 | 1).
+ *
+ * Why this exists: the shape of an extension problem is defined by seeding and
+ * chaining, so it cannot be recovered from an alignment record after the fact —
+ * a BAM says where a read landed, not which DP problems were posed to get it
+ * there. Anything that needs to reproduce a representative extension workload
+ * (benchmarks, kernel harnesses) has to observe the pairs here.
+ *
+ * The recorded tier is the routing decision this build actually made, which
+ * lets an external mirror of bsw8_envelope_ok() be checked against ground truth
+ * rather than against a re-reading of the rule.
+ *
+ * Off by default and inert when off: one getenv behind a function-local static
+ * (C++11 thread-safe init, so the OpenMP/pthread fan-out cannot race it), and
+ * the per-batch buffer is only touched when armed. Rows are buffered per batch
+ * and appended under a lock — a batch is thousands of pairs of DP work, so the
+ * contention is irrelevant next to what it is measuring.
+ * ------------------------------------------------------------------------- */
+static FILE *bsw_dump_fp(void)
+{
+    static FILE *fp = []() -> FILE * {
+        const char *path = getenv("BWAMEM3_DUMP_PAIRS");
+        if (!path || !*path) return NULL;
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            fprintf(stderr, "[bsw-dump] cannot open '%s' for writing; dump disabled\n", path);
+            return NULL;
+        }
+        fprintf(f, "len1\tlen2\th0\tw\ttier\n");
+        return f;
+    }();
+    return fp;
+}
+
+static inline bool bsw_dump_armed(void) { return bsw_dump_fp() != NULL; }
+
+static inline void bsw_dump_pair(std::string &buf, const SeqPair &sp, int w, int tier)
+{
+    char line[64];
+    int n = snprintf(line, sizeof line, "%d\t%d\t%d\t%d\t%d\n",
+                     sp.len1, sp.len2, sp.h0, w, tier);
+    if (n > 0) {
+        /* snprintf returns the would-be length; cap to what actually landed in
+         * `line` so append never over-reads the stack buffer on truncation. */
+        if ((size_t)n >= sizeof line) n = (int)(sizeof line - 1);
+        buf.append(line, (size_t)n);
+    }
+}
+
+static void bsw_dump_flush(std::string &buf)
+{
+    if (buf.empty()) return;
+    static std::mutex mtx;
+    FILE *fp = bsw_dump_fp();
+    if (!fp) return;   /* defensive: fp is non-null whenever dumping is armed */
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        fwrite(buf.data(), 1, buf.size(), fp);
+    }
+    buf.clear();
 }
 
             int tcnt = 0;
@@ -266,6 +368,7 @@ mem_opt_t *mem_opt_init()
     o->est_insert_high = 0;          // runtime state; set from data (mem_pestat) or -I during the run
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
+    o->alnreg_sort_fast = 0;  // off by default -> bwa-mem2's dedup sort (see mem_sort_dedup_patch); set by --fast
     o->skip_contained_ext = 0;   // off by default; opt-in via --skip-contained-ext (byte-identical)
     o->band_start  = 0;   // off by default (adaptive chain-geometry band); opt-in via --adaptive-band
     o->split_width = 10;
@@ -281,11 +384,25 @@ mem_opt_t *mem_opt_init()
     o->max_XA_hits = 5;
     o->max_XA_hits_alt = 200;
     o->max_matesw = 50;
+    o->rescue_kmer = 0;      /* off by default (opt-in, not byte-identical) */
+    o->rescue_band = MEM_RESCUE_BAND_DEFAULT;
+    o->rescue_skip = 0;      /* off by default; requires rescue_kmer (opt-in) */
     o->mask_level_redun = 0.95;
     o->min_chain_weight = 0;
     o->max_chain_extend = 1<<30;
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
     o->meth_scoring = MEM_METH_SCORING_COLLAPSED;  /* --meth default: bwameth-compatible */
+    o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
+    o->meth_tags    = MEM_METH_TAGS_ALL;           /* --meth default: emit XR/XG/XM (Bismark set) */
+    o->compat       = &COMPAT_TARGET_OFF;          /* --compat off: bwa-mem3's native output */
+    /* Match bwa and bwa-mem2, which both derive FLAG 0x2 from a[0]. Explicit
+     * rather than left to calloc: this default is what keeps the proper-pair
+     * bit agreeing with both upstreams on ALT-aware runs (fg-labs/bwa-mem3#362)
+     * -- it settles FLAG 0x2 alone, not the rest of the record, which still
+     * carries bwa-mem3's own MQ/HN tags and header unless --compat shapes them
+     * away -- and a default that important should be visible where the others
+     * are set. */
+    o->proper_pair_from_emitted = 0;
     bwa_fill_scmat(o->a, o->b, o->mat);
     mem_opt_fill_meth_mat(o);
     return o;
@@ -293,23 +410,84 @@ mem_opt_t *mem_opt_init()
 
 /* D3 (--meth, PR-4): (re)derive the per-hypothesis ASYMMETRIC matrices from the
  * symmetric `mat` + match score `a`. Target-major mat[ref*5+read], ACGT order
- * A,C,G,T,N. Free exactly ONE off-diagonal cell to a MATCH (+a); leave everything
- * else (incl. the mirror cell, a real variant) at the symmetric value:
+ * A,C,G,T,N. Free the conversion cell; leave everything else (incl. the mirror
+ * cell, a real variant) at the symmetric value:
  *   OT: free mat[C][T] = mat[1*5+3]  (ref C, read T = unmethylated C→T)
  *   OB: free mat[G][A] = mat[2*5+0]  (ref G, read A = bottom-strand G→A)
- * GENOMIC (opt->meth_scoring): only that one cell is freed ⇒ the mirror stays a
- * real mismatch and the SIMD kernel takes its rank-1 fast path. COLLAPSED: the
- * mirror cell is ALSO freed (two cells) so C/T and G/A are interchangeable
- * (bwameth-compatible), via bandedSWA's general-matrix path. Selected per chain
+ * The freed VALUE and whether the mirror is freed too depend on opt->meth_scoring:
+ * GENOMIC frees only that cell, to a MATCH (+a) ⇒ the mirror stays a real mismatch
+ * and the SIMD kernel takes its rank-1 fast path. NEUTRAL frees only that cell, to
+ * 0 (tolerated but not rewarded) ⇒ the mirror likewise stays a mismatch; one freed
+ * cell but not rank-1, so bandedSWA uses its general-matrix path. COLLAPSED: the
+ * mirror cell is ALSO freed (two cells, both to +a) so C/T and G/A are
+ * interchangeable (bwameth-compatible), via bandedSWA's general-matrix path.
+ * Selected per chain
  * via mem_opt_meth_mat(); valid only under --meth. MUST be called after EVERY
  * rebuild of opt->mat (mem_opt_init AND after main_mem parses -A/-B/-x and
  * re-runs bwa_fill_scmat) — otherwise the meth matrices keep the default
  * match/mismatch and silently ignore the user's scoring options. */
+/* Map one tag name to its MEM_METH_TAG_* bit; 0 if unknown. Case-insensitive. */
+static int meth_tag_bit(const char *name, size_t len)
+{
+    if (len != 2 || (name[0] != 'X' && name[0] != 'x')) return 0;
+    switch (name[1]) {
+        case 'R': case 'r': return MEM_METH_TAG_XR;
+        case 'G': case 'g': return MEM_METH_TAG_XG;
+        case 'M': case 'm': return MEM_METH_TAG_XM;
+        default:            return 0;
+    }
+}
+
+int mem_opt_parse_meth_tags(const char *spec, int *out, const char **err)
+{
+    if (spec == NULL || *spec == '\0') { *err = "empty tag spec"; return -1; }
+    if (strcasecmp(spec, "all")  == 0) { *out = MEM_METH_TAGS_ALL; return 0; }
+    if (strcasecmp(spec, "none") == 0) { *out = 0;                 return 0; }
+
+    /* A spec is either all-inclusion (`XR,XG`) or all-exclusion (`^XM`).
+     * Mixing the two has no obvious reading -- is `XR,^XM` "only XR" or
+     * "everything but XM"? -- so reject it rather than pick a meaning. */
+    int included = 0, excluded = 0, n_inc = 0, n_exc = 0;
+    const char *p = spec;
+    while (*p != '\0') {
+        const char *comma = strchr(p, ',');
+        size_t len = comma != NULL ? (size_t)(comma - p) : strlen(p);
+        /* Separate from the unknown-tag case below: in `,XR` or `XR,,XG` there
+         * is no tag name to be unknown, and saying so sends the user hunting
+         * for a misspelling that isn't there. `XR,` is caught as a trailing
+         * comma at the bottom of the loop. */
+        if (len == 0) { *err = "empty tag in list"; return -1; }
+        /* '-' is accepted as a synonym for '^' because a bare ^XM is a negated
+         * glob in zsh with EXTENDED_GLOB (the oh-my-zsh/prezto default), where
+         * it silently expands to every file in the directory except XM. '-XM'
+         * needs no quoting in any common shell. */
+        int is_exclusion = (*p == '^' || *p == '-');
+        const char *name = is_exclusion ? p + 1 : p;
+        size_t name_len  = is_exclusion ? len - 1 : len;
+        int bit = meth_tag_bit(name, name_len);
+        if (bit == 0) { *err = "unknown tag (expected XR, XG or XM)"; return -1; }
+        if (is_exclusion) { excluded |= bit; ++n_exc; }
+        else              { included |= bit; ++n_inc; }
+        if (comma == NULL) break;
+        p = comma + 1;
+        if (*p == '\0') { *err = "trailing comma"; return -1; }
+    }
+    if (n_inc > 0 && n_exc > 0) {
+        *err = "cannot mix included and ^excluded tags in one spec";
+        return -1;
+    }
+    *out = n_exc > 0 ? (MEM_METH_TAGS_ALL & ~excluded) : included;
+    return 0;
+}
+
 void mem_opt_fill_meth_mat(mem_opt_t *o) {
     memcpy(o->mat_ot, o->mat, sizeof(o->mat));
     memcpy(o->mat_ob, o->mat, sizeof(o->mat));
-    o->mat_ot[1 * 5 + 3] = o->a;   /* OT: ref C / read T → match (C→T conversion)   */
-    o->mat_ob[2 * 5 + 0] = o->a;   /* OB: ref G / read A → match (G→A conversion)   */
+    /* Conversion cell: +a (rewarded) for COLLAPSED/GENOMIC, 0 (tolerated but not
+     * rewarded) for NEUTRAL. See enum mem_meth_scoring for the rationale. */
+    int8_t conv = (o->meth_scoring == MEM_METH_SCORING_NEUTRAL) ? 0 : (int8_t)o->a;
+    o->mat_ot[1 * 5 + 3] = conv;   /* OT: ref C / read T (C→T conversion)   */
+    o->mat_ob[2 * 5 + 0] = conv;   /* OB: ref G / read A (G→A conversion)   */
     if (o->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
         /* bwameth-compatible: free the MIRROR cell too so C/T (and G/A) are
          * mutually interchangeable (collapsed 3-letter space). Two freed cells ⇒
@@ -320,20 +498,51 @@ void mem_opt_fill_meth_mat(mem_opt_t *o) {
     }
 }
 
+/* See bwamem.h for the contract. The `* opt->a` factors are the fix for -A
+ * being discarded under --meth: bwameth's constants assume a == 1, and bwa
+ * scales every other score-derived default by opt->a in update_a(). */
+void mem_opt_apply_meth_defaults(mem_opt_t *opt, const mem_opt_t *opt0)
+{
+    if (!opt0->pen_clip5)    opt->pen_clip5    = 10 * opt->a;   /* bwameth -L 10 */
+    if (!opt0->pen_clip3)    opt->pen_clip3    = 10 * opt->a;
+    if (!opt0->pen_unpaired) opt->pen_unpaired = 100 * opt->a;  /* bwameth -U 100 (paired) */
+    if (!opt0->T)            opt->T            = 40 * opt->a;   /* bwameth -T 40 */
+    opt->flag |= MEM_F_NO_MULTI;                                /* -M */
+    if (opt->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
+        if (!opt0->b) opt->b = 2 * opt->a;                      /* bwameth's lenient -B 2 */
+    }
+    /* GENOMIC and NEUTRAL keep bwa's default b (already scaled by update_a):
+     * both are variant-aware, so the mirror cell must stay a real mismatch. */
+}
+
 /******************************
  * De-overlap single-end hits *
  ******************************/
 
-/* mem_ars2: primary sort by reference END position (`re`). Used by
- * mem_sort_dedup_patch as the first ordering before its order-sensitive
- * dedup/patch loop. The tie-break keys (rb, score-desc, qb) make the
- * order deterministic at equal `re`; without them, the dedup outcome
- * depended on whichever ordering the underlying sort algorithm happened
- * to produce (klib introsort is unstable, pdqsort is unstable
- * differently, radix is stable) — different orderings produced
- * different surviving alnreg sets, propagating to `sub_n` and MAPQ.
- * With the full key, every sort algorithm produces the same surviving
- * set and the SAM is bit-equal regardless of which sort runs. */
+/* The two comparators below are the two halves of the same trade-off, and
+ * mem_sort_dedup_patch picks between them on opt->alnreg_sort_fast. Its first
+ * sort feeds an ORDER-SENSITIVE dedup loop, so the comparator decides which of
+ * several equal-`re` regions survives, propagating to `sub_n` and MAPQ:
+ *
+ *   mem_ars2_m2 (default) -- bwa-mem2's ORIGINAL comparator, a PARTIAL order on
+ *     `re` alone, run under klib's unstable introsort. The surviving set depends
+ *     on the *permutation* introsort produces, which is precisely what
+ *     bwa-mem2's output is defined by. Kept so the default build reproduces
+ *     upstream's dedup outcome exactly.
+ *
+ *   mem_ars2 (--fast) -- a STRICT TOTAL order: `re`, then the tie-break keys
+ *     (rb, score-desc, qb). Every sort algorithm then produces the same
+ *     surviving set, so the SAM is bit-equal regardless of which sort runs
+ *     (klib introsort is unstable, pdqsort is unstable differently, radix is
+ *     stable). Paired with pdqsort here.
+ *
+ * The two properties are mutually exclusive: any strict total order necessarily
+ * picks different winners among equal-`re` records than the permutation
+ * introsort happens to leave, so robustness-to-sort-choice and bwa-mem2 parity
+ * cannot both hold. Covered by test/unit/test_alnreg_sort_dedup.cpp. */
+#define alnreg_slt2_m2(a, b) ((a).re < (b).re)
+KSORT_INIT(mem_ars2_m2, mem_alnreg_t, alnreg_slt2_m2)
+
 #define alnreg_slt2(a, b) \
     ((a).re < (b).re || ((a).re == (b).re && \
      ((a).rb < (b).rb || ((a).rb == (b).rb && \
@@ -342,9 +551,100 @@ void mem_opt_fill_meth_mat(mem_opt_t *o) {
 KSORT_INIT(mem_ars2, mem_alnreg_t, alnreg_slt2)
 PDQSORT_INIT(mem_ars2, mem_alnreg_t, alnreg_slt2)
 
+PDQSORT_INIT(mem_ars2_m2, mem_alnreg_t, alnreg_slt2_m2)
+
 #define alnreg_slt(a, b) ((a).score > (b).score || ((a).score == (b).score && ((a).rb < (b).rb || ((a).rb == (b).rb && (a).qb < (b).qb))))
 KSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
 PDQSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
+
+/*----------------------------------------------------------------------------
+ * Tie-free fast path for the default (bwa-mem2-compatible) dedup sorts.
+ *
+ * Under alnreg_sort_fast == 0 the surviving alnreg set is defined by the
+ * *permutation* klib's unstable introsort happens to produce, so substituting a
+ * faster sort changes which regions survive -- but only when the comparator
+ * actually sees a tie. With no tied pair the sorted sequence is unique, so
+ * pdqsort's result is bit-for-bit what introsort would have produced and the
+ * substitution is free. Ties are therefore detected, not avoided.
+ *
+ * Ties are rare. Instrumented over 2.32M calls / 186M regions (533,334 HG00096
+ * WGS pairs, -t 16): the `re` sort ties on 0.98% of calls and the closing
+ * by-score sort on 0 of them -- two survivors cannot share (rb, qb), see the
+ * comment at the end of mem_sort_dedup_patch. So ~99% of calls get pdqsort and
+ * the rest pay pdqsort plus a restore plus introsort.
+ *
+ * Saving the input first is what makes the fallback exact: ks_introsort is
+ * input-order-dependent, so running it on the pdqsort-permuted array would give
+ * a different permutation -- and a different SAM -- than bwa-mem2.
+ *--------------------------------------------------------------------------*/
+
+/* Below ~9 elements pdqsort wins nothing: on the alnreg microbench
+ * (reports/2026-07-12-dedup-sort-benchmark-arm64.md, 2-8 bucket) klib's introsort
+ * leads on the `re` sort (127.4 vs 119.0 Mcell/s) and ties it on the by-score
+ * sort (130.8 vs 130.1). Short arrays are ~46% of calls, so the save-copy is not
+ * worth paying there for either. */
+#define DEDUP_SORT_PDQ_MIN 9
+
+/* Per-thread save buffer, grown geometrically and released at thread exit. Held
+ * as bytes so it can reuse the u8vec scratch holder; realloc returns storage
+ * suitably aligned for mem_alnreg_t. Returns NULL only if the allocation fails,
+ * in which case the caller takes the exact (introsort) path. */
+static inline mem_alnreg_t *alnreg_save_buf(int n)
+{
+    static thread_local u8vec_scratch_t save;
+    const size_t want = (size_t)n * sizeof(mem_alnreg_t);
+    if (save.v.m < want) {
+        size_t cap = save.v.m * 2;
+        if (cap < want) cap = want;
+        uint8_t *p = (uint8_t *)realloc(save.v.a, cap);
+        if (p == NULL) return NULL;   /* keep the existing buffer intact */
+        save.v.a = p;
+        save.v.m = cap;
+    }
+    return (mem_alnreg_t *)save.v.a;
+}
+
+/* Emit `static void fn(int n, mem_alnreg_t *a)` that sorts `a` exactly as
+ * ks_introsort(name, n, a) would, but via pdqsort_##name whenever `lt` sees no
+ * tie. `lt` must be the comparator KSORT_INIT and PDQSORT_INIT were given. */
+#define DEDUP_TIE_SORT_INIT(fn, name, lt)                                        \
+    static void fn(int n, mem_alnreg_t *a)                                       \
+    {                                                                            \
+        mem_alnreg_t *save;                                                      \
+        if (n < DEDUP_SORT_PDQ_MIN || (save = alnreg_save_buf(n)) == NULL) {     \
+            ks_introsort(name, n, a);                                            \
+            return;                                                              \
+        }                                                                        \
+        memcpy(save, a, (size_t)n * sizeof(*a));                                 \
+        pdqsort_##name(n, a);                                                    \
+        for (int i = 1; i < n; ++i) {                                            \
+            /* `a` is sorted, so !lt(a[i-1], a[i]) means the pair is tied. */    \
+            if (!lt(a[i - 1], a[i])) {                                           \
+                memcpy(a, save, (size_t)n * sizeof(*a));                         \
+                ks_introsort(name, n, a);                                        \
+                return;                                                          \
+            }                                                                    \
+        }                                                                        \
+    }
+
+DEDUP_TIE_SORT_INIT(dedup_sort_by_re,    mem_ars2_m2, alnreg_slt2_m2)
+DEDUP_TIE_SORT_INIT(dedup_sort_by_score, mem_ars,     alnreg_slt)
+
+/* Exposed for test/unit/test_alnreg_sort_dedup.cpp, which asserts each fast path
+ * against the introsort it claims to reproduce, array for array. Thin enough not
+ * to perturb the call sites above, which still call the static helpers. Each
+ * takes the region count `n` and the array `a`, sorted in place. */
+
+/* The `re` sort as mem_sort_dedup_patch runs it by default: pdqsort, or restore
+ * plus introsort on a tie. */
+void bwamem3_dedup_sort_by_re(int n, mem_alnreg_t *a)          { dedup_sort_by_re(n, a); }
+/* The `re` sort bwa-mem2 runs: klib introsort, unconditionally. The oracle the
+ * fast path above must match record for record. */
+void bwamem3_dedup_sort_by_re_exact(int n, mem_alnreg_t *a)    { ks_introsort(mem_ars2_m2, n, a); }
+/* The closing by-score sort as mem_sort_dedup_patch runs it by default. */
+void bwamem3_dedup_sort_by_score(int n, mem_alnreg_t *a)       { dedup_sort_by_score(n, a); }
+/* The closing by-score sort bwa-mem2 runs, i.e. the oracle for the above. */
+void bwamem3_dedup_sort_by_score_exact(int n, mem_alnreg_t *a) { ks_introsort(mem_ars, n, a); }
 
 #define alnreg_hlt(a, b)  ((a).score > (b).score || ((a).score == (b).score && ((a).is_alt < (b).is_alt || ((a).is_alt == (b).is_alt && (a).hash < (b).hash))))
 KSORT_INIT(mem_ars_hash, mem_alnreg_t, alnreg_hlt)
@@ -499,7 +799,13 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
     if (mat == NULL) mat = opt->mat;
     int m, i, j;
     if (n <= 1) return n;
-    pdqsort_mem_ars2(n, a); // sort by the END position, not START!
+    /* Default: bwa-mem2's re-only comparator, ordered exactly as klib introsort
+     * would order it -- dedup_sort_by_re runs pdqsort and restores-and-introsorts
+     * only on a tie -- reproducing upstream's dedup outcome. --fast: strict total
+     * order + pdqsort unconditionally, which skips the save-copy and the tie scan
+     * but resolves equal-`re` ties differently. */
+    if (opt->alnreg_sort_fast) pdqsort_mem_ars2(n, a);       // sort by the END position, not START!
+    else                       dedup_sort_by_re(n, a);
 
     for (i = 0; i < n; ++i) a[i].n_comp = 1;
     for (i = 1; i < n; ++i)
@@ -543,7 +849,8 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
             else ++m;
         }
     n = m;
-    pdqsort_mem_ars(n, a);
+    if (opt->alnreg_sort_fast) pdqsort_mem_ars(n, a);
+    else                       dedup_sort_by_score(n, a);
     /* The historical post-sort exact-duplicate passes (mark then exclude regions
      * sharing (score, rb, qb)) have been removed: they are provably dead. Any two
      * regions with equal (rb, qb) have the shorter fully contained in the longer,
@@ -588,10 +895,13 @@ static int test_and_merge(const mem_opt_t *opt, int64_t l_pac, mem_chain_t *c,
             int pm = c->m;
             c->m <<= 1;
             if (pm == SEEDS_PER_CHAIN) {  // re-new memory
-                if ((auxSeedBuf = (mem_seed_t *) calloc(c->m, sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory auxSeedBuf\n"); exit(1); }
+                /* CHN-11: was calloc; the zero-fill it did over [0, m) was pure
+                 * waste -- [0, n) is immediately overwritten by the memcpy below
+                 * and [n, m) by the shared memset that follows (identical to the
+                 * realloc branch). malloc leaves exactly the same final bytes. */
+                if ((auxSeedBuf = (mem_seed_t *) malloc(c->m * sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory auxSeedBuf\n"); exit(1); }
                 memcpy((char*) (auxSeedBuf), c->seeds, c->n * sizeof(mem_seed_t));
                 c->seeds = auxSeedBuf;
-                tprof[PE13][tid]++;
             } else {  // new memory
                 // fprintf(stderr, "[%0.4d] re-allocing old seed, m: %d\n", tid, c->m);
                 if ((auxSeedBuf = (mem_seed_t *) realloc(c->seeds, c->m * sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory auxSeedBuf\n"); exit(1); }
@@ -648,22 +958,24 @@ int mem_seed_sw(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 
 int mem_chain_weight(const mem_chain_t *c)
 {
-    int64_t end;
-    int j, w = 0, tmp;
-    for (j = 0, end = 0; j < c->n; ++j) {
+    /* CL-1: fused query- and reference-axis coverage into a single seed sweep.
+     * The two accumulations are independent (query coverage keys off qbeg/len,
+     * reference coverage off rbeg/len), so interleaving them in one pass with a
+     * separate running end per axis is byte-identical to the former two sweeps
+     * -- it only halves the loop iterations (the second sweep re-read the same
+     * L1-resident seeds), a tidy-up rather than a speedup. */
+    int64_t qend, rend;
+    int j, wq = 0, wr = 0, w;
+    for (j = 0, qend = 0, rend = 0; j < c->n; ++j) {
         const mem_seed_t *s = &c->seeds[j];
-        if (s->qbeg >= end) w += s->len;
-        else if (s->qbeg + s->len > end) w += s->qbeg + s->len - end;
-        end = end > s->qbeg + s->len? end : s->qbeg + s->len;
+        if (s->qbeg >= qend) wq += s->len;
+        else if (s->qbeg + s->len > qend) wq += s->qbeg + s->len - qend;
+        qend = qend > s->qbeg + s->len? qend : s->qbeg + s->len;
+        if (s->rbeg >= rend) wr += s->len;
+        else if (s->rbeg + s->len > rend) wr += s->rbeg + s->len - rend;
+        rend = rend > s->rbeg + s->len? rend : s->rbeg + s->len;
     }
-    tmp = w; w = 0;
-    for (j = 0, end = 0; j < c->n; ++j) {
-        const mem_seed_t *s = &c->seeds[j];
-        if (s->rbeg >= end) w += s->len;
-        else if (s->rbeg + s->len > end) w += s->rbeg + s->len - end;
-        end = end > s->rbeg + s->len? end : s->rbeg + s->len;
-    }
-    w = w < tmp? w : tmp;
+    w = wq < wr? wq : wr;
     return w < 1<<30? w : (1<<30)-1;
 }
 
@@ -726,6 +1038,17 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
     int i, j, k;// min_HSP_score = (int)(opt->a * min_l + .499);
     //if (min_l > MEM_SEEDSW_COEF * l_query) return; // don't run the following for short reads
 
+    /* min_l/min_HSP_score depend only on (opt, l_query). Upstream hoisted them out
+     * of the loop because it was called per read; here `a` holds chains for a whole
+     * batch, so l_query = seq_[c->seqid].l_seq varies and a plain hoist is wrong.
+     * But chains arrive grouped by seqid and libraries are usually fixed-length, so
+     * a one-entry memo on l_query collapses ~all of the per-chain libm log() calls
+     * (order 10 chains/read => ~1e8 log() on a 10M-read run). Byte-identical: the
+     * same inputs produce the same IEEE double, we just stop recomputing it. */
+    int    memo_l_query = -1;
+    double memo_min_l = 0.0;
+    int    memo_min_HSP_score = 0;
+
     /* D3 (--meth, PR-4): the chained-seed SW filter must score the ORIGINAL read
      * against the original ref with the per-chain asymmetric matrix, same as
      * extension — otherwise it over-penalizes bisulfite conversions and drops
@@ -758,7 +1081,7 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
                 /* CodeRabbit: don't assign realloc() result back to meth_qbuf
                  * directly — a NULL return would leak the old buffer. */
                 uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
-                assert(meth_qbuf_new != NULL);
+                xassert(meth_qbuf_new != NULL, "out of memory: meth_qbuf_new");
                 meth_qbuf = meth_qbuf_new;
             }
             const char *os = seq_[c->seqid].meth_orig_seq;
@@ -775,9 +1098,17 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
             mat = mem_opt_meth_mat(opt, hyp);
         }
 
-        double min_l = opt->min_chain_weight?
-        MEM_HSP_COEF * opt->min_chain_weight : MEM_MINSC_COEF * log(l_query);
-        int min_HSP_score = (int)(opt->a * min_l + .499);
+        double min_l;
+        int min_HSP_score;
+        if (l_query == memo_l_query) {          /* same read length as the previous chain */
+            min_l = memo_min_l;
+            min_HSP_score = memo_min_HSP_score;
+        } else {
+            min_l = opt->min_chain_weight?
+                MEM_HSP_COEF * opt->min_chain_weight : MEM_MINSC_COEF * log(l_query);
+            min_HSP_score = (int)(opt->a * min_l + .499);
+            memo_l_query = l_query; memo_min_l = min_l; memo_min_HSP_score = min_HSP_score;
+        }
         if (min_l > MEM_SEEDSW_COEF * l_query) continue;
 
         for (j = k = 0; j < c->n; ++j)
@@ -876,137 +1207,394 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
     return k;
 }
 
+/* ---- mem_chain_flt greedy pairwise overlap pass (CHN-FLT-2) ----------------
+ * The pass compares each weight-sorted chain i against the already-kept chains
+ * and decides which chains survive. Two implementations share one signature so
+ * a debug build can run both and assert they agree byte-for-byte:
+ *   - chn_flt_pairwise_ref : the historical O(n^2) naive scan (reference).
+ *   - chn_flt_pairwise_fast: the BI-1 skip that visits only effect-bearing
+ *     comparisons (the case analysis is in the block comment above it).
+ *
+ * Both read the sorted chain array `a` (weight-descending) and the SoA-hoisted
+ * query coordinates cb/ce, and write their results into caller-owned arrays:
+ *   first[t]  first shadowing chain of sorted-chain t, or -1 (init by caller)
+ *   kept[t]   0/2/3 kept-class of sorted-chain t (init 0 by caller)
+ *   *surv     survivor list, in scan (weight-descending) order
+ * Nothing in `a` is mutated, so the two runs are independent. All indices are
+ * into the post-ks_introsort array `a`.
+ *
+ * The reference is compiled only for the opt-in cross-check build (see the
+ * BWA_MEM3_DEBUG_CHN_FLT_XCHECK note at the call site); production builds
+ * contain the fast pass alone. */
+typedef kvec_t(int) kvi_t;
+
+#ifdef BWA_MEM3_DEBUG_CHN_FLT_XCHECK
+static void chn_flt_pairwise_ref(int n_chn, const mem_chain_t *a,
+    const int *cb, const int *ce,
+    float mask_level, float drop_ratio, int max_chain_gap, int min_seed_gap,
+    int *first, int *kept, kvi_t *surv)
+{
+    int i, k;
+    kept[0] = 3;
+    kv_push(int, *surv, 0);
+    for (i = 1; i < n_chn; ++i)
+    {
+        int large_ovlp = 0;
+        const int cbi = cb[i], cei = ce[i];
+        const int li = cei - cbi;
+        const int wi = a[i].w;
+        const int ai_alt = a[i].is_alt;
+        for (k = 0; k < (int)surv->n; ++k)
+        {
+            int j = surv->a[k];
+            int b_max = cb[j] > cbi? cb[j] : cbi;
+            int e_min = ce[j] < cei? ce[j] : cei;
+            if (e_min > b_max && (!a[j].is_alt || ai_alt)) { // have overlap; don't consider ovlp where the kept chain is ALT while the current chain is primary
+                int lj = ce[j] - cb[j];
+                int min_l = li < lj? li : lj;
+                if (e_min - b_max >= min_l * mask_level && min_l < max_chain_gap) { // significant overlap
+                    large_ovlp = 1;
+                    if (first[j] < 0) first[j] = i; // keep the first shadowed hit s.t. mapq can be more accurate
+                    if (wi < a[j].w * drop_ratio && a[j].w - wi >= min_seed_gap)
+                        break;
+                }
+            }
+        }
+        if (k == (int)surv->n)
+        {
+            kv_push(int, *surv, i);
+            kept[i] = large_ovlp? 2 : 3;
+        }
+    }
+}
+#endif /* BWA_MEM3_DEBUG_CHN_FLT_XCHECK */
+
+/* BI-1 skip: the naive pass wastes the vast majority of its comparisons on kept
+ * chains j that can have no observable effect on i -- j already has a first
+ * shadower, is too light to dominate i, and is reached after i's large_ovlp latch
+ * has fired. This visits only the effect-bearing comparisons and is byte-identical
+ * to chn_flt_pairwise_ref (proven by case analysis; asserted per-read in debug).
+ *
+ * Per i, the three observable effects of a comparison are localized:
+ *   (C) large_ovlp latch: fires only on i's FIRST significant overlap; found by a
+ *       linear scan (phase 1) that stops there -- exactly what the ref does before
+ *       any skipping could begin.
+ *   (B) domination break: needs `wi < wj*drop_ratio && wj-wi >= gap`, a pure weight
+ *       test. Since `surv` is weight-descending, any chain reached after i's first
+ *       significant overlap is no heavier than that one, so if that first overlap did
+ *       not dominate i, nothing later can either: the break can only fire at the first
+ *       significant overlap (handled in phase 1) or never. i then survives.
+ *   (A) first[j]=i: only for j with first<0 that i significantly overlaps. Tracked in
+ *       an intrusive doubly-linked list of surv positions whose chain still has
+ *       first<0 (phase 2); the list only shrinks (a chain leaves once shadowed) and
+ *       grows by one per newly kept chain. */
+static void chn_flt_pairwise_fast(int n_chn, const mem_chain_t *a,
+    const int *cb, const int *ce,
+    float mask_level, float drop_ratio, int max_chain_gap, int min_seed_gap,
+    int *first, int *kept, kvi_t *surv)
+{
+    /* Intrusive DLL over surv positions (0..surv->n-1) with first<0. A position is
+     * appended once (when its chain is kept) and removed once (when its chain gets
+     * a first shadower), so each entry is live for one contiguous span and phase 2
+     * visits every still-unshadowed chain exactly once.
+     * Grow-only thread_local scratch; only touched entries are initialized. */
+    static thread_local std::vector<int> nxt_v, prv_v;
+    if ((int)nxt_v.size() < n_chn) { nxt_v.resize(n_chn); prv_v.resize(n_chn); }
+    int *nxt = nxt_v.data(), *prv = prv_v.data();
+    int f0_head, f0_tail;
+
+    kept[0] = 3;
+    kv_push(int, *surv, 0);
+    nxt[0] = -1; prv[0] = -1; f0_head = 0; f0_tail = 0;   // f0 = { position 0 }
+
+    for (int i = 1; i < n_chn; ++i)
+    {
+        const int cbi = cb[i], cei = ce[i];
+        const int li = cei - cbi;
+        const int wi = a[i].w;
+        const int ai_alt = a[i].is_alt;
+
+        /* significant overlap of i with chain j (identical test to the ref). */
+        auto sig = [&](int j) -> bool {
+            int b_max = cb[j] > cbi? cb[j] : cbi;
+            int e_min = ce[j] < cei? ce[j] : cei;
+            if (!(e_min > b_max && (!a[j].is_alt || ai_alt))) return false;
+            int lj = ce[j] - cb[j];
+            int min_l = li < lj? li : lj;
+            return (e_min - b_max >= min_l * mask_level && min_l < max_chain_gap);
+        };
+        /* j is heavy enough to dominate i (pure weight test; overlap-independent). */
+        auto wdom = [&](int j) -> bool {
+            return (wi < a[j].w * drop_ratio && a[j].w - wi >= min_seed_gap);
+        };
+        auto f0_remove = [&](int p) {
+            int pv = prv[p], nx = nxt[p];
+            if (pv >= 0) nxt[pv] = nx; else f0_head = nx;
+            if (nx >= 0) prv[nx] = pv; else f0_tail = pv;
+        };
+        auto f0_append = [&](int p) {
+            nxt[p] = -1; prv[p] = f0_tail;
+            if (f0_tail >= 0) nxt[f0_tail] = p; else f0_head = p;
+            f0_tail = p;
+        };
+
+        int large_ovlp = 0, dominated = 0, k0 = -1, k;
+        const int nsurv = (int)surv->n;
+
+        /* Phase 1: linear scan to i's first significant overlap (latches large_ovlp).
+         * Nothing is skippable before the latch, so this mirrors the ref exactly. */
+        for (k = 0; k < nsurv; ++k) {
+            int j = surv->a[k];
+            if (sig(j)) {
+                large_ovlp = 1;
+                if (first[j] < 0) { first[j] = i; f0_remove(k); }
+                if (wdom(j)) dominated = 1;   // first sig overlap is a dominator -> break here
+                k0 = k;
+                break;
+            }
+        }
+
+        if (large_ovlp == 0) {                // no significant overlap: keep, kept=3
+            int p = surv->n;
+            kv_push(int, *surv, i);
+            kept[i] = 3; first[i] = -1;
+            f0_append(p);
+            continue;
+        }
+        if (dominated) continue;              // dominated at k0: i dropped, ref broke here too
+
+        /* i survives (kept=2): no chain after k0 can dominate it (see (B) above), so
+         * the ref would scan on without breaking. Phase 2: record i as the first
+         * shadower of every still-unshadowed chain it significantly overlaps at a
+         * position after k0. Positions <= k0 either did not overlap (k0 is the first
+         * overlap) or were handled in phase 1. */
+        for (int p = f0_head; p >= 0; ) {
+            int nx = nxt[p];
+            if (p > k0) {
+                int j = surv->a[p];
+                if (sig(j)) { first[j] = i; f0_remove(p); }
+            }
+            p = nx;
+        }
+
+        int p = surv->n;                      // survives with a large overlap: kept=2
+        kv_push(int, *surv, i);
+        kept[i] = 2; first[i] = -1;
+        f0_append(p);
+    }
+}
+
 int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
 {
-    int i, k, n_numc = 0;
+    int i, k;
     if (n_chn_ == 0) return 0; // no need to filter
     // compute the weight of each chain and drop chains with small weight
-    for (i = k = 0; i < n_chn_; ++i)
+    /* CHN-17: with min_chain_weight <= 0 no chain can ever be dropped -- c->w is
+     * an unsigned 27-bit bitfield, so it is always >= 0 and `c->w < min_chain_weight`
+     * is never true. The general loop below then degenerates to `a_[k++] = *c` with
+     * k == i throughout: a per-chain self-copy of a 48-byte mem_chain_t. Take a fast
+     * path that updates the gate fields in place and skips the copy. Byte-identical:
+     * the surviving array (all chains), their order, and every field value are
+     * unchanged, and nothing is freed because nothing is dropped. min_chain_weight
+     * defaults to 0, so this is the dominant case. */
+    if (opt->min_chain_weight <= 0)
     {
-        mem_chain_t *c = &a_[i];
-        c->first = -1; c->kept = 0;
-        c->w = mem_chain_weight(c);
-        if (c->w < opt->min_chain_weight)
+        for (i = 0; i < n_chn_; ++i)
         {
-            if (c->m > SEEDS_PER_CHAIN) {
-                tprof[PE11][tid] ++;
-                free(c->seeds);
-            }
-            //free(c->seeds);
+            mem_chain_t *c = &a_[i];
+            c->first = -1; c->kept = 0;
+            c->w = mem_chain_weight(c);
         }
-        else a_[k++] = *c;
+        /* No chain can be dropped, so there is no compaction and n_chn_ is
+         * unchanged; the general path's `k` would have ended at n_chn_. */
     }
-    n_chn_ = k;
+    else
+    {
+        /* Slot 0's seeds are freed LATE. If every chain is dropped the array is
+         * never compacted, so a_[0] still holds chain 0 -- and the empty-array
+         * path below hands exactly that slot back to the caller with kept = 3
+         * (bwa-mem2 behaviour, preserved verbatim; see the CHN-6/19 note).
+         * bwa-mem2 frees those seeds here and then returns the chain pointing at
+         * the freed block, so what the caller extends depends on whether the
+         * allocator has reused it. Deferring this one free yields the same chain
+         * with its own seeds still intact -- the result bwa-mem2 produces
+         * whenever the block is untouched -- without the use-after-free. When at
+         * least one chain survives, slot 0 was either kept or overwritten by
+         * compaction, and the seeds are freed immediately after the loop. */
+        mem_seed_t *slot0_seeds = NULL;
+        for (i = k = 0; i < n_chn_; ++i)
+        {
+            mem_chain_t *c = &a_[i];
+            c->first = -1; c->kept = 0;
+            c->w = mem_chain_weight(c);
+            if (c->w < opt->min_chain_weight)
+            {
+                if (c->m > SEEDS_PER_CHAIN)  // CHN-16: dead tprof[PE11] counter removed
+                {
+                    if (i == 0) slot0_seeds = c->seeds;  // may be resurrected below
+                    else free(c->seeds);
+                }
+            }
+            else a_[k++] = *c;
+        }
+        // Not resurrected -- drop it now. free(NULL) when chain 0 was kept.
+        if (k != 0) free(slot0_seeds);
+        n_chn_ = k;
+    }
 
     /* Fast path for the dominant single-chain (unique-mapper) case. With one
-     * surviving chain the range split is a single [0,1) range and the pairwise-
-     * overlap pass reduces to `a_[0].kept = 3` (set unconditionally, kept through
-     * compaction) returning 1 — but the general path still builds a std::vector,
-     * a kvec, and calls ks_introsort to get there. a_[0].first was already reset
-     * to -1 in the weight-filter loop above. (Only n_chn_ == 1 is short-circuited;
-     * n_chn_ == 0 falls through to preserve the existing general-path behavior.) */
+     * surviving chain the pairwise-overlap pass reduces to `a_[0].kept = 3` (set
+     * unconditionally, kept through compaction) returning 1 — but the general path
+     * still builds a kvec and calls ks_introsort to get there. a_[0].first was
+     * already reset to -1 in the weight-filter loop above. (Only n_chn_ == 1 is
+     * short-circuited; n_chn_ == 0 falls through to preserve the existing
+     * general-path behavior.) */
     if (n_chn_ == 1) {
         a_[0].kept = 3;
         return 1;
     }
 
-    std::vector<std::pair<int, int> > range;
-    std::pair<int, int> pr;
-    int pseqid = a_[0].seqid;
-    pr.first = 0;
-    for (i=1; i<n_chn_; i++)
-    {
-        mem_chain_t *c =&a_[i];
-        if (c->seqid != pseqid) {
-            //if (flag == -1) {
-            //  pr.first = i;
-            //flag = 1;
-            //}
-            //else
-            {
-                pr.second = i;
-                range.push_back(pr);
-                pr.first = i;
-                // flag = -1;
-            }
-        }
-        pseqid = c->seqid;
-    }
-    pr.second = i;
-    range.push_back(pr);
+    /* CHN-6/19: mem_chain_flt runs once per read (chn = &chain_ar[l]); every chain
+     * chain_add_one_seed emits for that read is stamped seqid = l, so all chains
+     * reaching here share a single seqid and the removed seqid-run scan always
+     * produced exactly one range [0, n_chn_) -- the `c->seqid != pseqid` test could
+     * never fire. Run the former per-range body once over the whole array.
+     * Byte-identical: with one range `ilag` stays 0, so `a[k++ - ilag] == a[k++]`,
+     * and the return value equals `k` (the old `n_numc`). The post-weight-filter
+     * n_chn_ == 0 case is preserved exactly: the old scan built the range {0,1} and
+     * ran the body over one uncompacted slot, so n_chn falls back to 1 and slot 0
+     * is returned with kept = 3. Its seeds are still live -- see the deferred free
+     * in the weight filter above. */
+    mem_chain_t *a = a_;
+    int n_chn = n_chn_ ? n_chn_ : 1;
+    kvi_t chains = {0,0,0};
+    kv_resize(int, chains, n_chn);   // CHN-19: reserve up front (kept count <= n_chn)
+    ks_introsort(mem_flt, n_chn, a);
 
-    int ilag = 0;
-    for (int l=0; l<range.size(); l++)
-    {
-        // this keeps int indices of the non-overlapping chains
-        kvec_t(int) chains = {0,0,0};
-        mem_chain_t *a =&a_[range[l].first];
-        int n_chn = range[l].second - range[l].first;
-        // original code block starts
-        ks_introsort(mem_flt, n_chn, a);
-
-        // pairwise chain comparisons
-        a[0].kept = 3;
-        kv_push(int, chains, 0);
-        for (i = 1; i < n_chn; ++i)
-        {
-            int large_ovlp = 0;
-            for (k = 0; k < chains.n; ++k)
-            {
-                int j = chains.a[k];
-                int b_max = chn_beg(a[j]) > chn_beg(a[i])? chn_beg(a[j]) : chn_beg(a[i]);
-                int e_min = chn_end(a[j]) < chn_end(a[i])? chn_end(a[j]) : chn_end(a[i]);
-                if (e_min > b_max && (!a[j].is_alt || a[i].is_alt)) { // have overlap; don't consider ovlp where the kept chain is ALT while the current chain is primary
-                    int li = chn_end(a[i]) - chn_beg(a[i]);
-                    int lj = chn_end(a[j]) - chn_beg(a[j]);
-                    int min_l = li < lj? li : lj;
-                    if (e_min - b_max >= min_l * opt->mask_level && min_l < opt->max_chain_gap) { // significant overlap
-                        large_ovlp = 1;
-                        if (a[j].first < 0) a[j].first = i; // keep the first shadowed hit s.t. mapq can be more accurate
-                        if (a[i].w < a[j].w * opt->drop_ratio && a[j].w - a[i].w >= opt->min_seed_len<<1)
-                            break;
-                    }
-                }
-            }
-            if (k == chains.n)
-            {
-                kv_push(int, chains, i);
-                a[i].kept = large_ovlp? 2 : 3;
-            }
-        }
-        for (i = 0; i < chains.n; ++i)
-        {
-            mem_chain_t *c = &a[chains.a[i]];
-            if (c->first >= 0) a[c->first].kept = 1;
-        }
-        free(chains.a);
-        for (i = k = 0; i < n_chn; ++i) { // don't extend more than opt->max_chain_extend .kept=1/2 chains
-            if (a[i].kept == 0 || a[i].kept == 3) continue;
-            if (++k >= opt->max_chain_extend) break;
-        }
-
-        for (; i < n_chn; ++i)
-            if (a[i].kept < 3) a[i].kept = 0;
-
-        for (i = k = 0; i < n_chn; ++i)  // free discarded chains
-        {
-            mem_chain_t *c = &a[i];
-            if (c->kept == 0)
-            {
-                if (c->m > SEEDS_PER_CHAIN) {
-                    tprof[PE11][tid] ++;
-                    free(c->seeds);
-                }
-                //free(c->seeds);
-            }
-            else a[k++ - ilag] = a[i];
-        }
-        // original code block ends
-        ilag += n_chn - k;
-        n_numc += k;
+    /* SoA hoist (#265, byte-identical). chn_beg()/chn_end() each chase a[].seeds --
+     * a dependent load of the seeds pointer, then a load from the 65k-entry seedBuf
+     * arena -- and the pairwise loop below evaluates them for EVERY (i,j) pair, so
+     * the j-side is re-chased on every inner iteration. Cache them once into two
+     * contiguous int arrays (typical ~25 chains/read, so a couple hundred bytes,
+     * L1-resident). The seed arrays are not modified anywhere in this loop, so
+     * these are exactly the values the macros would have recomputed. thread_local
+     * + grow-only: no per-read allocation. */
+    static thread_local std::vector<int> cb_v, ce_v;
+    int *cb = NULL, *ce = NULL;
+    /* Skipped for n_chn < 2. cb/ce are read only by the `i >= 1` pairwise loop
+     * below, so with a single chain they are dead -- and the one way to reach
+     * here with n_chn == 1 is the resurrected-empty-array path, where bwa-mem2
+     * evaluates chn_beg()/chn_end() inline inside that same never-entered loop
+     * and so never touches a_[0].seeds at all. Hoisting unconditionally would
+     * add a seeds dereference bwa-mem2 does not perform. */
+    if (n_chn > 1) {
+        if ((int)cb_v.size() < n_chn) { cb_v.resize(n_chn); ce_v.resize(n_chn); }
+        cb = cb_v.data(); ce = ce_v.data();
+        for (int t = 0; t < n_chn; ++t) { cb[t] = chn_beg(a[t]); ce[t] = chn_end(a[t]); }
     }
 
-    return n_numc;
+    // pairwise chain comparisons
+    /* CL-4: hoist the filter constants read every iteration of the nested pass. */
+    const float mask_level    = opt->mask_level;
+    const float drop_ratio    = opt->drop_ratio;
+    const int   max_chain_gap = opt->max_chain_gap;
+    const int   min_seed_gap  = opt->min_seed_len << 1;
+
+    /* Run the pairwise pass into caller-owned first[]/kept[] scratch, then write
+     * the results back into a[]. Keeping the pass out of a[] lets a debug build
+     * cross-check the fast skip against the naive reference on identical inputs.
+     * Grow-only thread_local scratch: no per-read allocation. */
+    static thread_local std::vector<int> first_v, kept_v;
+    if ((int)first_v.size() < n_chn) { first_v.resize(n_chn); kept_v.resize(n_chn); }
+    int *first = first_v.data(), *kept = kept_v.data();
+    for (int t = 0; t < n_chn; ++t) { first[t] = -1; kept[t] = 0; }
+
+    chn_flt_pairwise_fast(n_chn, a, cb, ce,
+                          mask_level, drop_ratio, max_chain_gap, min_seed_gap,
+                          first, kept, &chains);
+
+    /* Adversarial cross-check: run the naive reference into separate scratch and
+     * assert the fast skip produced identical survivors, first[] and kept[] for
+     * this read.
+     *
+     * Opt-in via BWA_MEM3_DEBUG_CHN_FLT_XCHECK rather than `#ifndef NDEBUG`: no
+     * target in this build system ever defines NDEBUG, so an NDEBUG gate would
+     * leave the O(n^2) reference -- precisely the work this pass exists to skip --
+     * running on every read of every shipped binary. That is the same trap already
+     * recorded for the pac-fetch poison in bntseq.cpp. Enable the cross-check with
+     *   make EXTRA_CXXFLAGS=-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK
+     * Byte-identical: production never defines the macro, so nothing here runs. */
+#ifdef BWA_MEM3_DEBUG_CHN_FLT_XCHECK
+    {
+        static thread_local std::vector<int> rf_v, rk_v;
+        if ((int)rf_v.size() < n_chn) { rf_v.resize(n_chn); rk_v.resize(n_chn); }
+        int *rfirst = rf_v.data(), *rkept = rk_v.data();
+        for (int t = 0; t < n_chn; ++t) { rfirst[t] = -1; rkept[t] = 0; }
+        /* Reference survivor list. Grow-only thread_local like rf_v/rk_v above, so
+         * the cross-check adds no per-read malloc/free on top of the one the pass
+         * itself already does. The RAII holder mirrors u8vec_scratch_t: kv_destroy
+         * runs at thread exit, so a sanitizer debug build sees no leak (a bare
+         * thread_local kvi_t would never be freed). kv_resize reallocs
+         * unconditionally, hence the capacity guard. */
+        struct kvi_scratch_t {
+            kvi_t v;
+            kvi_scratch_t() { kv_init(v); }
+            ~kvi_scratch_t() { kv_destroy(v); }
+        };
+        static thread_local kvi_scratch_t rs;
+        rs.v.n = 0;
+        if (rs.v.m < (size_t)n_chn) kv_resize(int, rs.v, n_chn);
+        chn_flt_pairwise_ref(n_chn, a, cb, ce,
+                             mask_level, drop_ratio, max_chain_gap, min_seed_gap,
+                             rfirst, rkept, &rs.v);
+        /* xassert, not assert: defining this macro alongside -DNDEBUG would
+         * otherwise compile the quadratic reference into the hot path while
+         * stripping every check -- full cost, zero verification, which is the
+         * one configuration in which enabling the cross-check is strictly
+         * worse than not. xassert survives NDEBUG (utils.h), so the check is
+         * live whenever the reference is compiled. */
+        xassert(rs.v.n == chains.n, "BI-1: survivor count differs from reference");
+        for (int t = 0; t < (int)chains.n; ++t)
+            xassert(rs.v.a[t] == chains.a[t], "BI-1: survivor set/order differs");
+        for (int t = 0; t < n_chn; ++t) {
+            xassert(rfirst[t] == first[t], "BI-1: first[] differs from reference");
+            xassert(rkept[t] == kept[t], "BI-1: kept[] differs from reference");
+        }
+    }
+#endif /* BWA_MEM3_DEBUG_CHN_FLT_XCHECK */
+
+    for (int t = 0; t < n_chn; ++t) { a[t].first = first[t]; a[t].kept = kept[t]; }
+
+    for (i = 0; i < chains.n; ++i)
+    {
+        mem_chain_t *c = &a[chains.a[i]];
+        if (c->first >= 0) a[c->first].kept = 1;
+    }
+    free(chains.a);
+    for (i = k = 0; i < n_chn; ++i) { // don't extend more than opt->max_chain_extend .kept=1/2 chains
+        if (a[i].kept == 0 || a[i].kept == 3) continue;
+        if (++k >= opt->max_chain_extend) break;
+    }
+    /* CL-5: the former standalone demotion loop (demote kept<3 chains from the
+     * extend-cap cutoff onward to 0) is fused into the free+compact pass below,
+     * one scan instead of two. `cap_cutoff` is the index the cap-count loop above
+     * stopped at (n_chn if the cap was never reached); chains at or beyond it with
+     * kept<3 are demoted inline as we compact. Byte-identical to the two-loop form. */
+    const int cap_cutoff = i;
+
+    for (i = k = 0; i < n_chn; ++i)  // demote-beyond-cap + free discarded + compact
+    {
+        mem_chain_t *c = &a[i];
+        if (i >= cap_cutoff && c->kept < 3) c->kept = 0;   // CL-5: former step-10 demotion
+        if (c->kept == 0)
+        {
+            if (c->m > SEEDS_PER_CHAIN)  // CHN-16: dead tprof[PE11] counter removed
+                free(c->seeds);
+        }
+        else a[k++] = a[i];
+    }
+
+    return k;
 }
 
 SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
@@ -1087,16 +1675,18 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
                     tid, tmp, mmc->wsize_mem[tid]);
         }
         mmc->matchArray[tid]    = (SMEM *) _mm_malloc(mmc->wsize_mem[tid] * sizeof(SMEM), 64);
-        assert(mmc->matchArray[tid] != NULL);
+        xassert(mmc->matchArray[tid] != NULL, "out of memory: mmc->matchArray[tid]");
         matchArray = mmc->matchArray[tid];
         // w.mmc.min_intv_ar[l]   = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
         // w.mmc.query_pos_ar[tid]  = (int16_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int16_t));
         // w.mmc.enc_qdb[l]       = (uint8_t *) malloc(w.mmc.wsize_mem[l] * sizeof(uint8_t));
         // w.mmc.rid[l]           = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
         //w.mmc.lim[l]         = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
-        for (int i=0; i<num_smem1; i++) {
-            mmc->matchArray[tid][i] = ptr1[i];
-        }
+        // SMEM is trivially copyable POD; ptr1 (old buffer) and the freshly
+        // _mm_malloc'd destination are distinct, non-overlapping allocations, so
+        // a bulk memcpy of num_smem1 records is byte-identical to the per-element
+        // copy it replaces.
+        memcpy(mmc->matchArray[tid], ptr1, (size_t)num_smem1 * sizeof(SMEM));
         _mm_free(ptr1);
     }
     #endif
@@ -1151,16 +1741,17 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
                         tid, tmp, mmc->wsize_mem[tid]);
             }
 		    mmc->matchArray[tid]    = (SMEM *) _mm_malloc(mmc->wsize_mem[tid] * sizeof(SMEM), 64);
-		    assert(mmc->matchArray[tid] != NULL);
+		    xassert(mmc->matchArray[tid] != NULL, "out of memory: mmc->matchArray[tid]");
 		    matchArray = mmc->matchArray[tid];
 		    // First pass wrote num_smem1 records at offset 0; the second pass
 		    // (getSMEMsOnePosOneThread*) just wrote num_smem2 records at offset
 		    // num_smem1. Preserve both — bwtSeedStrategyAllPosOneThread() below
 		    // appends at offset num_smem1 + num_smem2.
 		    int64_t already_written = (int64_t)num_smem1 + num_smem2;
-		    for (int64_t i = 0; i < already_written; ++i) {
-		        mmc->matchArray[tid][i] = ptr1[i];
-		    }
+		    // Bulk-copy the already-written prefix: SMEM is trivially copyable
+		    // POD and src/dst are distinct non-overlapping allocations, so this
+		    // memcpy is byte-identical to the per-element loop it replaces.
+		    memcpy(mmc->matchArray[tid], ptr1, (size_t)already_written * sizeof(SMEM));
 		    _mm_free(ptr1);
 		}
         #endif
@@ -1191,7 +1782,7 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
     tot_smem = num_smem1 + num_smem2 + num_smem3;
     // assert(mmc->wsize_mem[tid] > (tot_smem));
     // fprintf(stderr, "num_smems: %d %d %d, %d\n", num_smem1, num_smem2, num_smem3, tot_smem);
-    fmi->sortSMEMs(matchArray, &tot_smem, nseq, seq_[0].l_seq, 1); // seq_[0].l_seq - only used for blocking when using nthreads
+    fmi->sortSMEMs(matchArray, &tot_smem, nseq, seq_[0].l_seq, 1, mmc->smem_sort_scratch[tid]); // seq_[0].l_seq - only used for blocking when using nthreads
 
     pos = 0;
     int64_t smem_ptr = 0;
@@ -1244,9 +1835,27 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
  * original remap + OT/OB PE/strand placement regression tests
  * (test/regression/meth_seed_index.sh and the live mem --meth placement tests).
  */
+/* --meth seed-chemistry filter (default ON; BWAMEM3_METH_SEED_FILTER=0 disables).
+ * A directional read is projected under a single chemistry by read number
+ * (R1=OT/C->T, R2=OB/G->A). Its true seeds therefore only land on converted
+ * copies whose implied chemistry matches: a seed on copy parity P at genomic
+ * strand S implies chemistry (P XOR S), and the true locus always satisfies
+ * (P XOR S) == read#. A seed that disagrees is a paralog/low-complexity
+ * coincidence on the wrong converted copy; dropping it stops it from seeding a
+ * confident wrong-chromosome placement (the #202 tail). */
+static inline bool meth_seed_filter_enabled()
+{
+    static const bool on = []() {
+        const char *e = getenv("BWAMEM3_METH_SEED_FILTER");
+        return !(e != NULL && strcmp(e, "0") == 0);
+    }();
+    return on;
+}
+
 static inline int meth_seed_to_orig(const bntseq_t *seed_bns,
                                     const bntseq_t *orig_bns,
                                     int64_t seed_rbeg, int32_t seed_len,
+                                    int read_meth_base_ot,
                                     int64_t *orig_rbeg, int *orig_rid,
                                     int8_t *hypothesis)
 {
@@ -1263,6 +1872,15 @@ static inline int meth_seed_to_orig(const bntseq_t *seed_bns,
     int o_rid = seed_rid >> 1;
     if (o_rid < 0 || o_rid >= orig_bns->n_seqs) return -1;
     *hypothesis = (int8_t)(seed_rid & 1); /* 1=f=OT(C→T), 0=r=OB(G→A) */
+
+    /* Drop cross-chemistry seeds by read number (see meth_seed_filter_enabled).
+     * parity = seed_rid & 1 (which converted copy: 1=OT/f, 0=OB/r); seed_is_rev =
+     * genomic strand; read# = read_meth_base_ot (R1=1/OT, R2=0/OB). Keep iff the
+     * seed's implied chemistry (parity XOR strand) equals the read number. */
+    if (read_meth_base_ot >= 0 && meth_seed_filter_enabled()) {
+        if ((((int)(seed_rid & 1)) ^ seed_is_rev) != (read_meth_base_ot & 1))
+            return -1; /* cross-chemistry seed: drop */
+    }
 
     /* f/r seed contigs are forward projections of the original, so the seed-local
      * offset is the original-local offset. Reject seeds that bridge the contig
@@ -1315,19 +1933,21 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
                                       const bntseq_t *chain_bns, kbtree_t(chn) *tree,
                                       mem_seed_t *seedBuf, int64_t *seedBufCount,
                                       int64_t seedBufSize, int tid, int seqid,
-                                      int *num_seqid, const mem_seed_t *seed_in,
+                                      const mem_seed_t *seed_in,
                                       int rid, int8_t meth_hyp)
 {
-    mem_seed_t s = *seed_in;
-    mem_chain_t tmp, *lower, *upper;
+    /* CHN-15: no local `mem_seed_t s = *seed_in` copy -- seed_in is const and is
+     * never mutated here (test_and_merge takes const mem_seed_t*), so the probe
+     * and the new-chain store read straight from seed_in. */
+    mem_chain_t tmp, *lower;   // CHN-13: `upper` dropped; kb_intervalp never read it
     int to_add = 0;
-    tmp.pos = s.rbeg;
+    tmp.pos = seed_in->rbeg;
 
     if (kb_size(tree))
     {
-        kb_intervalp(chn, tree, &tmp, &lower, &upper); // find the closest chain
+        kb_intervalp(chn, tree, &tmp, &lower, NULL); // find the closest chain
 
-        if (!lower || !test_and_merge(opt, l_pac, lower, &s, rid, tid))
+        if (!lower || !test_and_merge(opt, l_pac, lower, seed_in, rid, tid))
             to_add = 1;
     }
     else to_add = 1;
@@ -1338,16 +1958,22 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
         if((*seedBufCount + tmp.m) > seedBufSize)
         {
             tmp.m += 1;
-            tmp.seeds = (mem_seed_t *)calloc (tmp.m, sizeof(mem_seed_t));
-            assert(tmp.seeds != NULL);
-            tprof[PE13][tid]++;
+            /* CHN-16: dead tprof[PE13] counter removed. The allocation is guarded
+             * the same way test_and_merge guards its seed-buffer growth: an
+             * `assert` alone compiles out under NDEBUG, so a release build would
+             * fall through and dereference NULL at `tmp.seeds[0] = *seed_in`. */
+            if ((tmp.seeds = (mem_seed_t *)calloc(tmp.m, sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory tmp.seeds\n"); exit(1); }
         }
         else {
             tmp.seeds = seedBuf + *seedBufCount;
             *seedBufCount += tmp.m;
         }
-        memset((char*) (tmp.seeds), 0, tmp.m * sizeof(mem_seed_t));
-        tmp.seeds[0] = s;
+        /* CHN-11: the per-new-chain memset(tmp.seeds, 0, ...) was dead. tmp.n == 1,
+         * so only slot 0 is live and it is overwritten immediately below; any
+         * further slots (the +1 overflow buffer, already calloc-zeroed) are never
+         * read while zero -- every seed read is bounded by c->n and each slot is
+         * written before n reaches it (test_and_merge: c->seeds[c->n++] = *p). */
+        tmp.seeds[0] = *seed_in;
         tmp.rid = rid;
         tmp.seqid = seqid;
         /* is_alt indexes the chain-side bns (original in --meth). */
@@ -1355,7 +1981,7 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
         /* D3: carry the OT/OB hypothesis on the chain (-1 non-meth). */
         tmp.meth_hypothesis = meth_hyp;
         kb_putp(chn, tree, &tmp);
-        (*num_seqid)++;
+        // CHN-12: (*num_seqid)++ removed with the dead num[] array (see mem_chain_seeds)
     }
 }
 
@@ -1388,8 +2014,9 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
      * Only a selected reorder mode needs the materialize/order/replay path. */
     const int reorder = (opt->seed_emit_order != SEED_ORDER_OFF);
 
-    int num[nseq];
-    memset(num, 0, nseq*sizeof(int));
+    /* CHN-12: the per-read `int num[nseq]` counter (zeroed each batch, incremented
+     * once per opened chain via a stack-passed pointer) was never read anywhere --
+     * pure dead work. Removed along with chain_add_one_seed's num_seqid parameter. */
     int smem_buf_size = 6000;
     int64_t *sa_coord = (int64_t *) _mm_malloc(sizeof(int64_t) * opt->max_occ * smem_buf_size, 64);
     int64_t seedBufCount = 0;
@@ -1405,6 +2032,55 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
 
     // filter seq at early stage than this!, shifted to collect!!!
     // if (len < opt->min_seed_len) return chain; // if the query is shorter than the seed length, no match
+
+    /* Cross-read SA resolution (default ON; BWA3_SA_PER_READ=1 restores the
+     * per-read call for A/B).
+     *
+     * get_sa_entries_prefetch is a 20-lane refill pipeline over independent
+     * compressed-SA walks. Calling it once per read starves it: the median read
+     * supplies ~13 positions, so mean lane occupancy is only 10.5/20 and ~20% of
+     * all walk rounds run with a SINGLE lane active (fully serialized DRAM
+     * latency). The whole batch's SMEMs are already resident in matchArray,
+     * rid-sorted and rid-grouped, so resolving a run of reads per call keeps the
+     * lanes full. Measured -21..-28% on MEM_SA / -2.0..-2.4% on kernel time,
+     * byte-identical, across Graviton4 / Sapphire Rapids / Zen3.
+     *
+     * Order-preserving by construction: the per-read loop below consumes SMEM
+     * runs contiguously in matchArray order, and the staging loop inside
+     * get_sa_entries_prefetch enumerates each SMEM's occurrences with the
+     * identical stride/cap rule. A chunk's coordArray is therefore the exact
+     * concatenation of the per-read ones it covers, so each read's positions stay
+     * in that read's order and `mypos` is a simple cursor from the chunk base. */
+#if SA_COMPRESSION
+    /* Treat an explicit "0" as off, matching meth_seed_filter_enabled(): a
+     * presence-only check would let BWA3_SA_PER_READ=0 silently flip on per-read
+     * mode and quietly invalidate an A/B comparison run. */
+    static const int sa_per_read = []() {
+        const char *e = getenv("BWA3_SA_PER_READ");
+        return e != NULL && strcmp(e, "0") != 0;
+    }();
+    const int sa_across = !sa_per_read;
+#else
+    /* The walk inside get_sa_entries_prefetch assumes the compressed-SA index
+     * layout; an uncompressed build resolves via get_sa_entries below instead. */
+    const int sa_across = 0;
+#endif
+    /* Resolve in read-run-aligned chunks rather than one whole-batch call. Two
+     * independent reasons, and the tighter one sets the size:
+     *   1. Memory. A whole-batch position count is unbounded on repetitive input,
+     *      and get_sa_entries_prefetch's staging (t_sa) is thread_local and
+     *      grow-only, so one pathological batch would pin that high-water for the
+     *      life of the process.
+     *   2. Cache. Staging is 16 B/position across pos_ar+map_ar. Per-read it was
+     *      L1-resident; a whole batch (~58k positions) is ~930 KB and spills L2.
+     * 16k positions = 256 KB of staging, still three orders of magnitude more than
+     * the ~13-57 a single read supplies -- far past where occupancy saturates.
+     * A chunk sweep (1k..256k) is flat, so this is a comfortable default, not a
+     * tuned one. */
+    constexpr int64_t sa_chunk_positions = 16384;
+    int64_t mypos = 0;          /* cursor into sa_coord, relative to chunk start */
+    int64_t chunk_end = 0;      /* exclusive SMEM index resolved so far */
+    int64_t sa_cap = (int64_t)opt->max_occ * smem_buf_size;   /* sa_coord elements */
 
     uint64_t tim = __rdtsc();
     for (int l=0; l<nseq && pos < num_smem - 1; l++)
@@ -1437,13 +2113,27 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
 
         // bwt_sa
         // assert(pos - smem_ptr + 1 < 6000);
-        if (pos - smem_ptr + 1 >= smem_buf_size)
+        /* sa_across grows sa_coord per chunk below; a grow here would move the
+         * buffer out from under the chunk it already filled. */
+        if (!sa_across && pos - smem_ptr + 1 >= smem_buf_size)
         {
-            int csize = smem_buf_size;
-            smem_buf_size *= 2;
-            sa_coord = (int64_t *) _mm_realloc(sa_coord, csize, opt->max_occ * smem_buf_size,
+            /* csize is in ELEMENTS, matching nsize (see _mm_realloc). sa_coord
+             * holds max_occ entries per SMEM, so the old element count is
+             * max_occ * smem_buf_size -- not smem_buf_size, which understated it
+             * by a factor of max_occ and left the tail of the buffer uncopied.
+             * Harmless today only because sa_coord's contents are dead here (the
+             * resolve that fills it runs after this grow), but it silently
+             * corrupts any caller that makes them live across the grow. */
+            int64_t csize = (int64_t)opt->max_occ * smem_buf_size;
+            /* A single read can yield more than 2x the current SMEM count, so
+             * one doubling may not be enough -- grow until the buffer holds the
+             * whole run, or the subsequent get_sa_entries* writes overrun it. */
+            while (pos - smem_ptr + 1 >= smem_buf_size)
+                smem_buf_size *= 2;
+            sa_coord = (int64_t *) _mm_realloc(sa_coord, csize,
+                                               (int64_t)opt->max_occ * smem_buf_size,
                                                sizeof(int64_t));
-            assert(sa_coord != NULL);
+            xassert(sa_coord != NULL, "out of memory: sa_coord");
         }
 
         /* Phase A buffer (Spec S4): resolved-seed records for the reorder path.
@@ -1468,17 +2158,67 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 recs_cap = recs_need;
                 /* CodeRabbit: temp pointer so a NULL realloc doesn't leak recs. */
                 seed_rec_t *recs_new = (seed_rec_t *) realloc(recs, recs_cap * sizeof(seed_rec_t));
-                assert(recs_new != NULL);
+                xassert(recs_new != NULL, "out of memory: recs_new");
                 recs = recs_new;
             }
         }
 
-        int64_t id = 0, cnt_ = 0, mypos = 0;
+        int64_t id = 0, cnt_ = 0;
         #if SA_COMPRESSION
-        uint64_t tim = __rdtsc();
-        fmi->get_sa_entries_prefetch(&matchArray[smem_ptr], sa_coord, &cnt_,
-                                     pos - smem_ptr + 1, opt->max_occ, tid, id);  // sa compressed prefetch
-        tprof[MEM_SA][tid] += __rdtsc() - tim;
+        if (sa_across)
+        {
+            /* Start a new chunk when this read's run falls outside the resolved
+             * one. Chunk boundaries are read-run boundaries, so a read's
+             * positions are never split across two calls and `mypos` stays a
+             * simple cursor from the chunk's base. */
+            if (smem_ptr >= chunk_end)
+            {
+                int64_t need = 0, si = smem_ptr;
+                while (si < num_smem)
+                {
+                    /* Extend by one whole read-run (matchArray is rid-grouped). */
+                    int64_t run_start = si, run_need = 0;
+                    int32_t rid_cur = matchArray[si].rid;
+                    while (si < num_smem && matchArray[si].rid == rid_cur)
+                    {
+                        int64_t occ = matchArray[si].s;
+                        run_need += occ < opt->max_occ ? occ : opt->max_occ;
+                        si++;
+                    }
+                    /* Always take at least one run, even if it alone exceeds the
+                     * budget -- a single read must never be split. */
+                    if (need > 0 && need + run_need > sa_chunk_positions)
+                    {
+                        si = run_start;
+                        break;
+                    }
+                    need += run_need;
+                    if (need >= sa_chunk_positions) break;
+                }
+                chunk_end = si;
+                if (need > sa_cap)
+                {
+                    sa_coord = (int64_t *) _mm_realloc(sa_coord, sa_cap, need, sizeof(int64_t));
+                    xassert(sa_coord != NULL, "out of memory: sa_coord");
+                    sa_cap = need;
+                }
+                uint64_t tim_sa = __rdtsc();
+                fmi->get_sa_entries_prefetch(&matchArray[smem_ptr], sa_coord, &cnt_,
+                                             chunk_end - smem_ptr, opt->max_occ, tid, id);
+                tprof[MEM_SA][tid] += __rdtsc() - tim_sa;
+                mypos = 0;
+            }
+        }
+        else
+        {
+            mypos = 0;   /* per-read path: sa_coord is rewritten for each read */
+            uint64_t tim = __rdtsc();
+            fmi->get_sa_entries_prefetch(&matchArray[smem_ptr], sa_coord, &cnt_,
+                                         pos - smem_ptr + 1, opt->max_occ, tid, id);  // sa compressed prefetch
+            tprof[MEM_SA][tid] += __rdtsc() - tim;
+        }
+        #else
+        mypos = 0;
         #endif
 
         for (i = smem_ptr; i <= pos; i++)
@@ -1516,9 +2256,10 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 s.score= s.len = slen;
                 // Propagate SMEM SA-count so chain_n_hits gates --supp-rep-hard-cap.
                 s.n_hits = static_cast<int32_t>(p->s);
-                if (s.rbeg < 0 || s.len < 0)
-                    fprintf(stderr, "rbeg: %lld, slen: %d, cnt: %d, n: %d, m: %d, num_smem: %lld\n",
-                            (long long)s.rbeg, s.len, cnt-1, p->n, p->m, (long long)num_smem);
+                /* CHN-18: dropped the per-seed `if (s.rbeg < 0 || s.len < 0) fprintf`
+                 * sanity branch -- a never-firing debug guard (valid SA decodes give
+                 * rbeg >= 0 and len = p->n+1-p->m >= 0) that only wrote to stderr and
+                 * never altered s or control flow, so removal is output-identical. */
 
                 /* D3 (--meth, PR-3) seed→original remap (spec §5.2). The SA coord
                  * just decoded (s.rbeg) is in SEED (f/r-doubled) coordinates. Map
@@ -1529,8 +2270,9 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 if (meth_remap) {
                     int64_t o_rbeg = 0; int o_rid = -1;
                     if (meth_seed_to_orig(bns, meth_orig_bns, s.rbeg, s.len,
+                                          seq_[l].meth_base_ot,
                                           &o_rbeg, &o_rid, &meth_hyp) != 0)
-                        continue; /* un-remappable (bridge/range): drop the seed */
+                        continue; /* un-remappable, or cross-chemistry: drop the seed */
                     s.rbeg = o_rbeg;
                     rid = o_rid;
                 } else {
@@ -1548,7 +2290,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                      * no order_seeds; byte-identical to buffering with the
                      * identity order but without the double memory traffic. */
                     chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf,
-                                       &seedBufCount, seedBufSize, tid, l, &num[l],
+                                       &seedBufCount, seedBufSize, tid, l,
                                        &s, rid, meth_hyp);
                 }
                 else
@@ -1574,7 +2316,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             // preserved (no dedup/compact beyond order_seeds).
             for (int64_t ri = 0; ri < nrec; ++ri)
                 chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf,
-                                   &seedBufCount, seedBufSize, tid, l, &num[l],
+                                   &seedBufCount, seedBufSize, tid, l,
                                    &recs[ri].seed, recs[ri].rid, recs[ri].meth_hyp);
         } // reorder
 
@@ -1861,14 +2603,22 @@ int mem_kernel2_core(FMI_search *fmi,
         for (int i = 0; i < chain->n; ++i)
         {
             mem_chain_t chn = chain->a[i];
+            // CHN-16: dead tprof[PE11]/[PE12] false-sharing counters removed
             if (chn.m > SEEDS_PER_CHAIN)
-            {
-                tprof[PE11][tid] ++;
                 free(chn.seeds);
-            }
-            tprof[PE12][tid]++;
         }
         free(chain_ar[l].a);
+
+        /* mem_chain2aln_across_reads_V2 parks a back-pointer to the originating
+         * chain on every alnreg (a->c) and walks a->c->seeds to compute
+         * a->seedcov. Every one of those reads happens above, inside that
+         * function; nothing downstream of this point touches a->c. The chain it
+         * points at has just been freed, and its seeds lived in this thread's
+         * seed_scratch window -- which the very next work item on this thread
+         * will overwrite. Clear the pointer so a future reader gets a null
+         * dereference instead of silently-recycled seeds. */
+        for (int i2 = 0; i2 < (int) regs[l].n; ++i2)
+            regs[l].a[i2].c = NULL;
     }
 
     int m = 0;
@@ -1901,7 +2651,7 @@ int mem_kernel2_core(FMI_search *fmi,
             if (l_query > dd_qbuf_cap) {
                 dd_qbuf_cap = l_query;
                 dd_qbuf = (uint8_t *) realloc(dd_qbuf, (size_t) dd_qbuf_cap);
-                assert(dd_qbuf != NULL);
+                xassert(dd_qbuf != NULL, "out of memory: dd_qbuf");
             }
             const char *os = seq_[l].meth_orig_seq;
             for (int q = 0; q < l_query; ++q) {
@@ -1918,11 +2668,9 @@ int mem_kernel2_core(FMI_search *fmi,
                                          aln_pac,
                                          dd_query,
                                          regs[l].n, regs[l].a, dd_mat);
-    }
-    free(dd_qbuf);  /* NULL outside --meth; free() is NULL-safe */
-
-    for (int l=0; l<nseq; l++)
-    {
+        /* SAM-A18: stamp is_alt in this same pass. Each read's regions are now
+         * final (dedup done) and is_alt is not read by any later read's dedup,
+         * so folding the former separate full pass in here is byte-identical. */
         for (i = 0; i < regs[l].n; ++i)
         {
             mem_alnreg_t *p = &regs[l].a[i];
@@ -1930,6 +2678,7 @@ int mem_kernel2_core(FMI_search *fmi,
                 p->is_alt = 1;
         }
     }
+    free(dd_qbuf);  /* NULL outside --meth; free() is NULL-safe */
     // tprof[POST_SWA][tid] += __rdtsc() - tim;
 
     return 1;
@@ -1947,7 +2696,10 @@ static void worker_aln(void *data, int seq_id, int batch_size, int tid)
                      w->seqs + seq_id,
                      w->regs + seq_id,
                      batch_size,
-                     w->chain_ar + seq_id,
+                     /* This thread's chain window -- the SAME one worker_bwt
+                      * just filled for this work item. Per-tid, not per-seq_id;
+                      * see worker_alloc. */
+                     w->chain_scratch + (size_t) tid * BATCH_SIZE,
                      &w->mmc,
                      mem_aln_ref_string(w),
                      tid,
@@ -1956,24 +2708,34 @@ static void worker_aln(void *data, int seq_id, int batch_size, int tid)
 
 }
 
+
 /* Kernel, called by threads */
 static void worker_bwt(void *data, int seq_id, int batch_size, int tid)
 {
     worker_t *w = (worker_t*) data;
     printf_(VER, "4. Calling mem_kernel1_core..%d %d\n", seq_id, tid);
-    int seedBufSz = w->seedBufSize;
 
-    int memSize = w->nreads;
-    if (batch_size < BATCH_SIZE) {
-        seedBufSz = (memSize - seq_id) * AVG_SEEDS_PER_READ;
-        // fprintf(stderr, "[%0.4d] Info: adjusted seedBufSz %d\n", tid, seedBufSz);
-    }
+    /* One fixed-size window per thread. The old code additionally granted the
+     * final (ragged) work item the whole unused remainder of a global,
+     * nreads-sized arena via `(w->nreads - seq_id) * AVG_SEEDS_PER_READ` --
+     * which, because nreads is a deliberate over-estimate of the read count
+     * (chunk_bases / NREADS_ESTIMATE_AVG_BASES + 10), handed that item millions
+     * of extra seed slots. With per-thread windows there is no remainder to
+     * grant, so that adjustment is gone.
+     *
+     * Dropping it only moves where a chain's seeds are allocated: on overflow
+     * chain_add_one_seed falls back to calloc and marks the chain with
+     * m == SEEDS_PER_CHAIN + 1. That flag is output-dead -- it is read only by
+     * the capacity-growth ladder in test_and_merge (which preserves
+     * seeds[0..n-1] either way) and by the `m > SEEDS_PER_CHAIN` free sites --
+     * so a chain's contents, and therefore every alignment, are unchanged. */
+    int seedBufSz = w->seed_scratch_size;
 
     mem_kernel1_core(w->fmi, w->opt,
                      w->seqs + seq_id,
                      batch_size,
-                     w->chain_ar + seq_id,
-                     w->seedBuf + seq_id * AVG_SEEDS_PER_READ,
+                     w->chain_scratch + (size_t) tid * BATCH_SIZE,
+                     w->seed_scratch + (size_t) tid * BATCH_SIZE * AVG_SEEDS_PER_READ,
                      seedBufSz,
                      &(w->mmc),
                      tid,
@@ -2009,6 +2771,18 @@ int64_t sort_classify(mem_cache *mmc, int64_t pcnt, int tid)
     }
 
     return pos8;
+}
+
+/* Fused seed+extend work item: runs mem_kernel1_core then mem_kernel2_core on the
+ * SAME reads while they are still hot in this thread's cache, instead of paying a
+ * global barrier and a full DRAM round-trip of chain_ar/seedBuf between two
+ * separate kt_for passes. Both halves are per-read independent, so this is
+ * byte-identical; worker_bwt's seedBufSz tail adjustment is preserved verbatim by
+ * delegating rather than inlining. */
+static void worker_bwt_aln(void *data, int seq_id, int batch_size, int tid)
+{
+    worker_bwt(data, seq_id, batch_size, tid);
+    worker_aln(data, seq_id, batch_size, tid);
 }
 
 static void worker_sam(void *data, int seqid, int batch_size, int tid)
@@ -2072,7 +2846,7 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         int64_t pcnt8 = sort_classify(&w->mmc, pcnt, tid);
 
         kswr_t *aln = (kswr_t *) _mm_malloc ((pcnt + SIMD_WIDTH8) * sizeof(kswr_t), 64);
-        assert(aln != NULL);
+        xassert(aln != NULL, "out of memory: aln");
 
         // processing
         mem_sam_pe_batch(w->opt, &w->mmc, pcnt, pcnt8, aln, maxRefLen, maxQerLen, tid);
@@ -2119,6 +2893,93 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
     }
 }
 
+/* Align phase for one slice of a pestat cohort: seeding + BSW only.
+ *
+ * Split out of mem_process_seqs so the pipeline can align a cohort in several
+ * smaller physical reads while mem_pestat still sees the whole cohort. Nothing
+ * here depends on how the cohort is partitioned: seeding and BSW are per-read
+ * independent, and the read ids that feed the tie-break hashes come from the
+ * global n_processed counter, so a read gets the same id under any slicing.
+ *
+ * `seqs` and `regs` point at THIS slice (i.e. cohort base + offset), and
+ * `n_processed` is the global id of the slice's first read. The caller's
+ * w.seqs / w.regs / w.n_processed are saved and restored, so a slice can never
+ * leave w.regs pointing into the middle of the allocation -- worker_free()
+ * frees that pointer. */
+void mem_align_cohort_slice(mem_opt_t *opt,
+                            int64_t n_processed,
+                            int n,
+                            bseq1_t *seqs,
+                            mem_alnreg_v *regs,
+                            worker_t &w)
+{
+    bseq1_t      *saved_seqs = w.seqs;
+    mem_alnreg_v *saved_regs = w.regs;
+    int64_t       saved_np   = w.n_processed;
+
+    w.opt = opt;
+    w.seqs = seqs;
+    w.regs = regs;
+    w.n_processed = n_processed;
+
+    uint64_t tim = __rdtsc();
+    kt_for(worker_bwt_aln, &w, n);
+    tprof[WORKER10][0] += __rdtsc() - tim;
+
+    w.seqs = saved_seqs;
+    w.regs = saved_regs;
+    w.n_processed = saved_np;
+}
+
+/* Pair + emit phase for a complete pestat cohort.
+ *
+ * mem_pestat runs here, over the cohort's contiguous regs -- exactly the read
+ * set bwa-mem2 would have handed it for the same batch -- so the inferred
+ * insert-size distribution, and therefore pairing, mate rescue and MAPQ, are
+ * unchanged by however many slices the align phase used. */
+void mem_pair_and_emit_cohort(mem_opt_t *opt,
+                              int64_t n_processed,
+                              int n,
+                              bseq1_t *seqs,
+                              const mem_pestat_t *pes0,
+                              worker_t &w)
+{
+    mem_pestat_t pes[4];
+    double ctime = cputime(), rtime = realtime();
+
+    w.opt = opt;
+    w.seqs = seqs;
+    w.n_processed = n_processed;
+    w.pes = &pes[0];
+
+    if (opt->flag & MEM_F_PE) {
+        if (pes0)
+            memcpy(pes, pes0, 4 * sizeof(mem_pestat_t));
+        else {
+            /* D3 (--meth): insert-size inference operates on alnreg.rb which are
+             * in ORIGINAL doubled-pac space, so use the ORIGINAL l_pac. */
+            const bntseq_t *pestat_bns = mem_aln_bns(&w);
+            fprintf(stderr, "[0000] Inferring insert size distribution of PE reads from data, "
+                    "l_pac: %lld, n: %d\n", (long long)pestat_bns->l_pac, n);
+            mem_pestat(opt, pestat_bns->l_pac, n, w.regs, pes);
+        }
+        /* Publish the FR proper-pair insert high bound onto opt so the NEXT
+         * cohort's mate-concordant chain cap (which runs before pairing) can use
+         * it as its window (--extend-mate-concordant auto). pes index 1 = FR. */
+        if (!pes[1].failed && pes[1].high > 0)
+            opt->est_insert_high = pes[1].high;
+    }
+
+    uint64_t tim = __rdtsc();
+    fprintf(stderr, "[0000] 3. Calling kt_for - worker_sam\n");
+    kt_for(worker_sam, &w, n);
+    tprof[WORKER20][0] += __rdtsc() - tim;
+
+    fprintf(stderr, "\t[0000][ M::%s] Processed %d reads in %.3f "
+            "CPU sec, %.3f real sec\n",
+            __func__, n, cputime() - ctime, realtime() - rtime);
+}
+
 void mem_process_seqs(mem_opt_t *opt,
                       int64_t n_processed,
                       int n,
@@ -2149,13 +3010,19 @@ void mem_process_seqs(mem_opt_t *opt,
     int n_ = n;
 
     uint64_t tim = __rdtsc();
-    fprintf(stderr, "[0000] 1. Calling kt_for - worker_bwt\n");
+    fprintf(stderr, "[0000] 1. Calling kt_for - worker_bwt_aln (fused)\n");
 
-    kt_for(worker_bwt, &w, n_); // SMEMs (+SAL)
-
-    fprintf(stderr, "[0000] 2. Calling kt_for - worker_aln\n");
-
-    kt_for(worker_aln, &w, n_); // BSW
+    /* FUSED: these were two separate kt_for passes over the whole chunk. Both are
+     * strictly per-work-item -- worker_bwt writes chain_ar[seq_id..] / seedBuf for
+     * its own reads and worker_aln reads exactly those, with no cross-read
+     * dependency, and the only thing that sat between them was an fprintf. Running
+     * them as one pass removes a 16-way global barrier per chunk and, more
+     * importantly, keeps that chunk's chains and seeds in L2 instead of streaming
+     * them out to DRAM at the end of pass 1 and back in at the start of pass 2
+     * (order of GB per chunk). Byte-identical: per-read results are independent and
+     * the only tid-keyed state (w.mmc) is scratch consumed inside a single call.
+     * mem_pestat's barrier below is unaffected and must stay. */
+    kt_for(worker_bwt_aln, &w, n_); // SMEMs (+SAL) then BSW, fused
     tprof[WORKER10][0] += __rdtsc() - tim;
 
 
@@ -2222,10 +3089,29 @@ static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *
     }
 }
 
+/* Thread-local holder for mem_mark_primary_se's index scratch. Frees the buffer
+ * in its destructor, i.e. at thread exit, which is the whole reason it is a
+ * struct rather than a bare `static thread_local int_v`: a buffer that is never
+ * released is a leak by LeakSanitizer's definition — still-reachable at exit is
+ * still unfreed — and the ASan CI row aborts on it. Same shape and rationale as
+ * u8vec_scratch_t, kept local because this is its only user. */
+struct mark_primary_scratch_t {
+    int_v v;
+    mark_primary_scratch_t() { kv_init(v); }
+    ~mark_primary_scratch_t() { kv_destroy(v); }
+};
+
 int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id)
 {
     int i, n_pri;
-    int_v z = {0,0,0};
+    /* Per-thread scratch for the overlap index set. Reused across every read on
+     * this thread instead of malloc/free per call: it is pure scratch (only
+     * indices, never observable in output), so reuse is byte-identical. Held for
+     * the thread's lifetime rather than freed per call, and released at thread
+     * exit by the holder's destructor; mem_mark_primary_se_core resets z.n = 0
+     * before repopulating, so no stale entry is ever read. */
+    static thread_local mark_primary_scratch_t z_scratch;
+    int_v &z = z_scratch.v;
     if (n == 0) return 0;
 
     /* Fast path for the dominant unique-mapper case. With a single region the
@@ -2278,7 +3164,8 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
         for (i = 0; i < n; ++i)
             a[i].secondary_all = a[i].secondary;
     }
-    free(z.a);
+    /* z.a intentionally NOT freed here: it is a thread-lifetime scratch buffer,
+     * released by z_scratch's destructor at thread exit. */
     return n_pri;
 }
 
@@ -2347,7 +3234,7 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
     int *HN = 0;
 
     if (!(opt->flag & MEM_F_ALL))
-        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq, &HN);
+        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq, &HN, s->meth_orig_seq);
 
     kv_init(aa);
     str.l = str.m = 0; str.s = 0;
@@ -2424,9 +3311,11 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                  bseq1_t *s, int n, const mem_aln_t *list, int which, const mem_aln_t *m_)
 {
     SpEncodeScope _enc;   /* stage_prof: time the SAM/BAM build (all return paths) */
-    /* BAM short-circuit: meth_mode applies the bisulfite overlay (chrom
-     * consolidation, YD:Z, chimera QC), plain bam_mode uses the generic
-     * writer. Either path leaves `str` untouched. */
+    /* bam1_t short-circuit: meth_mode applies the bisulfite overlay (Bismark
+     * XR:Z/XG:Z/XM:Z, opt-in chimera QC), plain bam_mode uses the generic
+     * writer. Either path leaves `str` untouched, so callers must branch on
+     * mem_opt_records_are_bam(), not opt->bam_mode — --meth builds bam1_t even
+     * when the container is SAM text. */
     if (opt->meth_mode) {
         struct bam1_t *b = bam_writer_alloc();
         if (b == NULL)
@@ -2467,21 +3356,29 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
      * SEQ + QUAL + tags + headers; rare overflow falls back to ks_resize.
      */
     l_name = (int)strlen(s->name);
+    /* Cache lengths that are needed both for pre-sizing and for the actual
+     * unsafe writes below, so each string is measured exactly once per record:
+     *   - md_len   : MD:Z string (SAM-A16)
+     *   - rname_len: RNAME contig name (SAM-A14)
+     *   - rnext_len: RNEXT contig name (SAM-A14)
+     * Each is only *used* at its write site under the same guard that makes it
+     * hold a real strlen here, so the cached value is byte-identical to the
+     * strlen kputs_u() would have recomputed. */
+    size_t md_len = 0;
+    if (p->n_cigar)
+        md_len = strlen((const char*)(p->cigar + p->n_cigar));
+    /* RNAME/RNEXT contig names can be very long (T2T-style assemblies).
+     * Mate CIGAR (MC:Z) under V17 is also written via add_cigar(). */
+    size_t rname_len = (p->rid >= 0) ? strlen(bns->anns[p->rid].name) : 1;
+    size_t rnext_len = (m && m->rid >= 0 && m->rid != p->rid)
+                       ? strlen(bns->anns[m->rid].name) : 1;
     {
-        size_t md_len = 0;
-        if (p->n_cigar)
-            md_len = strlen((const char*)(p->cigar + p->n_cigar));
         size_t comm_len = s->comment ? strlen(s->comment) : 0;
         size_t anno_len = ((opt->flag & MEM_F_REF_HDR) && p->rid >= 0
                            && bns->anns[p->rid].anno && bns->anns[p->rid].anno[0])
                           ? strlen(bns->anns[p->rid].anno) : 0;
         size_t xa_len   = p->XA ? strlen(p->XA) : 0;
         size_t rg_len   = bwa_rg_id[0] ? strlen(bwa_rg_id) : 0;
-        /* RNAME/RNEXT contig names can be very long (T2T-style assemblies).
-         * Mate CIGAR (MC:Z) under V17 is also written via add_cigar(). */
-        size_t rname_len = (p->rid >= 0) ? strlen(bns->anns[p->rid].name) : 1;
-        size_t rnext_len = (m && m->rid >= 0 && m->rid != p->rid)
-                           ? strlen(bns->anns[m->rid].name) : 1;
         size_t mate_cigar_len = (m && m->n_cigar) ? (size_t)m->n_cigar * 16 : 0;
         /* SA:Z worst case (only emitted when n>1 and there are other primary
          * hits, but priced unconditionally so the local ks_resize at the
@@ -2499,7 +3396,9 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                     + rname_len + rnext_len    /* RNAME + RNEXT */
                     + md_len + xa_len + rg_len + comm_len + anno_len
                     + sa_need                  /* SA:Z (multi-supp) */
-                    + 256;                      /* slack for ints + tags */
+                    + 256;                      /* slack for ints + tags
+                                                 * (incl. pa:f:, bounded by
+                                                 * BWA_PA_TEXT_MAX) */
         ks_resize(str, str->l + need);
     }
 
@@ -2507,7 +3406,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     kputsn_u(s->name, l_name, str); kputc_u('\t', str); // QNAME
     kputw_u((p->flag&0xffff) | (p->flag&0x10000? 0x100 : 0), str); kputc_u('\t', str); // FLAG
     if (p->rid >= 0) { // with coordinate
-        kputs_u(bns->anns[p->rid].name, str); kputc_u('\t', str); // RNAME
+        kputsn_u(bns->anns[p->rid].name, (int)rname_len, str); kputc_u('\t', str); // RNAME
         kputl_u(p->pos + 1, str); kputc_u('\t', str); // POS
         kputw_u(p->mapq, str); kputc_u('\t', str); // MAPQ
 #if OLD // from v15
@@ -2529,7 +3428,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     // print the mate position if applicable
     if (m && m->rid >= 0) {
         if (p->rid == m->rid) kputc_u('=', str);
-        else kputs_u(bns->anns[m->rid].name, str);
+        else kputsn_u(bns->anns[m->rid].name, (int)rnext_len, str);
         kputc_u('\t', str);
         kputl_u(m->pos + 1, str); kputc_u('\t', str);
         if (p->rid == m->rid) {
@@ -2577,12 +3476,12 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     // print optional tags
     if (p->n_cigar) {
         kputsn_u("\tNM:i:", 6, str); kputw_u(p->NM, str);
-        kputsn_u("\tMD:Z:", 6, str); kputs_u((char*)(p->cigar + p->n_cigar), str);
+        kputsn_u("\tMD:Z:", 6, str); kputsn_u((char*)(p->cigar + p->n_cigar), (int)md_len, str);
     }
 #if V17
     if (m && m->n_cigar) { kputsn_u("\tMC:Z:", 6, str); add_cigar(opt, m, str, which); }
 #endif
-    if (m) { kputsn_u("\tMQ:i:", 6, str); kputw_u(m->mapq, str); }
+    if (m && opt->compat->emit_mq) { kputsn_u("\tMQ:i:", 6, str); kputw_u(m->mapq, str); }
     if (p->score >= 0) { kputsn_u("\tAS:i:", 6, str); kputw_u(p->score, str); }
     if (p->sub >= 0) { kputsn_u("\tXS:i:", 6, str); kputw_u(p->sub, str); }
     if (bwa_rg_id[0]) { kputsn_u("\tRG:Z:", 6, str); kputs_u(bwa_rg_id, str); }
@@ -2607,12 +3506,19 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                 kputc_u(';', str);
             }
         }
-        if (p->alt_sc > 0)
-            ksprintf(str, "\tpa:f:%.3f", (double)p->score / p->alt_sc);
+        if (p->alt_sc > 0) {
+            /* Shared with the --bam and --meth writers so the three cannot
+             * drift again; see bwa_format_pa_value. The token is at most
+             * BWA_PA_TEXT_MAX-1 bytes, covered by the tag slack in the
+             * pre-size above, so the unsafe writes stay in bounds. */
+            char pa[BWA_PA_TEXT_MAX];
+            const int pa_len = bwa_format_pa_value(pa, p->score, p->alt_sc);
+            kputsn_u("\tpa:f:", 6, str); kputsn_u(pa, pa_len, str);
+        }
     }
 
     if (p->XA) { kputsn_u("\tXA:Z:", 6, str); kputs_u(p->XA, str); }
-    if (p->HN >= 0) { kputsn_u("\tHN:i:", 6, str); kputw_u(p->HN, str); }
+    if (p->HN >= 0 && opt->compat->emit_hn) { kputsn_u("\tHN:i:", 6, str); kputw_u(p->HN, str); }
 
     if (s->comment) { kputc_u('\t', str); kputs_u(s->comment, str); }
     if ((opt->flag&MEM_F_REF_HDR) && !opt->meth_mode && p->rid >= 0 && bns->anns[p->rid].anno != 0 && bns->anns[p->rid].anno[0] != 0) {
@@ -2627,6 +3533,36 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     }
     kputc_u('\n', str);
     str->s[str->l] = 0;  /* single trailing NUL — unsafe writers skipped this */
+}
+
+/* Does this region's CIGAR/NM/MD regeneration run in NATIVE (--meth) mode?
+ *
+ * One predicate, because it selects THREE things at once and they must never
+ * disagree: the query bases (original vs projected), the scoring matrix
+ * (per-hypothesis asymmetric vs symmetric), and the NM/MD predicate
+ * (matrix-derived vs literal). A caller that satisfies two of the three inputs
+ * but not the third silently produces a record with the OTHER tag semantics and
+ * no diagnostic — which is exactly how XA:Z sub-entries ended up reporting
+ * conversion-counting NM alongside a conversion-hiding primary (fixed by
+ * threading meth_orig_query through mem_gen_alt). Keeping the decision in one
+ * named place is what makes that class of mistake reviewable.
+ *
+ * On the `meth_hypothesis >= 0` term: for a MAPPED region under --meth this is
+ * always true, so the term is defensive rather than a real branch.
+ *   - Chain seeds that cannot be remapped to an OT/OB hypothesis are DROPPED,
+ *     not carried with -1 (mem_chain_seeds -> meth_seed_to_orig returns
+ *     non-zero and the seed is skipped).
+ *   - meth_orig_bns is NULL only if the reference prefix overflowed PATH_MAX,
+ *     which warns loudly at startup.
+ *   - Every mem_matesw call site passes `opt->meth_mode ? i : -1`, so a rescued
+ *     mate under --meth inherits 0 or 1, never -1.
+ * Were it ever false, the fallback is still self-consistent rather than mixed:
+ * the symmetric opt->mat has every off-diagonal at -b < 0 (--meth rejects
+ * -B 0), so the matrix-derived and literal NM/MD predicates agree on it. */
+static int mem_use_native_regen(const mem_opt_t *opt, const mem_alnreg_t *ar,
+                                const char *meth_orig_query)
+{
+    return opt->meth_mode && meth_orig_query != NULL && ar->meth_hypothesis >= 0;
 }
 
 mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar, const char *meth_orig_query)
@@ -2647,14 +3583,13 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     qb = ar->qb, qe = ar->qe;
     rb = ar->rb, re = ar->re;
     /* D3 (--meth, PR-5): output CIGAR/NM/MD must reflect the ORIGINAL read vs the
-     * ORIGINAL reference in the original alphabet, so a real (non-converting) SNP
-     * shows as a mismatch and the bisulfite C→T/G→A conversion shows as read-T at
-     * ref-C (the substrate a downstream double-masking step like Revelio expects;
-     * plan §4 / spec §6.1). When `meth_orig_query` is supplied, regen from the
-     * original bases; else fall back to the projected `query_` (non-meth path,
-     * byte-for-byte identical to legacy). */
-    const int use_meth_orig = (opt->meth_mode && meth_orig_query != NULL
-                               && ar->meth_hypothesis >= 0);
+     * ORIGINAL reference in the original alphabet, so placement and gap shape are
+     * expressed in real coordinates and a real (non-converting) SNP stays a
+     * mismatch. When `meth_orig_query` is supplied, regen from the original
+     * bases; else fall back to the projected `query_` (non-meth path,
+     * byte-for-byte identical to legacy). How conversions themselves are treated
+     * in NM/MD is governed by the policy note below, not here. */
+    const int use_meth_orig = mem_use_native_regen(opt, ar, meth_orig_query);
     const char *regen_query = use_meth_orig ? meth_orig_query : query_;
     /* Reuse a per-thread nt4 scratch instead of a malloc/free per region. The
      * buffer is consumed within this call (copied into a.cigar via the DP), so
@@ -2662,7 +3597,11 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     static thread_local u8vec_scratch_t t_query;
     if (t_query.v.m < (size_t)l_query) kv_resize(uint8_t, t_query.v, (size_t)l_query);
     query = t_query.v.a;
-    for (i = 0; i < l_query; ++i) // convert to the nt4 encoding
+    /* SAM-A10: only [qb,qe) of `query` is ever read (bwa_gen_cigar2 below is
+     * handed &query[qb] with length qe-qb); the encode was over the whole read.
+     * Encode only the consumed window — the untouched prefix/suffix are never
+     * referenced, so output is byte-identical. */
+    for (i = qb; i < qe; ++i) // convert to the nt4 encoding
         query[i] = regen_query[i] < 5? regen_query[i] : nst_nt4_table[(int)regen_query[i]];
     a.mapq = ar->secondary < 0? mem_approx_mapq_se(opt, ar) : 0;
     if (ar->secondary >= 0) a.flag |= 0x100; // secondary alignment
@@ -2681,19 +3620,31 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
      *     re-penalize every conversion as a mismatch and can shift gaps); for
      *     non-meth it is the symmetric opt->mat (legacy, unchanged).
      *
-     * NOTE (--meth NM/MD-vs-conversion policy, RESOLVED — plan §4): bwa_gen_cigar2
-     * computes NM/MD by LITERAL base comparison (query[x+i] != rseq[y+i]),
-     * independent of `regen_mat`. So a bisulfite C→T (OT) / G→A (OB) at a
-     * ref-C/ref-G is COUNTED as one mismatch in NM and emitted in MD, exactly like
-     * a real SNP — it is NOT hidden. This is deliberate: it is the substrate a
-     * downstream Revelio-style double-mask + conventional caller expects (the
-     * conversion is visible as read-T at ref-C, then BQ-masked downstream; the
-     * aligner does no masking). The conversion is NOT double-counted against the
-     * alignment SCORE: the asymmetric `regen_mat` frees the conversion cell to a
-     * match (+a) for the DP, while NM/MD count it once as a literal mismatch — two
-     * separate concerns. Hiding conversions from NM/MD (e.g. a Bismark-style
-     * XM-only consumer) would be a different, explicit choice and must be made
-     * here, not assumed. */
+     * NOTE (--meth NM/MD-vs-conversion policy): under --meth, NM/MD are derived
+     * from `regen_mat`, not from literal base inequality — a column is a mismatch
+     * iff the matrix penalises it (`bwa_gen_cigar3(..., nm_from_mat=1)`). Because
+     * the asymmetric matrix scores the conversion cell as a match, a bisulfite
+     * C→T (OT) / G→A (OB) at a ref-C/ref-G is a MATCH for NM/MD exactly as it
+     * already is for the DP. One definition drives both; there is no bisulfite
+     * special case in the NM/MD pass itself.
+     *
+     * Consequences, by design and by scoring mode:
+     *   - Conversions never reach NM/MD. A perfectly converted read is NM:i:0,
+     *     and MD does not enumerate every ref-C (which otherwise dominates the
+     *     record; see issue #327).
+     *   - `genomic` frees only the conversion direction, so a real variant in the
+     *     opposite direction stays a mismatch and remains visible.
+     *   - `collapsed` frees the mirror cell too, so C/T (and G/A) are fully
+     *     interchangeable and real variants in that class are hidden as well —
+     *     the documented cost of bwameth-compatible placement.
+     *
+     * A read alone cannot distinguish a bisulfite C→T from a real C→T SNP; that
+     * aliasing is resolved downstream at the pileup, not here. The aligner
+     * therefore reports what its scoring model treats as divergence rather than
+     * adjudicating chemistry-vs-genotype per base. NOTE: this makes NM/MD
+     * deliberately non-conformant with the SAM spec's "edit distance to the
+     * reference" under --meth (the same divergence class as BISCUIT's NM and
+     * bwameth's collapsed-space NM); the non-meth path is unchanged. */
     /* D3 (--meth, fix): the CIGAR regen must use the SAME strand-adjusted matrix
      * as the extension (see mem_alnreg_t.meth_strand_hyp). ar->rb is final here,
      * so derive is_rev directly (rb in doubled-pac; >= l_pac = reverse) and flip
@@ -2706,7 +3657,7 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     do {
         free(a.cigar);
         w2 = w2 < opt->w<<2? w2 : opt->w<<2;
-        a.cigar = bwa_gen_cigar2(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM);
+        a.cigar = bwa_gen_cigar3(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM, use_meth_orig);
         if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, score, ar->truesc);
         if (score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
         last_sc = score;
@@ -2743,8 +3694,21 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
             a.cigar[a.n_cigar++] = clip3<<4 | 3;
         }
     }
-    a.rid = bns_pos2rid(bns, pos);
-    assert(a.rid == ar->rid);
+    /* SAM-A9: the region already carries its rid and bns_pos2rid(bns, pos) is
+     * provably equal to it (the original code asserted exactly this). Use the
+     * known value rather than recomputing. Output is byte-identical:
+     * a.rid == ar->rid == old bns_pos2rid result.
+     *
+     * The equality is kept as a cross-check, but opt-in rather than under a
+     * bare `assert`. Nothing in this build system defines NDEBUG, so an assert
+     * here is live in every shipped binary -- meaning the recompute this
+     * optimization exists to avoid ran on every emitted alignment, and the
+     * saving the comment claimed was never realized anywhere. Enable with
+     *   make EXTRA_CXXFLAGS=-DBWA_MEM3_DEBUG_RID_CHECK */
+    a.rid = ar->rid;
+#ifdef BWA_MEM3_DEBUG_RID_CHECK
+    assert(a.rid == bns_pos2rid(bns, pos));
+#endif
     a.pos = pos - bns->anns[a.rid].offset;
     a.score = ar->score; a.sub = ar->sub > ar->csub? ar->sub : ar->csub;
     a.is_alt = ar->is_alt; a.alt_sc = ar->alt_sc;
@@ -2779,6 +3743,21 @@ static inline int get_rlen(int n_cigar, const uint32_t *cigar)
 /************************ New functions, version2*****************************************/
 #define _get_pac(pac, l) ((pac)[(l)>>2]>>((~(l)&3)<<1)&3)
 
+void seqbuf_capacity_fatal(const char *buf_name, const char *func,
+                           int64_t current) {
+    fprintf(stderr,
+            "ERROR: %s in %s cannot grow past the int32 offset range "
+            "(at %lld bytes).\n"
+            "  The extension buffers are sized on a short-read model, so a "
+            "block of very long reads\n"
+            "  (HiFi/ONT) can exhaust them. Reduce the reads per block "
+            "(lower -K, or fewer threads),\n"
+            "  or split the input. Continuing would index outside the "
+            "allocation.\n",
+            buf_name, func, (long long)current);
+    exit(EXIT_FAILURE);
+}
+
 void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize) {
     if (nsize <= csize)
     {
@@ -2786,7 +3765,7 @@ void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize) {
         return ptr;
     }
     void *nptr = _mm_malloc(nsize * dsize, 64);
-    assert(nptr != NULL);
+    xassert(nptr != NULL, "out of memory: nptr");
     /* csize is in elements (matching nsize), not bytes — multiply by dsize so
      * callers passing dsize > 1 (sa_coord with sizeof(int64_t), matchArray
      * with sizeof(SMEM)) get the full pre-grow contents copied across, not
@@ -2842,6 +3821,15 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
      * re-baselining handles arbitrary score, so a pair can be 8-bit even with
      * minval >= MAX_SEQ_LEN8. Clamp the bin to keep it in range — only the
      * ordering, not correctness, depends on the exact key. */
+    /* BWAMEM3_DUMP_PAIRS observation buffer (empty unless the hook is armed).
+     * Recording the tier from inside the branches below — rather than
+     * re-deriving it afterwards — is deliberate: the dump is used to validate
+     * external mirrors of this routing rule, so it must report the branch this
+     * function actually took, not a second opinion that could drift from it. */
+    std::string dump_buf;
+    const bool dumping = bsw_dump_armed();
+    if (dumping) dump_buf.reserve((size_t)count * 24);
+
     for(i = 0; i < count; i++)
     {
         SeqPair sp = pairArray[i];
@@ -2850,12 +3838,18 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
         if (bsw8_envelope_ok(sp.len1, sp.len2, w, score_a, zdrop, sp.h0)) {
             int bin = minval < 0 ? 0 : (minval < MAX_SEQ_LEN8 ? (int)minval : MAX_SEQ_LEN8 - 1);
             hist[bin]++;
+            if (dumping) bsw_dump_pair(dump_buf, sp, w, 8);
         }
-        else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16)
+        else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16) {
             hist2[(int)minval] ++;
-        else
+            if (dumping) bsw_dump_pair(dump_buf, sp, w, 16);
+        }
+        else {
             hist3[0] ++;
+            if (dumping) bsw_dump_pair(dump_buf, sp, w, 1);
+        }
     }
+    if (dumping) bsw_dump_flush(dump_buf);
 
     int32_t cumulSum = 0;
     for(i = 0; i < MAX_SEQ_LEN8; i++)
@@ -2907,21 +3901,37 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
     }
 }
 
-inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, int32_t *hist)
+/* Counting-sort the tier's pairs so lanes packed into one SIMD group have
+ * similar dimensions. `key_by_max` selects the sort key:
+ *   false (16-bit tier): key = len1 (the historical bwa-mem2 behavior).
+ *   true  (8-bit tier, EXT-13): key = max(len1, len2). The int8 kernel derives
+ *     its per-group column count (`ncol`, from maxLen2) and gscore threshold
+ *     (`minq`, from min len2) across the whole lane group, so packing purely by
+ *     len1 leaves both pessimal whenever len2 varies. Keying on max(len1,len2)
+ *     groups pairs of similar total extent, tightening ncol/minq.
+ *
+ * This changes only the ORDER in which pairs are packed into lane groups: each
+ * pair's banded-SW result is computed per-lane from its own len1/len2/band, and
+ * the caller scatters results back by the pair's unique (seqid, regid), so the
+ * reorder is output-invariant (byte-identical). The counting sort remains stable
+ * (equal keys keep input order) regardless of which key is chosen. */
+inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, int32_t *hist,
+                         bool key_by_max)
 {
 
     int32_t i;
     if (count <= 0) return;
 
-    /* Bins are keyed directly by len1, so only [minLen, maxLen] is ever touched;
-     * clearing + cumulating the full [0, MAX_SEQ_LEN16] range every call was
-     * O(32768) regardless of count. Window to the actual length range — output
+    /* Bins are keyed directly by the sort key, so only [minLen, maxLen] is ever
+     * touched; clearing + cumulating the full [0, MAX_SEQ_LEN16] range every call
+     * was O(32768) regardless of count. Window to the actual key range — output
      * is identical because every pair falls in [minLen, maxLen], bins below add
      * 0 to the cumulative sum, and bins above are never read. */
-    int32_t minLen = pairArray[0].len1, maxLen = pairArray[0].len1;
+    int32_t key0 = key_by_max ? max_(pairArray[0].len1, pairArray[0].len2) : pairArray[0].len1;
+    int32_t minLen = key0, maxLen = key0;
     for(i = 1; i < count; i++)
     {
-        int32_t L = pairArray[i].len1;
+        int32_t L = key_by_max ? max_(pairArray[i].len1, pairArray[i].len2) : pairArray[i].len1;
         if (L < minLen) minLen = L;
         if (L > maxLen) maxLen = L;
     }
@@ -2930,7 +3940,8 @@ inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, 
     for(i = 0; i < count; i++)
     {
         SeqPair sp = pairArray[i];
-        hist[sp.len1]++;
+        int32_t key = key_by_max ? max_(sp.len1, sp.len2) : sp.len1;
+        hist[key]++;
     }
     int32_t cumulSum = 0;
     for(i = minLen; i <= maxLen; i++)
@@ -2943,10 +3954,11 @@ inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, 
     for(i = 0; i < count; i++)
     {
         SeqPair sp = pairArray[i];
-        int32_t pos = hist[sp.len1];
+        int32_t key = key_by_max ? max_(sp.len1, sp.len2) : sp.len1;
+        int32_t pos = hist[key];
 
         tempArray[pos] = sp;
-        hist[sp.len1]++;
+        hist[key]++;
     }
 
     for(i = 0; i < count; i++) {
@@ -2989,7 +4001,7 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
 #if !HAVE_BSW_VECTOR_8_16
         bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
 #else
-        sortPairsLen(pa, n, sort_scratch, hist);
+        sortPairsLen(pa, n, sort_scratch, hist, /*key_by_max=*/false);
         bsw->getScores16(pa, ref, qer, n, nthreads, w);
 #endif
         break;
@@ -2997,7 +4009,10 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
 #if !HAVE_BSW_VECTOR_8_16
         bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
 #else
-        sortPairsLen(pa, n, sort_scratch, hist);
+        /* EXT-13: pack the int8 lane groups by max(len1,len2) so ncol/minq are
+         * tight (len2 varies within a len1-keyed group). Byte-identical: only
+         * the packing order changes; results scatter back by (seqid,regid). */
+        sortPairsLen(pa, n, sort_scratch, hist, /*key_by_max=*/true);
         /* int8 diagonal encoding can't represent a band >= 128; divert to the
          * 16-bit kernel once the doubling retry pushes w past the envelope. */
         if (w <= BSW8_MAX_W) bsw->getScores8(pa, ref, qer, n, nthreads, w);
@@ -3442,12 +4457,62 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     int64_t leftRefOffset = 0, rightRefOffset = 0;
     int64_t leftQerOffset = 0, rightQerOffset = 0;
 
-    // ungapped fast-path threshold, computed once per call from
-    // the scoring model. See ungapped_fastpath_walk docstring.
+    // Ungapped fast-path threshold, computed once per call from the scoring
+    // model: the largest mismatch count X for which an ungapped diagonal is
+    // provably optimal, so ungapped_analyze may return FP_STATUS_HIT and skip
+    // the banded SW entirely.
+    //
+    // An ungapped walk carrying X mismatches scores X*(a+b) below the all-match
+    // diagonal. The cheapest gapped alternative pays at least one gap open plus
+    // extend, o_min + e_min, and can at best convert every one of those X
+    // mismatches back into a match. So the ungapped walk is safe only while it
+    // wins STRICTLY:
+    //
+    //     X * (a + b) < o_min + e_min   =>   X <= (o_min + e_min - 1) / (a + b)
+    //
+    // Strictness is load-bearing, not pedantry: on an exact tie the gapped path
+    // scores the same, and ksw_extend2 breaks ties with `if (m > max)` -- the
+    // cell reached first keeps the max -- so the DP can return the gapped CIGAR
+    // while this fast path returns the ungapped one.
+    //
+    // This previously read o_min / (a + b - e_min), which coincides with the
+    // correct bound at bwa's defaults (6/4 == 1 and (6+1-1)/5 == 1) but is too
+    // permissive elsewhere. Measured on 250k HG002 WGS pairs vs hg38 against a
+    // build with the fast path disabled outright, i.e. always running the DP
+    // (what bwa-mem2 does -- it has no ungapped fast path at all):
+    //
+    //   -B 3             old bound admits X = 2, yet 2*(1+3) = 8 > 6+1, so one
+    //                    deletion beats the diagonal:    51/501,821 records
+    //                    (0.010%) differ from the DP -- CIGAR in all 51, POS in
+    //                    27, MAPQ in none. The fast path emits e.g. 151M and
+    //                    148M3S where the DP finds 138M1D13M and 148M1D3M.
+    //   -A1 -B1 -O1 -E1  old bound admits X = 1 and 1*(1+1) == 1+1 exactly, the
+    //                    tie case:                    1,522/501,091 records
+    //                    (0.30%) differ, including 10 MAPQ changes.
+    //
+    // Defaults are unchanged in both directions, so this costs no fast-path
+    // coverage on a stock run.
+    //
+    // That second scheme is what -x pacbio and -x ont2d set, but long reads
+    // never reached it: FP_N_MAX caps the fast path at 128 columns and their
+    // extensions are longer, so 2,000 HG002 HiFi reads under -x pacbio come out
+    // byte-identical with the bound either way. Note the cap is a coverage
+    // limit, not a correctness guard -- the bound above is sound at every
+    // scoring scheme tested, so raising FP_N_MAX does not reopen this.
+    //
+    // The fast path is disabled entirely under --meth (see the three call sites
+    // below), since ungapped_analyze hardcodes symmetric opt->a/opt->b and
+    // cannot express the asymmetric OT/OB matrix. This bound is not consulted
+    // there.
     const int fp_o_min = opt->o_del < opt->o_ins ? opt->o_del : opt->o_ins;
     const int fp_e_min = opt->e_del < opt->e_ins ? opt->e_del : opt->e_ins;
-    const int fp_denom = opt->a + opt->b - fp_e_min;
-    const int fp_x_threshold = (fp_denom > 0) ? (fp_o_min / fp_denom) : -1;
+    // Cheapest single gap the scoring scheme allows; a degenerate scheme that
+    // makes gaps free (or a non-positive a+b) leaves nothing provable, so the
+    // fast path is disabled with -1 rather than guessed at.
+    const int fp_gap_min = fp_o_min + fp_e_min;
+    const int fp_denom   = opt->a + opt->b;
+    const int fp_x_threshold =
+        (fp_denom > 0 && fp_gap_min > 0) ? ((fp_gap_min - 1) / fp_denom) : -1;
     // (fp_o_min, fp_e_min above are reused directly by ungapped_analyze.)
 
     int srt_size = MAX_SEEDS_PER_READ, fac = FAC;
@@ -3492,7 +4557,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 meth_qbuf_cap = l_query;
                 /* CodeRabbit: temp pointer so a NULL realloc doesn't leak. */
                 uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
-                assert(meth_qbuf_new != NULL);
+                xassert(meth_qbuf_new != NULL, "out of memory: meth_qbuf_new");
                 meth_qbuf = meth_qbuf_new;
             }
             const char *os = seq_[l].meth_orig_seq;
@@ -3672,7 +4737,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     sp.regid = av->n - 1;
 
                     if (numPairsLeft >= *wsize_pair) {
-                        fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairArrays, in Left\n", tid);
+                        if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairArrays, in Left\n", tid);
                         *wsize_pair +=  1024;
                         // assert(*wsize_pair > numPairsLeft);
                         *wsize_pair += numPairsLeft + 1024;
@@ -3697,12 +4762,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     leftQerOffset += s->qbeg;
                     if (leftQerOffset >= *wsize_buf_qer)
                     {
-                        fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (left)\n",
+                        if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (left)\n",
                                 tid, __func__);
                         int64_t tmp = *wsize_buf_qer;
-                        *wsize_buf_qer *= 2;
+                        *wsize_buf_qer = seqbuf_grow_capacity(tmp);
+                        if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
+                            seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
                         assert(*wsize_buf_qer > leftQerOffset);
-                        
+
                         uint8_t *seqBufQer_ = (uint8_t*)
                             _mm_realloc(seqBufLeftQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
                         mmc->seqBufLeftQer[tid*CACHE_LINE] = seqBufLeftQer = seqBufQer_;
@@ -3719,10 +4786,13 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     leftRefOffset += tmp;
                     if (leftRefOffset >= *wsize_buf_ref)
                     {
-                        fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (left)\n",
+                        if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (left)\n",
                                 tid, __func__);
                         int64_t tmp = *wsize_buf_ref;
-                        *wsize_buf_ref *= 2;
+                        *wsize_buf_ref = seqbuf_grow_capacity(tmp);
+                        if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
+                            seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
+                        assert(*wsize_buf_ref > leftRefOffset);
                         uint8_t *seqBufRef_ = (uint8_t*)
                             _mm_realloc(seqBufLeftRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
                         mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufLeftRef = seqBufRef_;
@@ -3902,7 +4972,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
                     if (numPairsRight >= *wsize_pair)
                     {
-                        fprintf(stderr, "[0000] [%0.4d] Re-allocating seqPairArrays Right\n", tid);
+                        if (bwa_verbose >= 4) fprintf(stderr, "[0000] [%0.4d] Re-allocating seqPairArrays Right\n", tid);
                         *wsize_pair += 1024;
                         // assert(*wsize_pair > numPairsRight);
                         *wsize_pair += numPairsLeft + 1024;
@@ -3929,12 +4999,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     rightQerOffset += sp.len2;
                     if (rightQerOffset >= *wsize_buf_qer)
                     {
-                        fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (right)\n",
+                        if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (right)\n",
                                 tid, __func__);
                         int64_t tmp = *wsize_buf_qer;
-                        *wsize_buf_qer *= 2;
+                        *wsize_buf_qer = seqbuf_grow_capacity(tmp);
+                        if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
+                            seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
                         assert(*wsize_buf_qer > rightQerOffset);
-                        
+
                         uint8_t *seqBufQer_ = (uint8_t*)
                             _mm_realloc(seqBufLeftQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
                         mmc->seqBufLeftQer[tid*CACHE_LINE] = seqBufLeftQer = seqBufQer_;
@@ -3947,10 +5019,13 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     rightRefOffset += sp.len1;
                     if (rightRefOffset >= *wsize_buf_ref)
                     {
-                        fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (right)\n",
+                        if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (right)\n",
                                 tid, __func__);
                         int64_t tmp = *wsize_buf_ref;
-                        *wsize_buf_ref *= 2;
+                        *wsize_buf_ref = seqbuf_grow_capacity(tmp);
+                        if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
+                            seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
+                        assert(*wsize_buf_ref > rightRefOffset);
                         uint8_t *seqBufRef_ = (uint8_t*)
                             _mm_realloc(seqBufLeftRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
                         mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufLeftRef = seqBufRef_;
@@ -4819,7 +5894,6 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         const mem_seed_t *t;
                         if (srt2[v] == UINT_MAX) continue;
                         t = &c->seeds[srt2[v]];
-                        //if (t->done == H0_) continue;  //check for interferences!!!
                         // only check overlapping if t is long enough;
                         // TODO: more efficient by early stopping
                         if (t->len < s->len * .95) continue;

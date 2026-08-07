@@ -28,12 +28,15 @@ typedef struct bam_writer_s bam_writer_t;
  * win on any @HD/@SQ collision via htslib's header de-dup rules. `hdr_line`
  * carries user-supplied header lines (e.g., `@RG` from `-R` and `-H`
  * insertions, as accumulated by bwa_insert_header); it is inserted before
- * `@PG`. `bwa_pg` is inserted as-is. All three may be NULL. Returns NULL on
- * failure. */
+ * `@PG`. `bwa_pg` is inserted as-is. All three may be NULL. `compat` selects
+ * the output-compatibility target whose @HD policy the header follows (NULL =
+ * COMPAT_TARGET_OFF); it shapes only the default @HD, never @SQ. Returns NULL
+ * on failure. */
 bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
                               const char *idx_hdr_lines,
                               const char *hdr_line, const char *bwa_pg,
-                              int compression_level);
+                              int compression_level,
+                              const compat_target_t *compat);
 
 /* Write one record. Returns 0 on success, -1 on error. */
 int bam_writer_write(bam_writer_t *w, struct bam1_t *b);
@@ -72,11 +75,15 @@ int bam_writer_push_aln(bseq1_t *s,
  * Factored out so both the generic bam_writer path and the meth_bam path
  * produce identical output for --bam vs --meth. `rid` is the bwa-mem3
  * internal contig index (bns-relative), not a post-remap output tid. */
-void bam_writer_append_generic_aux(struct bam1_t *b,
-                                   const bseq1_t *s,
-                                   const mem_opt_t *opt,
-                                   const bntseq_t *bns,
-                                   int rid);
+/* Returns 0 on success, -1 if a tag could not be appended (htslib sets errno
+ * to ENOMEM or EINVAL). On -1 the record is incomplete and must not be
+ * emitted -- a partially-tagged record is the silent corruption this return
+ * exists to prevent. */
+int bam_writer_append_generic_aux(struct bam1_t *b,
+                                  const bseq1_t *s,
+                                  const mem_opt_t *opt,
+                                  const bntseq_t *bns,
+                                  int rid);
 
 #ifdef __cplusplus
 }

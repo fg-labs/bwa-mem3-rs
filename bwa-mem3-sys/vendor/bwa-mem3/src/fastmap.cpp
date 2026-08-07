@@ -32,16 +32,24 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strcasecmp(): POSIX declares it here, not in string.h */
 #include "bwa_madvise.h"
 #if NUMA_ENABLED
 #include <numa.h>
 #endif
 #include <sstream>
 #include <getopt.h>
+#include <errno.h>    /* errno/ERANGE: strtoll validation of the INT options */
+#include <unistd.h>   /* access(): --compat's "you passed a file" diagnostic */
+#ifdef BWA_MEM3_DEBUG_RESCUE_STATS
+#  include <atomic>
+#  include <cstdint>
+#endif
 #include "fastmap.h"
 #include "FMI_search.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
+#include "meth_xm.h"   /* meth_chem_t for --meth=emseq|taps */
 #include "stage_prof.h"
 #include "seed_order.h"
 #include "version.h"
@@ -57,6 +65,77 @@ int affy[256];
 // --------------
 extern uint64_t tprof[LIM_R][LIM_C];
 // ---------------
+
+/* --cohort-slices / BWA_MEM3_COHORT_SLICES. Named here rather than repeated at
+ * each site because the value is needed in four places -- the ramp's shift
+ * clamp, the flag's range check, that check's error message, and the `mem
+ * --help` default -- and a help text or a validator that disagrees with the
+ * ramp is exactly the drift this consolidates away.
+ *
+ * MAX is 20 because the ramp shift saturates there (task_size >> 20): a larger
+ * value is indistinguishable from 20, so asking for one is a mistake worth
+ * naming rather than silently accepting. See the ramp in the read step for how
+ * the default is derived. */
+#define COHORT_SLICES_DEFAULT 6
+#define COHORT_SLICES_MAX     20
+
+/* Ramp SHAPE defaults (--cohort-ramp-first / --cohort-ramp-ratio). At file scope
+ * for the same reason as the constants above: usage() is defined before
+ * main_mem, so a function-local default cannot be printed in `mem --help` and
+ * would have to be duplicated as a literal there. See the derivation at the
+ * cohort_ramp_ratio declaration in main_mem.
+ *
+ * Kept ABOVE the architecture split below, like the constants above: these are
+ * read by kt_pipeline, usage() and main_mem on every architecture, so defining
+ * them inside the ARM branch would leave them undeclared on x86. */
+static const double  cohort_ramp_ratio_default = 1.6;
+static const int64_t cohort_ramp_first_default = 16000000;
+
+/* Strict parsers shared by the batch-shaping options (--chunk-cap,
+ * --cohort-slices, --cohort-ramp-ratio, --cohort-ramp-first) and by each one's
+ * BWA_MEM3_* env override.
+ *
+ * Every one of those options had to reject what atoll()/atof() silently accept:
+ * a typo parses as 0, and 0 means "off" or "use the default" for all of them,
+ * so an unvalidated parse quietly disables the very thing the option was set to
+ * configure -- and atoll("16M") is 16, a SIXTEEN-BYTE first slice rather than
+ * 16 Mbases. That made every site carry the same errno/end-pointer/range
+ * checks, which is how one site once shipped a bare atoll() while its siblings
+ * were already hardened, and how the env spelling of --cohort-slices came to
+ * hardcode its upper bound instead of naming COHORT_SLICES_MAX. One
+ * implementation each removes both failure modes.
+ *
+ * Both return 0 on success and -1 on rejection, leaving *out untouched, so the
+ * caller keeps its own choice of fatal (CLI, nothing loaded yet) versus warn
+ * and carry on (env, index already read). */
+
+/* Reject unless `s` is a complete decimal integer within [min, max]. */
+static int parse_bounded_i64(const char *s, int64_t min, int64_t max, int64_t *out)
+{
+    char *end = NULL;
+    errno = 0;
+    const long long v = strtoll(s, &end, 10);
+    if (end == s || end == NULL || *end != '\0' || errno == ERANGE ||
+        (int64_t)v < min || (int64_t)v > max)
+        return -1;
+    *out = (int64_t)v;
+    return 0;
+}
+
+/* Reject unless `s` is a complete floating-point number. Range is deliberately
+ * NOT checked: the ramp-ratio sites share a documented `<= 1` fallback that
+ * reports and substitutes the default rather than failing, so only parseability
+ * belongs here. */
+static int parse_full_double(const char *s, double *out)
+{
+    char *end = NULL;
+    errno = 0;
+    const double v = strtod(s, &end);
+    if (end == s || end == NULL || *end != '\0' || errno == ERANGE)
+        return -1;
+    *out = v;
+    return 0;
+}
 
 #if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
 /* ARM/Apple Silicon - no CPUID instruction, use system calls */
@@ -193,6 +272,13 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
     assert(opt != NULL);
     assert(nreads >= 0);
     assert(nthreads > 0);
+    /* The assert above compiles out under NDEBUG, and the chaining scratch is
+     * now sized FROM nthreads rather than from nreads -- so a release build
+     * given nthreads <= 0 would allocate a zero-entry scratch that kt_for then
+     * writes into, because kt_for makes the same input safe by clamping
+     * (`if (n_threads < 1) n_threads = 1`, kthread.cpp) instead of refusing.
+     * Clamp identically so the two agree on how many windows exist. */
+    if (nthreads < 1) nthreads = 1;
 
     // Record the thread count on the worker so worker_free can validate the
     // paired call and the per-thread loops can never walk past the slots
@@ -202,28 +288,96 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
     int32_t memSize = nreads;
 
     /* Mem allocation section for core kernels */
-    w.regs = NULL; w.chain_ar = NULL; w.seedBuf = NULL;
+    w.regs = NULL; w.chain_scratch = NULL; w.seed_scratch = NULL;
 
-    w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
-    w.chain_ar = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
-    w.seedBuf = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
+    /* regs is genuinely chunk-lifetime, and the only nreads-sized allocation
+     * left here: it is filled by the align pass, read by mem_pestat, and
+     * consumed (and freed per read) by worker_sam.
+     *
+     * PIPE-F24: when memSize == 0 the caller is deferring that sizing to the
+     * grow-on-demand path in kt_pipeline (step 1), which allocates regs EXACTLY
+     * from the parsed read count (ret->n_seqs) and reuses it across chunks.
+     * Leaving the pointer NULL here is a valid state: that path free()s it
+     * (free(NULL) is a no-op) before its own calloc, and worker_free is
+     * NULL-safe too. For memSize > 0 (e.g. language-binding consumers that size
+     * regs themselves) the behavior is byte-identical to before. */
+    if (memSize > 0) {
+        w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
+        xassert(w.regs != NULL, "out of memory: w.regs");
+    }
 
-    assert(w.seedBuf  != NULL);
-    assert(w.regs     != NULL);
-    assert(w.chain_ar != NULL);
+    /* chain_scratch / seed_scratch are PER-THREAD scratch, not per-read arrays.
+     * They used to be sized by nreads and indexed by seq_id, because worker_bwt
+     * and worker_aln were two separate kt_for passes and the chains + their
+     * seeds had to survive the barrier between them. The fused worker_bwt_aln
+     * removed that requirement: mem_kernel2_core frees chain->a for every read
+     * in the item before returning, so both buffers are dead the moment a work
+     * item ends and a thread can reuse its own window for the next item.
+     *
+     * kt_for dispatches items of at most BATCH_SIZE reads and never hands the
+     * same tid to two concurrent invocations, so nthreads windows of BATCH_SIZE
+     * entries each is exactly sufficient.
+     *
+     * At -t 64 and the default -K this takes seed_scratch from 13.1 GB to 67 MB
+     * and chain_scratch from 204.8 MB to 1.0 MB. The old sizing came off the
+     * read-count estimate (chunk_bases / NREADS_ESTIMATE_AVG_BASES, and
+     * chunk_bases is -K * -t), so it grew in BOTH -t and -K -- 39.3 GB of
+     * seed_scratch alone at -t 192. The new sizing drops the -K dependence
+     * entirely and leaves a per-thread constant.
+     *
+     * Those new figures are for BATCH_SIZE 512; arm64 uses 1024, so double them
+     * there (134 MB / 2.1 MB). The old figures do not depend on BATCH_SIZE.
+     *
+     * Both are sized from nthreads, so PIPE-F24's memSize == 0 deferral does not
+     * apply to them: that exists so an nreads-shaped buffer is not sized before
+     * the read count is known, and neither of these is nreads-shaped any more.
+     * They are allocated unconditionally, and the reallocation in kt_pipeline
+     * step 1 correspondingly regrows only regs. */
+    const int64_t scratch_reads = (int64_t) nthreads * BATCH_SIZE;
+    w.chain_scratch = (mem_chain_v*) malloc (scratch_reads * sizeof(mem_chain_v));
+    w.seed_scratch  = (mem_seed_t *) calloc(scratch_reads * AVG_SEEDS_PER_READ,
+                                            sizeof(mem_seed_t));
 
-    w.seedBufSize = BATCH_SIZE * AVG_SEEDS_PER_READ;
+    xassert(w.seed_scratch  != NULL, "out of memory: w.seed_scratch");
+    xassert(w.chain_scratch != NULL, "out of memory: w.chain_scratch");
+
+    /* Size of ONE thread's seed window. */
+    w.seed_scratch_size = BATCH_SIZE * AVG_SEEDS_PER_READ;
 
     /*** printing ***/
-    int64_t allocMem = memSize * sizeof(mem_alnreg_v) +
-        memSize * sizeof(mem_chain_v) +
-        sizeof(mem_seed_t) * memSize * AVG_SEEDS_PER_READ;
+    int64_t scratchMem = scratch_reads * sizeof(mem_chain_v) +
+        sizeof(mem_seed_t) * scratch_reads * AVG_SEEDS_PER_READ;
+    int64_t allocMem = memSize * sizeof(mem_alnreg_v) + scratchMem;
     fprintf(stderr, "------------------------------------------\n");
     fprintf(stderr, "1. Memory pre-allocation for Chaining: %0.4lf MB\n", allocMem/1e6);
+    /* Reported separately from the total because the two scale differently and
+     * conflating them hides regressions: regs is legitimately per-read (it
+     * tracks -K), whereas the chaining scratch must depend only on the thread
+     * count. test/regression/chain_scratch_per_thread.sh asserts this figure is
+     * invariant across -K. */
+    fprintf(stderr, "   per-thread chaining scratch: %0.4lf MB (%d threads)\n",
+            scratchMem/1e6, nthreads);
 
 
-    /* SWA mem allocation */
-    int64_t wsize = BATCH_SIZE * SEEDS_PER_READ;
+    /* SWA mem allocation.
+     *
+     * These are a STARTING size, not a bound: seqBufRef/Qer double via
+     * seqbuf_grow_capacity() and the seqPairArrays realloc on demand, both in
+     * mem_chain2aln_across_reads_V2 and the batched mate-rescue path. So the
+     * only thing the initial value buys is avoiding a few early reallocs.
+     *
+     * It used to start at BATCH_SIZE * SEEDS_PER_READ. SEEDS_PER_READ is 500 --
+     * a worst-case seeds-per-read bound -- but these arrays hold extension
+     * PAIRS, roughly a couple per chain, not one per seed. The result was
+     * ~504 MB per thread reserved up front and, being per-thread, growth linear
+     * in -t: 32.2 GB at -t 64 and ~97 GB at -t 192, dwarfing even the index.
+     *
+     * Start from AVG_SEEDS_PER_READ instead -- the same per-read seed estimate
+     * the chaining scratch is sized with -- for an 8x smaller reservation, and
+     * let the existing growth paths cover anything heavier. Byte-identical:
+     * capacity affects only where the extension data lives, never its
+     * contents. */
+    int64_t wsize = BATCH_SIZE * AVG_SEEDS_PER_READ;
     for(int l=0; l<nthreads; l++)
     {
         w.mmc.seqBufLeftRef[l*CACHE_LINE]  = (uint8_t *)
@@ -250,9 +404,9 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         w.mmc.seqPairArrayRight128[l] = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.wsize[l] = wsize;
 
-        assert(w.mmc.seqPairArrayAux[l] != NULL);
-        assert(w.mmc.seqPairArrayLeft128[l] != NULL);
-        assert(w.mmc.seqPairArrayRight128[l] != NULL);
+        xassert(w.mmc.seqPairArrayAux[l] != NULL, "out of memory: w.mmc.seqPairArrayAux[l]");
+        xassert(w.mmc.seqPairArrayLeft128[l] != NULL, "out of memory: w.mmc.seqPairArrayLeft128[l]");
+        xassert(w.mmc.seqPairArrayRight128[l] != NULL, "out of memory: w.mmc.seqPairArrayRight128[l]");
     }
 
 
@@ -282,6 +436,11 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         w.mmc.lockstep_prev[l]      = NULL;
         w.mmc.lockstep_match_buf[l] = NULL;
         w.mmc.lockstep_buf_cap[l]   = 0;
+
+        w.mmc.smem_sort_scratch[l].cnt    = NULL;
+        w.mmc.smem_sort_scratch[l].cntCap = 0;
+        w.mmc.smem_sort_scratch[l].tmp    = NULL;
+        w.mmc.smem_sort_scratch[l].tmpCap = 0;
     }
 
     allocMem = nthreads * (BATCH_SIZE + 32) * sizeof(int32_t);
@@ -300,9 +459,9 @@ void worker_free(worker_t &w, int32_t nthreads)
     // Catch mismatched alloc/free pairs before they drive out-of-bounds frees.
     assert(w.nthreads == nthreads);
 
-    free(w.chain_ar);
+    free(w.chain_scratch);
     free(w.regs);
-    free(w.seedBuf);
+    free(w.seed_scratch);
 
     for(int l=0; l<nthreads; l++) {
         _mm_free(w.mmc.seqBufLeftRef[l*CACHE_LINE]);
@@ -330,6 +489,9 @@ void worker_free(worker_t &w, int32_t nthreads)
 
         _mm_free(w.mmc.lockstep_prev[l]);
         _mm_free(w.mmc.lockstep_match_buf[l]);
+
+        _mm_free(w.mmc.smem_sort_scratch[l].cnt);
+        _mm_free(w.mmc.smem_sort_scratch[l].tmp);
     }
 }
 
@@ -337,6 +499,33 @@ void worker_free(worker_t &w, int32_t nthreads)
 void memoryAlloc(ktp_aux_t *aux, worker_t &w, int32_t nreads, int32_t nthreads)
 {
     worker_alloc(aux->opt, w, nreads, nthreads);
+}
+
+/* Copy the compute step's --profile counters out of the per-thread kt_for
+ * accumulator and into this chunk's profile row (see stage_prof.h).
+ *
+ * Step 1 has two exits -- a whole cohort, and a partial cohort that is still
+ * accumulating slices -- and g_ktfor is reset at every step-1 entry, so a path
+ * that forgets to harvest does not merely lose detail: that slice's compute CPU
+ * is gone. Both exits call this, so adding a third cannot silently drop it.
+ *
+ * `sp_p0` is the sp_wall() reading taken at step-1 entry.
+ */
+static void sp_harvest_proc(prof_chunk_t *p, double sp_p0)
+{
+    p->proc_wall      = sp_wall() - sp_p0;
+    p->proc_cpu       = g_ktfor.proc_cpu;
+    p->thr_busy_min   = g_ktfor.thr_busy_min;
+    p->thr_busy_max   = g_ktfor.thr_busy_max;
+    p->thr_busy_mean  = g_ktfor.thr_busy_mean;
+    p->thr_busy_stdev = g_ktfor.thr_busy_stdev;
+    /* encode = SAM/BAM-build CPU (accurate, summed over compute threads);
+     * compute = the rest of the alignment CPU. Same clock, so subtractable.
+     * A slice that only seeds and extends never enters mem_aln2sam, so its
+     * encode is legitimately 0 and compute is the whole of proc_cpu. */
+    p->encode  = g_ktfor.encode;
+    p->compute = (g_ktfor.proc_cpu > g_ktfor.encode)
+                 ? g_ktfor.proc_cpu - g_ktfor.encode : NAN;
 }
 
 ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, worker_t &w)
@@ -347,7 +536,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
     if (step == 0)
     {
         ktp_data_t *ret = (ktp_data_t *) calloc(1, sizeof(ktp_data_t));
-        assert(ret != NULL);
+        xassert(ret != NULL, "out of memory: ret");
         uint64_t tim = __rdtsc();
         double sp_r0 = 0.0;
         if (sp_enabled()) {
@@ -356,11 +545,155 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             sp_r0 = sp_wall();
         }
 
-        /* Read "reads" from input file (fread) */
+        /* Read "reads" from input file (fread).
+         *
+         * A cohort is one task_size batch. Normally it is read in a single call
+         * and this is exactly the old code path. When slicing is enabled the
+         * FIRST cohort is read as a ramp of growing slices: the first is an
+         * absolute cohort_ramp_first bases (16 Mbase by default, capped at
+         * task/2) and each next is cohort_ramp_ratio times the previous (1.6 by
+         * default), for at most cohort_slices slices. Compute therefore starts
+         * working while the rest is still being read -- only the first read of a
+         * run overlaps nothing, and it is the largest single unhidden cost in
+         * the pipeline.
+         *
+         * The target for every slice is clamped to the bases the cohort still
+         * needs. That clamp is load-bearing, not defensive: both readers stop at
+         * the first whole-record, even-n boundary at or PAST the requested size,
+         * so each slice overshoots independently. Reading T/8 + T/4 + T/2 + T/8
+         * without the clamp lands at T + e1+e2+e3+e4, whereas one read of T lands
+         * at T + e -- a different last record, hence a different cohort, hence a
+         * different mem_pestat. With the clamp, the first even-n boundary at or
+         * past (cohort_bases + slice_target) is provably the same record as the
+         * first at or past T whenever the slice crosses T, because every earlier
+         * boundary sits strictly below it. */
+        int64_t slice_target = aux->task_size - aux->cohort_bases;
+        if (slice_target <= 0) slice_target = aux->task_size;   /* new cohort */
+        /* Normally only the first cohort ramps -- later ones are already
+         * overlapped by the pipeline. slice_all is a STRESS knob for the
+         * identity test: it slices EVERY cohort and drops the efficiency floor,
+         * so a short run exercises the accumulator, the cohort-id advance and
+         * the boundary clamp at dozens of boundaries instead of one. It is not
+         * a performance mode -- tiny slices cost more in kt_for passes and lost
+         * SIMD batching than they can ever recover in overlap. */
+        if (aux->cohort_slices > 0 &&
+            (aux->cohort_slice_all || aux->cohort_index == 0) &&
+            aux->cohort_slice < aux->cohort_slices) {
+            /* How fast the ramp is allowed to grow. Doubling every slice is only
+             * free while the reader can deliver slice k+1 inside the time step 1
+             * spends on slice k; past that the ramp starves the very pipeline it
+             * exists to fill. See cohort_ramp_ratio in fastmap.h. */
+            double ratio = aux->cohort_ramp_ratio;
+            int64_t ramped;
+            if (aux->cohort_slice == 0 || aux->ramp_prev_target <= 0) {
+                /* The first slice is an ABSOLUTE size, not a fraction of the
+                 * cohort. Both costs it trades against are absolute -- its own
+                 * read overlaps nothing, and every extra slice costs one more
+                 * kt_for pass -- so nothing about the right answer scales with
+                 * task_size. Sizing it as task_size/ratio^depth made it grow with
+                 * -t, which is backwards: task_size is chunk_size * n_threads, so
+                 * at -t 128 a 1280 Mbase cohort would open with a 76 Mbase slice
+                 * and 0.37 s of pure unhidden fill, against 0.077 s for a fixed
+                 * 16 Mbase. The penalty grows linearly with thread count.
+                 *
+                 * Capped at half the cohort so a small task_size (a short test,
+                 * or an explicit -K) still gets at least two slices.
+                 *
+                 * The stress knob keeps the fractional shape on purpose: it
+                 * exists to make a short run cross as many cohort boundaries as
+                 * possible, and is explicitly not a performance mode. */
+                if (aux->cohort_ramp_first > 0 && !aux->cohort_slice_all) {
+                    ramped = aux->cohort_ramp_first;
+                    if (ramped > aux->task_size >> 1) ramped = aux->task_size >> 1;
+                } else if (ratio == 2.0) {
+                    /* Ratio 2 keeps the original integer shift, so pinning the
+                     * ratio to 2 with --cohort-ramp-first 0 reproduces the
+                     * pre-existing slice sizes exactly rather than approximately
+                     * via pow(). That exactness is what makes an A/B against the
+                     * old shape meaningful. */
+                    int shift = (int)(aux->cohort_slices - aux->cohort_slice);
+                    if (shift > COHORT_SLICES_MAX) shift = COHORT_SLICES_MAX;
+                    ramped = aux->task_size >> shift;
+                } else {
+                    double denom = pow(ratio, (double)aux->cohort_slices);
+                    ramped = (denom > 1.0)
+                             ? (int64_t)((double)aux->task_size / denom)
+                             : aux->task_size;
+                }
+            } else {
+                /* Saturate in double space, before the narrowing cast. The
+                 * ratio is only validated as > 1.0, so a sweep value like 30
+                 * or 100 compounds ramp_prev_target past INT64_MAX within a
+                 * handful of slices, and converting an out-of-range double to
+                 * int64_t is undefined behaviour. Saturating at task_size
+                 * costs nothing: slice_target is never above task_size, so a
+                 * ramp at or past it already means "the whole cohort", and it
+                 * keeps the stored ramp_prev_target from compounding away. */
+                const double grown = (double)aux->ramp_prev_target * ratio;
+                ramped = (grown >= (double)aux->task_size)
+                         ? aux->task_size
+                         : (int64_t)grown;
+            }
+
+            /* A slice must stay large enough for its own SMEM/BSW batching to be
+             * efficient; below this the extra kt_for passes cost more than the
+             * overlap they buy. The stress knob deliberately bypasses this. */
+            int64_t floor_bases = aux->cohort_slice_all ? 1 : 1000000;
+            if (ramped < floor_bases) ramped = floor_bases;
+            /* Remember the REQUESTED size, not what the reader returns: the ramp
+             * shape must not drift with each slice's whole-record overshoot. */
+            aux->ramp_prev_target = ramped;
+            if (ramped < slice_target) slice_target = ramped;
+        }
+
         int64_t sz = 0;
+        /* ONE arena per cohort, not per read call. The accumulator below copies
+         * only the bseq1_t structs into aux->cohort_seqs and shares name/seq/qual
+         * BY POINTER -- so those bytes must outlive the slice that carved them and
+         * stay alive until the whole cohort has been paired and written. Carrying
+         * the cohort's arena into each slice's read gives exactly that: the reader
+         * appends to it (see read_arena.h -- blocks are chained and never moved,
+         * so earlier pointers stay valid), and the completing slice hands the
+         * single arena to the write stage, which destroys it once.
+         *
+         * Scoping the arena per read call instead is a use-after-free: the write
+         * stage destroys every item's arena unconditionally, including the empty
+         * items partial slices return, freeing the strings the cohort still
+         * references. */
+        ret->read_arena = aux->cohort_arena;
         ret->seqs = aux->legacy_reader
-            ? bseq_read_orig(aux->task_size, &ret->n_seqs, aux->ks, aux->ks2, &sz)
-            : bseq_read_fast(aux->task_size, &ret->n_seqs, aux->frks, aux->frks2, &sz);
+            ? bseq_read_orig(slice_target, &ret->n_seqs, aux->ks, aux->ks2, &sz, &ret->read_arena)
+            : bseq_read_fast(slice_target, &ret->n_seqs, aux->frks, aux->frks2, &sz, &ret->read_arena);
+        aux->cohort_arena = ret->read_arena;
+
+        /* A short read means the input ran out, which ends the cohort early. */
+        aux->cohort_bases += sz;
+        /* Is a cohort mid-accumulation? cohort_slice counts the partial slices of
+         * the current cohort and is reset the moment one completes, so a non-zero
+         * value means step 1 is holding earlier slices that still have to be
+         * paired and emitted. Read from cohort_slice rather than cohort_n because
+         * only step 0 touches it: step 0 and step 1 run concurrently on different
+         * items, and cohort_n belongs to step 1. Captured before the bookkeeping
+         * below resets it. */
+        const int mid_cohort = (aux->cohort_slice > 0);
+        ret->cohort_complete = (sz < slice_target) ||
+                               (aux->cohort_bases >= aux->task_size) ||
+                               (ret->seqs == NULL) || (ret->n_seqs == 0);
+        if (ret->cohort_complete) {
+            aux->cohort_bases = 0;
+            aux->cohort_slice = 0;
+            aux->ramp_prev_target = 0;
+            aux->cohort_index++;
+            /* This item carries the cohort's arena to the write stage, which
+             * destroys it. Drop our reference so the NEXT cohort starts fresh. */
+            aux->cohort_arena = NULL;
+        } else {
+            aux->cohort_slice++;
+            /* Partial slice: the arena stays with the cohort, not this item. The
+             * write stage destroys ret->read_arena unconditionally, so it must
+             * not see it here -- the strings are still live. */
+            ret->read_arena = NULL;
+        }
 
         tprof[READ_IO][0] += __rdtsc() - tim;
 
@@ -376,10 +709,37 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             ret->prof.n_bp = sz;
         }
 
-        fprintf(stderr, "[0000] read_chunk: %lld, work_chunk_size: %lld, nseq: %d\n",
-                (long long)aux->task_size, (long long)sz, ret->n_seqs);
+        /* `read_chunk` keeps meaning the COHORT (batch) target, as it did before
+         * slicing existed. Reporting slice_target here instead would repurpose an
+         * existing field rather than add one: the batch size is the thing this
+         * change is careful NOT to move -- byte-identity depends on it -- so it is
+         * exactly what a reader of this line wants, and
+         * test/regression/chunk_cap_optin.sh asserts on it. The slice request is
+         * reported as its own field, and only when the cohort is actually being
+         * sliced, so the common single-slice line stays character-for-character
+         * what it was. `work_chunk_size` is unchanged: bases actually delivered by
+         * this read, which for a slice is that slice's real size (the readers stop
+         * at the first whole-record boundary at or past the request, so delivered
+         * and requested differ). */
+        if (slice_target != aux->task_size)
+            fprintf(stderr, "[0000] read_chunk: %lld, slice: %lld, work_chunk_size: %lld, nseq: %d%s\n",
+                    (long long)aux->task_size, (long long)slice_target,
+                    (long long)sz, ret->n_seqs,
+                    ret->cohort_complete ? "" : " (cohort slice)");
+        else
+            fprintf(stderr, "[0000] read_chunk: %lld, work_chunk_size: %lld, nseq: %d%s\n",
+                    (long long)aux->task_size, (long long)sz, ret->n_seqs,
+                    ret->cohort_complete ? "" : " (cohort slice)");
 
-        if (ret->seqs == 0) {
+        /* No reads. Normally that is clean EOF: returning 0 retires this worker.
+         * But if a cohort is still accumulating, the input ended exactly ON a
+         * slice boundary (the previous slice delivered at least its target, so it
+         * did not end the cohort, and there is nothing left to read). Its earlier
+         * slices are already aligned and still have to be paired, emitted, and
+         * have their arena destroyed. Retiring here dropped them silently --
+         * short output, exit status 0. Hand step 1 an empty item instead: the
+         * accumulator appends nothing, aligns nothing, and flushes the cohort. */
+        if (ret->seqs == 0 && !mid_cohort) {
             free(ret);
             return 0;
         }
@@ -437,7 +797,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                 size_t prior_len = prior ? strlen(prior) : 0;
                 size_t yslen = (size_t)l + 32 + (prior_len ? prior_len + 1 : 0);
                 char *comment = (char *)malloc(yslen);
-                assert(comment != NULL);
+                xassert(comment != NULL, "out of memory: comment");
                 int off = snprintf(comment, yslen, "YS:Z:");
                 memcpy(comment + off, s->seq, (size_t)l);
                 off += l;
@@ -454,7 +814,10 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                  * strdup is fine for the draft; freed in the per-batch free
                  * loop below alongside s->seq. */
                 s->meth_orig_seq = strdup(s->seq);
-                assert(s->meth_orig_seq != NULL);
+                xassert(s->meth_orig_seq != NULL, "out of memory: s->meth_orig_seq");
+                /* --meth: read-number chemistry (R1=OT=1, R2=OB=0) for the
+                 * seed-chemistry filter in meth_seed_to_orig. */
+                s->meth_base_ot = is_r2 ? 0 : 1;
                 /* Project in place. */
                 for (int j = 0; j < l; ++j) {
                     char c = s->seq[j];
@@ -475,15 +838,61 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
     else if (step == 1)  /* Step 2: Main processing-engine */
     {
         static int task = 0;
-        if (w.nreads < ret->n_seqs)
+        /* regs must hold the whole COHORT, not just the reads this item carries.
+         * A sliced cohort aligns each slice as it arrives and keeps the results
+         * until mem_pair_and_emit_cohort consumes them, so growing this array
+         * must PRESERVE what the earlier slices already wrote -- hence realloc,
+         * not free() + calloc(). The old free()+calloc() sized from this slice's
+         * ret->n_seqs alone and discarded every earlier slice of the cohort,
+         * which emitted the cohort's leading reads as unmapped.
+         *
+         * Not zeroed: mem_kernel2_core kv_init()s every entry of the range it is
+         * given before writing it (src/bwamem.cpp), so no reader ever observes
+         * an entry the align phase has not initialized. That is also why the
+         * pre-existing `w.nreads >= n_seqs` case has always been safe without
+         * zeroing, and why dropping the whole-array calloc is output-neutral.
+         *
+         * Only regs is sized by the read count. chain_scratch/seed_scratch are
+         * per-thread windows sized by nthreads * BATCH_SIZE and are unaffected
+         * by how many reads a chunk turns out to hold. */
+        int32_t regs_want = aux->cohort_n + ret->n_seqs;
+        if (w.nreads < regs_want)
         {
             fprintf(stderr, "[0000] Reallocating initial memory allocations!!\n");
-            free(w.regs); free(w.chain_ar); free(w.seedBuf);
-            w.nreads = ret->n_seqs;
-            w.regs = (mem_alnreg_v *) calloc(w.nreads, sizeof(mem_alnreg_v));
-            w.chain_ar = (mem_chain_v*) malloc (w.nreads * sizeof(mem_chain_v));
-            w.seedBuf = (mem_seed_t *) calloc(sizeof(mem_seed_t), w.nreads * AVG_SEEDS_PER_READ);
-            assert(w.regs != NULL); assert(w.chain_ar != NULL); assert(w.seedBuf != NULL);
+            /* Into a temporary, and err_fatal rather than assert, for the same
+             * reason as the seed-scratch check below: assert compiles out under
+             * NDEBUG, so in a release build a failed realloc would null the live
+             * pointer, drop the previous allocation, and let the align phase
+             * dereference NULL a few lines later. */
+            mem_alnreg_v *regs_tmp = (mem_alnreg_v *) realloc(w.regs,
+                                              (size_t) regs_want * sizeof(mem_alnreg_v));
+            if (regs_tmp == NULL)
+                err_fatal(__func__, "failed to grow the cohort's regs array to %d reads",
+                          regs_want);
+            w.regs = regs_tmp;
+            w.nreads = regs_want;
+        }
+
+        /* The per-thread chaining scratch must never be resized per chunk: it is
+         * sized from nthreads * BATCH_SIZE in worker_alloc and indexed by tid, so
+         * an nreads-shaped reallocation here would give back the memory this
+         * sizing reclaimed, and a SMALLER one would hand two threads overlapping
+         * windows.
+         *
+         * Enforced rather than merely commented because the mistake is invisible
+         * downstream: the alignments are byte-identical either way, so every
+         * parity and determinism test in the suite would still pass. Deliberately
+         * not an assert -- this has to survive NDEBUG, which is exactly the build
+         * a memory regression would be noticed in. Costs one comparison per
+         * chunk. */
+        if (w.seed_scratch_size != (int64_t) BATCH_SIZE * AVG_SEEDS_PER_READ) {
+            fprintf(stderr,
+                    "ERROR: per-thread seed scratch was resized per chunk "
+                    "(%lld seeds, expected %lld); the chaining scratch must be "
+                    "sized only in worker_alloc (src/fastmap.cpp).\n",
+                    (long long) w.seed_scratch_size,
+                    (long long) BATCH_SIZE * AVG_SEEDS_PER_READ);
+            exit(EXIT_FAILURE);
         }
 
         fprintf(stderr, "[0000] Calling mem_process_seqs.., task: %d\n", task++);
@@ -547,8 +956,9 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             }
             free(sep[0]); free(sep[1]);
         }
-        else {
-            /* pure (single/paired-end), reads processing */
+        else if (ret->cohort_complete && aux->cohort_n == 0) {
+            /* The common case: this slice IS the whole cohort. Byte-for-byte the
+             * pre-slicing code path -- no accumulation, no copy. */
             mem_process_seqs(opt,
                              aux->n_processed,
                              ret->n_seqs,
@@ -556,21 +966,146 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                              aux->pes0,
                              w);
         }
+        else {
+            /* Multi-slice cohort. Append this slice to the cohort array, align
+             * just this slice, and only pair + emit once the cohort is whole.
+             *
+             * Only the bseq1_t structs are copied; the per-read name/seq/qual
+             * allocations are shared by pointer and the slice's own array is
+             * freed. The pipeline is one-item-in / one-item-out, so the cohort
+             * must be handed to the write step as a single contiguous array. */
+            if (aux->cohort_n == 0) aux->cohort_first_id = aux->n_processed;
+
+            if (aux->cohort_n + ret->n_seqs > aux->cohort_cap) {
+                int want = aux->cohort_n + ret->n_seqs;
+                int cap  = aux->cohort_cap ? aux->cohort_cap : 1024;
+                /* A cohort with more slices still coming: project its final read
+                 * count from this slice's mean read length and reserve it in one
+                 * go.
+                 *
+                 * Doubling from 1024 instead takes ~13 reallocs to reach a
+                 * default t=64 cohort (task_size = chunk_size * nthreads = 640
+                 * Mbase, ~4.27M reads) and lands on the next power of two --
+                 * 8388608 slots for 4266668 reads, i.e. ~330 MB of bseq1_t held
+                 * and never used. The cohort's size is not a surprise: the ramp
+                 * appends slices until it reaches aux->task_size bases, so one
+                 * projection is enough.
+                 *
+                 * Deliberately NOT projected on the cohort's first slice, even
+                 * though that is where the reallocs would be saved. On the first
+                 * slice "more is coming" is not yet known: a file that ends
+                 * exactly at the slice boundary returns sz == slice_target with
+                 * seqs != NULL, which fails every cohort_complete test, so the
+                 * slice looks mid-cohort and EOF only surfaces on the next read
+                 * as the empty flush item (see the memcpy guard below). Projecting
+                 * there would reserve a whole task_size -- ~330 MB for what turns
+                 * out to be one ~16 Mbase slice, strictly worse than the doubling
+                 * this replaces. Waiting for cohort_n > 0 makes a second slice the
+                 * proof that the input did not end, and costs only the first
+                 * slice's doublings, which are small and cheap.
+                 *
+                 * Idempotent across later slices: the projected total is the same
+                 * each time and cap only ever moves up, so slices 3+ recompute it
+                 * and find nothing to do.
+                 *
+                 * The doubling below is kept as the fallback: if reads later in
+                 * the cohort are shorter than this slice's mean, the projection
+                 * undershoots and growth proceeds exactly as before. Capacity
+                 * only ever affects allocation, never which reads land in the
+                 * cohort, so output is unchanged either way. */
+                if (aux->cohort_n > 0 && !ret->cohort_complete && ret->n_seqs > 0) {
+                    int64_t slice_bases = 0;
+                    for (int i = 0; i < ret->n_seqs; ++i)
+                        slice_bases += ret->seqs[i].l_seq;
+                    if (slice_bases > 0 && aux->task_size > slice_bases) {
+                        /* +2 for the rounding slack: both readers stop at the
+                         * first whole-record, even-n boundary at or PAST each
+                         * request, so the cohort can end a record or two past
+                         * task_size. */
+                        double projected = (double) ret->n_seqs *
+                                           ((double) aux->task_size / (double) slice_bases) + 2.0;
+                        if (projected > (double) cap && projected < (double) INT_MAX)
+                            cap = (int) projected;
+                    }
+                }
+                while (cap < want) cap <<= 1;
+                /* Temporary + err_fatal, not assert -- see the regs growth in
+                 * step 1. A release-build realloc failure here would null the
+                 * accumulated cohort, leak every slice already copied into it,
+                 * and be dereferenced by the memcpy immediately below. */
+                bseq1_t *cohort_tmp = (bseq1_t *) realloc(aux->cohort_seqs,
+                                                       (size_t) cap * sizeof(bseq1_t));
+                if (cohort_tmp == NULL)
+                    err_fatal(__func__, "failed to grow the cohort buffer to %d reads", cap);
+                aux->cohort_seqs = cohort_tmp;
+                aux->cohort_cap = cap;
+                /* -v 4 only: capacity has no effect on output, so this exists
+                 * purely so a test can tell a projected reservation from a
+                 * doubled one. Default verbosity is 3, so ordinary runs and every
+                 * stderr-parsing test see exactly what they saw before. */
+                if (bwa_verbose >= 4)
+                    fprintf(stderr, "[0000] cohort_reserve: cap: %d, held: %d\n",
+                            cap, aux->cohort_n + ret->n_seqs);
+            }
+            /* Guarded because the EOF-on-slice-boundary item reaches here with
+             * seqs == NULL and n_seqs == 0 -- it exists only to flush the cohort
+             * (see step 0). memcpy(dst, NULL, 0) is UB in C/C++ even at zero
+             * length, and UBSan's nonnull-attribute check reports it. */
+            if (ret->n_seqs > 0)
+                memcpy(aux->cohort_seqs + aux->cohort_n, ret->seqs,
+                       (size_t) ret->n_seqs * sizeof(bseq1_t));
+            int slice_off = aux->cohort_n;
+            aux->cohort_n += ret->n_seqs;
+            free(ret->seqs);            /* structs copied out; strings still owned */
+            ret->seqs = NULL; ret->n_seqs = 0;
+
+            /* Re-base ids to the cohort. Only bseq_classify reads .id, and that
+             * path is excluded from slicing, but a stale per-slice id would be a
+             * trap for the next reader. */
+            for (int i = 0; i < aux->cohort_n - slice_off; ++i)
+                aux->cohort_seqs[slice_off + i].id = slice_off + i;
+
+            /* regs is sized once per item, at the top of this step, to the whole
+             * cohort (cohort_n + this slice's reads) and grown with realloc so
+             * the earlier slices' alignments survive -- they are computed as each
+             * slice arrives but consumed only by mem_pair_and_emit_cohort once
+             * the cohort is whole. Nothing to do here but rely on that.
+             *
+             * Sizing there rather than here is what makes the invariant hold for
+             * BOTH paths: the single-slice fast path above needs the same array
+             * and never reaches this branch. */
+            assert(w.nreads >= aux->cohort_n);
+
+            mem_align_cohort_slice(opt,
+                                   aux->cohort_first_id + slice_off,
+                                   aux->cohort_n - slice_off,
+                                   aux->cohort_seqs + slice_off,
+                                   w.regs + slice_off,
+                                   w);
+
+            if (!ret->cohort_complete) {
+                /* Partial cohort: hand the pipeline a non-NULL empty item. NULL
+                 * would retire this worker (see ktp_worker's step advance). */
+                tprof[MEM_PROCESS2][0] += __rdtsc() - tim;
+                if (sp_enabled()) sp_harvest_proc(&ret->prof, sp_p0);
+                return ret;
+            }
+
+            mem_pair_and_emit_cohort(opt,
+                                     aux->cohort_first_id,
+                                     aux->cohort_n,
+                                     aux->cohort_seqs,
+                                     aux->pes0,
+                                     w);
+
+            /* Hand the cohort to the write step, which frees the array. */
+            ret->seqs   = aux->cohort_seqs;
+            ret->n_seqs = aux->cohort_n;
+            aux->cohort_seqs = NULL; aux->cohort_n = 0; aux->cohort_cap = 0;
+        }
         tprof[MEM_PROCESS2][0] += __rdtsc() - tim;
 
-        if (sp_enabled()) {
-            ret->prof.proc_wall      = sp_wall() - sp_p0;
-            ret->prof.proc_cpu       = g_ktfor.proc_cpu;
-            ret->prof.thr_busy_min   = g_ktfor.thr_busy_min;
-            ret->prof.thr_busy_max   = g_ktfor.thr_busy_max;
-            ret->prof.thr_busy_mean  = g_ktfor.thr_busy_mean;
-            ret->prof.thr_busy_stdev = g_ktfor.thr_busy_stdev;
-            /* encode = SAM/BAM-build CPU (accurate, summed over compute threads);
-             * compute = the rest of the alignment CPU. Same clock, so subtractable. */
-            ret->prof.encode  = g_ktfor.encode;
-            ret->prof.compute = (g_ktfor.proc_cpu > g_ktfor.encode)
-                                ? g_ktfor.proc_cpu - g_ktfor.encode : NAN;
-        }
+        if (sp_enabled()) sp_harvest_proc(&ret->prof, sp_p0);
 
         aux->n_processed += ret->n_seqs;
         return ret;
@@ -646,19 +1181,26 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
 
             for (int k = 0; k < group_size; ++k) {
                 if (sp_enabled() && ret->seqs[i+k].sam) sp_wbytes += (long)strlen(ret->seqs[i+k].sam);
-                free(ret->seqs[i+k].name);
+                /* PIPE-F6: name/seq/qual are carved from ret->read_arena, which
+                 * is freed once below — do NOT free them individually here.
+                 * comment stays heap-owned (see the reader / --meth notes), and
+                 * sam/bams are allocated during processing; those still free
+                 * per-read. meth_orig_seq is a step-0 heap strdup (NULL outside
+                 * --meth; free() is NULL-safe). */
                 free(ret->seqs[i+k].comment);
-                free(ret->seqs[i+k].seq);
-                free(ret->seqs[i+k].qual);
                 free(ret->seqs[i+k].sam);
                 free(ret->seqs[i+k].bams);
-                free(ret->seqs[i+k].meth_orig_seq); /* NULL outside --meth; free() is NULL-safe */
+                free(ret->seqs[i+k].meth_orig_seq);
             }
             i += group_size;
         }
         if (sp_enabled()) {
             ret->prof.write_wall = sp_wall() - sp_w0;
             ret->prof.write_bytes = sp_wbytes;
+            /* bam_mode, NOT mem_opt_records_are_bam(): this asks whether the
+             * write path DEFLATES, and only --bam does. A --meth run without
+             * --bam builds bam1_t but htslib serializes them as plain text, so
+             * there is no compression stage to fuse — it belongs in `else`. */
             if (aux->opt->bam_mode) {            /* htslib fuses compress+diskwrite */
                 ret->prof.write_compress = ret->prof.write_wall;   /* diskwrite stays NaN */
             } else {
@@ -669,6 +1211,11 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             ret->prof.chunk = __sync_fetch_and_add(&g_sp_chunk, 1);
             sp_add_chunk(&ret->prof);
         }
+        /* PIPE-F6: every name/seq/qual freed above by the former per-field loop
+         * now lives in this one arena; release it once for the whole chunk.
+         * All uses are done: output was written above and the seq/qual bytes
+         * are never read after the SAM/BAM string was built. NULL-safe. */
+        read_arena_destroy(ret->read_arena);
         free(ret->seqs);
         free(ret);
         tprof[SAM_IO][0] += __rdtsc() - tim;
@@ -818,7 +1365,21 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     }
 #endif
 
-    int32_t nreads = aux->actual_chunk_size / NREADS_ESTIMATE_AVG_BASES + 10;
+    /* PIPE-F24: do NOT pre-size the read-count-sized scratch from a
+     * bytes/NREADS_ESTIMATE_AVG_BASES heuristic. That estimate (chunk_bytes/100
+     * + 10) is right only for ~100 bp reads: it OVER-allocates for longer reads
+     * (pure waste — the pool is never shrunk) and UNDER-allocates for shorter
+     * ones, forcing a free() + large calloc() on the first chunk. Start at 0 and
+     * let the grow-on-demand path in kt_pipeline (step 1) size it EXACTLY from
+     * the actual parsed read count (ret->n_seqs) and reuse it across chunks.
+     * Correctness is unchanged: that path runs BEFORE any read indexes the
+     * buffer and guarantees w.nreads >= n_seqs, with identical calloc zero-init.
+     *
+     * `regs` is the only such buffer now — chain_scratch/seed_scratch are sized
+     * from nthreads * BATCH_SIZE in worker_alloc and never depend on nreads, so
+     * a 0 here costs them nothing. That is also what retires the worst case this
+     * comment was written about: the multi-GB overshoot was seed_scratch's. */
+    int32_t nreads = 0;
 
     /* All memory allocation */
     memoryAlloc(aux, w, nreads, nthreads);
@@ -860,7 +1421,7 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
 
     fprintf(stderr, "* No. of pipeline threads: %d\n\n", p_nt);
     aux_.workers = (ktp_worker_t*) malloc(p_nt * sizeof(ktp_worker_t));
-    assert(aux_.workers != NULL);
+    xassert(aux_.workers != NULL, "out of memory: aux_.workers");
 
     for (int i = 0; i < p_nt; ++i) {
         ktp_worker_t *wr = &aux_.workers[i];
@@ -872,7 +1433,7 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     }
 
     pthread_t *ptid = (pthread_t *) calloc(p_nt, sizeof(pthread_t));
-    assert(ptid != NULL);
+    xassert(ptid != NULL, "out of memory: ptid");
 
     for (int i = 0; i < p_nt; ++i)
         pthread_create(&ptid[i], 0, ktp_worker, (void*) &aux_.workers[i]);
@@ -917,6 +1478,61 @@ static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
     }
 }
 
+/* True if `p` names something on disk, or is the base of a bwa index (the
+ * <idxbase> argument is a prefix, not a file: "ref.fa" with "ref.fa.amb"
+ * alongside it). Used only to decide whether a positional that *looks* like an
+ * option value is in fact a real path the user meant. */
+static int path_exists(const char *p)
+{
+    char buf[PATH_MAX];
+    if (p == NULL || *p == '\0') return 0;
+    if (access(p, F_OK) == 0) return 1;
+    /* Probe one index sidecar rather than all of them: .amb is written by every
+     * index variant (plain and --meth) and is the smallest. */
+    if (snprintf(buf, sizeof(buf), "%s.amb", p) < (int)sizeof(buf)
+        && access(buf, F_OK) == 0) return 1;
+    return 0;
+}
+
+/* If `s` is a value that belongs to one of the --meth family's options rather
+ * than a path, return the flag it belongs to; else NULL. Deliberately narrow:
+ * every token here is a closed-vocabulary keyword no one would name a reference
+ * after, and the caller additionally requires that no such path exists. */
+static const char *stray_option_value_flag(const char *s)
+{
+    static const struct { const char *value, *flag; } known[] = {
+        { "taps",      "--meth"         }, { "emseq",     "--meth" },
+        { "em-seq",    "--meth"         }, { "bisulfite", "--meth" },
+        { "collapsed", "--meth-scoring" }, { "genomic",   "--meth-scoring" },
+        { "neutral",   "--meth-scoring" },
+        { "XR",        "--meth-tags"    }, { "XG",        "--meth-tags" },
+        { "XM",        "--meth-tags"    }, { "all",       "--meth-tags" },
+        { "none",      "--meth-tags"    },
+    };
+    if (s == NULL) return NULL;
+    /* A `^`-prefixed exclusion can only have come from --meth-tags. Its `-XM`
+     * synonym needs no case here: `X` takes an argument in the short optstring,
+     * so getopt binds `-XM` as `-X M` and it never reaches a positional slot. */
+    if (s[0] == '^') return "--meth-tags";
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); ++i)
+        if (strcasecmp(s, known[i].value) == 0) return known[i].flag;
+    return NULL;
+}
+
+/* The corrective spelling for a stray value, tailored to how it got orphaned. */
+static const char *stray_option_value_advice(const char *s)
+{
+    const char *flag = stray_option_value_flag(s);
+    if (flag == NULL) return "";
+    if (strcmp(flag, "--meth") == 0)
+        return "       --meth takes an OPTIONAL argument, which getopt only binds with '=':\n"
+               "       write --meth=taps, not --meth taps.";
+    if (strcmp(flag, "--meth-tags") == 0)
+        return "       --meth-tags takes ONE comma-separated list, not a space-separated one:\n"
+               "       write --meth-tags XR,XG (or --meth-tags '^XM'), not --meth-tags XR XG.";
+    return "       Pass it as the argument to that flag, e.g. --meth-scoring genomic.";
+}
+
 static void usage(const mem_opt_t *opt)
 {
     fprintf(stderr, "Usage: bwa-mem3 mem [options] <idxbase> <in1.fq> [in2.fq]\n");
@@ -933,22 +1549,49 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -y INT        seed occurrence for the 3rd round seeding [%ld]\n", (long)opt->max_mem_intv);
     fprintf(stderr, "    -c INT        skip seeds with more than INT occurrences [%d]\n", opt->max_occ);
     fprintf(stderr, "    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10%% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]\n");
-    fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical (non-meth), ~10%% less alignment CPU; no effect under --meth [off]\n");
+    fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
-    fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; long-read speedup (~1.3x on SBX), no-op on short reads; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
+    fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT do not run at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
     fprintf(stderr, "    --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [%s]\n", opt->mate_concordant_window? (opt->mate_concordant_window<0? "auto":"fixed") : "off");
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
+    fprintf(stderr, "    --rescue-kmer[=K]  band the mate-rescue Smith-Waterman to a K-mer exact-match anchor\n");
+    fprintf(stderr, "                  diagonal, falling back to the full insert window when no anchor. K is\n");
+    fprintf(stderr, "                  1..%d (bare = %d, =0 = off); the value must be attached with '='.\n",
+            MEM_RESCUE_KMER_MAX, MEM_RESCUE_KMER_DEFAULT);
+    fprintf(stderr, "                  Opt-in speedup, NOT byte-identical; enabled by --fast [off]\n");
+    fprintf(stderr, "    --rescue-band INT  half-width (bp) of the band around the anchor diagonal, 1..%d [%d]\n",
+            MEM_RESCUE_BAND_MAX, opt->rescue_band);
+    fprintf(stderr, "    --rescue-skip  skip the mate-rescue Smith-Waterman outright when no K-mer anchor\n");
+    fprintf(stderr, "                  clears the vote floor, instead of falling back to the full window.\n");
+    fprintf(stderr, "                  Requires --rescue-kmer. Drops rescues rather than shortening them,\n");
+    fprintf(stderr, "                  so it can lose alignments; NOT part of --fast [off]\n");
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
-    fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup\n");
-    fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 5 --adaptive-band (and\n");
-    fprintf(stderr, "                  -s 2 --extend-mate-concordant under --meth). Opt-in; explicit\n");
+    fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup --rescue-kmer=6\n");
+    fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 20 --adaptive-band\n");
+    fprintf(stderr, "                  --extend-mate-concordant (under --meth: --max-extend-chains 10,\n");
+    fprintf(stderr, "                  -s 2). Opt-in; explicit\n");
     fprintf(stderr, "                  flags override where applicable; --smem-dedup,\n");
     fprintf(stderr, "                  --skip-contained-ext and --adaptive-band are always enabled.\n");
+    fprintf(stderr, "                  Also switches the alignment-region dedup sort to a strict\n");
+    fprintf(stderr, "                  total order (faster, but resolves equal-end-position ties\n");
+    fprintf(stderr, "                  differently from bwa-mem2, which the default reproduces).\n");
     fprintf(stderr, "                  NOT byte-identical to the default (divergence confined to the\n");
-    fprintf(stderr, "                  low-confidence tail).\n");
+    fprintf(stderr, "                  low-confidence tail). Also implies --chunk-cap 256000000.\n");
+    fprintf(stderr, "    --compat STR  shape output to be byte-identical to another aligner.\n");
+    fprintf(stderr, "                  Targets: %s\n", compat_target_selectable_list());
+    fprintf(stderr, "                  Both targets drop the HN:i tag and ignore the <prefix>.hdr /\n");
+    fprintf(stderr, "                  <baseprefix>.dict sidecar, so @SQ is generated as bare SN/LN\n");
+    fprintf(stderr, "                  (+AH:* on ALT contigs). They differ where the upstreams do:\n");
+    fprintf(stderr, "                  bwa-mem2: also suppress MQ:i and the default @HD -- bwa-mem2\n");
+    fprintf(stderr, "                  v2.2.1 forked at bwa 0.7.17, before either landed.\n");
+    fprintf(stderr, "                  bwa-mem:  keep both -- bwa 0.7.18+ emits them. Pinned at 0.7.19.\n");
+    fprintf(stderr, "                  Shapes output only; changes no alignment. @PG still differs (it\n");
+    fprintf(stderr, "                  is run-specific) -- exclude it when comparing. Mutually exclusive\n");
+    fprintf(stderr, "                  with --fast (which changes alignments) and with --meth (neither\n");
+    fprintf(stderr, "                  target has a bisulfite mode) -- combining them is an error [off]\n");
     fprintf(stderr, "Scoring options:\n");
     fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
     fprintf(stderr, "   -B INT        penalty for a mismatch [%d]\n", opt->b);
@@ -968,6 +1611,36 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   -5            for split alignment, take the alignment with the smallest coordinate as primary\n");
     fprintf(stderr, "   -q            don't modify mapQ of supplementary alignments\n");
     fprintf(stderr, "   -K INT        process INT input bases in each batch regardless of nThreads (for reproducibility) []\n");
+    fprintf(stderr, "   --chunk-cap INT\n");
+    fprintf(stderr, "                 upper bound (bases) on the default nThreads-scaled batch size;\n");
+    fprintf(stderr, "                 0 = off. Off by default so batching matches bwa/bwa-mem2 exactly\n");
+    fprintf(stderr, "                 at any -t. Capping re-partitions the input and is NOT\n");
+    fprintf(stderr, "                 byte-identical. Prefer -K if you want a fixed batch size AND\n");
+    fprintf(stderr, "                 reproducibility [0]\n");
+    fprintf(stderr, "   --cohort-slices INT\n");
+    fprintf(stderr, "                 read the FIRST batch as a ramp of up to INT growing slices, so\n");
+    fprintf(stderr, "                 alignment starts before the whole batch has been read. 0 = off\n");
+    fprintf(stderr, "                 (single read). The slice SIZES come from --cohort-ramp-first and\n");
+    fprintf(stderr, "                 --cohort-ramp-ratio. Later batches are always read whole, since\n");
+    fprintf(stderr, "                 their read already overlaps the previous batch's compute. Does NOT\n");
+    fprintf(stderr, "                 move the batch boundary, so output is unchanged. Max %d. Overridden\n",
+            (int)COHORT_SLICES_MAX);
+    fprintf(stderr, "                 by BWA_MEM3_COHORT_SLICES [%d]\n", (int)COHORT_SLICES_DEFAULT);
+    fprintf(stderr, "   --cohort-ramp-first INT\n");
+    fprintf(stderr, "                 bases in the FIRST ramp slice. An absolute size, not a fraction of\n");
+    fprintf(stderr, "                 the batch: this slice's read overlaps nothing and each extra slice\n");
+    fprintf(stderr, "                 costs one more pipeline pass, and neither cost scales with the\n");
+    fprintf(stderr, "                 batch. Capped at half the batch so a small batch still gets two\n");
+    fprintf(stderr, "                 slices. 0 selects the fractional shape (batch / ratio^slices).\n");
+    fprintf(stderr, "                 Output-neutral. Overridden by BWA_MEM3_COHORT_RAMP_FIRST [%lld]\n",
+            (long long)cohort_ramp_first_default);
+    fprintf(stderr, "   --cohort-ramp-ratio FLOAT\n");
+    fprintf(stderr, "                 growth factor between consecutive ramp slices. Growing faster than\n");
+    fprintf(stderr, "                 the reader can deliver the next slice while the current one is\n");
+    fprintf(stderr, "                 being aligned stalls the pipeline, and that ceiling FALLS as -t\n");
+    fprintf(stderr, "                 rises because only compute scales with threads. Output-neutral.\n");
+    fprintf(stderr, "                 Overridden by BWA_MEM3_COHORT_RAMP_RATIO [%.1f]\n",
+            cohort_ramp_ratio_default);
     fprintf(stderr, "   -v INT        verbose level: 1=error, 2=warning, 3=message, 4+=debugging [%d]\n", bwa_verbose);
     fprintf(stderr, "   -T INT        minimum score to output [%d]\n", opt->T);
     fprintf(stderr, "   -h INT[,INT]  if there are <INT hits with score >%.2f%% of the max score, output all in XA [%d,%d]\n",
@@ -983,16 +1656,45 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 specify the mean, standard deviation (10%% of the mean if absent), max\n");
     fprintf(stderr, "                 (4 sigma from the mean if absent) and min of the insert size distribution.\n");
     fprintf(stderr, "                 FR orientation only. [inferred]\n");
-    fprintf(stderr, "Bisulfite (--meth) options:\n");
-    fprintf(stderr, "   --meth        enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM\n");
-    fprintf(stderr, "                 emission. Implies --bam. Requires the reference to have been built\n");
-    fprintf(stderr, "                 with `bwa-mem3 index --meth` (emits the original index plus a\n");
-    fprintf(stderr, "                 ref.fa.meth.* converted seed index).\n");
-    fprintf(stderr, "   --meth-scoring collapsed|genomic\n");
-    fprintf(stderr, "                 bisulfite scoring mode [collapsed]. collapsed: C/T (and G/A)\n");
-    fprintf(stderr, "                 interchangeable, bwameth-compatible placement (sets -B 2).\n");
-    fprintf(stderr, "                 genomic: free only the conversion direction, keep variants as\n");
-    fprintf(stderr, "                 mismatches (variant-aware, truthful NM/MD; -B 4).\n");
+    fprintf(stderr, "Methylation (--meth) options:\n");
+    fprintf(stderr, "   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware\n");
+    fprintf(stderr, "                 record emission (XM:Z/XG:Z/XR:Z). Output is SAM text by default,\n");
+    fprintf(stderr, "                 as without --meth; add --bam for BAM. Requires the reference to\n");
+    fprintf(stderr, "                 have been built with `bwa-mem3 index --meth` (emits the original\n");
+    fprintf(stderr, "                 index plus a ref.fa.meth.* converted seed index).\n");
+    fprintf(stderr, "                 CHEM selects the chemistry and thus the XM:Z call polarity:\n");
+    fprintf(stderr, "                   emseq  bisulfite/EM-seq, UNmethylated C converts [default]\n");
+    fprintf(stderr, "                          (aliases: em-seq, bisulfite)\n");
+    fprintf(stderr, "                   taps   TET-assisted pyridine borane, METHYLATED C converts;\n");
+    fprintf(stderr, "                          also defaults --meth-scoring to neutral\n");
+    fprintf(stderr, "                 NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS\n");
+    fprintf(stderr, "                 data without =taps inverts every methylation call.\n");
+    fprintf(stderr, "   --meth-scoring collapsed|genomic|neutral\n");
+    fprintf(stderr, "                 scoring mode. Default depends on chemistry: collapsed for\n");
+    fprintf(stderr, "                 --meth/--meth=emseq, neutral for --meth=taps (TAPS conversions\n");
+    fprintf(stderr, "                 are sparse, so collapsing costs specificity it can't repay).\n");
+    fprintf(stderr, "                 collapsed: C/T (and G/A) interchangeable, bwameth-compatible\n");
+    fprintf(stderr, "                 placement (sets -B 2).\n");
+    fprintf(stderr, "                 genomic: free only the conversion direction, scored as a full\n");
+    fprintf(stderr, "                 match, keep variants as mismatches (variant-aware: variants\n");
+    fprintf(stderr, "                 outside the conversion direction visible in NM/MD; -B 4).\n");
+    fprintf(stderr, "                 neutral: free only the conversion direction but score it 0\n");
+    fprintf(stderr, "                 (tolerated, not rewarded); best for TAPS (variant-aware:\n");
+    fprintf(stderr, "                 variants visible in NM/MD as in genomic; -B 4).\n");
+    fprintf(stderr, "                 In genomic/neutral a real variant in the conversion direction\n");
+    fprintf(stderr, "                 itself (C->T at a reference C) is indistinguishable from a\n");
+    fprintf(stderr, "                 conversion and stays hidden in NM/MD.\n");
+    fprintf(stderr, "   --meth-tags SPEC\n");
+    fprintf(stderr, "                 which Bismark tags to emit: 'all' (default), 'none', a\n");
+    fprintf(stderr, "                 comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).\n");
+    fprintf(stderr, "                 Comma-separated, NOT space-separated (a second word becomes\n");
+    fprintf(stderr, "                 the reference). An exclusion may be written ^XM or -XM; prefer\n");
+    fprintf(stderr, "                 -XM in scripts (bare ^ is a negated glob in zsh EXTENDED_GLOB).\n");
+    fprintf(stderr, "                 Unselected tags are not computed. XM:Z is a read-length string\n");
+    fprintf(stderr, "                 and dominates the BAM's aux payload; '^XM' drops it for callers\n");
+    fprintf(stderr, "                 that recompute from the reference (MethylDackel, biscuit).\n");
+    fprintf(stderr, "                 Keep XM for Bismark-family tools (bismark_methylation_extractor,\n");
+    fprintf(stderr, "                 methylKit, methtuple, DMRfinder, epialleleR).\n");
     fprintf(stderr, "   --set-as-failed f|r\n");
     fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
     fprintf(stderr, "   --chimera-qc\n");
@@ -1004,6 +1706,12 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 with >=INT genome occurrences (i.e. the supp region is repetitive on its\n");
     fprintf(stderr, "                 own). 0 disables (default). Typical values 5-20; lower = more aggressive.\n");
     fprintf(stderr, "                 Primary MAPQ is unaffected.\n");
+    fprintf(stderr, "   --proper-pair-from-emitted\n");
+    fprintf(stderr, "                 derive the proper-pair FLAG bit (0x2) from the alignment actually\n");
+    fprintf(stderr, "                 emitted rather than the top-scoring one. bwa and bwa-mem2 both use\n");
+    fprintf(stderr, "                 the top-scoring one, so this deviates from both and is mutually\n");
+    fprintf(stderr, "                 exclusive with --compat. Has no effect unless the index has a .alt\n");
+    fprintf(stderr, "                 sidecar: the two differ only for reads with ALT hits [off]\n");
     fprintf(stderr, "Seed ordering (fg-labs extension):\n");
     fprintf(stderr, "   --seed-order STR\n");
     fprintf(stderr, "                 seed emission order before chaining: off|local-longest [off]\n");
@@ -1083,6 +1791,103 @@ int main_mem(int argc, char *argv[])
     char        *p, *rg_line               = 0, *hdr_line = 0;
     const char  *mode                      = 0;
     int          fast                      = 0;
+    /* --chunk-cap: upper bound (bases) on the default `chunk_size * n_threads`
+     * batch size. 0 = off, which is the DEFAULT and matches bwa and bwa-mem2
+     * exactly (both compute `chunk_size * n_threads` with no cap). Capping
+     * re-partitions the input, which changes each batch's mem_pestat cohort and
+     * therefore the output, so it must never be on by default -- see the
+     * task_size block below. */
+    int64_t      chunk_cap                 = 0;
+    int          chunk_cap_set             = 0;
+    /* --cohort-slices: how many geometric slices to read the FIRST batch in, so
+     * compute can start before the whole batch has been read. Byte-identical --
+     * the batch (pestat cohort) boundary is unchanged, only the physical read
+     * granularity inside it. 0 = one slice, i.e. the pre-slicing behaviour.
+     *
+     * The default was swept, not guessed. This is the ramp's DEPTH only -- an
+     * upper bound on how many slices the first cohort is carved into. Their sizes
+     * come from cohort_ramp_first and cohort_ramp_ratio below, so the depth binds
+     * only until the ramp reaches the cohort or the 1 Mbase slice floor, which is
+     * about where 6 lands on ordinary inputs. The measured sweep is in the PR that
+     * introduced this option rather than here: it is a wall-clock result for one
+     * host, thread count and input, so it dates in a way the shape of the curve
+     * does not, and it would read as live justification long after it stopped
+     * being one. */
+    int64_t      cohort_slices             = COHORT_SLICES_DEFAULT;
+    /* --cohort-ramp-first / --cohort-ramp-ratio: the ramp's shape. Output-neutral
+     * at any setting -- these change slice SIZES, and the cohort boundary is
+     * pinned by the slice-target clamp, not by how the cohort is carved up.
+     *
+     * A ramp schedule pays exactly three costs, all measured on wgs-5M/hg38
+     * (c8g.16xlarge, warm cache, from --profile):
+     *
+     *   fill      the first slice's read, which by definition overlaps nothing.
+     *             Reading is single-threaded and flat at 4.83 ms/Mbase at every -t.
+     *   stalls    while step 1 computes slice k the reader must deliver slice k+1,
+     *             so growth of r stalls unless r <= (compute s/base)/(read s/base).
+     *             Compute is 31.5 / 15.4 / 7.87 ms/Mbase at -t 16 / 32 / 64, so
+     *             that ceiling is 6.5 / 3.2 / 1.63 -- it FALLS as threads are
+     *             added, because only compute scales.
+     *   overhead  every extra slice is one more kt_for pass over the pipeline:
+     *             0.0351 / 0.0498 / 0.0689 s per slice at -t 16 / 32 / 64,
+     *             measured from Sproc_wall against ramp slice count.
+     *
+     * Those pull in opposite directions and the third is easy to forget: at low
+     * -t stalls are impossible and overhead rules, so few large slices win; at
+     * high -t the stall ceiling binds and the ratio must stay under it.
+     *
+     * A cost model over those three terms suggested r=1.80, and measurement
+     * refused it: at -t 64 that is ABOVE the 1.63 ceiling, and the run sat right on
+     * the cliff -- mid-run stall 0.109 s on one rep and 0.614 s on the next, with a
+     * 0.54 s PROCESS spread. The model under-predicts stalls near the ceiling, so
+     * the ratio stays at 1.6, under it.
+     *
+     * Measured in one binary, three shapes selected by the env knobs, 3 reps
+     * interleaved, warm cache, warmup discarded, EVERY arm writing SAM to a real
+     * file (head / mid / overhead from --profile; ramp = slice count):
+     *
+     *    -t   shape                 ramp    head     mid    ovhd    PROCESS
+     *    16   fractional, r=2.0        7   0.018   0.000   0.211   86.44
+     *    16   fractional, r=1.6        6   0.051   0.000   0.175   86.51
+     *    16   absolute 16 Mb, r=1.6    5   0.081   0.000   0.140   86.50
+     *    32   fractional, r=2.0        7   0.034   0.000   0.299   44.45
+     *    32   fractional, r=1.6        6   0.099   0.000   0.249   44.47
+     *    32   absolute 16 Mb, r=1.6    6   0.087   0.000   0.249   44.49
+     *    64   fractional, r=2.0        7   0.066   0.416   0.413   23.99
+     *    64   fractional, r=1.6        6   0.199   0.000   0.345   23.62
+     *    64   absolute 16 Mb, r=1.6    7   0.095   0.018   0.413   23.61
+     *
+     * The ratio is what buys wall time: at -t 64 it takes the mid-run stall from
+     * 0.416 s to zero, -1.5% end to end. It costs 0.06-0.07 s (0.07%) at -t 16/32,
+     * where no stall was possible to begin with.
+     *
+     * The absolute first slice is a WASH on this input at every rung -- -0.005 /
+     * -0.012 / -0.017 s in the ramp terms, and inside the run-to-run spread end to
+     * end. It is here for what the table shows about how the fractional form
+     * SCALES, not for a speedup. Sizing the first slice as task_size/ratio^depth
+     * makes it grow with -t, because task_size is chunk_size * n_threads, and the
+     * measured head fill tracks that exactly: 0.051 -> 0.099 -> 0.199 s across
+     * -t 16 -> 32 -> 64, doubling with every rung. The absolute form is flat at
+     * 0.081 -> 0.087 -> 0.095 s. Extending the same arithmetic, -t 128 would open
+     * a 1280 Mbase cohort with a 76 Mbase slice and ~0.37 s of wholly unhidden
+     * fill. Fill and overhead are both absolute costs, so nothing about the right
+     * first slice scales with the cohort; the fractional form only looked free
+     * because it was never measured above -t 64.
+     *
+     * The honest cost of pinning it: at -t 64 the absolute slice needs one extra
+     * ramp slice (7 vs 6), and that +0.068 s of kt_for overhead eats most of the
+     * 0.104 s of head fill it saves. That trade gets better with -t, since fill
+     * would keep doubling while the per-slice cost does not.
+     *
+     * Deriving the ratio at run time from the ramp's own slices was implemented
+     * and rejected. Beyond a sign error, it is not robust: the estimate must come
+     * from the small early slices, which under-report compute throughput because
+     * fixed kt_for costs dominate, and its outcome at -t 64 flips sign on whether
+     * step 1 is one or two slices behind step 0 -- a scheduling artifact, not
+     * something a policy can pin. A fixed pair is deterministic and measured
+     * better. */
+    double       cohort_ramp_ratio         = cohort_ramp_ratio_default;
+    int64_t      cohort_ramp_first         = cohort_ramp_first_default;
 
     mem_opt_t    *opt, opt0;
     gzFile        fp = 0, fp2 = 0;
@@ -1108,7 +1913,8 @@ int main_mem(int argc, char *argv[])
     // comment: added option '5' in the list
     //
     // Long-only options for bisulfite mode (bwa-mem3 meth fork):
-    //   --meth              Enable inline bwameth-style c2t + post-processing + BAM output.
+    //   --meth              Enable inline bwameth-style c2t + post-processing. Output
+    //                       container is --bam's job, same as without --meth.
     //                       Expects a reference built with `bwa-mem3 index --meth`.
     //   --set-as-failed f|r Flag alignments to this strand as QC-fail (0x200)
     //   --chimera-qc        Enable the bwameth.py-style longest-M <44% chimera heuristic
@@ -1117,9 +1923,11 @@ int main_mem(int argc, char *argv[])
         OPT_BAM = 1000,
         OPT_METH,
         OPT_METH_SCORING,
+        OPT_METH_TAGS,
         OPT_METH_SET_AS_FAILED,
         OPT_METH_CHIMERA_QC,
         OPT_SUPP_REP_HARD_CAP,
+        OPT_PROPER_PAIR_FROM_EMITTED,
         OPT_LEGACY_READER,
         OPT_MIN_EXT_LEN,
         OPT_MAX_EXTEND_CHAINS,
@@ -1129,6 +1937,14 @@ int main_mem(int argc, char *argv[])
         OPT_SKIP_CONTAINED_EXT,
         OPT_ADAPTIVE_BAND,
         OPT_EXTEND_MATE_CONCORDANT,
+        OPT_COMPAT,
+        OPT_CHUNK_CAP,
+        OPT_COHORT_SLICES,
+        OPT_RESCUE_KMER,
+        OPT_RESCUE_BAND,
+        OPT_RESCUE_SKIP,
+        OPT_COHORT_RAMP_RATIO,
+        OPT_COHORT_RAMP_FIRST,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1143,12 +1959,22 @@ int main_mem(int argc, char *argv[])
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
         {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
-        {"meth",                     no_argument,       0, OPT_METH},
+        {"chunk-cap",                required_argument, 0, OPT_CHUNK_CAP},
+        {"cohort-slices",            required_argument, 0, OPT_COHORT_SLICES},
+        {"rescue-kmer",              optional_argument, 0, OPT_RESCUE_KMER},
+        {"rescue-band",              required_argument, 0, OPT_RESCUE_BAND},
+        {"rescue-skip",              no_argument,       0, OPT_RESCUE_SKIP},
+        {"cohort-ramp-ratio",        required_argument, 0, OPT_COHORT_RAMP_RATIO},
+        {"cohort-ramp-first",        required_argument, 0, OPT_COHORT_RAMP_FIRST},
+        {"meth",                     optional_argument, 0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
+        {"meth-tags",                required_argument, 0, OPT_METH_TAGS},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
+        {"proper-pair-from-emitted", no_argument,       0, OPT_PROPER_PAIR_FROM_EMITTED},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
+        {"compat",                   required_argument, 0, OPT_COMPAT},
         {"legacy-reader",            no_argument,       0, OPT_LEGACY_READER},
 #ifdef STAGE_PROF
         {"profile",                  required_argument, 0, OPT_PROFILE},
@@ -1281,6 +2107,10 @@ int main_mem(int argc, char *argv[])
                     return 1;
                 }
                 opt->bam_level = lvl;
+                /* The compressed-BAM warning is emitted once after parsing,
+                 * from the resolved bam_level -- see below. Warning here would
+                 * fire per occurrence and would warn for a level a later
+                 * --bam=0 goes on to override. */
             }
         }
 #ifdef STAGE_PROF
@@ -1290,19 +2120,57 @@ int main_mem(int argc, char *argv[])
 #endif
         else if (c == OPT_METH) {
             opt->meth_mode = 1;
-            opt->bam_mode = 1;  /* meth implies BAM output */
+            /* --meth selects bisulfite ALIGNMENT semantics only; the output
+             * container is --bam's job here exactly as it is without --meth.
+             * (Through 0.7.x this set bam_mode=1, which made text SAM
+             * unreachable under --meth — there was no flag that undid it.) */
+            /* Optional chemistry argument. getopt_long's optional_argument only
+             * accepts the `--meth=taps` form (a separate word is treated as a
+             * positional), so a bare `--meth` leaves optarg NULL => em-seq. */
+            if (optarg != NULL) {
+                if (strcmp(optarg, "emseq") == 0 || strcmp(optarg, "em-seq") == 0
+                        || strcmp(optarg, "bisulfite") == 0) {
+                    opt->meth_chem = METH_CHEM_EMSEQ;
+                } else if (strcmp(optarg, "taps") == 0) {
+                    opt->meth_chem = METH_CHEM_TAPS;
+                } else {
+                    fprintf(stderr, "ERROR: --meth accepts 'emseq' (default) or 'taps', got '%s'\n"
+                                    "       note: use --meth=taps, not --meth taps\n", optarg);
+                    free(opt);
+                    if (out_opened) fclose(aux.fp);
+                    return 1;
+                }
+            }
         }
         else if (c == OPT_METH_SCORING) {
             if (optarg != NULL && strcmp(optarg, "collapsed") == 0) {
                 opt->meth_scoring = MEM_METH_SCORING_COLLAPSED;
+                opt0.meth_scoring = 1;
             } else if (optarg != NULL && strcmp(optarg, "genomic") == 0) {
                 opt->meth_scoring = MEM_METH_SCORING_GENOMIC;
+                opt0.meth_scoring = 1;
+            } else if (optarg != NULL && strcmp(optarg, "neutral") == 0) {
+                opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
+                opt0.meth_scoring = 1;
             } else {
-                fprintf(stderr, "ERROR: --meth-scoring requires 'collapsed' or 'genomic'\n");
+                fprintf(stderr, "ERROR: --meth-scoring requires 'collapsed', 'genomic', or 'neutral'\n");
                 free(opt);
                 if (out_opened) fclose(aux.fp);
                 return 1;
             }
+        }
+        else if (c == OPT_METH_TAGS) {
+            const char *tag_err = NULL;
+            if (mem_opt_parse_meth_tags(optarg, &opt->meth_tags, &tag_err) != 0) {
+                fprintf(stderr, "ERROR: --meth-tags '%s': %s\n"
+                                "       expected 'all', 'none', a comma-separated list "
+                                "(e.g. XR,XG), or ^-prefixed exclusions (e.g. ^XM)\n",
+                        optarg != NULL ? optarg : "", tag_err);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt0.meth_tags = 1;
         }
         else if (c == OPT_METH_SET_AS_FAILED) {
             if (optarg == NULL || !(optarg[0] == 'f' || optarg[0] == 'r') || optarg[1] != '\0') {
@@ -1340,8 +2208,152 @@ int main_mem(int argc, char *argv[])
                 return 1;
             }
         }
+        else if (c == OPT_COMPAT) {
+            const compat_target_t *t = compat_target_from_name(optarg);
+            if (t == NULL) {
+                fprintf(stderr, "[E::%s] unknown --compat target '%s' (%s)\n",
+                        __func__, optarg, compat_target_selectable_list());
+                /* --compat takes a required argument, so a bare `--compat`
+                 * silently swallows the next token -- usually the index
+                 * prefix. Recognize that shape and say so, rather than leaving
+                 * the user staring at their own reference path being called a
+                 * compat target. */
+                if (access(optarg, R_OK) == 0)
+                    fprintf(stderr, "[E::%s] ('%s' is an existing file -- "
+                            "--compat requires a target, e.g. --compat=bwa-mem2)\n",
+                            __func__, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            /* A recognized-but-unavailable target gets its own diagnostic:
+             * "unknown target" would be a lie, and a user asking for bwa-mem
+             * deserves the real reason rather than a shrug. The reason travels
+             * with the table row, not with this parser. */
+            if (t->unavailable_reason != NULL) {
+                fprintf(stderr,
+                        "[E::%s] compat target '%s' is recognized but not yet selectable: "
+                        "%s. Supported: %s\n",
+                        __func__, t->name, t->unavailable_reason,
+                        compat_target_selectable_list());
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->compat = t;
+        }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_FAST) fast = 1;
+        else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
+        else if (c == OPT_RESCUE_KMER) {
+            /* Validated rather than atoi'd for the same reason as --chunk-cap
+             * below: atoi maps every unparseable value to 0, and 0 here means
+             * "off" -- so `--rescue-kmer=x` would silently disable the option it
+             * was meant to configure, and would keep it disabled under --fast
+             * (which defers to any explicitly-set value). K above the uint32 code
+             * width is rejected rather than clamped so `--rescue-kmer=20` cannot
+             * masquerade as a distinct setting from K=16. */
+            int64_t k = MEM_RESCUE_KMER_DEFAULT;   /* bare --rescue-kmer */
+            if (optarg && parse_bounded_i64(optarg, 0, MEM_RESCUE_KMER_MAX, &k) != 0) {
+                fprintf(stderr, "ERROR: --rescue-kmer requires an integer in "
+                                "0..%d (0 = off), got '%s'\n",
+                        MEM_RESCUE_KMER_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->rescue_kmer = (int)k;
+            opt0.rescue_kmer = 1;
+        }
+        else if (c == OPT_RESCUE_BAND) {
+            /* Validated like --rescue-kmer above. A bare atoi accepted both
+             * unparseable text and negatives, and the kernel's `band > 0 ? band
+             * : 50` guard then turned either into the default -- so a typo read
+             * as a deliberate band width but silently ran the default one. */
+            int64_t band = 0;
+            if (parse_bounded_i64(optarg, 1, MEM_RESCUE_BAND_MAX, &band) != 0) {
+                fprintf(stderr, "ERROR: --rescue-band requires an integer in "
+                                "1..%d bp, got '%s'\n",
+                        MEM_RESCUE_BAND_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->rescue_band = (int)band;
+        }
+        else if (c == OPT_RESCUE_SKIP) {
+            /* A plain switch: there is no `=0` form because there is no preset to
+             * opt out of -- --fast deliberately does not enable this. Validated
+             * AFTER getopt (below), not here: it needs a non-zero rescue_kmer,
+             * but --rescue-kmer may not be parsed yet and --fast resolves it
+             * later still, so an inline check would make the diagnostic depend
+             * on flag order. */
+            opt->rescue_skip = 1;
+            opt0.rescue_skip = 1;
+        }
+        else if (c == OPT_CHUNK_CAP) {
+            /* Validated the same way as --supp-rep-hard-cap below rather than via
+             * a bare atoll, which maps every unparseable value to 0 -- and 0 here
+             * means "no cap". A typo would therefore silently change the batch
+             * size, which is the exact class of invisible batching change this
+             * option exists to make explicit. */
+            if (parse_bounded_i64(optarg, 0, INT64_MAX, &chunk_cap) != 0) {
+                fprintf(stderr, "ERROR: --chunk-cap requires a non-negative "
+                                "integer number of bases (0 = off), got '%s'\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            chunk_cap_set = 1;
+        }
+        else if (c == OPT_COHORT_SLICES) {
+            /* Same validation as --chunk-cap above, for the same reason: a bare
+             * atoll maps every unparseable value to 0, and 0 here means "no
+             * slicing". `--cohort-slices 3x` would silently disable the feature
+             * it was meant to configure. Capped at COHORT_SLICES_MAX because the
+             * ramp shift is clamped there anyway, so a larger value is
+             * indistinguishable from it and asking for it is a mistake worth
+             * naming. */
+            if (parse_bounded_i64(optarg, 0, COHORT_SLICES_MAX, &cohort_slices) != 0) {
+                fprintf(stderr, "ERROR: --cohort-slices requires an integer in "
+                                "0..%d (0 = off), got '%s'\n",
+                        (int)COHORT_SLICES_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
+        else if (c == OPT_COHORT_RAMP_RATIO) {
+            /* Validated like the two above. atof() maps anything unparseable to
+             * 0.0, which the `ratio <= 1` guard below then reports as a ratio the
+             * user never asked for and silently replaces with the default -- a
+             * confusing way to learn you made a typo. Only PARSEABILITY is
+             * enforced here; the `<= 1` range check stays where it is, because it
+             * is shared with the env override and is a documented fallback rather
+             * than an error. */
+            if (parse_full_double(optarg, &cohort_ramp_ratio) != 0) {
+                fprintf(stderr, "ERROR: --cohort-ramp-ratio requires a number, "
+                                "got '%s'\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
+        else if (c == OPT_COHORT_RAMP_FIRST) {
+            /* Validated for the same reason, and this one is the sharpest of the
+             * four: atoll("16M") is 16, which is > 0 and therefore accepted as a
+             * SIXTEEN-BYTE first slice rather than 16 Mbases. That is a silent
+             * ~million-fold error in the option this PR exists to introduce.
+             * --chunk-cap already rejects '100M' for exactly this reason. */
+            if (parse_bounded_i64(optarg, 0, INT64_MAX, &cohort_ramp_first) != 0) {
+                fprintf(stderr, "ERROR: --cohort-ramp-first requires a "
+                                "non-negative integer number of bases "
+                                "(0 = fraction of the batch), got '%s'\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
         else if (c == OPT_ADAPTIVE_BAND) opt->band_start = ADAPTIVE_BAND_START;
         else if (c == OPT_EXTEND_MATE_CONCORDANT) {
@@ -1390,6 +2402,29 @@ int main_mem(int argc, char *argv[])
     }
 
     if (opt->n_threads < 1) opt->n_threads = 1;
+    /* A stray word on the command line slides silently into a positional slot.
+     * Two spellings invite it:
+     *   --meth taps        (optional argument: getopt_long only binds it with '=')
+     *   --meth-tags XR XG  (required argument: 'XR' binds, 'XG' does not)
+     * In both cases the orphan lands in <idxbase>, and with a single-end read
+     * file the result still has three positionals -- a perfectly well-formed
+     * paired-end invocation whose reference happens to be "taps" or "XG". The
+     * user then gets a missing-index error naming a token they never meant as a
+     * path. Diagnose it here, before any index work, whenever a positional
+     * matches a known option-value vocabulary and is not an actual path. */
+    for (int pos = optind; pos < argc; ++pos) {
+        const char *flag = stray_option_value_flag(argv[pos]);
+        if (flag == NULL || path_exists(argv[pos])) continue;
+        fprintf(stderr,
+                "ERROR: '%s' was taken as a positional argument (%s), but it looks like\n"
+                "       the value for %s and no such file exists.\n"
+                "%s\n",
+                argv[pos], pos == optind ? "the <idxbase> reference" : "a read file",
+                flag, stray_option_value_advice(argv[pos]));
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
     if (optind + 2 != argc && optind + 3 != argc) {
         usage(opt);
         free(opt);
@@ -1397,6 +2432,23 @@ int main_mem(int argc, char *argv[])
             fclose(aux.fp);
         return 1;
     }
+
+    /* In-process BGZF deflate runs on the single writer thread, so for large
+     * outputs it -- not alignment -- is usually what caps throughput. Warn
+     * once, here rather than in the parsing loop, so the message describes the
+     * *resolved* setting: `--bam=6 --bam=0` must stay silent (the last --bam
+     * wins and it is uncompressed) and `--bam=6 --bam=6` must warn once, not
+     * per occurrence. Placed after the positional-argument check so a usage
+     * error is not preceded by a warning about output it never writes. */
+    if (opt->bam_mode && opt->bam_level > 0)
+        fprintf(stderr,
+            "WARNING: --bam=%d writes compressed BAM on a single writer "
+            "thread; BGZF deflate is not parallelized here, so for large "
+            "outputs this serial compression is usually the bottleneck. "
+            "Prefer uncompressed output (--bam, i.e. --bam=0) piped to a "
+            "threaded compressor, e.g. "
+            "`bwa-mem3 mem --bam ... | samtools view -@ N -b -o out.bam`.\n",
+            opt->bam_level);
 
     /* Further input parsing */
     if (mode)
@@ -1445,31 +2497,126 @@ int main_mem(int argc, char *argv[])
 
     /* --fast: one-flag shorthand for the characterized speed levers
      *   -m 10  -y 0  --min-ext-len 30  --smem-dedup  --skip-contained-ext
-     *   --max-extend-chains 5  --adaptive-band
-     *   (under --meth: also adds -s 2 and --extend-mate-concordant).
+     *   --max-extend-chains 20  --adaptive-band  --extend-mate-concordant
+     *   (under --meth: --max-extend-chains 10 and also adds -s 2),
+     *   plus the strict-total-order + pdqsort dedup sort (alnreg_sort_fast),
+     *   which has no flag of its own -- see the alnreg_sort_fast assignment
+     *   below and the comparator commentary in src/bwamem.cpp.
      * Mirrors the -x preset: each lever is applied only when the user did not
      * set it explicitly (opt0), so explicit flags win where applicable. The
-     * exceptions are --smem-dedup and --skip-contained-ext, which are plain
-     * on/off booleans forced on unconditionally (no opt-out flag exists).
+     * exceptions are --smem-dedup, --skip-contained-ext and the dedup sort,
+     * which are plain on/off booleans forced on unconditionally (no opt-out
+     * flag exists; the dedup sort has no flag at all).
      * --skip-contained-ext is byte-identical on non-meth SE/PE and no-ops under
      * --meth via its own internal gate (see bwamem.cpp), so forcing it on here is
      * safe for --fast --meth too.
      * Output is NOT byte-identical to the default; divergence is confined to the
      * low-confidence tail (see docs/best-practices/settings-profiles.md).
      * meth_mode is already resolved here (parsed in the getopt loop above). */
+    /* The two guards and the warning below all key on "a target other than
+     * `off` is selected" -- --compat=off is exactly equivalent to not passing
+     * the flag, so it must trip none of them. */
+    const int compat_on = (opt->compat != &COMPAT_TARGET_OFF);
+    /* --fast and --compat are mutually exclusive. --compat suppresses only
+     * additive output (MQ:i/HN:i, @HD, sidecar @SQ tags) to reproduce another
+     * aligner byte-for-byte, but --fast deliberately CHANGES alignments;
+     * combining them would yield a diff-clean-looking stream over genuinely
+     * different alignments, defeating the parity-validation purpose of
+     * --compat. Reject up front. */
+    if (fast && compat_on) {
+        fprintf(stderr, "[E::%s] --compat and --fast are mutually exclusive: "
+                "--compat targets byte-identical %s output, but --fast changes alignments\n",
+                __func__, opt->compat->name);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
+    /* --proper-pair-from-emitted deliberately derives FLAG 0x2 differently from
+     * both upstreams (fg-labs/bwa-mem3#17, #362), so pairing it with a --compat
+     * target asks for byte-identity and for a documented deviation from it in
+     * the same command. Same shape as --fast above: refuse rather than emit a
+     * stream that diffs clean everywhere except the ALT records. */
+    if (opt->proper_pair_from_emitted && compat_on) {
+        fprintf(stderr, "[E::%s] --compat and --proper-pair-from-emitted are mutually exclusive: "
+                "--compat targets byte-identical %s output, but --proper-pair-from-emitted "
+                "derives FLAG 0x2 from the emitted alignment, which %s does not\n",
+                __func__, opt->compat->name, opt->compat->name);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
+    /* --compat is an output-parity target, but no target has a bisulfite mode,
+     * so "byte-identical" is undefined under --meth, which also emits
+     * meth-specific tags that no target models. Reject the combination rather
+     * than silently half-suppress. */
+    if (opt->meth_mode && compat_on) {
+        fprintf(stderr, "[E::%s] --compat is not supported with --meth: "
+                "--compat reproduces %s output, which has no methylation mode\n",
+                __func__, opt->compat->name);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
+    /* --compat with an @HD in -H: WARN, do not reject. Emitted only after every
+     * rejection above (--fast, --proper-pair-from-emitted, --meth), so a run
+     * that is about to be refused does not also collect a warning about how its
+     * header would have been ordered. A new --compat guard belongs above this
+     * comment, not below it.
+     *
+     * bwa-mem3 hoists a LEADING user @HD above the @SQ block, so the header is
+     * spec-valid (@HD must come first). Neither target does that: bwa 0.7.19
+     * emits -H records after @SQ and only warns (bwa.c:426-428), bwa-mem2 has
+     * no @HD logic at all. So the header differs from the target in line ORDER.
+     *
+     * This is not rejected, unlike --fast and --meth, because it is an explicit
+     * and coherent request: "give me a valid SAM header, everything else the
+     * same". --fast silently moves alignments and --meth is a different mode --
+     * the user cannot see those in their own command line. An @HD they typed
+     * themselves, they can. Records are unaffected either way.
+     *
+     * Only a LEADING @HD is hoisted, and only that case diverges; a later @HD
+     * is emitted inline after @SQ exactly as upstream does. Warn precisely, so
+     * the warning means something when it fires. */
+    if (compat_on && hdr_line != NULL &&
+        strncmp(hdr_line, "@HD\t", 4) == 0 && bwa_verbose >= 2) {
+        fprintf(stderr, "[W::%s] --compat=%s with an @HD from -H: bwa-mem3 emits it before "
+                "@SQ (the SAM spec requires @HD first), but %s emits -H records after @SQ, "
+                "so the header will differ from %s in line order. Records are unaffected. "
+                "Continue anyway.\n",
+                __func__, opt->compat->name, opt->compat->name, opt->compat->name);
+    }
     if (fast) {
         if (!opt0.max_matesw)   opt->max_matesw   = 10;  /* -m 10 */
         if (!opt0.max_mem_intv) opt->max_mem_intv = 0;   /* -y 0  */
         if (!opt0.min_ext_len)  opt->min_ext_len  = 30;  /* --min-ext-len 30 */
+        /* Band mate rescue to a 6-mer anchor diagonal (--rescue-kmer=6). Opt-in,
+         * not byte-identical, but truth-based ROC (holodeck, hg38 + bisulfite
+         * chr20) shows accuracy neutral-to-positive and confident (MAPQ>=60)
+         * mismaps unchanged; k=6 is the measured wall-time peak (~-22% on the
+         * rescue-heavy WGS tail). */
+        if (!opt0.rescue_kmer)  opt->rescue_kmer  = MEM_RESCUE_KMER_DEFAULT;
+        /* --rescue-skip is deliberately NOT part of --fast. It drops mate
+         * rescues rather than shortening them, and on real reads that costs
+         * confident alignments: measured against --rescue-kmer alone, 16 losses
+         * at MAPQ>=30 per 200k primaries on 125 bp WGBS and 420 per 2M on 75 bp
+         * em-seq, because the fixed vote floor is read-length-blind and skips
+         * 42%/79% of scans at those lengths. --fast is meant to be a
+         * characterized speed preset, not a recall trade. */
         /* --max-extend-chains: 5 for non-meth; 10 under --meth. A 7-point ablation
          * ({0,5,10,20,50,100,1000}) on 1M sim-meth PE pairs (with mate-concordant
          * rescue on, below) shows chr-accuracy flat (0.9908) at every cap but the
          * confident wrong-chromosome rate is U-shaped, minimized at 10 (cap 5: 592
          * MAPQ>=30 mismaps; cap 10: 382; uncapped: 1056), for +0.7s wall (20.2->20.9s,
-         * still -6% vs uncapped). Non-meth keeps 5 (its placement is cap-insensitive
-         * and 5 is the pure-speed pick). */
-        if (!opt0.max_extend_chains) opt->max_extend_chains = opt->meth_mode ? 10 : 5;
+         * still -6% vs uncapped). Non-meth uses 20 + --extend-mate-concordant
+         * (below): the non-meth sweep in #202 shows the plain cap 5 inflates the
+         * confident (MAPQ>=1) mis-placement tail 3.8x on sim-wgs-place (3,626 ->
+         * 13,921 vs uncapped); cap 20 + mate-concordant lands within +827 of that
+         * floor (verified --fast) while keeping ~-20% aligner CPU. */
+        if (!opt0.max_extend_chains) opt->max_extend_chains = opt->meth_mode ? 10 : 20;
         opt->smem_dedup = 1;                             /* --smem-dedup (plain on/off) */
+        opt->alnreg_sort_fast = 1;                       /* strict-total-order + pdqsort dedup sort
+                                                          * (~35-55% faster for n>=9; diverges from
+                                                          * bwa-mem2 on equal-`re` ties) */
         opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
                                                           * meth-gated internally) */
         opt->band_start = ADAPTIVE_BAND_START;           /* --adaptive-band: no-op on short reads
@@ -1485,11 +2632,15 @@ int main_mem(int argc, char *argv[])
          * locus (99% proper-pair). Keeping any capped chain that is concordant with
          * a mate chain retains exactly the true pair's low-weight chain while still
          * dropping the far/redundant ones, recovering placement to default parity
-         * (97.64% -> 98.08%, == cap-off 98.09%). Non-meth --fast keeps the plain
-         * cap (WGS placement is already unaffected and the exemption would erode
-         * the speedup). Auto (-1) sizes the concordance window to the estimated
-         * proper-pair insert bound so only genuine pair anchors are retained. */
-        if (opt->meth_mode && !opt0.mate_concordant_window)
+         * (97.64% -> 98.08%, == cap-off 98.09%). Non-meth --fast benefits too:
+         * the same top-5 cap inflates confident (MAPQ>=1) mismaps 3.8x on
+         * sim-wgs-place (3,626 -> 13,921 vs uncapped), for the same reason -- the
+         * true chain is low-weight but mate-concordant in 98% of cap-dropped reads.
+         * Mate-concordant retention recovers ~60% of that (-> 5,521) at ~neutral
+         * CPU, so it is enabled for non-meth --fast as well (fg-labs/bwa-mem3#202).
+         * Auto (-1) sizes the concordance window to the estimated proper-pair
+         * insert bound so only genuine pair anchors are retained. */
+        if (!opt0.mate_concordant_window)
             opt->mate_concordant_window = -1;
         if (opt->meth_mode && !opt0.split_width)
             opt->split_width = 2;                        /* -s 2 (meth only): light Pass-2 reseed.
@@ -1502,8 +2653,8 @@ int main_mem(int argc, char *argv[])
     /* Meth-mode default tuning. bwameth.py runs bwa as
      * `bwa mem -T 40 -B 2 -L 10 -CM`, adding `-U 100 -p` for paired-end. We adopt
      * the soft-clip (-L 10), unpaired (-U 100), output-threshold (-T 40), -M and
-     * -C defaults for BOTH --meth-scoring modes; the ONLY mode-dependent knob is
-     * the mismatch penalty (the leniency gate):
+     * -C defaults for ALL THREE --meth-scoring modes; the ONLY mode-dependent knob
+     * is the mismatch penalty (the leniency gate):
      *   COLLAPSED (bwameth drop-in): -B 2 — bwameth's lenient mismatch. Combined
      *     with the two-cell matrix (C/T and G/A free both ways) this reproduces
      *     bwameth's collapsed-space placement.
@@ -1511,20 +2662,64 @@ int main_mem(int argc, char *argv[])
      *     A/B with the asymmetric matrix showed b=4 places better and is better
      *     MAPQ-calibrated than b=2 (placement 92.6 vs 92.5, discordant MAPQ
      *     1.8 vs 2.1).
+     *   NEUTRAL (variant-aware, the --meth=taps default): also keeps -B 4. It
+     *     differs from GENOMIC only in the freed cell's VALUE (0 vs +a), not in
+     *     the leniency gate, so the same b=4 argument applies unchanged.
      * pen_unpaired is only consulted for paired-end rescue, so setting it
      * unconditionally is a no-op for single-end. -A/-B always override and reach
-     * the matrices (mem_opt_fill_meth_mat below). */
+     * the matrices (mem_opt_fill_meth_mat below).
+     * NB: those constants are quoted at bwameth's match score (a == 1) and are
+     * scaled by opt->a inside mem_opt_apply_meth_defaults — see bwamem.h. Before
+     * that, they were applied flat and silently discarded -A. */
     if (opt->meth_mode) {
-        if (!opt0.pen_clip5)    opt->pen_clip5   = 10;
-        if (!opt0.pen_clip3)    opt->pen_clip3   = 10;
-        if (!opt0.pen_unpaired) opt->pen_unpaired = 100;  /* bwameth -U 100 (paired) */
-        if (!opt0.T)            opt->T           = 40;
-        opt->flag |= MEM_F_NO_MULTI;   /* -M */
+        /* TAPS defaults to NEUTRAL scoring. TAPS converts only the METHYLATED
+         * cytosines, so conversions are ~20-30x rarer than under em-seq (measured:
+         * 3.2% of C vs 94.6% on chr22 @ 12x). The collapsed 3-letter alphabet buys
+         * little at that density and costs specificity. NEUTRAL goes one step
+         * further: it scores the conversion cell as 0 rather than a full match,
+         * so a sparse TAPS conversion is tolerated without over-crediting spurious
+         * C->T alignments. Measured on 4.07M simulated TAPS reads vs full hg38,
+         * across three methylation loads: NEUTRAL placed 95.95-96.01% (essentially
+         * the 96.02% unconverted ceiling) vs GENOMIC 95.68-95.73% and COLLAPSED
+         * 95.37-95.43% -- a robust +0.24-0.28 pp over genomic -- with IDENTICAL
+         * MAPQ calibration (60+ bin 99.99% both) and NM (1.966 vs 1.969), so the
+         * gain is not bought with over-confidence or inflated edit distance.
+         * NEUTRAL's freed cell is not rank-1, but the generalized kswv freed-cell
+         * blend scores it to its matrix value, so mate rescue stays on the batched
+         * kernel on the freed-capable tiers (NEON/AVX2/AVX512BW) and falls back to
+         * scalar ksw_align2 only on the freed-less x86 tiers (sse41/sse42/avx),
+         * exactly as GENOMIC and COLLAPSED do. An explicit --meth-scoring still wins.
+         * Set before mem_opt_apply_meth_defaults so its COLLAPSED -B 2 branch keys
+         * off the resolved scoring mode. See
+         * reports/2026-07-20-taps-alignment-experiment-results.md. */
+        if (opt->meth_chem == METH_CHEM_TAPS && !opt0.meth_scoring)
+            opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
+        /* Scored defaults live in mem_opt_apply_meth_defaults so they scale with
+         * -A (bwameth's constants assume a==1) and can be unit-tested. */
+        mem_opt_apply_meth_defaults(opt, &opt0);
         aux.copy_comment = 1;          /* -C, needed for YS:Z/YC:Z passthrough */
-        if (opt->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
-            if (!opt0.b) opt->b = 2;   /* bwameth's lenient mismatch */
-        }
-        /* GENOMIC keeps bwa's default b=4 (variant-aware). */
+    }
+
+    /* Under --meth, NM/MD are derived from the scoring matrix (a column is a
+     * mismatch iff the matrix penalizes it), so a non-positive -B makes every
+     * substitution cell non-negative and silently collapses NM to 0 and MD to
+     * a bare match run -- hiding real variants, not just conversions. Refuse it
+     * rather than emit output that looks clean because scoring is degenerate.
+     * The bound is `<= 0`, not `== 0`: bwa_fill_scmat stores -b, so a NEGATIVE
+     * -B turns every substitution into a positive reward, which hides real
+     * variants at least as thoroughly as -B 0 does.
+     * The message reports the EFFECTIVE penalty rather than echoing "-B":
+     * update_a() scales b by -A when -B was not given, so `-A 0` reaches b == 0
+     * without the user ever passing -B, and naming -B there would misdirect.
+     * The non-meth path keeps the literal comparison and is unaffected. */
+    if (opt->meth_mode && opt->b <= 0) {
+        fprintf(stderr, "ERROR: --meth requires a positive mismatch penalty, but the "
+                        "effective penalty is %d; a non-positive penalty makes every "
+                        "substitution free or rewarded, which collapses NM/MD to zero "
+                        "and hides real variants (check -B and -A)\n", opt->b);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
     }
 
     /* Matrix for SWA */
@@ -1609,15 +2804,50 @@ int main_mem(int argc, char *argv[])
     if (opt->seed_emit_order != SEED_ORDER_OFF)
         fprintf(stderr, "[M::%s] seed order: %s\n", __func__, seed_order_to_str(opt->seed_emit_order));
     if (fast) {
+        /* `alnreg-sort=fast` is deliberately spelled WITHOUT a leading `--`: unlike
+         * every other item on this line it is not a flag the user can pass, only a
+         * lever --fast turns on. That is also why it must be here: with no flag to
+         * grep for, this line is the only record a run leaves of a lever that
+         * changes output (see the comparator commentary in src/bwamem.cpp). It is
+         * not meth-gated, so it appears on both branches. */
+        /* --rescue-kmer reports its RESOLVED K, and reports `=0` when the user opted
+         * back out, because 0 is the one --fast lever whose off-state is invisible
+         * anywhere else in the run -- it changes MAPQ on rescued reads, so which way
+         * it resolved has to be on the record. It applies under --meth too (the
+         * anchor scan collapses to 3 letters there), so it is on both branches. */
         if (opt->meth_mode)
             /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
              * intentionally omitted from the meth audit line to reflect the effective levers.
              * --adaptive-band is set unconditionally and applies under --meth, so it stays. */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width);
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains);
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
+        /* --fast also caps the batch size, which keeps the read/compute/write
+         * pipeline overlapped at high -t. It re-partitions the input and so is not
+         * byte-identical -- which --fast already is not -- hence it rides here
+         * rather than in the default path. An explicit --chunk-cap still wins. */
+        if (!chunk_cap_set) chunk_cap = 256000000;
+    }
+
+    /* --rescue-skip keys entirely off the --rescue-kmer anchor scan, so without
+     * that scan it has nothing to decide on and would silently do nothing. Reject
+     * rather than no-op, matching how --rescue-kmer and --rescue-band already
+     * reject out-of-range values instead of clamping: a flag that changes which
+     * reads get rescued must not be quietly inert.
+     *
+     * Deliberately placed AFTER getopt and after the --fast block: rescue_kmer is
+     * not final until --fast has resolved it, so checking inline in the getopt
+     * case would make the diagnostic depend on the order the flags were typed.
+     * --fast does not set rescue_skip, so `--fast --rescue-kmer=0` reaches here
+     * with rescue_skip == 0 and passes. */
+    if (opt->rescue_skip && !opt->rescue_kmer) {
+        fprintf(stderr, "ERROR: --rescue-skip requires --rescue-kmer (the skip decision "
+                        "reuses the k-mer anchor scan); got --rescue-kmer=0\n");
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
     }
 
     /* Load bwt2/FMI index */
@@ -1635,7 +2865,7 @@ int main_mem(int argc, char *argv[])
     /* D3 --meth: load the SEED index's FM + bns but NOT its pac. The seed pac is
      * never read in --meth (extension/scoring/mate-rescue use meth_orig_pac);
      * skipping it saves ~1.6 GB on hg38. Outside --meth, load the pac as before. */
-    aux.fmi->load_index(/*load_pac=*/!opt->meth_mode);
+    aux.fmi->load_index(/*load_pac=*/!opt->meth_mode, /*n_threads=*/opt->n_threads);
     aux.shm_base = aux.fmi->shm_attached_base();
     tprof[FMI][0] += __rdtsc() - tim;
 
@@ -1807,21 +3037,46 @@ int main_mem(int argc, char *argv[])
      * <baseprefix>.dict) once and route them into both output paths. The
      * SAM text path merges these with user -H per lh3/bwa#348 precedence;
      * the --bam path forwards them to htslib's sam_hdr_add_lines so the
-     * rich @SQ (AS/M5/SP/AH/…) also makes it into the BAM header. */
-    char *idx_hdr_lines = bwa_load_hdr_from_index(ref_prefix);
+     * rich @SQ (AS/M5/SP/AH/…) also makes it into the BAM header.
+     *
+     * Skipped entirely under a compat target: the sidecar is a bwa-mem3-only
+     * feature (a port of lh3/bwa#348, which lh3 closed unmerged), so neither
+     * bwa nor bwa-mem2 has anything to load. Its @SQ block adds M5/AS/UR/SP
+     * that no upstream emits, and on the bench hg38 index its @HD as well.
+     * Skipping restores the generated bare SN/LN @SQ block -- including the
+     * AH:* on ALT contigs that both upstreams emit -- which is exactly the
+     * target output. */
+    char *idx_hdr_lines = opt->compat->read_sidecar
+                        ? bwa_load_hdr_from_index(ref_prefix)
+                        : NULL;
+    /* A sidecar @SQ block that omits AH on ALT contigs silently strips ALT
+     * status from the output. We do not rewrite it (it is authoritative --
+     * see the function's comment), but we do say so. Not reached under a
+     * compat target: idx_hdr_lines is NULL there and @SQ is regenerated from
+     * bns, AH included. */
+    if (idx_hdr_lines != NULL && !opt->meth_mode)
+        bwa_warn_sidecar_missing_AH(aux.fmi->idx->bns, idx_hdr_lines, ref_prefix);
     /* --meth only: the original (pre-c2t) reference's .hdr/.dict sidecar, for
      * @SQ M5/UR enrichment and @CO/@PG/@RG pass-through in meth_bam_writer_open.
-     * NULL outside --meth or when the original has no sidecar. */
+     * NULL outside --meth or when the original has no sidecar.
+     *
+     * Deliberately NOT gated on opt->compat->read_sidecar, unlike the load
+     * above: --compat with --meth is rejected during option validation (see the
+     * guard earlier in this function), so this load is unreachable under any
+     * compat target. If that exclusion is ever relaxed, this needs the gate. */
     char *meth_orig_hdr_lines = (meth_orig_ref_prefix != NULL)
                                 ? bwa_load_hdr_from_index(meth_orig_ref_prefix)
                                 : NULL;
 
-    /* Output path:
-     *  - --meth: open meth_bam_writer with strand-consolidated SQ headers.
-     *    Honors -o/-f (target path) or stdout ("-").
+    /* Output path. --meth picks the WRITER (it owns the meth @SQ/@PG header and
+     * the bam1_t overlay); --bam picks the CONTAINER within whichever writer.
+     *  - --meth [--bam]: open meth_bam_writer, which serializes its bam1_t to
+     *    BGZF under --bam and to SAM text without it. Honors -o/-f or stdout.
      *  - --bam (no --meth): open generic bam_writer; htslib writes its own
      *    @HD + @SQ + @PG header. Honors -o/-f or stdout.
-     *  - SAM text: open -o/-f path (if any) as a FILE*; bwa_print_sam_hdr2. */
+     *  - SAM text (no --meth, no --bam): open -o/-f path (if any) as a FILE*;
+     *    bwa_print_sam_hdr2. Note the meth writer claims -o itself in the first
+     *    branch, so this fopen stays unreachable under --meth. */
     bam_writer_t *bam_writer = NULL;
 #ifdef DISABLE_OUTPUT
     /* profile-build (-DDISABLE_OUTPUT) skips ALL filesystem-touching output
@@ -1879,9 +3134,10 @@ int main_mem(int argc, char *argv[])
         g_meth_bam_writer = meth_bam_writer_open(meth_out_path, aux.meth_orig_bns,
                                                  bwa_pg, NULL,
                                                  hdr_line, meth_orig_hdr_lines,
-                                                 opt->bam_level);
+                                                 opt->bam_mode, opt->bam_level);
         if (g_meth_bam_writer == NULL) {
-            fprintf(stderr, "ERROR: meth: failed to open BAM writer for '%s'\n", meth_out_path);
+            fprintf(stderr, "ERROR: meth: failed to open %s writer for '%s'\n",
+                    opt->bam_mode ? "BAM" : "SAM", meth_out_path);
             g_meth_orig_pac = NULL;
             free(opt);
             delete aux.fmi;
@@ -1892,15 +3148,11 @@ int main_mem(int argc, char *argv[])
         extern char *bwa_pg;
         /* Suppress idx .hdr/.dict records entirely when the user's -H
          * supplies any @SQ, matching bwa_print_sam_hdr2's SAM precedence. */
-        const char *bam_idx_hdr = idx_hdr_lines;
-        if (hdr_line != NULL) {
-            if (strncmp(hdr_line, "@SQ\t", 4) == 0 ||
-                strstr(hdr_line, "\n@SQ\t") != NULL)
-                bam_idx_hdr = NULL;
-        }
+        const char *bam_idx_hdr = bwa_hdr_text_has_type(hdr_line, "@SQ\t")
+                                ? NULL : idx_hdr_lines;
         bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns,
                                      bam_idx_hdr, hdr_line,
-                                     bwa_pg, opt->bam_level);
+                                     bwa_pg, opt->bam_level, opt->compat);
         if (bam_writer == NULL) {
             fprintf(stderr, "ERROR: failed to open BAM writer at '%s'\n", bam_path);
             free(opt);
@@ -1920,7 +3172,8 @@ int main_mem(int argc, char *argv[])
             }
             out_opened = true;
         }
-        bwa_print_sam_hdr2(aux.fmi->idx->bns, idx_hdr_lines, hdr_line, aux.fp);
+        bwa_print_sam_hdr2(aux.fmi->idx->bns, idx_hdr_lines, hdr_line, aux.fp,
+                           opt->compat);
     }
 #endif
 
@@ -1929,25 +3182,172 @@ int main_mem(int argc, char *argv[])
          * exactly, never cap. */
         aux.task_size = fixed_chunk_size;
     } else {
-        /* Default batch size is chunk_size (~10M bases) per thread. That keeps
-         * each thread well-fed, but at very high -t it makes a single chunk
-         * enormous (10M * 192 ~= 1.9G bases), so the input is only ~3-4 chunks
-         * and the pipeline starves: the first chunk's read and the last chunk's
-         * write don't overlap anything, leaving cores idle (fill/drain). Cap the
-         * default so high -t still produces enough chunks to keep read/compute/
-         * write overlapped, while keeping each chunk far above the ~33k-pairs
-         * floor below which per-chunk overhead (pestat/barriers) starts to bite.
-         * Output stays identical for -t small enough that the cap doesn't engage
-         * (scaled <= cap); above that, batch composition changes exactly as -K
-         * would (validated to leave proper-pair rate unchanged). The cap is
-         * overridable via BWA_MEM3_CHUNK_CAP (bases; <=0 disables, for sweeps). */
-        int64_t cap = 256000000;
+        /* Default batch size is chunk_size (~10M bases) per thread -- byte-for-byte
+         * the same formula as bwa (fastmap.c: `opt->chunk_size * opt->n_threads`)
+         * and bwa-mem2 v2.2.1 (fastmap.cpp: same), with NO cap.
+         *
+         * A cap is tempting: at very high -t a single chunk becomes enormous
+         * (10M * 192 ~= 1.9G bases), so the input is only ~3-4 chunks and the
+         * pipeline starves -- the first chunk's read and the last chunk's write
+         * overlap nothing (fill/drain). Measured on c8g.16xlarge / wgs-5M, that
+         * costs ~1.6s of a 25.8s PROCESS() at -t 64.
+         *
+         * But capping RE-PARTITIONS THE INPUT, and the partition is not an
+         * implementation detail: mem_pestat() infers the insert-size distribution
+         * from whatever reads land in a batch (bwamem.cpp), and those percentile
+         * bounds feed pairing, mate rescue and MAPQ. Different batches => different
+         * pes => different output. Everything else in the aligner is batch-invariant
+         * (read ids come from the global n_processed counter, so the hash_64 tie
+         * breaks are stable), which makes mem_pestat the single reason a cap is
+         * observable at all -- and it is enough.
+         *
+         * A default cap of 256M therefore silently broke byte-identity with
+         * bwa/bwa-mem2 for every -t >= 26 (10M * 26 > 256M) -- ordinary production
+         * settings -- while looking safe because the benchmark aligns at -t 16,
+         * where the cap never engaged. So the cap is now OPT-IN:
+         *
+         *   default            no cap; identical batching to bwa/bwa-mem2 at any -t
+         *   --chunk-cap N      cap at N bases (0 = off)
+         *   --fast             implies --chunk-cap 256000000 (--fast already does
+         *                      not promise byte-identical output)
+         *   BWA_MEM3_CHUNK_CAP env override, for sweeps; wins over both
+         *
+         * If you want a specific batch size AND reproducibility, use -K: it pins
+         * the size exactly and is never capped (see the branch above), which also
+         * makes output independent of -t. */
+        int64_t cap = chunk_cap;
+        /* An unset or EMPTY value leaves the CLI/--fast cap alone -- atoll("") is
+         * 0, which would otherwise read as "no cap" and silently switch an
+         * explicit --chunk-cap off. A malformed value is reported rather than
+         * silently treated as 0 for the same reason: this variable changes how
+         * the input is partitioned, so a typo in it must not quietly change the
+         * output. Reported, not fatal -- unlike the --chunk-cap flag, the index
+         * is already loaded here, and an unusable sweep value should not throw
+         * that work away when the documented default is still correct. */
         const char *cap_env = getenv("BWA_MEM3_CHUNK_CAP");
-        if (cap_env && *cap_env) cap = (int64_t)atoll(cap_env);
+        if (cap_env && *cap_env) {
+            if (parse_bounded_i64(cap_env, 0, INT64_MAX, &cap) != 0)
+                fprintf(stderr, "WARNING: BWA_MEM3_CHUNK_CAP='%s' is not a "
+                                "non-negative integer; ignoring it and using "
+                                "chunk cap %lld\n", cap_env, (long long)cap);
+        }
         int64_t scaled = (int64_t)opt->chunk_size * (int64_t)opt->n_threads;
         aux.task_size = (cap > 0 && scaled > cap) ? cap : scaled;
+        if (cap > 0 && scaled > cap)
+            fprintf(stderr, "[M::%s] chunk cap engaged: batch %lld -> %lld bases; "
+                    "output is NOT byte-identical to bwa/bwa-mem2 at this -t\n",
+                    __func__, (long long)scaled, (long long)cap);
     }
     tprof[MISC][1] = opt->chunk_size = aux.actual_chunk_size = aux.task_size;
+
+    /* Cohort slicing. The first batch's read overlaps nothing -- the compute
+     * pipeline has nothing to chew on until it lands -- and with the cap now
+     * opt-in that first read is `chunk_size * n_threads` bases, the largest
+     * single unhidden cost in the run. Reading the FIRST cohort as a geometric
+     * ramp lets compute start on the first slice -- cohort_ramp_first bases,
+     * 16 Mbase by default, independent of -t -- while the rest is still
+     * arriving.
+     *
+     * This does not move the cohort boundary, so mem_pestat sees exactly the
+     * read set it would have seen otherwise and the output is unchanged. See
+     * the slice-target clamp in the read step for why the boundary is preserved
+     * even though each read overshoots its request.
+     *
+     * Steady-state cohorts stay single-slice: once the pipeline is full,
+     * read(N+1) already overlaps compute(N), so slicing them would only add
+     * kt_for passes and shrink the SIMD batches for no overlap gain. */
+    {
+        int64_t slices = cohort_slices;
+        /* Validated like BWA_MEM3_CHUNK_CAP, and non-fatal for the same reason
+         * (the index is already loaded here): a bare atoll turns a typo into 0,
+         * which means "no slicing" -- silently disabling the thing the variable
+         * was set to configure. An empty value leaves the CLI/default alone. */
+        const char *cs_env = getenv("BWA_MEM3_COHORT_SLICES");
+        if (cs_env && *cs_env) {
+            if (parse_bounded_i64(cs_env, 0, COHORT_SLICES_MAX, &slices) != 0)
+                fprintf(stderr, "WARNING: BWA_MEM3_COHORT_SLICES='%s' is not an "
+                                "integer in 0..%d; ignoring it and using %lld\n",
+                        cs_env, (int)COHORT_SLICES_MAX, (long long)slices);
+        }
+        /* -p re-derives pairing from adjacency across the WHOLE array
+         * (bseq_classify carries has_last state), so a slice boundary between
+         * two mates would classify them as two SEs, change n_sep[], and shift
+         * the read-id base handed to the second mem_process_seqs. Classification
+         * must therefore precede alignment, which is incompatible with aligning
+         * slices early. Fall back to un-sliced cohorts. */
+        if (opt->flag & MEM_F_SMARTPE) {
+            if (slices > 0)
+                fprintf(stderr, "[M::%s] -p (smart pairing) is incompatible with "
+                        "cohort slicing; reading each batch in one slice\n", __func__);
+            slices = 0;
+        }
+        aux.cohort_slices = slices > 0 ? slices : 0;
+        /* Stress knob for test/regression/cohort_slice_identity.sh: slice every
+         * cohort, not just the first, so a small input exercises the accumulator
+         * and the boundary clamp many times over. Deliberately env-only -- it
+         * trades throughput for coverage and is not a mode users should pick. */
+        const char *sa_env = getenv("BWA_MEM3_COHORT_SLICE_ALL");
+        aux.cohort_slice_all = (sa_env && *sa_env && strcmp(sa_env, "0") != 0) ? 1 : 0;
+        if (aux.cohort_slice_all && aux.cohort_slices > 0)
+            fprintf(stderr, "[M::%s] BWA_MEM3_COHORT_SLICE_ALL set: slicing every "
+                    "cohort (stress mode; slower)\n", __func__);
+
+        /* Ramp growth ratio. Env override for sweeps, as with the slice count.
+         * A ratio at or below 1 would shrink the ramp rather than grow it, so it
+         * cannot reach the cohort at all; that is user error, not a mode, and the
+         * default is restored rather than reading the input in equal dribbles. */
+        double ramp_ratio = cohort_ramp_ratio;
+        const char *rr_env = getenv("BWA_MEM3_COHORT_RAMP_RATIO");
+        if (rr_env && *rr_env) {
+            /* Parsed exactly like --cohort-ramp-ratio, and for the same reason:
+             * atof() accepts a prefix, so '1.5x' silently becomes 1.5 and
+             * 'abc' becomes 0.0. The 0.0 case would at least surface via the
+             * `<= 1` guard below, but as a ratio the user never typed. Only
+             * PARSEABILITY is checked here -- the `<= 1` range check stays
+             * below, shared with the CLI value, because it is a documented
+             * fallback rather than an error. */
+            if (parse_full_double(rr_env, &ramp_ratio) != 0)
+                fprintf(stderr, "WARNING: BWA_MEM3_COHORT_RAMP_RATIO='%s' is not "
+                                "a number; ignoring it and using %.2f\n",
+                        rr_env, ramp_ratio);
+        }
+        /* Spelled as the negation of the ACCEPT condition, not `<= 1.0`, so NaN
+         * lands here too: strtod("nan") parses cleanly and every comparison
+         * against NaN is false, so `<= 1.0` would wave it through as a valid
+         * ratio. It would then poison the ramp -- prev * NaN is NaN, which is
+         * neither >= task_size nor convertible to int64_t, putting the ramp back
+         * on the undefined conversion the saturation in the read step exists to
+         * avoid. A ratio that cannot grow the ramp is user error either way. */
+        if (!(ramp_ratio > 1.0)) {
+            fprintf(stderr, "[M::%s] a cohort ramp ratio of %.3f would never grow "
+                    "the ramp to the cohort; using %.2f\n",
+                    __func__, ramp_ratio, cohort_ramp_ratio_default);
+            ramp_ratio = cohort_ramp_ratio_default;
+        }
+        aux.cohort_ramp_ratio = ramp_ratio;
+
+        /* First-slice size, also env-overridable for sweeps. 0 selects the old
+         * fractional shape (task_size / ratio^depth), which is what makes an
+         * exact A/B against the pre-absolute behaviour possible; negative is
+         * meaningless, so it is treated as 0 rather than silently clamped. */
+        int64_t ramp_first = cohort_ramp_first;
+        const char *rf_env = getenv("BWA_MEM3_COHORT_RAMP_FIRST");
+        if (rf_env && *rf_env) {
+            /* Validated exactly like --cohort-ramp-first. Without this, the env
+             * spelling reintroduces the bug the flag's validation exists to
+             * prevent: atoll("16M") is 16, a positive value, so
+             * BWA_MEM3_COHORT_RAMP_FIRST=16M would silently request a SIXTEEN
+             * BYTE first slice instead of 16 Mbases. Non-fatal here, unlike the
+             * flag, because the index is already loaded by this point -- same
+             * choice BWA_MEM3_CHUNK_CAP and BWA_MEM3_COHORT_SLICES make above. */
+            if (parse_bounded_i64(rf_env, 0, INT64_MAX, &ramp_first) != 0)
+                fprintf(stderr, "WARNING: BWA_MEM3_COHORT_RAMP_FIRST='%s' is not "
+                                "a non-negative integer number of bases; ignoring "
+                                "it and using %lld\n",
+                        rf_env, (long long)ramp_first);
+        }
+        aux.cohort_ramp_first = ramp_first > 0 ? ramp_first : 0;
+    }
 
     /* Pipeline depth. The 3-step pipeline (read / process / write) is gated by
      * how many of those steps can run at once. With 2 workers only 2 of the 3
@@ -2062,6 +3462,29 @@ int main_mem(int argc, char *argv[])
     /* Display runtime profiling stats */
     tprof[MEM][0] = __rdtsc() - tprof[MEM][0];
     display_stats(nt);
+
+#ifdef BWA_MEM3_DEBUG_RESCUE_STATS
+    /* How the --rescue-kmer anchor gate resolved over the whole run. A wall-time
+     * delta is uninterpretable without these: a vote floor tuned too high drives
+     * the narrowing rate toward zero while the scan still costs its full pass,
+     * which reads as "the optimization did nothing" rather than "the gate
+     * rejected everything". Printed unconditionally under the macro so a run with
+     * the knob off shows 0/0/0 rather than nothing at all. */
+    {
+        extern std::atomic<uint64_t> g_rescue_stat_scans;
+        extern std::atomic<uint64_t> g_rescue_stat_narrowed;
+        extern std::atomic<uint64_t> g_rescue_stat_skipped;
+        uint64_t sc = g_rescue_stat_scans.load(std::memory_order_relaxed);
+        uint64_t nw = g_rescue_stat_narrowed.load(std::memory_order_relaxed);
+        uint64_t sk = g_rescue_stat_skipped.load(std::memory_order_relaxed);
+        fprintf(stderr, "[M::%s] rescue-anchor: scans %llu narrowed %llu (%.2f%%) "
+                        "skipped %llu (%.2f%%)\n", __func__,
+                (unsigned long long)sc, (unsigned long long)nw,
+                sc ? 100.0 * (double)nw / (double)sc : 0.0,
+                (unsigned long long)sk,
+                sc ? 100.0 * (double)sk / (double)sc : 0.0);
+    }
+#endif
 
     return exit_code;
 }

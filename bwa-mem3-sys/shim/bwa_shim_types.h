@@ -69,6 +69,10 @@ typedef struct mem_opt_t {
     int mapQ_coef_fac;
     int max_ins;
     int max_matesw;
+    /* v0.9.0 */
+    int rescue_kmer;
+    int rescue_band;
+    int rescue_skip;
     int max_XA_hits, max_XA_hits_alt;
     int8_t mat[25];
     int8_t mat_ot[25];
@@ -77,12 +81,26 @@ typedef struct mem_opt_t {
     int    bam_level;
     int    meth_mode;
     int    meth_scoring;
+    /* v0.9.0 */
+    int    meth_chem;
+    int    meth_tags;
     char   meth_set_as_failed;
     int    meth_chimera_qc;
+    /* v0.9.0 */
+    int    proper_pair_from_emitted;
     int    supp_rep_hard_cap;
     int    smem_dedup;
+    /* v0.9.0 */
+    int    alnreg_sort_fast;
     int    skip_contained_ext;
     int    band_start;
+    /* v0.9.0. Upstream's type is `const compat_target_t *`; mirrored as an
+     * opaque `const void *` because the POD only has to reproduce the LAYOUT
+     * (pointer size and alignment), and pulling in compat_target_t would drag
+     * the header graph bwa_shim.h exists to avoid. Nothing on the Rust side
+     * reads it; bwa_shim_layout_assert.cpp checks the offset against the real
+     * struct, which is what keeps this honest. */
+    const void *compat;
 } mem_opt_t;
 
 /* Mirror of bwamem.h:239-243. */

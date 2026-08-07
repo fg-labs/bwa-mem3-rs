@@ -37,7 +37,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 indexEle::indexEle()
 {
     idx = (bwaidx_fm_t*) calloc(1, sizeof(bwaidx_fm_t));
-    assert(idx != NULL);
+    xassert(idx != NULL, "out of memory: idx");
 }
 
 indexEle::~indexEle()
@@ -48,6 +48,9 @@ indexEle::~indexEle()
         if (idx->bns) bns_destroy(idx->bns);
         if (idx->pac) free(idx->pac);
     } else {
+        // SAM-A3: pos2rid_bucket is a private heap allocation (not aliased into
+        // the shm segment), so it must be freed even on the shm branch.
+        free(idx->bns->pos2rid_bucket);
         free(idx->bns->anns); free(idx->bns);
         if (!idx->is_shm) free(idx->mem);
     }
@@ -59,7 +62,7 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which)
     char *prefix;
     int l_hint = strlen(hint);
     prefix = (char *) malloc(l_hint + 3 + 4 + 1);
-    assert(prefix != NULL);
+    xassert(prefix != NULL, "out of memory: prefix");
     strcpy(prefix, hint);
 
     fprintf(stderr, "* Index prefix: %s\n", prefix);
@@ -81,7 +84,7 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which)
         {
             int64_t pac_bytes = idx->bns->l_pac/4+1;
             idx->pac = (uint8_t*) calloc(pac_bytes, 1);
-            assert(idx->pac != NULL);
+            xassert(idx->pac != NULL, "out of memory: idx->pac");
             bwamem_madv_hugepage(idx->pac, pac_bytes);
             err_fread_noeof(idx->pac, 1, pac_bytes, idx->bns->fp_pac); // concatenated 2-bit encoded sequence
             err_fclose(idx->bns->fp_pac);
@@ -140,6 +143,12 @@ void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pa
      * the segment was packed after that close, but zeroing here is cheap
      * insurance against a future writer that forgets. */
     idx->bns->fp_pac = NULL;
+    /* SAM-A3: bwa_shm_pack_into stages a NULL pos2rid_bucket, but a segment
+     * written by an older or out-of-tree stager may carry a pointer into that
+     * writer's address space. Drop whatever the memcpy above brought in; the
+     * table is rebuilt against this process's own anns[] once anns are
+     * populated (see below). */
+    idx->bns->pos2rid_bucket = NULL;
 
     /* Validate the trusted-by-default scalar fields immediately after the
      * memcpy from the segment. A corrupt or maliciously crafted segment
@@ -240,6 +249,10 @@ void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pa
      * must NOT be freed individually. Likewise the patched anns[i].name /
      * anns[i].anno pointers. The destructor only frees idx->bns and
      * idx->bns->anns (both heap-copies above), gated by is_shm correctly. */
+    /* SAM-A3: anns[] (with offsets) are now populated in this process's heap,
+     * so build the position->rid acceleration table against them. */
+    bns_build_pos2rid(idx->bns);
+
     idx->is_shm = 1;
     idx->mem    = base;
     idx->l_mem  = (int64_t)len;
@@ -256,7 +269,7 @@ char* indexEle::bwa_idx_infer_prefix(const char *hint)
     FILE *fp;
     l_hint = strlen(hint);
     prefix = (char *) malloc(l_hint + 3 + 4 + 1);
-    assert(prefix != NULL);
+    xassert(prefix != NULL, "out of memory: prefix");
     strcpy(prefix, hint);
     strcpy(prefix + l_hint, ".64.bwt");
     if ((fp = fopen(prefix, "rb")) != 0)
