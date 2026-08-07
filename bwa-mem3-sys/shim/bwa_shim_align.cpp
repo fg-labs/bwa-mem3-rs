@@ -75,7 +75,22 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
      * any future upstream code cannot act on an indeterminate pointer. */
     w.auxSeedBuf = NULL; w.auxSeedBufSize = 0;
 
-    w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
+    /* Every allocation in this block is sized from memSize (see the divergence
+     * note below), so a zero-read batch makes all three zero-size requests --
+     * and calloc(0, n) / malloc(0) are both permitted to return NULL. The
+     * xasserts deliberately do NOT compile out under NDEBUG, so without this
+     * guard an empty batch would abort a *release* build on any allocator that
+     * takes that option.
+     *
+     * Upstream guards only `regs` (fastmap.cpp:303-307); its other two are
+     * nthreads-sized and so never zero. Ours keeps the nreads sizing, so the
+     * guard has to cover all three.
+     *
+     * Leaving them NULL is a valid state, as it is upstream: the seeding and
+     * extension loops are bounded by n_seqs and never run, and worker_free is
+     * NULL-safe (free(NULL) is a no-op). */
+    if (memSize > 0) {
+        w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
 
     /* DELIBERATE DIVERGENCE from upstream's v0.9.0 worker_alloc, which sizes
      * these as `nthreads * BATCH_SIZE` and indexes them by `tid`.
@@ -101,18 +116,19 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
      * that nothing allocates (every real `auxSeedBuf` upstream is a local in
      * test_and_merge, bwamem.cpp:894). Taking that suggestion compiles and
      * then dereferences an unallocated pointer. */
-    w.chain_scratch = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
-    w.seed_scratch  = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
+        w.chain_scratch = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
+        w.seed_scratch  = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
 
-    /* xassert, not assert: these are ALLOCATION failures, and plain assert
-     * compiles out under NDEBUG -- turning an OOM into a null deref in exactly
-     * the build most likely to be memory-pressured. Upstream made the same
-     * switch in v0.9.0's worker_alloc (fastmap.cpp:306, :341-342). The argument
-     * preconditions above stay `assert`: those are programmer errors, not
-     * runtime conditions. */
-    xassert(w.seed_scratch  != NULL, "out of memory: w.seed_scratch");
-    xassert(w.regs          != NULL, "out of memory: w.regs");
-    xassert(w.chain_scratch != NULL, "out of memory: w.chain_scratch");
+        /* xassert, not assert: these are ALLOCATION failures, and plain assert
+         * compiles out under NDEBUG -- turning an OOM into a null deref in
+         * exactly the build most likely to be memory-pressured. Upstream made
+         * the same switch in v0.9.0's worker_alloc (fastmap.cpp:306, :341-342).
+         * The argument preconditions above stay `assert`: those are programmer
+         * errors, not runtime conditions. */
+        xassert(w.seed_scratch  != NULL, "out of memory: w.seed_scratch");
+        xassert(w.regs          != NULL, "out of memory: w.regs");
+        xassert(w.chain_scratch != NULL, "out of memory: w.chain_scratch");
+    }
 
     w.seed_scratch_size = BATCH_SIZE * AVG_SEEDS_PER_READ;
 
@@ -383,6 +399,11 @@ int64_t shim_align_idx_contig_len(void *opaque, size_t i) {
 static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
                                    int meth_mode) {
     int nseqs = (int)(2 * n_pairs);
+    /* NULL is an ALLOCATION FAILURE only when nseqs > 0. calloc(0, n) may
+     * legally return NULL, so on an empty batch a NULL return here means "no
+     * reads", not "out of memory" -- the caller distinguishes the two on
+     * n_pairs. Downstream is NULL-safe either way: every loop over the array is
+     * bounded by n_seqs, and free_seqs() returns early on NULL. */
     bseq1_t *seqs = (bseq1_t *) calloc(nseqs, sizeof(bseq1_t));
     if (!seqs) return nullptr;
     for (size_t i = 0; i < n_pairs; ++i) {
@@ -1002,7 +1023,10 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
     s->fmi  = fmi;
     s->n_seqs = (int)(2 * n_pairs);
     s->seqs = copy_pairs_to_seqs(pairs, n_pairs, opts->meth_mode);
-    if (!s->seqs) { free(s); return nullptr; }
+    /* `n_pairs > 0` qualifies the check: for an empty batch a NULL return is
+     * the allocator's prerogative on a zero-size request, not a failure, and
+     * reporting it as one would turn "align nothing" into a spurious error. */
+    if (!s->seqs && n_pairs > 0) { free(s); return nullptr; }
 
     /* D3 (--meth): borrow the original-coordinate handles from the index. NULL
      * outside --meth (or if a non-meth index was loaded), in which case the
