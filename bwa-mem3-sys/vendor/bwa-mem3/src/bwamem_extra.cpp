@@ -129,7 +129,7 @@ static inline int get_pri_idx(double XA_drop_ratio, const mem_alnreg_t *a, int i
 // Okay, returning strings is bad, but this has happened a lot elsewhere. If I have time, I need serious code cleanup.
 // When out_hn is non-NULL, it is set to a newly-allocated int[a->n] of per-primary
 // hit counts (cnt[r]) so callers can emit the HN:i tag; caller owns the buffer.
-char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn) // ONLY work after mem_mark_primary_se()
+char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn, const char *meth_orig_query) // ONLY work after mem_mark_primary_se()
 {
 	int i, k, r, *cnt, tot;
 	kstring_t *aln = 0, str = {0,0,0};
@@ -144,9 +144,9 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 	char has_alt_stack[HAS_ALT_STACK_N];
 
 	cnt = (int *) calloc(a->n, sizeof(int));
-    assert(cnt != NULL);
+    xassert(cnt != NULL, "out of memory: cnt");
 	has_alt = a->n <= HAS_ALT_STACK_N ? has_alt_stack : (char *) malloc(a->n);
-    assert(has_alt != NULL);
+    xassert(has_alt != NULL, "out of memory: has_alt");
 	memset(has_alt, 0, a->n);
 	for (i = 0, tot = 0; i < a->n; ++i) {
 		r = get_pri_idx(opt->XA_drop_ratio, a->a, i);
@@ -163,12 +163,16 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 	if (out_hn) *out_hn = cnt;
 	if (tot == 0) goto end_gen_alt;
 	aln = (kstring_t*) calloc(a->n, sizeof(kstring_t));
-    assert(aln != NULL);
+    xassert(aln != NULL, "out of memory: aln");
 	for (i = 0; i < a->n; ++i) {
 		mem_aln_t t;
 		if ((r = get_pri_idx(opt->XA_drop_ratio, a->a, i)) < 0) continue;
 		if (cnt[r] > opt->max_XA_hits_alt || (!has_alt[r] && cnt[r] > opt->max_XA_hits)) continue;
-		t = mem_reg2aln(opt, bns, pac, l_query, query, &a->a[i]);
+		/* Pass meth_orig_query so each XA sub-entry regenerates under the SAME
+		 * NM/MD policy as the primary record. Omitting it silently falls back to
+		 * the literal predicate, so one record would report matrix-derived NM:i:
+		 * on the primary and conversion-counting NM inside its own XA:Z. */
+		t = mem_reg2aln(opt, bns, pac, l_query, query, &a->a[i], meth_orig_query);
 		str.l = 0;
 		kputs(bns->anns[t.rid].name, &str);
 		kputc(',', &str); kputc("+-"[t.is_rev], &str); kputl(t.pos + 1, &str);
@@ -194,7 +198,7 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 		kputsn(str.s, str.l, &aln[r]);
 	}
 	XA = (char**) calloc(a->n, sizeof(char*));
-    assert(XA != NULL);
+    xassert(XA != NULL, "out of memory: XA");
 	for (k = 0; k < a->n; ++k)
 		XA[k] = aln[k].s;
 

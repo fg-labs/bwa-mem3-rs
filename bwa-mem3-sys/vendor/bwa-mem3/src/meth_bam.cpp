@@ -6,6 +6,7 @@
 #include "htslib/kstring.h"
 
 #include "meth_bam.h"
+#include "bam_rec_scratch.h"
 #include "bam_writer.h"
 #include "cigar_util.h"
 #include "meth_xm.h"
@@ -37,22 +38,6 @@ static void sanitize_cl(char *s)
     for (; *s; ++s) if (*s == '\t') *s = ' ';
 }
 
-/* True if the SAM header text `s` contains a line whose type is `tag4`
- * (e.g. "@HD\t"): either as the first line or following a newline. Used to
- * avoid emitting a default @HD when the user's -H already supplies one —
- * htslib's sam_hdr_add_lines does not de-dup @HD records, so two would be
- * written. Mirrors the same guard in bam_writer.cpp's default path. */
-static int hdr_text_has_type(const char *s, const char *tag4)
-{
-    if (s == NULL || s[0] == '\0') return 0;
-    size_t n = strlen(tag4);
-    if (strncmp(s, tag4, n) == 0) return 1;
-    char needle[8] = "\n";
-    /* tag4 is always 4 chars ("@XX\t"); "\n" + tag4 fits in 8. */
-    strncpy(needle + 1, tag4, sizeof(needle) - 2);
-    return strstr(s, needle) != NULL;
-}
-
 /* True if the tab-delimited @SQ `line` (length `line_len`) carries a token
  * exactly equal to `key``val` (whole token, not a prefix) — e.g. key="SN:"
  * val="<name>", or key="LN:" val="<decimal>". */
@@ -77,34 +62,36 @@ static int sq_line_has_kv(const char *line, size_t line_len,
 
 /* Append to `out` the reference-identity tags (M5/UR/AS/SP) found on the @SQ
  * line of `hdr_text` whose SN equals `sn`, each as "\t<TAG>:<value>". Used to
- * enrich the consolidated --meth @SQ with identity tags from the *original*
- * (pre-c2t) reference's .hdr/.dict sidecar, matched by SN. Enrichment is gated
- * on the sidecar line's LN also equalling `expected_len` (the chrom-map
- * length): a SN match with a differing LN means a stale or foreign sidecar
+ * enrich the --meth @SQ with identity tags from the *original* (pre-c2t)
+ * reference's .hdr/.dict sidecar, matched by SN. Enrichment is gated on the
+ * sidecar line's LN also equalling `expected_len` (the contig length from the
+ * original bns): a SN match with a differing LN means a stale or foreign sidecar
  * whose M5/UR would misidentify the sequence, so nothing is appended in that
  * case. Appends nothing if `hdr_text` is NULL/empty or has no matching @SQ.
  * SN is unique in a valid header, so the first match wins. */
-static void meth_append_sq_extra_tags(const char *hdr_text, const char *sn,
-                                      int64_t expected_len, kstring_t *out)
+/* Returns 0 on success (including "nothing to append"), -1 if a kstring append
+ * failed. The caller must not add the @SQ line on -1: `out` would be a
+ * truncated record, and emitting a header line missing half its identity tags
+ * is worse than failing the open. */
+static int meth_append_sq_extra_tags(const char *hdr_text, const char *sn,
+                                     int64_t expected_len, kstring_t *out)
 {
-    if (hdr_text == NULL || hdr_text[0] == '\0' || sn == NULL) return;
+    if (hdr_text == NULL || hdr_text[0] == '\0' || sn == NULL) return 0;
     static const char *const WANT[] = { "M5:", "UR:", "AS:", "SP:" };
     const int n_want = (int)(sizeof(WANT) / sizeof(WANT[0]));
     const size_t sn_len = strlen(sn);
     char ln_buf[32];
     int ln_len = snprintf(ln_buf, sizeof(ln_buf), "%lld", (long long)expected_len);
-    if (ln_len <= 0 || (size_t)ln_len >= sizeof(ln_buf)) return;
+    if (ln_len <= 0 || (size_t)ln_len >= sizeof(ln_buf)) return 0;
 
-    const char *line = hdr_text;
-    while (*line != '\0') {
-        const char *eol = strchr(line, '\n');
-        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+    const char *cur = hdr_text, *line; size_t line_len;
+    while (bwa_hdr_next_line(&cur, &line, &line_len)) {
         if (line_len >= 4 && strncmp(line, "@SQ\t", 4) == 0 &&
             sq_line_has_kv(line, line_len, "SN:", 3, sn, sn_len)) {
             /* SN matched: only enrich when LN agrees, else the sidecar is
              * stale/foreign and its identity tags can't be trusted. */
             if (!sq_line_has_kv(line, line_len, "LN:", 3, ln_buf, (size_t)ln_len))
-                return;
+                return 0;
             const char *end = line + line_len;
             const char *p = line + 3;
             while (p < end) {
@@ -113,41 +100,43 @@ static void meth_append_sq_extra_tags(const char *hdr_text, const char *sn,
                 if (tok_end == NULL) tok_end = end;
                 for (int i = 0; i < n_want; ++i) {
                     if ((size_t)(tok_end - tok) > 3 && strncmp(tok, WANT[i], 3) == 0) {
-                        kputc('\t', out);
-                        kputsn(tok, (int)(tok_end - tok), out);
+                        if (kputc('\t', out) < 0 ||
+                            kputsn(tok, (int)(tok_end - tok), out) < 0)
+                            return -1;
                         break;
                     }
                 }
                 p = tok_end;
             }
-            return;                           /* SN is unique; first match wins */
+            return 0;                         /* SN is unique; first match wins */
         }
-        if (eol == NULL) break;
-        line = eol + 1;
     }
+    return 0;
 }
 
 /* Append to `out` every record line of `hdr_text` that is NOT @HD or @SQ
  * (i.e. @CO/@PG/@RG and any others), each terminated by '\n'. @SQ is skipped
- * because the consolidated @SQ block is authoritative (its identity tags are
- * merged separately by meth_append_sq_extra_tags); @HD is skipped because the
- * writer emits its own. */
-static void meth_append_passthrough_records(const char *hdr_text, kstring_t *out)
+ * because the @SQ block built from the original reference is authoritative
+ * (its identity tags are merged separately by meth_append_sq_extra_tags); @HD
+ * is skipped because the
+ * writer emits its own.
+ *
+ * Returns 0 on success, -1 if a kstring append failed -- the same contract as
+ * meth_append_sq_extra_tags above, and for the same reason: on -1 `out` holds a
+ * truncated record set, so the caller must not pass it to sam_hdr_add_lines. */
+static int meth_append_passthrough_records(const char *hdr_text, kstring_t *out)
 {
-    if (hdr_text == NULL) return;
-    const char *line = hdr_text;
-    while (*line != '\0') {
-        const char *eol = strchr(line, '\n');
-        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+    if (hdr_text == NULL) return 0;
+    const char *cur = hdr_text, *line; size_t line_len;
+    while (bwa_hdr_next_line(&cur, &line, &line_len)) {
         int skip = (line_len >= 4 && (strncmp(line, "@HD\t", 4) == 0 ||
                                       strncmp(line, "@SQ\t", 4) == 0));
         if (!skip && line_len > 0) {
-            kputsn(line, (int)line_len, out);
-            kputc('\n', out);
+            if (kputsn(line, (int)line_len, out) < 0 || kputc('\n', out) < 0)
+                return -1;
         }
-        if (eol == NULL) break;
-        line = eol + 1;
     }
+    return 0;
 }
 
 meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
@@ -156,6 +145,7 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                                         const char *meth_pg_cl,
                                         const char *hdr_line,
                                         const char *orig_idx_hdr_lines,
+                                        int bam,
                                         int compression_level)
 {
     if (path_or_dash == NULL || bns == NULL) return NULL;
@@ -164,8 +154,13 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
 
     if (compression_level < 0) compression_level = 0;
     if (compression_level > 9) compression_level = 9;
+    /* The container is the ONLY difference between the two output formats: the
+     * records below are the same bam1_t either way, and htslib serializes them
+     * to BGZF ("wb<level>") or to text ("w"). Keeping one construction path is
+     * what makes `--meth` and `--meth --bam` byte-identical after decode. */
     char mode[8];
-    snprintf(mode, sizeof(mode), "wb%d", compression_level);
+    if (bam) snprintf(mode, sizeof(mode), "wb%d", compression_level);
+    else     snprintf(mode, sizeof(mode), "w");
     w->fp = hts_open(path_or_dash, mode);
     if (w->fp == NULL) { free(w); return NULL; }
 
@@ -173,37 +168,65 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
     if (w->hdr == NULL) { hts_close(w->fp); free(w); return NULL; }
 
     /* @HD — skip the default when the user's -H already supplies one, else
-     * htslib would write two @HD lines (it does not de-dup @HD). */
-    if (!hdr_text_has_type(hdr_line, "@HD\t") &&
-        sam_hdr_add_line(w->hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
+     * htslib would write two @HD lines (it does not de-dup @HD).
+     *
+     * This writer does not consult a compat target, unlike bwa.cpp and
+     * bam_writer.cpp: --compat with --meth is a hard error (rejected in
+     * main_mem's option validation), so only COMPAT_TARGET_OFF can reach here,
+     * and OFF's hd_line IS BWAMEM3_DEFAULT_HD_LINE. A future target that
+     * relaxes the --meth exclusion must plumb compat->emit_hd/hd_line through
+     * here too. */
+    if (!bwa_hdr_text_has_type(hdr_line, "@HD\t") &&
+        sam_hdr_add_lines(w->hdr, BWAMEM3_DEFAULT_HD_LINE, 0) < 0) goto fail;
 
     /* @SQ directly from the ORIGINAL (un-converted) bns contigs (D3 PR-5: no
      * f/r consolidation — alignments already carry original rids). Each @SQ is
      * enriched by SN with the original reference's identity tags (M5/UR/AS/SP)
      * from its .hdr/.dict sidecar when available; the extra tags are appended
-     * verbatim, gated on a matching SN+LN. */
-    for (int i = 0; i < bns->n_seqs; ++i) {
+     * verbatim, gated on a matching SN+LN.
+     *
+     * AH:* on ALT contigs is appended from the ORIGINAL bns, matching both
+     * upstreams' generated @SQ (bwa/bwa.c:432, bwa-mem2/src/bwa.cpp:538) and
+     * our SAM text path; this block was written without it and
+     * dropped ALT status for every ALT-aware reference. It cannot collide with
+     * the sidecar enrichment: meth_append_sq_extra_tags copies only
+     * M5/UR/AS/SP, never AH. Appended BEFORE those tags so the line reads
+     * SN, LN, AH, then identity tags -- the order bwa emits. */
+    {
         kstring_t sq = {0, 0, NULL};
-        ksprintf(&sq, "@SQ\tSN:%s\tLN:%lld",
-                 bns->anns[i].name, (long long)bns->anns[i].len);
-        meth_append_sq_extra_tags(orig_idx_hdr_lines, bns->anns[i].name,
-                                  bns->anns[i].len, &sq);
-        int rc = (sq.s != NULL) ? sam_hdr_add_lines(w->hdr, sq.s, sq.l) : -1;
+        for (int i = 0; i < bns->n_seqs; ++i) {
+            sq.l = 0;                    /* reuse the buffer across contigs */
+            if (bwa_format_sq_line(&sq, &bns->anns[i]) < 0) { free(sq.s); goto fail; }
+            if (meth_append_sq_extra_tags(orig_idx_hdr_lines, bns->anns[i].name,
+                                          bns->anns[i].len, &sq) < 0) {
+                free(sq.s);
+                goto fail;
+            }
+            /* No `sq.s != NULL` guard: that check existed because the old
+             * inline ksprintf could leave sq.s NULL with no way to say so.
+             * bwa_format_sq_line reports that as -1 above, and a failed
+             * enrichment append is reported as -1 too -- so by here sq holds a
+             * complete record. bam_writer.cpp's copy of this loop never had it. */
+            int rc = sam_hdr_add_lines(w->hdr, sq.s, sq.l);
+            if (rc < 0) { free(sq.s); goto fail; }
+        }
         free(sq.s);
-        if (rc < 0) goto fail;
     }
 
     /* Original reference's non-@HD/@SQ sidecar records (@CO/@PG/@RG),
      * forwarded after @SQ and before the user header — mirroring the index
      * tier of bam_writer_open's precedence (index > default, below user). Its
-     * @SQ is consumed into the enriched consolidated block above and its @HD
+     * @SQ is consumed into the enriched @SQ block above and its @HD
      * is the writer's own, so both are dropped here. `orig_idx_hdr_lines` is
      * loaded from the *original* (pre-c2t) reference prefix by main_mem; the
      * c2t index's own sidecar (which describes the doubled f/r converted
      * contigs) is never consulted. */
     if (orig_idx_hdr_lines != NULL && orig_idx_hdr_lines[0] != '\0') {
         kstring_t pt = {0, 0, NULL};
-        meth_append_passthrough_records(orig_idx_hdr_lines, &pt);
+        if (meth_append_passthrough_records(orig_idx_hdr_lines, &pt) < 0) {
+            free(pt.s);
+            goto fail;
+        }
         int rc = (pt.l > 0) ? sam_hdr_add_lines(w->hdr, pt.s, pt.l) : 0;
         free(pt.s);
         if (rc < 0) goto fail;
@@ -213,7 +236,7 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      * forwarded sidecar records, before the @PG lines, matching the default
      * writer's precedence (user > index > default) so a -R read group becomes
      * an @RG header that the per-record RG:Z tags (stamped from bwa_rg_id
-     * below) actually reference. The consolidated @SQ above is authoritative
+     * below) actually reference. The @SQ block above is authoritative
      * for --meth, so a user -H that re-supplies @SQ for an already-emitted
      * contig will make htslib reject the add and the open fails loudly rather
      * than emitting duplicate references. */
@@ -278,6 +301,16 @@ int meth_bam_writer_close(meth_bam_writer_t *w)
  * alignment run covers < MIN_LONGEST_M_PCT% of the read. */
 static constexpr int MIN_LONGEST_M_PCT = 44;
 
+/* Contig name for an SA:Z hit, "*" when the rid names no contig. The SA:Z
+ * block sizes its buffer in one loop and fills it in another; both must agree
+ * on the name — and therefore on its length — or the buffer is under-sized, so
+ * they share this resolver rather than each repeating the bounds check. */
+static inline const char *meth_sa_ref_name(const bntseq_t *bns, int32_t rid)
+{
+    const char *name = (rid >= 0 && rid < bns->n_seqs) ? bns->anns[rid].name : NULL;
+    return name != NULL ? name : "*";
+}
+
 int meth_mem_aln_to_bam(bam1_t *b,
                         const mem_opt_t *opt, const bntseq_t *bns,
                         const uint8_t *pac,
@@ -287,6 +320,9 @@ int meth_mem_aln_to_bam(bam1_t *b,
 {
     if (b == NULL || opt == NULL || s == NULL || list == NULL
             || bns == NULL || pac == NULL) return -1;
+
+    /* Reused per-record scratch, shared with the non-meth writer. */
+    static thread_local bwamem3::BamRecScratch bs;
 
     /* Local copies so flag/rid can be mutated without touching the caller's. */
     mem_aln_t p = list[which];
@@ -318,6 +354,20 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * existing encoding. */
     int32_t tid = (p.rid >= 0 && p.rid < bns->n_seqs) ? p.rid : -1;
     int32_t mtid = (mp && mp->rid >= 0 && mp->rid < bns->n_seqs) ? mp->rid : -1;
+    /* The `meth_hypothesis >= 0` term is DEFENSIVE, not a reachable branch: a
+     * mapped record under --meth always carries 0 or 1. The value reaches `p`
+     * through mem_reg2aln, which defaults it to -1 and then copies the region's
+     * hypothesis over that default. A region (mem_alnreg_t) gets its hypothesis
+     * in exactly three places, all of which supply 0 or 1 under --meth:
+     *   - mem_chain2aln_across_reads_V2 (bwamem.cpp), copying the chain's
+     *     hypothesis (itself set in chain_add_one_seed) -- chain seeds that
+     *     cannot be remapped to an OT/OB hypothesis are dropped rather than
+     *     carried as -1;
+     *   - mem_matesw and mem_matesw_batch_post (bwamem_pair.cpp), the two
+     *     mate-rescue paths.
+     * The term is kept so an unmapped or non-meth record, which does keep the
+     * -1 default, cannot index off ((-1)&1)==1 and be labelled top-strand. Do
+     * not read it as evidence that -1 reaches a mapped record. */
     char direction = 0;
     if (tid >= 0 && p.meth_hypothesis >= 0)
         direction = (p.meth_hypothesis & 1) ? 'f' : 'r';
@@ -326,7 +376,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
     uint32_t *bam_cigar = NULL;
     size_t    bam_n_cigar = 0;
     if (p.n_cigar > 0) {
-        bam_cigar = (uint32_t *)malloc((size_t)p.n_cigar * sizeof(uint32_t));
+        bam_cigar = bs.ensure_cigar((size_t)p.n_cigar);
         if (bam_cigar == NULL) return -1;
         for (int i = 0; i < p.n_cigar; ++i) {
             int op  = p.cigar[i] & 0xf;
@@ -339,11 +389,13 @@ int meth_mem_aln_to_bam(bam1_t *b,
         bam_n_cigar = (size_t)p.n_cigar;
     }
 
-    /* TLEN is emitted on the consolidated (post-remap) contigs, so it must be
-     * gated on tid/mtid equality — not p.rid/mp->rid. Mates that rescue onto
-     * opposite projected strands (f* vs r*) of the same real chromosome have
-     * different internal rids but the same output tid, and SAM expects a real
-     * TLEN when RNAME==RNEXT. */
+    /* TLEN is defined only when both mates are placed on the same contig, which
+     * is what SAM means by RNAME==RNEXT. Since D3 PR-5, tid/mtid ARE p.rid /
+     * mp->rid (original rids straight from the seed→original remap), so this is
+     * a plain same-chromosome test. Pre-D3 it was not: output ran on
+     * consolidated contigs, and mates rescued onto opposite projected strands
+     * (f* vs r*) of one real chromosome had different internal rids but the same
+     * output tid — hence the gate on tid/mtid rather than the raw rids. */
     hts_pos_t tlen = 0;
     if (mp && tid >= 0 && mtid >= 0 && tid == mtid
         && p.n_cigar > 0 && m.n_cigar > 0) {
@@ -387,8 +439,8 @@ int meth_mem_aln_to_bam(bam1_t *b,
     char *qual_bin = NULL;
     if (emit_seq && qe > qb) {
         l_emit = (size_t)(qe - qb);
-        seq_text = (char *)malloc(l_emit + 1);
-        if (seq_text == NULL) { free(bam_cigar); return -1; }
+        seq_text = bs.ensure_seq(l_emit + 1);
+        if (seq_text == NULL) return -1;
         if (orig_seq != NULL) {
             /* Apply is_rev RC + supp soft-clip trim over pre-c2t bases. */
             if (!p.is_rev) {
@@ -417,8 +469,8 @@ int meth_mem_aln_to_bam(bam1_t *b,
         }
         seq_text[l_emit] = '\0';
         if (s->qual) {
-            qual_bin = (char *)malloc(l_emit);
-            if (qual_bin == NULL) { free(seq_text); free(bam_cigar); return -1; }
+            qual_bin = bs.ensure_qual(l_emit);
+            if (qual_bin == NULL) return -1;
             if (!p.is_rev) {
                 for (size_t i = 0; i < l_emit; ++i) qual_bin[i] = (char)((unsigned char)s->qual[qb + (int)i] - 33);
             } else {
@@ -456,16 +508,26 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * the original rid); meth_build_xm reads the original read-C-vs-T at ref-C
      * from `seq_text`, which is restored from meth_orig_seq above. */
     char *xm = NULL;
-    if (mapped && seq_text != NULL && bam_cigar != NULL && l_emit > 0) {
-        /* Match the XG `direction` guard at line ~322: a -1 hypothesis maps to
-         * XG:Z:GA (bottom strand), so treat it as bottom here too. ((-1)&1)==1
-         * would otherwise mislabel a -1-hypothesis record (e.g. mate rescued off
-         * a -1 anchor) as top strand, emitting XG:GA with a top-strand XM. */
+    if ((opt->meth_tags & MEM_METH_TAG_XM)
+        && mapped && seq_text != NULL && bam_cigar != NULL && l_emit > 0) {
+        /* The `>= 0` term cannot fire here: this block is gated on `mapped`,
+         * which requires `direction != 0`, and `direction` is only set when
+         * meth_hypothesis >= 0. So -1 is already excluded before this line --
+         * the term is redundant under the current control flow, not a guard
+         * against something that happens.
+         *
+         * It is kept for symmetry with the XG `direction` guard above, and so
+         * the two stay consistent if `mapped` is ever loosened: should a -1
+         * reach here then, it is treated as bottom strand, matching the
+         * XG:Z:GA that guard would emit. Dropping the term instead would let
+         * ((-1)&1)==1 mislabel such a record top-strand and pair XG:GA with a
+         * top-strand XM. */
         int is_top_strand = (p.meth_hypothesis >= 0 && (p.meth_hypothesis & 1)) ? 1 : 0;
         xm = meth_build_xm(bns, pac, tid, (int64_t)p.pos,
                            is_top_strand,
                            bam_cigar, (int)bam_n_cigar,
-                           seq_text, (int)l_emit);
+                           seq_text, (int)l_emit,
+                           (meth_chem_t)opt->meth_chem);
     }
 
     /* Build the bam1_t. bam_set1 handles 4-bit packing, name storage, etc. */
@@ -482,93 +544,137 @@ int meth_mem_aln_to_bam(bam1_t *b,
                        l_emit, seq_text, qual_bin,
                        /* l_aux */ 0);
 
-    free(bam_cigar);
-    free(seq_text);
-    free(qual_bin);
-    if (ret < 0) return -1;  /* xm aliases thread-local scratch; no free */
+    /* bam_cigar/seq_text/qual_bin are the reused thread-local scratch — no free
+     * here; bam_set1 has already copied them into b->data. Same for xm, which
+     * aliases meth_xm.cpp's own thread-local scratch. */
+    if (ret < 0) return -1;
 
     /* Aux tags — roughly match mem_aln2sam emission order */
     if (p.n_cigar > 0) {
         int32_t nm = (int32_t)p.NM;
-        bam_aux_append(b, "NM", 'i', sizeof(nm), (const uint8_t *)&nm);
+        if (bam_aux_append(b, "NM", 'i', sizeof(nm), (const uint8_t *)&nm) < 0) return -1;
         const char *md = (const char *)(p.cigar + p.n_cigar);
-        bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md);
+        if (bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md) < 0) return -1;
     }
     if (mp && mp->n_cigar > 0) {
-        /* Growable so long mate CIGARs don't silently truncate. */
-        kstring_t mc = {0, 0, NULL};
+        /* Reused thread-local kstring, grown as needed. */
+        kstring_t *mc = &bs.mc;
+        mc->l = 0;   /* reset the reused scratch; capacity/mc->s persist */
+        /* Propagate OOM: on failure ks_resize leaves the buffer too small, and
+         * kputw/kputc swallow their own failures, so without this the record
+         * could emit with MC silently truncated/omitted. */
+        if (ks_resize(mc, (size_t)mp->n_cigar * 12 + 1) < 0) return -1;   /* worst case: 10 digits + op + NUL */
         for (int i = 0; i < mp->n_cigar; ++i) {
             int op = mp->cigar[i] & 0xf;
             int len = mp->cigar[i] >> 4;
             if (!(opt->flag & MEM_F_SOFTCLIP) && !mp->is_alt && (op == 3 || op == 4))
                 op = which ? 4 : 3;
-            ksprintf(&mc, "%d%c", len, "MIDSH"[op]);
+            /* kputw + kputc instead of ksprintf("%d%c"): same bytes, no vsnprintf
+             * (which ran twice per op — measure then format). */
+            kputw(len, mc);
+            kputc("MIDSH"[op], mc);
         }
-        if (mc.l > 0)
-            bam_aux_append(b, "MC", 'Z', (int)mc.l + 1, (const uint8_t *)mc.s);
-        free(mc.s);
+        if (mc->l > 0)
+            if (bam_aux_append(b, "MC", 'Z', (int)mc->l + 1, (const uint8_t *)mc->s) < 0) return -1;
+        /* no free: bs.mc.s persists across records, freed on thread exit */
+    }
+    /* MQ:i — guarded on `mp` alone, not on the MC block's `mp->n_cigar > 0`, so
+     * a mate with no CIGAR still gets its MAPQ. The compat gate is always open
+     * under --meth (fastmap.cpp refuses --compat with --meth) but is read here
+     * anyway so this stays a copy of bam_writer.cpp rather than a divergence. */
+    if (mp && opt->compat->emit_mq) {
+        int32_t mq = (int32_t)mp->mapq;
+        if (bam_aux_append(b, "MQ", 'i', sizeof(mq), (const uint8_t *)&mq) < 0) return -1;
     }
     if (p.score >= 0) {
         int32_t as = (int32_t)p.score;
-        bam_aux_append(b, "AS", 'i', sizeof(as), (const uint8_t *)&as);
+        if (bam_aux_append(b, "AS", 'i', sizeof(as), (const uint8_t *)&as) < 0) return -1;
     }
     if (p.sub >= 0) {
         int32_t xs = (int32_t)p.sub;
-        bam_aux_append(b, "XS", 'i', sizeof(xs), (const uint8_t *)&xs);
+        if (bam_aux_append(b, "XS", 'i', sizeof(xs), (const uint8_t *)&xs) < 0) return -1;
     }
     if (bwa_rg_id[0]) {
-        bam_aux_append(b, "RG", 'Z', (int)strlen(bwa_rg_id) + 1, (const uint8_t *)bwa_rg_id);
+        if (bam_aux_append(b, "RG", 'Z', (int)strlen(bwa_rg_id) + 1, (const uint8_t *)bwa_rg_id) < 0) return -1;
     }
-    if (p.alt_sc > 0) {
-        float pa_f = (float)((double)p.score / (double)p.alt_sc);
-        bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f);
-    }
-    /* SA:Z (other primary hits) — mirrors mem_aln2sam. D3 (PR-5): rids are
-     * already ORIGINAL, so the contig name comes straight from bns->anns (no
-     * f/r→chrom rewrite). */
+    /* SA:Z (other primary hits) and pa:f — mirrors mem_aln2sam, which emits
+     * both only for non-secondary records and in this order.
+     *
+     * D3 (PR-5), SA:Z only: rids are already ORIGINAL, so the contig name comes
+     * straight from bns->anns (no f/r→chrom rewrite). */
     if (!(p.flag & 0x100)) {
         int has_other = 0;
         for (int i = 0; i < n_alns; ++i)
             if (i != which && !(list[i].flag & 0x100)) { has_other = 1; break; }
         if (has_other) {
-            kstring_t sa = {0, 0, NULL};
+            kstring_t *sa = &bs.sa;
+            sa->l = 0;   /* reset the reused scratch; capacity/sa->s persist */
+            /* Propagate OOM like the MC:Z path above: kputs/kputw/kputc swallow
+             * their own failures, so without pre-sizing the record could emit
+             * with SA silently truncated/omitted. Worst case per hit: rname +
+             * n_cigar*(10 digits + op) + 64 (pos/strand/mapq/NM/commas/;). Both
+             * loops resolve the name through meth_sa_ref_name so the length
+             * measured here is the length written below. */
+            size_t max_sa_len = 0;
+            for (int i = 0; i < n_alns; ++i) {
+                if (i == which || (list[i].flag & 0x100)) continue;
+                const mem_aln_t *r = &list[i];
+                max_sa_len += strlen(meth_sa_ref_name(bns, r->rid))
+                            + (size_t)r->n_cigar * 12 + 64;
+            }
+            if (ks_resize(sa, max_sa_len + 1) < 0) return -1;
             for (int i = 0; i < n_alns; ++i) {
                 const mem_aln_t *r = &list[i];
                 if (i == which || (r->flag & 0x100)) continue;
-                const char *r_name = NULL;
-                if (r->rid >= 0 && r->rid < bns->n_seqs)
-                    r_name = bns->anns[r->rid].name;
-                if (r_name == NULL) r_name = "*";
-                kputs(r_name, &sa); kputc(',', &sa);
-                kputl(r->pos + 1, &sa); kputc(',', &sa);
-                kputc("+-"[r->is_rev], &sa); kputc(',', &sa);
+                const char *r_name = meth_sa_ref_name(bns, r->rid);
+                kputs(r_name, sa); kputc(',', sa);
+                kputl(r->pos + 1, sa); kputc(',', sa);
+                kputc("+-"[r->is_rev], sa); kputc(',', sa);
                 for (int k = 0; k < r->n_cigar; ++k) {
-                    kputw(r->cigar[k] >> 4, &sa);
-                    kputc("MIDSH"[r->cigar[k] & 0xf], &sa);
+                    kputw(r->cigar[k] >> 4, sa);
+                    kputc("MIDSH"[r->cigar[k] & 0xf], sa);
                 }
-                kputc(',', &sa); kputw(r->mapq, &sa);
-                kputc(',', &sa); kputw(r->NM, &sa);
-                kputc(';', &sa);
+                kputc(',', sa); kputw(r->mapq, sa);
+                kputc(',', sa); kputw(r->NM, sa);
+                kputc(';', sa);
             }
-            if (sa.l > 0)
-                bam_aux_append(b, "SA", 'Z', (int)sa.l + 1, (const uint8_t *)sa.s);
-            free(sa.s);
+            if (sa->l > 0)
+                if (bam_aux_append(b, "SA", 'Z', (int)sa->l + 1, (const uint8_t *)sa->s) < 0) return -1;
+            /* no free: bs.sa.s persists across records, freed on thread exit */
+        }
+        if (p.alt_sc > 0) {
+            /* Same shared value as the SAM-text and --bam writers; see
+             * bwa_pa_tag_value. --compat is refused under --meth, but a
+             * --meth --bam consumer still has to see the SAM rendering. */
+            float pa_f = bwa_pa_tag_value(p.score, p.alt_sc);
+            if (bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f) < 0) return -1;
         }
     }
     /* XA:Z — D3 (PR-5): p.XA is produced by mem_gen_alt against the ORIGINAL
      * bns, so its `name,+/-pos,cigar,NM;` entries already carry original contig
      * names. No f/r prefix stripping or chrom rewrite is needed; emit verbatim. */
     if (p.XA != NULL) {
-        bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA);
+        if (bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;
+    }
+    /* HN:i — the same mem_gen_alt call that fills p.XA fills p.HN, so this
+     * counts the hits XA enumerates. Like XA above it is already stated against
+     * the ORIGINAL bns, so the doubled C->T/G->A reference does not double-count
+     * it. See the MQ:i note above re: the compat gate. */
+    if (p.HN >= 0 && opt->compat->emit_hn) {
+        int32_t hn = (int32_t)p.HN;
+        if (bam_aux_append(b, "HN", 'i', sizeof(hn), (const uint8_t *)&hn) < 0) return -1;
     }
     /* Bismark-compatible XR:Z (read conversion) emitted on every record;
      * XG:Z (genome strand) and XM:Z (methylation call string) only on
-     * mapped records. The YC:Z payload in s->comment carries the (CT|GA)
+     * mapped records. Each is additionally gated on its --meth-tags bit, and
+     * the gate wraps the value's derivation rather than just the append, so a
+     * deselected tag costs nothing to compute -- the contract --help and the
+     * methylation docs state. The YC:Z payload in s->comment carries the (CT|GA)
      * value (the comment buffer is "YS:Z:<seq>\tYC:Z:<dir>", see
      * src/fastmap.cpp:415-425). Locate it with a marker search rather
      * than l_seq arithmetic so any future YS framing change (alternate
      * prefix length, prior FASTQ comments folded in) stays detectable. */
-    {
+    if (opt->meth_tags & MEM_METH_TAG_XR) {
         const char *xr = NULL;
         if (s->comment != NULL) {
             const char *yc = strstr(s->comment, "\tYC:Z:");
@@ -579,18 +685,20 @@ int meth_mem_aln_to_bam(bam1_t *b,
             }
         }
         if (xr != NULL) {
-            bam_aux_append(b, "XR", 'Z', 3, (const uint8_t *)xr);
+            if (bam_aux_append(b, "XR", 'Z', 3, (const uint8_t *)xr) < 0) return -1;
         }
     }
     if (mapped) {
-        /* XG:Z genome strand from the winning hypothesis: OT→CT, OB→GA
-         * (direction is the 'f'/'r' encoding of p.meth_hypothesis above). */
-        const char *xg = (direction == 'f') ? "CT" : "GA";
-        bam_aux_append(b, "XG", 'Z', 3, (const uint8_t *)xg);
+        if (opt->meth_tags & MEM_METH_TAG_XG) {
+            /* XG:Z genome strand from the winning hypothesis: OT→CT, OB→GA
+             * (direction is the 'f'/'r' encoding of p.meth_hypothesis above). */
+            const char *xg = (direction == 'f') ? "CT" : "GA";
+            if (bam_aux_append(b, "XG", 'Z', 3, (const uint8_t *)xg) < 0) return -1;
+        }
         if (xm != NULL) {
             /* xm aliases thread-local scratch in meth_xm.cpp; do not free. */
-            bam_aux_append(b, "XM", 'Z', (int)l_emit + 1,
-                           (const uint8_t *)xm);
+            if (bam_aux_append(b, "XM", 'Z', (int)l_emit + 1,
+                               (const uint8_t *)xm) < 0) return -1;
         }
     }
 
@@ -600,7 +708,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * the BAM output (they're internal carriers only — XR:Z replaces YC,
      * SEQ restoration replaces YS). D3 (PR-5): p.rid is the ORIGINAL contig
      * index, which is what the original `bns` passed here uses. */
-    bam_writer_append_generic_aux(b, s, opt, bns, p.rid);
+    if (bam_writer_append_generic_aux(b, s, opt, bns, p.rid) < 0) return -1;
 
     return 0;
 }

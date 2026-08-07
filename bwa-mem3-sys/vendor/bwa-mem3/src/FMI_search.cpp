@@ -33,12 +33,176 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <inttypes.h>
 #include <climits>
 #include <cstring>
+#include <vector>
+#include <cstdarg>
+#include <pthread.h>
+#include <unistd.h>       /* pread, _exit */
 #include <sys/mman.h>     /* munmap */
+#if defined(__linux__)
+#include <fcntl.h>        /* posix_fadvise */
+#endif
 #include "bwa_madvise.h"
 #include "bwa_shm.h"
+#include "utils.h"        /* ATTRIBUTE, err_fread_noeof */
 #include "FMI_search.h"
 #include "profiling.h"
 #include "libsais_build.h"
+
+/*
+ * Parallel index load.
+ *
+ * The bwa-mem3 FM-index (cp_occ + compressed SA samples, ~10 GB on hg38) is
+ * otherwise slurped by a single-threaded fread whose warm-cache cost is one
+ * core's page-fault + memcpy bandwidth out of the page cache (~0.8 s on hg38).
+ * Splitting each big array across a few workers is memory-bandwidth bound and
+ * cuts that ~4x. pread (not read) lets every worker share one fd without
+ * touching the shared file offset, so no locking is needed.
+ *
+ * The destination stays the _mm_malloc'd + MADV_HUGEPAGE buffer, so the
+ * transparent-hugepage coverage the hot Occ-lookup loop relies on is preserved
+ * -- unlike an mmap/shm alias of the file, which lands on non-THP pages and
+ * slows alignment enough to erase the load saving.
+ */
+
+/* Declared in FMI_search.h; see there for the contract. Uses a floor division
+ * so the chunk size never dips below FMI_PREAD_MIN_CHUNK: at `nbytes` a whole
+ * multiple of the floor, `nbytes / min_chunk + 1` would hand out one chunk more
+ * than the array can cover at that size (8 MB read across 2 workers = 4 MB
+ * chunks). Only reachable for small arrays -- a caller asking for more workers
+ * than a test-sized reference can feed, or a large BWA3_LOAD_THREADS. */
+int fmi_pread_worker_count(size_t nbytes, int nthreads)
+{
+    if (nthreads < 1) nthreads = 1;
+    size_t max_threads = nbytes / FMI_PREAD_MIN_CHUNK;
+    if (max_threads < 1) max_threads = 1;
+    if ((size_t)nthreads > max_threads) nthreads = (int)max_threads;
+    return nthreads;
+}
+
+size_t fmi_pread_request_size(size_t remaining)
+{
+    const size_t PREAD_MAX_ONCE = (size_t)1 << 30;   /* 1GiB, well under INT_MAX */
+    return remaining > PREAD_MAX_ONCE ? PREAD_MAX_ONCE : remaining;
+}
+
+namespace {
+
+struct PreadChunk { int fd; char *dst; size_t nbytes; off_t off; };
+
+/* Bail out of a failed chunk read.
+ *
+ * _exit, not exit: this runs on a worker thread while its siblings are still
+ * inside pread(). exit() would run atexit handlers and static destructors
+ * (mimalloc teardown, htslib) against live threads, and two workers reaching it
+ * at once -- what a truncated index produces, since every chunk past the real
+ * EOF fails together -- is undefined. stderr is unbuffered, but flush anyway so
+ * the diagnostic survives if a caller made it buffered.
+ *
+ * noreturn keeps the caller's `if (r < 0) { ... }` terminating the way the
+ * inline exit() it replaced did; format(printf) keeps -Wformat checking the
+ * call sites, matching utils.h's err_fatal family. */
+void pread_chunk_fail(const char *fmt, ...)
+    ATTRIBUTE((noreturn)) ATTRIBUTE((format(printf, 1, 2)));
+
+void pread_chunk_fail(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+    _exit(EXIT_FAILURE);
+}
+
+void *pread_chunk_worker(void *arg)
+{
+    PreadChunk *c = static_cast<PreadChunk *>(arg);
+    size_t done = 0;
+    /* macOS pread() rejects any count > INT_MAX with EINVAL, so a chunk larger
+     * than 2GiB fails outright -- with the 8-worker cap that is every index over
+     * ~17.2GB (the hg38 --meth FM-index is 20.9GB). Request a bounded slice per
+     * call; the loop already accumulates partial reads. Linux has no such limit,
+     * which is why this only ever bit local macOS runs. */
+    while (done < c->nbytes) {
+        ssize_t r = pread(c->fd, c->dst + done,
+                          fmi_pread_request_size(c->nbytes - done),
+                          c->off + (off_t)done);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            pread_chunk_fail("ERROR: pread failed during index load: %s\n", strerror(errno));
+        }
+        if (r == 0) {  // index file shorter than the header says it should be
+            // Counts are for THIS worker's chunk, not the whole array: a
+            // truncated index trips every chunk past the real EOF, so several
+            // of these can interleave, each describing a different slice.
+            pread_chunk_fail("ERROR: unexpected EOF during index load "
+                             "(chunk at offset %lld: %zu of %zu bytes)\n",
+                             (long long)c->off, done, c->nbytes);
+        }
+        done += (size_t)r;
+    }
+    return NULL;
+}
+
+// Read `nbytes` at file offset `off` into `dst` using up to `nthreads` workers.
+void parallel_pread(int fd, void *dst, size_t nbytes, off_t off, int nthreads)
+{
+    if (nbytes == 0) return;
+    nthreads = fmi_pread_worker_count(nbytes, nthreads);
+
+    std::vector<PreadChunk> chunks((size_t)nthreads);
+    std::vector<pthread_t>  tids((size_t)nthreads);
+    std::vector<bool>       spawned((size_t)nthreads, false);
+    size_t base = nbytes / (size_t)nthreads, rem = nbytes % (size_t)nthreads, cum = 0;
+    for (int i = 0; i < nthreads; i++) {
+        size_t len = base + ((size_t)i < rem ? 1 : 0);
+        chunks[i] = PreadChunk{ fd, (char *)dst + cum, len, off + (off_t)cum };
+        cum += len;
+    }
+    // Main thread takes chunk 0; spawn workers for the rest. If a spawn fails
+    // (e.g. thread limit), fall back to reading that chunk inline so the load
+    // still completes correctly, just less parallel.
+    for (int i = 1; i < nthreads; i++) {
+        if (pthread_create(&tids[i], NULL, pread_chunk_worker, &chunks[i]) == 0)
+            spawned[i] = true;
+        else
+            pread_chunk_worker(&chunks[i]);
+    }
+    pread_chunk_worker(&chunks[0]);
+    for (int i = 1; i < nthreads; i++)
+        if (spawned[i]) pthread_join(tids[i], NULL);
+}
+
+// Worker count for the index load: the caller's -t, capped (bandwidth bound
+// past ~8), with an explicit BWA3_LOAD_THREADS override for tuning.
+int index_load_threads(int n_threads)
+{
+    int t = n_threads > 0 ? n_threads : 1;
+    if (t > 8) t = 8;
+    const char *e = getenv("BWA3_LOAD_THREADS");
+    if (e != NULL) { int v = atoi(e); if (v > 0) t = v; }
+    return t;
+}
+
+}  // namespace
+
+/* Declared in FMI_search.h; see there for the contract. ftello reports the
+ * stream's logical position (buffered bytes included), so it is the right
+ * offset to hand pread; the fseeko afterwards drops the now-stale buffer and
+ * re-anchors the stream past the array we just read behind its back. */
+void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads)
+{
+    off_t off = ftello(fp);
+    if (off < 0) {
+        fprintf(stderr, "ERROR: ftello failed during index load: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    parallel_pread(fileno(fp), dst, nbytes, off, nthreads);
+    if (fseeko(fp, off + (off_t)nbytes, SEEK_SET) != 0) {
+        fprintf(stderr, "ERROR: fseeko failed during index load: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+}
 
 /* Build "<prefix><suffix>" into `out` (sized `outsz`); aborts on overflow.
  * Replaces the prior strcpy_s/strcat_s pattern for assembling FMI sidecar
@@ -65,17 +229,8 @@ FMI_search::FMI_search(const char *fname)
     shm_base = NULL;
     shm_len = 0;
 
-    /* one_hot_mask_array is constant across the FMI's lifetime and is
-     * identical on disk and shm paths; initialize it once at construction. */
-    int64_t one_hot_bytes = 64 * (int64_t)sizeof(uint64_t);
-    one_hot_mask_array = (uint64_t *)_mm_malloc(one_hot_bytes, 64);
-    assert_not_null(one_hot_mask_array, one_hot_bytes, one_hot_bytes);
-    one_hot_mask_array[0] = 0;
-    uint64_t base = 0x8000000000000000L;
-    one_hot_mask_array[1] = base;
-    for (int64_t i = 2; i < 64; ++i) {
-        one_hot_mask_array[i] = (one_hot_mask_array[i - 1] >> 1) | base;
-    }
+    /* one_hot_mask_array is now a file-scope compile-time constant table (see
+     * FMI_search.h); nothing to allocate or initialize here. */
 }
 
 FMI_search::~FMI_search()
@@ -93,7 +248,6 @@ FMI_search::~FMI_search()
         if (sa_ls_word) _mm_free(sa_ls_word);
         if (cp_occ)     _mm_free(cp_occ);
     }
-    if (one_hot_mask_array) _mm_free(one_hot_mask_array);
 }
 
 int64_t FMI_search::cp_occ_size_bytes() const {
@@ -224,11 +378,13 @@ int FMI_search::build_index(bool emit_unpacked_ref) {
         opts.max_memory_bytes = parse_ll(mm, "BWA_INDEX_MAX_MEMORY");
     if (const char* td = getenv("BWA_INDEX_TMPDIR"))
         opts.tmpdir           = td;
+    if (const char* mu = getenv("BWA_INDEX_MAX_MEMORY_USER"))
+        opts.max_memory_user_specified = (mu[0] == '1');
     opts.emit_unpacked_ref = emit_unpacked_ref;
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
-void FMI_search::load_index(bool load_pac)
+void FMI_search::load_index(bool load_pac, int n_threads)
 {
     /* Try the staged shm segment first. On hit, both the FMI internals
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
@@ -252,6 +408,9 @@ void FMI_search::load_index(bool load_pac)
     // attempted size and how much we'd already committed before failing.
     int64_t index_alloc = 0;
 
+    // Worker count for the big-array reads below (read once, out of any loop).
+    const int load_nt = index_load_threads(n_threads);
+
     char *ref_file_name = file_name;
     //beCalls = 0;
     char cp_file_name[PATH_MAX];
@@ -270,6 +429,12 @@ void FMI_search::load_index(bool load_pac)
         fprintf(stderr, "* Index file found. Loading index from %s\n", cp_file_name);
     }
 
+#if defined(__linux__)
+    // Kick readahead for the whole index so the parallel preads below hit warm
+    // pages on a cold cache (no-op benefit when already cached).
+    posix_fadvise(fileno(cpstream), 0, 0, POSIX_FADV_WILLNEED);
+#endif
+
     err_fread_noeof(&reference_seq_len, sizeof(int64_t), 1, cpstream);
     assert(reference_seq_len > 0);
     assert(reference_seq_len <= 0x7fffffffffL);
@@ -287,7 +452,7 @@ void FMI_search::load_index(bool load_pac)
     assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
     bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
 
-    err_fread_noeof(cp_occ, sizeof(CP_OCC), cp_occ_size, cpstream);
+    fmi_pread_from_stream(cpstream, cp_occ, (size_t)cp_occ_bytes, load_nt);
     int64_t ii = 0;
     for(ii = 0; ii < 5; ii++)// update read count structure
     {
@@ -307,8 +472,8 @@ void FMI_search::load_index(bool load_pac)
     assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
     bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
     bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
-    err_fread_noeof(sa_ms_byte, sizeof(int8_t), reference_seq_len_, cpstream);
-    err_fread_noeof(sa_ls_word, sizeof(uint32_t), reference_seq_len_, cpstream);
+    fmi_pread_from_stream(cpstream, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
 
     #else
 
@@ -322,8 +487,8 @@ void FMI_search::load_index(bool load_pac)
     assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
     bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
     bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
-    err_fread_noeof(sa_ms_byte, sizeof(int8_t), reference_seq_len, cpstream);
-    err_fread_noeof(sa_ls_word, sizeof(uint32_t), reference_seq_len, cpstream);
+    fmi_pread_from_stream(cpstream, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
 
     #endif
 
@@ -390,6 +555,13 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
     SMEM *prevArray = (SMEM *)_mm_malloc((size_t)prevArray_bytes, 64);
     assert_not_null(prevArray, prevArray_bytes, prevArray_bytes);
 
+    // Hoist the FM-index cumulative-count table into a local for the batch (as
+    // the bwa-mem2 reference does). count[] is a lifetime-constant member never
+    // mutated during seeding, so this is a pure cache of identical values: it
+    // trades the per-seed `this->count[..]` member loads for stack reads. Byte-
+    // identical to reading the member directly.
+    const int64_t counts[5] = {count[0], count[1], count[2], count[3], count[4]};
+
     uint32_t i;
     // Perform SMEM for original reads
     for(i = 0; i < numReads; i++)
@@ -409,9 +581,9 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
             smem.rid = rid;
             smem.m = x;
             smem.n = x;
-            smem.k = count[a];
-            smem.l = count[3 - a];
-            smem.s = count[a+1] - count[a];
+            smem.k = counts[a];
+            smem.l = counts[3 - a];
+            smem.s = counts[a+1] - counts[a];
             int numPrev = 0;
             
             int j;
@@ -445,8 +617,12 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                     }
                     smem = newSmem;
 #ifdef ENABLE_PREFETCH
-                    _mm_prefetch((const char *)(&cp_occ[(smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                    /* Next iteration swaps k<->l then backwardExt reads
+                     * sp = smem.l, ep = smem.l + smem.s (see ls_advance_forward_step
+                     * for the full derivation). Prefetching smem.k targeted an
+                     * address never touched; ep was never prefetched. Pure hint. */
                     _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(&cp_occ[(smem.l + smem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
                 }
                 else
@@ -638,14 +814,39 @@ void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
  * above lands at "this slot's next step" granularity; T1 here lands at
  * "this slot's step ~N/2 from now". For N=8 that's 4 stepping-passes ahead,
  * giving DRAM-latency-class lookahead when the cp_occ working set spills
- * out of L2/L3. */
+ * out of L2/L3.
+ *
+ * Target the interval the lookahead slot will actually read next, which
+ * differs by phase:
+ *
+ *   PH_FWD: smem is live and the next forward step consumes it, so warm all
+ *           four of its checkpoint blocks (k, l, k+s, l+s).
+ *
+ *   PH_BWD: ls_advance_backward_step runs entirely out of prev[] and NEVER
+ *           rewrites smem, so smem here is the STALE leftover from the end of
+ *           the forward phase -- warming it prefetches lines the backward walk
+ *           will not touch. The next backward step instead calls backwardExt on
+ *           each live prev[p], reading cp_occ[prev[p].k] and cp_occ[prev[p].k +
+ *           prev[p].s]. Aim the lookahead at those. This keeps the N/2-ahead L2
+ *           memory-level parallelism (the part that was actually hiding DRAM
+ *           latency) but points it at blocks that are really read. Pure hint,
+ *           so output is unchanged. */
 void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
 {
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+    if (s->phase == PH_BWD) {
+        const int32_t np = s->numPrev;
+        for (int32_t p = 0; p < np; p++) {
+            const SMEM m = s->prev[p];
+            _mm_prefetch((const char *)(&cp_occ[(m.k) >> CP_SHIFT]), _MM_HINT_T1);
+            _mm_prefetch((const char *)(&cp_occ[(m.k + m.s) >> CP_SHIFT]), _MM_HINT_T1);
+        }
+    } else {
+        _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
+        _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
+        _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+        _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+    }
 #else
     (void)s;
 #endif
@@ -743,8 +944,16 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
     s->smem = newSmem;
     s->j++;
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+    /* The NEXT forward step swaps k<->l (see smem_ above) before calling
+     * backwardExt, which reads sp = smem.k and ep = smem.k + smem.s. After the
+     * swap that is OUR smem.l and smem.l + smem.s -- so those are the two lines
+     * to prefetch. The old code prefetched smem.k (an address the next step
+     * never touches) and smem.l, leaving the ep line to always miss cold.
+     * Same targets as bsd_prefetch_cp_occ(), which fixed this for round 3 in
+     * #242; the fix was simply never propagated here. Prefetch is a pure hint,
+     * so this cannot change output. */
     _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
 }
 
@@ -897,28 +1106,32 @@ struct FMI_search::BwtSeedSlot {
     SMEM   *match_buf;     // -> thread-local cache slice, sized = max_readlength
 };
 
-// Same-slot T0 prefetch for the next inner-j step. The two CP_OCC blocks
-// the next backwardExt(smem, _) hits are at (smem.k >> CP_SHIFT) and
-// ((smem.k + smem.s) >> CP_SHIFT) — i.e. sp and ep. Matches the call
-// pattern in ls_advance_forward_step's tail prefetch.
+// Same-slot T0 prefetch for the next inner-j step. The bwtSeed walk is
+// forward-only: bsd_advance_step swaps k<->l and calls backwardExt on the
+// swapped interval, so the next occ read lands in cp_occ at (smem.l >> CP_SHIFT)
+// and ((smem.l + smem.s) >> CP_SHIFT) — i.e. sp and ep of the swapped interval,
+// NOT smem.k. Prefetching smem.k (the un-swapped field) targets the wrong lines,
+// so every continuation-step prefetch was a no-op and each step paid full cp_occ
+// latency. smem.s is unchanged by the k<->l swap.
 void FMI_search::bsd_prefetch_cp_occ(const BwtSeedSlot *s)
 {
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #else
     (void)s;
 #endif
 }
 
-// Cross-slot T1 (L2) prefetch — same two-line target as T0 but at L2
-// hint, used in the driver's (s + N/2) % N lookahead to cover DRAM-class
-// latency when cp_occ spills out of L3.
+// Cross-slot T1 (L2) prefetch — same two-line target as T0 (the swapped
+// interval at smem.l; see bsd_prefetch_cp_occ) but at L2 hint, used in the
+// driver's (s + N/2) % N lookahead to cover DRAM-class latency when cp_occ
+// spills out of L3.
 void FMI_search::bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s)
 {
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
 #else
     (void)s;
 #endif
@@ -1328,8 +1541,12 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
                         newSmem.n = j;
                         smem = newSmem;
 #ifdef ENABLE_PREFETCH
-                        _mm_prefetch((const char *)(&cp_occ[(smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                        /* Same correction as the lockstep path: the next step reads
+                         * sp = smem.l, ep = smem.l + smem.s after the k<->l swap.
+                         * This is the x86 default round-3 path (the lockstep variant
+                         * is arm64-gated), so it was missing the #242 fix entirely. */
                         _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+                        _mm_prefetch((const char *)(&cp_occ[(smem.l + smem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
 
 
@@ -1468,7 +1685,8 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
         int64_t numTotalSmem[],
         int32_t numReads,
         int32_t readlength,
-        int nthreads)
+        int nthreads,
+        SmemSortScratch &scratch)
 {
     /* The only property the caller needs from this sort is that every SMEM of a
      * given read (rid) is contiguous and the reads appear in ascending rid
@@ -1479,9 +1697,14 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
      * unstable re-sort's handling of them cannot depend on their incoming order.
      *
      * rid is a dense index in [0, numReads), so a counting sort by rid replaces
-     * the O(n log n) function-pointer qsort with an O(n + rid_range) pass. Buffers
-     * are call-local: FMI_search is shared across worker threads, so no member
-     * scratch may be used here. */
+     * the O(n log n) function-pointer qsort with an O(n + rid_range) pass.
+     *
+     * The count/offset array (`cnt`) and the stable-scatter buffer (`tmp`) live
+     * in caller-owned scratch that is allocated once and reused across batches
+     * (audit SEED-15), replacing the old per-batch calloc/_mm_malloc + free.
+     * FMI_search is shared across worker threads, so no member scratch may be
+     * used here; the scratch instead comes from the caller's per-thread
+     * mem_cache slot (mmc->smem_sort_scratch[tid]) and is never shared. */
     int tid;
     int32_t perThreadQuota = (numReads + (nthreads - 1)) / nthreads;
     for(tid = 0; tid < nthreads; tid++)
@@ -1502,12 +1725,32 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
         }
         int64_t range = (int64_t)maxRid - (int64_t)minRid + 1;
 
-        int64_t *cnt = (int64_t *) calloc((size_t)range, sizeof(int64_t));
-        SMEM    *tmp = (SMEM *) _mm_malloc((size_t)smem_count * sizeof(SMEM), 64);
-        if (cnt == NULL || tmp == NULL) {
-            fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
-            exit(EXIT_FAILURE);
+        /* Grow the reused scratch on demand; it is never shrunk. cnt is zeroed
+         * over [0, range) below — exactly what the old per-call calloc did — so
+         * only the used prefix must be reset, not the whole capacity. tmp is
+         * fully overwritten by the scatter, so it needs no initialization. */
+        if (range > scratch.cntCap) {
+            _mm_free(scratch.cnt);
+            scratch.cnt = (int64_t *) _mm_malloc((size_t)range * sizeof(int64_t), 64);
+            if (scratch.cnt == NULL) {
+                fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
+                exit(EXIT_FAILURE);
+            }
+            scratch.cntCap = range;
         }
+        if (smem_count > scratch.tmpCap) {
+            _mm_free(scratch.tmp);
+            scratch.tmp = (SMEM *) _mm_malloc((size_t)smem_count * sizeof(SMEM), 64);
+            if (scratch.tmp == NULL) {
+                fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
+                exit(EXIT_FAILURE);
+            }
+            scratch.tmpCap = smem_count;
+        }
+        int64_t *cnt = scratch.cnt;
+        SMEM    *tmp = scratch.tmp;
+
+        memset(cnt, 0, (size_t)range * sizeof(int64_t));
 
         for (int64_t i = 0; i < smem_count; i++)
             cnt[myMatchArray[i].rid - minRid]++;
@@ -1520,11 +1763,8 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
             int64_t b = (int64_t)myMatchArray[i].rid - minRid;
             tmp[cnt[b]++] = myMatchArray[i];
         }
-        /* tmp is a fresh allocation and cannot overlap myMatchArray */
+        /* tmp is distinct scratch storage and cannot overlap myMatchArray */
         memcpy(myMatchArray, tmp, (size_t)smem_count * sizeof(SMEM));
-
-        _mm_free(tmp);
-        free(cnt);
     }
 }
 
@@ -1758,16 +1998,20 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
  * worker threads, hence thread_local (not a member). Freed on thread exit. */
 namespace {
 struct SaPrefetchScratch {
-    int64_t *pos = nullptr, *map = nullptr;
+    // Only pos is staged now: the former map_ar array held map_ar[k] == k for
+    // every entry (the staging loop writes map_ar[id] = totalCoordCount + c,
+    // and totalCoordCount == id on entry to each SMEM while both advance in
+    // lockstep with c), so the map index is just the buffer index and the
+    // second allocation was dead. Downstream consumers use the index directly.
+    int64_t *pos = nullptr;
     int64_t  cap = 0;
     void ensure(int64_t n) {
         if (n <= cap) return;
-        _mm_free(pos); _mm_free(map);
+        _mm_free(pos);
         pos = (int64_t *) _mm_malloc((size_t)n * sizeof(int64_t), 64);
-        map = (int64_t *) _mm_malloc((size_t)n * sizeof(int64_t), 64);
         cap = n;
     }
-    ~SaPrefetchScratch() { _mm_free(pos); _mm_free(map); }
+    ~SaPrefetchScratch() { _mm_free(pos); }
 };
 } // namespace
 
@@ -1802,7 +2046,6 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     static thread_local SaPrefetchScratch t_sa;
     t_sa.ensure(mem_lim);
     int64_t *pos_ar = t_sa.pos;
-    int64_t *map_ar = t_sa.map;
 
     for(int i = 0; i < count; i++)
     {
@@ -1814,8 +2057,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         for(j = smem.k; (j < hi) && (c < max_occ); j+=step, c++)
         {
             int64_t pos = j;
-             pos_ar[id]  = pos;
-             map_ar[id++] = totalCoordCount + c;
+             pos_ar[id++]  = pos;
+            // map_ar[k] == k (== id here), so the staging index is stored
+            // implicitly; map_pos below reads the index directly.
             // int64_t sa_entry = get_sa_entry_compressed(pos, tid);
             // coordArray[totalCoordCount + c] = sa_entry;
         }
@@ -1835,7 +2079,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     {
         int64_t pos =  pos_ar[i];
         working_set[j] = pos;
-        map_pos[j] = map_ar[i];
+        map_pos[j] = i;   // map_ar[i] == i (see staging loop invariant)
         offset[j] = 0;
         
         if ((pos & SA_COMPX_MASK) == 0) {
@@ -1874,7 +2118,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                 {
                     pos = pos_ar[i];
                     working_set[k] = pos;
-                    map_pos[k] = map_ar[i++];
+                    map_pos[k] = i++;   // map_ar[i] == i (staging invariant)
                     offset[k] = 0;
                     
                     if ((pos & SA_COMPX_MASK) == 0) {
@@ -1902,5 +2146,5 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             }
         }
     }
-    /* pos_ar/map_ar are the reused thread-local scratch — no free here. */
+    /* pos_ar is the reused thread-local scratch — no free here. */
 }

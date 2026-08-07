@@ -34,6 +34,21 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kswv.h"
 #include "limits.h"
 
+/* Column blocking for the u8 kernels' post-row query-end recovery. The row's
+ * running max is checkpointed every QE_BLK columns, so the recovery scans only
+ * the block(s) holding the max instead of the whole row. Measured on wgs-5M at
+ * 64 lanes: 68.1 % of the rows that need a query end resolve inside a single
+ * block and 89.6 % within two (mean 1.50), cutting the scan from 160 columns to
+ * ~34 -- 4.7x. QE_BLK=16 is the flat part of that curve; 8 is a wash and 32 is
+ * worse, because halving the block-index sweep doubles the block being scanned.
+ *
+ * QE_MAXBLK bounds the checkpoint array. ncol cannot exceed 255 in the 8-bit
+ * kernels -- the width guard (l_ms * a < 250) caps it, and the u8 column index
+ * the kernel records would wrap otherwise -- so 256/QE_BLK blocks plus one for
+ * a partial tail is always enough. */
+#define QE_BLK    16
+#define QE_MAXBLK (256 / QE_BLK + 1)
+
 /* ARM/NEON support */
 #if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
 #include "neon_utils.h"
@@ -63,35 +78,124 @@ extern uint64_t prof[10][112];
 #define AMBR 4
 #define AMBQ 8
 
+/* Query-padding contract, shared by the batch wrappers and the kernels.
+ *
+ * A lane's query occupies columns [0, len2); the wrapper pads [len2, quantum)
+ * with the ambiguous-query code (DUMMY5 in the 8-bit kernels, DUMMY3 in the
+ * 16-bit ones) and every column from the lane's quantum out to the group's
+ * widest quantum with the high-bit sentinel (0xFF / 0xFFFF). The
+ * kernels must therefore zero the DP diagonal term on any cell whose query
+ * byte has bit 7 set, and can derive the FIRST such column for a whole group
+ * as min(query_quantum(len2)) over its lanes.
+ *
+ * Both halves read the quantum from here so the fill and the mask can never
+ * disagree: the lane count is the 8-bit SSE lane width (16) for the 8-bit
+ * kernels and the 16-bit one (8) for the 16-bit kernels, matching bwa-mem2. */
+static inline int query_quantum8(int len2)  { return ((len2 + 16 - 1) / 16) * 16; }
+static inline int query_quantum16(int len2) { return ((len2 + 8 - 1) / 8) * 8; }
+
+/* Why the two query pads differ, since only one of them is inert:
+ *   [len2, quantum)      DUMMY5 -> sbt = shift, i.e. m11 = h00. This
+ *                        reproduces ksw_qinit's profile-0 padding out to
+ *                        slen*p (ksw.cpp:103) -- scalar ksw computes these
+ *                        columns and scans them when picking qe (ksw.cpp:221),
+ *                        so they are part of the answer and MUST be computed.
+ *                        query_quantum8/16 IS ksw's slen*p.
+ *   [quantum, maxLen2]   0xFF/0xFFFF. Pure SoA batching slack with no scalar
+ *                        counterpart, so it must contribute NOTHING. Padding
+ *                        it with DUMMY5 instead would carry the diagonal
+ *                        undamped down-right across rows and can become a
+ *                        later row's maximum -- clearing minsc and inventing a
+ *                        second-best score. The high bit is what lets the
+ *                        kernels zero m11 there instead.
+ * A lane's own inert region therefore starts at query_quantum, and a whole
+ * group's starts at the min over its lanes. */
+
+/* First column of a group at which ANY lane can hold the DUMMY5 query pad:
+ *
+ *     min{ len2 : query_quantum8(len2) > len2 }   over the group's lanes
+ *
+ * A lane writes DUMMY5 only on [len2, quantum), so a lane whose len2 is already
+ * a multiple of 16 contributes no such column at all and is skipped. Below the
+ * minimum, the per-cell "is this the query's DUMMY5 tail padding?" test cannot
+ * fire on any lane, so the 8-bit kernels elide it there. This is not a claim
+ * about what that test COMPUTES -- it is that no input below the returned
+ * column can select it, so the bytes written are identical either way.
+ *
+ * `cap` clamps the result to the range the caller actually subdivides: the NEON
+ * and AVX-512BW kernels pass jsplit, because a group can have a jdummy above
+ * jsplit (one lane padding from a long len2 while another has a short
+ * exact-multiple len2) and splitting the expensive range as well would cost
+ * more loop bodies than it saves. The AVX2 kernel has no jsplit range and
+ * passes ncol, which the initial value already satisfies.
+ *
+ * `width` is the caller's lane count rather than SIMD_WIDTH8 directly so the
+ * three kernels share one definition of a derivation the DUMMY5 elision's
+ * correctness rests on -- three hand-maintained copies is how one tier comes to
+ * drift from the others. */
+static inline int compute_jdummy(const SeqPair *p, int width, int ncol, int cap)
+{
+    int jdummy = ncol;
+    for (int l = 0; l < width; l++) {
+        const int len2_l = p[l].len2;
+        if (query_quantum8(len2_l) > len2_l && len2_l < jdummy) jdummy = len2_l;
+    }
+    return jdummy < cap ? jdummy : cap;
+}
+
+/* "No freed cell active on this lane" markers for the freed-cell (--meth)
+ * blend, one per kernel width. Each must be a value a query byte can never
+ * take, so the blend provably never fires on a lane with no active freed cell:
+ *   8-bit   s2 holds 0-3, DUMMY5(5), AMBQ(8), or the 0xFF pad  -> 0xFE
+ *   16-bit  s2 holds 0-3, AMBQ16(16), DUMMY3(26), or the 0xFFFF pad -> 0x7FFF
+ * Both deliberately avoid the pad value itself. Aliasing it would make the
+ * blend fire on every padded column, leaving correctness dependent on the
+ * boundary mask zeroing m11 there -- two mechanisms propping each other up.
+ * Spelled as #define to match the sentinel block above (DUMMY5/AMBQ/...). */
+#define FREED_INACTIVE8  0xFE
+#define FREED_INACTIVE16 0x7FFF
+
 
 // -----------------------------------------------------------------------------------
 #if __AVX512BW__
 
-#define MAIN_SAM_CODE8_OPT(s1, s2, h00, h11, e11, f11, f21, max512, sft512) \
+/* BND is the boundary mask: bit 7 set in the reference base (rows past len1) or
+ * the query base (columns past this lane's quantum) marks a padding cell whose
+ * diagonal term must be zeroed. Callers pass the hoisted per-row
+ * rowboundary512 below jsplit, where no query byte can carry the high bit, and
+ * the full per-cell movepi8_mask(or(s1,s2)) from jsplit on. */
+#define MAIN_SAM_CODE8_OPT(s1, s2, h00, h11, e11, f11, f21, max512, sft512, BND, \
+                           NEED_DUMMY)                                  \
     {                                                                   \
-        __m512i sbt11, xor11, or11;                                     \
+        __m512i sbt11, xor11;                                           \
         xor11 = _mm512_xor_si512(s1, s2);                               \
         sbt11 = _mm512_shuffle_epi8(permSft512, xor11);                 \
-        __mmask64 cmpq = _mm512_cmpeq_epu8_mask(s2, five512);           \
-        sbt11 = _mm512_mask_blend_epi8(cmpq, sbt11, sft512);            \
-        if (HasFreed) {                                                 \
-            __mmask64 freed = rowfreed512 &                             \
-                _mm512_cmpeq_epi8_mask(s2, frread512);                  \
-            sbt11 = _mm512_mask_blend_epi8(freed, sbt11, match512);     \
-            __mmask64 freed2 = rowfreed2_512 &                          \
-                _mm512_cmpeq_epi8_mask(s2, frread2_512);                \
-            sbt11 = _mm512_mask_blend_epi8(freed2, sbt11, match512);    \
+        /* DUMMY5 tail test; provably unselectable below jdummy, so the \
+         * cmp+blend pair is elided there. See the jdummy derivation in \
+         * the u8 kernel. */                                            \
+        if (NEED_DUMMY) {                                               \
+            __mmask64 cmpq = _mm512_cmpeq_epu8_mask(s2, five512);       \
+            sbt11 = _mm512_mask_blend_epi8(cmpq, sbt11, sft512);        \
         }                                                               \
-        or11 =  _mm512_or_si512(s1, s2);                                \
-        __mmask64 cmp = _mm512_movepi8_mask(or11);                      \
+        if (HasFreed) {                                                 \
+            /* One compare + one blend against the per-row active_frread512   \
+             * target (built once per row); FREED_INACTIVE8 lanes never match \
+             * any s2 value. Fewer ops than the two-blend form and, unlike the\
+             * mask-OR collapse, no serializing kor on the blend's input.     \
+             * The blend target is freedval512 (fr_val biased by +shift), so  \
+             * NEUTRAL's zero-scored conversion cell uses the same path. */   \
+            __mmask64 freed = _mm512_cmpeq_epi8_mask(s2, active_frread512); \
+            sbt11 = _mm512_mask_blend_epi8(freed, sbt11, freedval512);  \
+        }                                                               \
+        __mmask64 cmp = (BND);                                          \
         __m512i m11 = _mm512_adds_epu8(h00, sbt11);                     \
         m11 = _mm512_mask_blend_epi8(cmp, m11, zero512);                \
         m11 = _mm512_subs_epu8(m11, sft512);                            \
         h11 = _mm512_max_epu8(m11, e11);                                \
         h11 = _mm512_max_epu8(h11, f11);                                \
-        __mmask64 cmp0 = _mm512_cmpgt_epu8_mask(h11, imax512);          \
+        /* Row max only; the query-end column is recovered after the row \
+         * from the QE_BLK checkpoints. See kswv_neon_u8_impl. */        \
         imax512 = _mm512_max_epu8(imax512, h11);                        \
-        iqe512 = _mm512_mask_blend_epi8(cmp0, iqe512, l512);            \
         __m512i gapE512 = _mm512_subs_epu8(h11, oe_ins512);             \
         e11 = _mm512_subs_epu8(e11, e_ins512);                          \
         e11 = _mm512_max_epu8(gapE512, e11);                            \
@@ -106,12 +210,11 @@ extern uint64_t prof[10][112];
         xor11 = _mm512_xor_si512(s1, s2);                               \
         sbt11 = _mm512_permutexvar_epi16(xor11, perm512);               \
         if (HasFreed) {                                                 \
-            __mmask32 freed = rowfreed512 &                             \
-                _mm512_cmpeq_epi16_mask(s2, frread512);                 \
-            sbt11 = _mm512_mask_blend_epi16(freed, sbt11, match512);    \
-            __mmask32 freed2 = rowfreed2_512 &                          \
-                _mm512_cmpeq_epi16_mask(s2, frread2_512);               \
-            sbt11 = _mm512_mask_blend_epi16(freed2, sbt11, match512);   \
+            /* One compare + one blend against the per-row active_frread512   \
+             * target (built once per row); FREED_INACTIVE16 lanes never      \
+             * match a real u16 s2 (0-3/AMBQ16=16/DUMMY3=26/0xFFFF pad). */   \
+            __mmask32 freed = _mm512_cmpeq_epi16_mask(s2, active_frread512); \
+            sbt11 = _mm512_mask_blend_epi16(freed, sbt11, freedval512); \
         }                                                               \
         __m512i m11 = _mm512_add_epi16(h00, sbt11);                     \
         or11 =  _mm512_or_si512(s1, s2);                                \
@@ -172,22 +275,32 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
     H8_0 = (uint8_t*) H16_0;
     H8_1 = (uint8_t*) H16_1;
     rowMax8 = (uint8_t*) rowMax16;
+
+    /* Column-index broadcast table for the u8 kernels' post-row query-end
+     * rescan; see kswv.h. Shared by all threads and never written after
+     * construction. */
+    colIdx8 = (uint8_t *)_mm_malloc((size_t) this->maxQerLen * SIMD_WIDTH8
+                                    * sizeof(uint8_t), 64);
+    for (int32_t j = 0; j < this->maxQerLen; ++j)
+        for (int k = 0; k < SIMD_WIDTH8; ++k)
+            colIdx8[(size_t) j * SIMD_WIDTH8 + k] = (uint8_t) j;
 }
 
 // Mat-aware constructor (issue 173). Delegates to the 9-arg ctor (identical
 // buffer allocation / field init), then inspects the supplied 5x5 scoring
-// matrix for the rank-1 asymmetric (bisulfite OT/OB) freed cell.
+// matrix for the asymmetric (bisulfite OT/OB) freed cell.
 //
 //   nullptr / symmetric matrix ⇒ the existing symmetric XOR-LUT kernel runs
 //     unchanged (has_freed = needs_scalar = false).
-//   exactly one off-diagonal cell freed to a match (rank-1, genomic OT/OB) ⇒
-//     has_freed, fr_ref/fr_read name it; the kernel applies the rank-1 override.
+//   exactly one off-diagonal cell freed to ANY value in [w_mismatch, w_match]
+//     (genomic OT/OB frees it to +a, neutral to 0) ⇒ has_freed, fr_ref/fr_read
+//     name it and fr_val carries the value; the kernel blends the cell to fr_val.
 //   an exact mirrored freed pair (collapsed --meth) ⇒ has_freed, both ordered
-//     cells named; the kernel applies both blends (rank-1 is the degenerate
-//     case where the mirror equals the primary).
+//     cells named; the kernel applies both blends (the single-cell case is the
+//     degenerate one where the mirror equals the primary).
 //   any other asymmetric matrix (non-mirror multi-cell free, changed diagonal,
-//     freed value != w_match) ⇒ needs_scalar; the caller routes those pairs to
-//     ksw_align2.
+//     freed value outside [w_mismatch, w_match]) ⇒ needs_scalar; the caller
+//     routes those pairs to ksw_align2.
 //   On SSE41/SSE42/AVX tiers (no HasFreed kernel override) ⇒ needs_scalar for
 //     ANY freed-cell matrix, so the caller falls back to ksw_align2 rather than
 //     running a kernel that would drop the bisulfite override.
@@ -211,6 +324,19 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
         // freed-cell-less tier, leave needs_scalar = true so the caller routes
         // the pair to the scalar ksw_align2 fallback instead of running a
         // kernel that would silently drop the bisulfite override.
+        //
+        // This compile-time test IS the runtime-tier test, and is not a
+        // baseline-vs-host mismatch waiting to happen. kswv.cpp is compiled
+        // ONCE PER TIER (KERNEL_SRCS x {sse41,sse42,avx,avx2,avx512bw} in the
+        // Makefile), each copy under that tier's -m flags with the class name
+        // mangled to kswv_<tier> by kernel_dispatch.h. simd_dispatch.cpp's
+        // make_kswv() switches on the runtime g_tier (incl. BWAMEM3_FORCE_TIER)
+        // to call make_kswv_kernel_<tier>_mat, which constructs THIS ctor out
+        // of the <tier> TU — so the macros below are exactly the ones that
+        // selected the kernel body compiled alongside it. Forcing sse41 on an
+        // AVX2 host runs kswv_sse41::kswv from kswv.sse41.o, where __AVX2__ is
+        // undefined and needs_scalar is correctly set. Keep this predicate in
+        // sync with the #if/#elif ladder that guards the kernel bodies below.
 #if defined(__AVX512BW__) || defined(__AVX2__) \
         || defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
         constexpr bool freed_simd_supported = true;
@@ -224,22 +350,37 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
         const bool generic = bsw_generic_matrix(mat25, w_match, w_mismatch) || forced;
         if (generic) {
             BswFreedCell fc = bsw_freed_cell(mat25, w_match, w_mismatch, forced);
-            if (fc.rank1) {
-                // GENOMIC (one freed cell): mirror == primary, so the kernel's
-                // second blend is idempotent.
+            if (fc.single) {
+                // ONE off-diagonal cell freed. GENOMIC frees it to a match
+                // (fc.value == w_match); NEUTRAL frees it to 0. Either way the
+                // mirror == primary, so the kernel's second blend is idempotent.
+                // The kernel blends the freed cell to fr_val (see fr_val member);
+                // fr_val == w_match reproduces the pre-generalization match blend.
                 if (!freed_simd_supported) { needs_scalar = true; return; }
+                // bsw_freed_cell accepts ANY freed value, but the 8-bit kernel
+                // blends fr_val + shift into the biased u8 domain, which only
+                // represents [w_mismatch, w_match]. mem_opt_fill_meth_mat never
+                // produces anything outside it (+a or 0), so this cannot fire
+                // today — but a freed value below/above the domain would wrap the
+                // biased byte and SILENTLY mis-score, so route it to the scalar
+                // ksw_align2 fallback (always correct) rather than trust it.
+                if (fc.value < w_mismatch || fc.value > w_match) {
+                    needs_scalar = true; return;
+                }
                 has_freed = true;
                 fr_ref  = fr_ref2  = fc.ref;
                 fr_read = fr_read2 = fc.read;
+                fr_val  = fc.value;
             } else {
                 // COLLAPSED (the --meth default) frees the conversion cell AND
-                // its mirror; the kernel frees both ordered cells.
+                // its mirror to a match; the kernel frees both ordered cells.
                 BswFreedPair fp = bsw_freed_pair(mat25, w_match, w_mismatch);
                 if (fp.supported) {
                     if (!freed_simd_supported) { needs_scalar = true; return; }
                     has_freed = true;
                     fr_ref  = fp.refA;  fr_read  = fp.readA;
                     fr_ref2 = fp.refB;  fr_read2 = fp.readB;
+                    fr_val  = w_match;   // collapsed frees both cells to a match
                 } else {
                     needs_scalar = true;
                 }
@@ -252,6 +393,7 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
 kswv::~kswv() {
     _mm_free(F16); _mm_free(H16_0); _mm_free(H16_1);
     _mm_free(rowMax16);
+    _mm_free(colIdx8);
 }
 
 
@@ -350,8 +492,7 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
 #else
                 seq2 = seqBufQer + sp.idq;
 #endif
-                int quanta = (sp.len2 + 16 - 1) / 16;
-                quanta *= 16;
+                int quanta = query_quantum8(sp.len2);
                 for (k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k] == AMBIG_ ? AMBQ : seq2[k]);
@@ -367,8 +508,7 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
             for (j = 0; j < SIMD_WIDTH8; j++)
             {
                 SeqPair sp = pairArray[i + j];
-                int quanta = (sp.len2 + 16 - 1) / 16;
-                quanta *= 16;
+                int quanta = query_quantum8(sp.len2);
                 for (k = quanta; k <= maxLen2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = 0xFF;
@@ -430,7 +570,11 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     uint64_t *b;
 
     uint8x16_t zero_vec = vdupq_n_u8(0);
-    uint8x16_t one_vec = vdupq_n_u8(1);
+
+    /* Per-row running-max checkpoints, one vector per QE_BLK columns. Rewritten
+     * every row, so no clearing is needed; a few hundred bytes of stack, hot in
+     * L1 beside H0/H1/F. */
+    alignas(64) uint8_t blockMax[QE_MAXBLK * SIMD_WIDTH8];
 
     m_b = n_b = 0; b = 0;
 
@@ -483,6 +627,9 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     uint8x16_t e_ins_vec = vdupq_n_u8(this->e_ins);
     uint8x16_t oe_ins_vec = vdupq_n_u8(this->o_ins + this->e_ins);
     uint8x16_t five_vec = vdupq_n_u8(DUMMY5);
+    /* Padding sentinel test: bit 7 set marks a reference row past len1 or a
+     * query column past this lane's quantum. */
+    const uint8x16_t highbit_vec = vdupq_n_u8(0x80);
     uint8x16_t gmax_vec = zero_vec;
     // 8-bit SW processes 16 pairs per SIMD batch, but te must be tracked in
     // 16-bit precision (ref positions > 255 are possible). Use two
@@ -544,6 +691,66 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     vst1q_u8(H0, zero_vec);
     vst1q_u8(H1, zero_vec);
 
+    /* Boundary-mask fast-path bounds, both derived from the group's lanes:
+     *   jsplit  - first column any lane pads with the 0xFF query sentinel, i.e.
+     *             min(query_quantum8(len2)). Below it no query byte can carry
+     *             bit 7, so the mask reduces to the per-row high_bit(s1).
+     *   minLen1 - shortest reference window. Below it no lane pads its
+     *             reference either, so the mask is provably all-zero and the
+     *             blend is skipped outright.
+     * Together they split the inner loop into three ranges (see below), of
+     * which a uniform-length group only ever runs the cheapest. That is the
+     * common case in PHASE 0 -- production ref windows and read lengths cluster
+     * tightly -- but not in phase 1, where the caller re-enters with
+     * len2 = qe + 1 per pair (bwamem_pair.cpp:875): those groups are ragged
+     * whatever the input lengths were, so jsplit < ncol and the per-cell range
+     * covers most of the row. The measured phase-0 parity therefore does not
+     * carry over to phase 1.
+     *
+     * That cost is now MEASURED, not just predicted: bwa-bsw-bench drives phase 1
+     * and times it separately (its rescue mode prints a phase-1 table alongside
+     * phase 0), and on quiet cloud hosts the per-cell range costs phase-1 8-bit
+     * throughput -7.2% at qlen 100 and -4.3% at qlen 150 on avx512bw, and
+     * -2.1% / -1.4% on Graviton4 NEON. Phase 0 is at parity on every tier, as
+     * this fast path intends.
+     *
+     * Two cross-checks fall out of that, and both hold, which is what makes the
+     * attribution to THIS range rather than something ambient:
+     *   - avx2 measures ~0 (-0.8% / +0.5%, i.e. noise). It must: avx2 never had
+     *     the hoist to restore, so the fix did not change its code at all (see
+     *     the register-pressure note in the avx2 kernel below).
+     *   - the cost vanishes at qlen 250 (+0.5% avx512bw, -0.0% NEON), where the
+     *     router picks the 16-bit kernel, which this hoist does not touch.
+     *
+     * The lever, if that ever matters: sort a phase-1 batch by len2 so each lane
+     * group's quanta agree and jsplit returns to ncol. bwamem.cpp:3462 already
+     * does precisely this for the extend path (sortPairsLen with key_by_max,
+     * "so ncol/minq are tight"), and it is byte-identical there because results
+     * scatter back by regid. Not done here because the end-to-end payoff is
+     * projected below the +/-0.5% noise floor: kswv is ~31% of mem CPU and phase 1
+     * is a fraction of that, and EXT-13 -- the same technique -- was predicted at
+     * 1-3% and measured -0.19%.
+     * Dummy tail lanes carry len1 == len2 == 0, pinning both to 0 for
+     * a partial final group: no fast path, still correct. */
+    int minLen1 = p[0].len1, jsplit = ncol;
+    for (int l = 0; l < SIMD_WIDTH8; l++) {
+        if (p[l].len1 < minLen1) minLen1 = p[l].len1;
+        const int quanta = query_quantum8(p[l].len2);
+        if (quanta < jsplit) jsplit = quanta;
+    }
+
+    /* Same unswitch one alphabet symbol over. Every cell pays a vceqq+vbslq to
+     * ask "is this column the query's DUMMY5 tail padding?", and per the fill
+     * contract above that is a provable no-op below compute_jdummy's column --
+     * nothing else in the alphabet is 5 (real bases are 0-3, ambiguous is
+     * AMBQ=8, the tail is 0xFF). See compute_jdummy for the derivation and for
+     * why the result is clamped to jsplit.
+     *
+     * Production pays this on 150 bp queries padded to 160, so 150 of every 160
+     * columns take the cheap body. Ragged phase-1 groups (len2 = qe + 1 per
+     * pair) push jdummy down and get correspondingly less. */
+    const int jdummy = compute_jdummy(p, SIMD_WIDTH8, ncol, jsplit);
+
     int i, limit = nrow;
     for (i = 0; i < nrow; i++)
     {
@@ -555,93 +762,151 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         s1 = vld1q_u8(seq1SoA + (i + 0) * SIMD_WIDTH8);
         h10 = zero_vec;
         imax_vec = zero_vec;
-        uint8x16_t iqe_vec = vdupq_n_u8(0xFF);
 
-        /* Rank-1 freed-cell override (issue 173, bisulfite OT/OB). The freed
-         * cell scores (s1==fr_ref, s2==fr_read) as a true match. s1 is
+        /* Freed-cell override (issue 173, bisulfite OT/OB + TAPS neutral). The
+         * freed cell (s1==fr_ref, s2==fr_read) scores fr_val. s1 is
          * loop-invariant across the inner j loop, so hoist the per-row
          * comparison here; per-cell only the s2 compare + blend remains.
-         * match_vec is the kernel's OWN biased match entry (temp[0] already
-         * includes +shift) so the freed cell scores byte-identically to a real
-         * match in the biased u8 domain. When !HasFreed, all of this and the
-         * per-cell block below compile out (identical codegen to today). */
+         * freedval_vec is fr_val biased by +shift into the u8 domain (same bias
+         * temp[] carries): fr_val==w_match (GENOMIC/COLLAPSED) equals temp[0]
+         * exactly, NEUTRAL (fr_val==0) scores the conversion as 0 after unbiasing.
+         * When !HasFreed, all of this and the per-cell block below compile out
+         * (identical codegen to today). */
         /* Free a SYMMETRIC PAIR of cells: (fr_ref,fr_read) and (fr_ref2,fr_read2).
-         * GENOMIC sets the mirror == primary (idempotent 2nd blend); COLLAPSED
-         * sets it to the transpose so C/T (or G/A) are interchangeable. */
-        uint8x16_t frread_vec, frread2_vec, match_vec, rowfreed, rowfreed2;
+         * GENOMIC/NEUTRAL set the mirror == primary; COLLAPSED sets it to the
+         * transpose so C/T (or G/A) are interchangeable.
+         *
+         * Fold the pair into ONE per-lane target base, active_frread: a lane whose
+         * ref is fr_ref frees against fr_read, a lane whose ref is fr_ref2 frees
+         * against fr_read2, and any other lane gets FREED_INACTIVE8. The two
+         * ref-side comparisons are mutually exclusive (s1 can't equal both fr_ref
+         * and fr_ref2), so at most one wins per lane. s2 holds real bases 0-3, the
+         * ambig/pad codes DUMMY5(5)/AMBQ(8), or the 0xFF query pad — never
+         * FREED_INACTIVE8 — so on a sentinel lane the single per-cell compare is
+         * unconditionally false. This
+         * turns the per-cell freed path into one vceqq + one vbslq (down from two
+         * compares, two ands, an orr, and a blend). Both cells of the pair score
+         * the same fr_val, so one freedval_vec covers the fold. */
+        uint8x16_t freedval_vec, active_frread;
         if (HasFreed) {
-            frread_vec  = vdupq_n_u8((uint8_t)fr_read);
-            frread2_vec = vdupq_n_u8((uint8_t)fr_read2);
-            match_vec   = vdupq_n_u8((uint8_t)temp[0]);
-            rowfreed    = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref));
-            rowfreed2   = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref2));
+            freedval_vec = vdupq_n_u8((uint8_t)(fr_val + shift));
+            uint8x16_t rowfreed  = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref));
+            uint8x16_t rowfreed2 = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref2));
+            active_frread = vbslq_u8(rowfreed2, vdupq_n_u8((uint8_t)fr_read2),
+                                     vdupq_n_u8(FREED_INACTIVE8));
+            active_frread = vbslq_u8(rowfreed,  vdupq_n_u8((uint8_t)fr_read),
+                                     active_frread);
         }
 
-        uint8x16_t l_vec = zero_vec;
-        for (j = 0; j < ncol; j++)
-        {
-            uint8x16_t f11, s2, f21;
-            h00 = vld1q_u8(H0 + j * SIMD_WIDTH8);
-            s2 = vld1q_u8(seq2SoA + j * SIMD_WIDTH8);
-            f11 = vld1q_u8(F + (j + 1) * SIMD_WIDTH8);
-
-            /* Core Smith-Waterman computation using NEON */
-            uint8x16_t xor_val = veorq_u8(s1, s2);
-            uint8x16_t sbt = vqtbl1q_u8(permSft, xor_val);
-
-            /* Check for ambiguous query base (DUMMY5) */
-            uint8x16_t cmpq = vceqq_u8(s2, five_vec);
-            sbt = vbslq_u8(cmpq, sft_vec, sbt);
-
-            /* Apply the rank-1 freed-cell override: where the row is fr_ref and
-             * this column is fr_read, force the biased match score. Real bases
-             * are 0-3 and fr_read ∈ {0,3}; s1 boundary (0xFF) and s2
-             * ambig/padding (AMBQ=8, DUMMY5=5) never equal fr_read, so vceqq
-             * is naturally false for them — no extra masking needed. */
-            if (HasFreed) {
-                uint8x16_t freed  = vandq_u8(rowfreed,  vceqq_u8(s2, frread_vec));
-                sbt = vbslq_u8(freed, match_vec, sbt);
-                uint8x16_t freed2 = vandq_u8(rowfreed2, vceqq_u8(s2, frread2_vec));
-                sbt = vbslq_u8(freed2, match_vec, sbt);
-            }
-
-            /* Check for boundary (high bit set in s1 or s2). vtstq_u8 against
-             * 0x80 sets 0xFF where bit 7 is set, 0x00 otherwise — one op vs the
-             * prior vshr+vceq pair, and this runs per cell in the inner loop. */
-            uint8x16_t or_val = vorrq_u8(s1, s2);
-            uint8x16_t is_boundary = vtstq_u8(or_val, vdupq_n_u8(0x80));
-
-            uint8x16_t m11 = vqaddq_u8(h00, sbt);
-            m11 = vbslq_u8(is_boundary, zero_vec, m11);
-            m11 = vqsubq_u8(m11, sft_vec);
-
-            h11 = vmaxq_u8(m11, e11);
-            h11 = vmaxq_u8(h11, f11);
-
-            /* Update imax tracking */
-            uint8x16_t cmp0 = vcgtq_u8(h11, imax_vec);
-            imax_vec = vmaxq_u8(imax_vec, h11);
-            iqe_vec = vbslq_u8(cmp0, l_vec, iqe_vec);
-
-            /* Reassociate BOTH gap recurrences off h11 (Daily-scan algebra).
-             * e uses max(m11,f11), f uses max(m11,e11) — each drops the term
-             * dominated by its own extension arg (O>=0, saturating u8). me must
-             * read the OLD e11, so compute it before the e-update overwrites e11. */
-            uint8x16_t mf = vmaxq_u8(m11, f11);
-            uint8x16_t me = vmaxq_u8(m11, e11);
-            uint8x16_t gapE = vqsubq_u8(mf, oe_ins_vec);
-            e11 = vqsubq_u8(e11, e_ins_vec);
-            e11 = vmaxq_u8(gapE, e11);
-
-            /* Gap extension for F (reassociated) */
-            uint8x16_t gapD = vqsubq_u8(me, oe_del_vec);
-            f21 = vqsubq_u8(f11, e_del_vec);
-            f21 = vmaxq_u8(gapD, f21);
-
-            vst1q_u8(H1 + (j + 1) * SIMD_WIDTH8, h11);
-            vst1q_u8(F + (j + 1) * SIMD_WIDTH8, f21);
-            l_vec = vaddq_u8(l_vec, one_vec);
+        /* One DP cell. BND is the boundary mask -- bit 7 set in the reference
+         * base (rows past len1) or the query base (columns past this lane's
+         * quantum) -- and APPLY_BND gates whether it is applied at all. Both
+         * are compile-time constants at each call site, so `if (APPLY_BND)`
+         * folds exactly like the `if (HasFreed)` below it and no per-cell
+         * branch survives. Passing them in lets each column range pay only for
+         * the half that can actually fire: nothing below both minLen1 and
+         * jsplit, the hoisted per-row reference mask below jsplit, and the full
+         * per-cell form from jsplit on. */
+#define KSWV_NEON_U8_CELL(APPLY_BND, BND, NEED_DUMMY)                           \
+        {                                                                       \
+            uint8x16_t f11, s2, f21;                                            \
+            h00 = vld1q_u8(H0 + j * SIMD_WIDTH8);                               \
+            s2 = vld1q_u8(seq2SoA + j * SIMD_WIDTH8);                           \
+            f11 = vld1q_u8(F + (j + 1) * SIMD_WIDTH8);                          \
+                                                                                \
+            /* Core Smith-Waterman computation using NEON */                    \
+            uint8x16_t xor_val = veorq_u8(s1, s2);                              \
+            uint8x16_t sbt = vqtbl1q_u8(permSft, xor_val);                      \
+                                                                                \
+            /* Check for ambiguous query base (DUMMY5). Elided below jdummy,   \
+             * where no lane can hold one -- see the derivation above. */       \
+            if (NEED_DUMMY) {                                                   \
+                uint8x16_t cmpq = vceqq_u8(s2, five_vec);                       \
+                sbt = vbslq_u8(cmpq, sft_vec, sbt);                             \
+            }                                                                   \
+                                                                                \
+            /* Apply the freed-cell override: force the biased freed score      \
+             * (fr_val + shift) where this column's read base equals the row's  \
+             * active freed base (built once per row in active_frread above).   \
+             * One compare + one blend; FREED_INACTIVE8 lanes never match any  \
+             * s2 value (0-3/5/8 or the 0xFF pad), so they blend through        \
+             * unchanged. */                                                    \
+            if (HasFreed) {                                                     \
+                sbt = vbslq_u8(vceqq_u8(s2, active_frread), freedval_vec, sbt); \
+            }                                                                   \
+                                                                                \
+            uint8x16_t m11 = vqaddq_u8(h00, sbt);                               \
+            if (APPLY_BND) m11 = vbslq_u8((BND), zero_vec, m11);                \
+            m11 = vqsubq_u8(m11, sft_vec);                                      \
+                                                                                \
+            /* hme = max(m11, e11); reused verbatim for `me` (gap-D) below,     \
+             * where the original code recomputed the identical max(m11,e11) -- \
+             * e11 is not modified between the two, so this is byte-identical   \
+             * and drops one vmaxq per cell. */                                 \
+            uint8x16_t hme = vmaxq_u8(m11, e11);                                \
+            h11 = vmaxq_u8(hme, f11);                                           \
+                                                                                \
+            /* Row max only. The COLUMN at which it sits (the query end) is    \
+             * recovered after the row, and only on the rows that actually     \
+             * advance a lane's global max -- see the rescan below. */         \
+            imax_vec = vmaxq_u8(imax_vec, h11);                                 \
+                                                                                \
+            /* Reassociate BOTH gap recurrences off h11 (Daily-scan algebra).   \
+             * e uses max(m11,f11), f uses max(m11,e11) — each drops the term   \
+             * dominated by its own extension arg (O>=0, saturating u8). me must\
+             * read the OLD e11, so compute it before e11 is overwritten. */    \
+            uint8x16_t mf = vmaxq_u8(m11, f11);                                 \
+            uint8x16_t me = hme;  /* == vmaxq_u8(m11, e11), e11 unchanged */    \
+            uint8x16_t gapE = vqsubq_u8(mf, oe_ins_vec);                        \
+            e11 = vqsubq_u8(e11, e_ins_vec);                                    \
+            e11 = vmaxq_u8(gapE, e11);                                          \
+                                                                                \
+            /* Gap extension for F (reassociated) */                            \
+            uint8x16_t gapD = vqsubq_u8(me, oe_del_vec);                        \
+            f21 = vqsubq_u8(f11, e_del_vec);                                    \
+            f21 = vmaxq_u8(gapD, f21);                                          \
+                                                                                \
+            vst1q_u8(H1 + (j + 1) * SIMD_WIDTH8, h11);                          \
+            vst1q_u8(F + (j + 1) * SIMD_WIDTH8, f21);                           \
+            /* Checkpoint the running row max once per QE_BLK columns, so the   \
+             * post-row query-end recovery can find the block holding the max   \
+             * without rescanning the whole row. One vector store per QE_BLK    \
+             * cells, on a branch taken 1-in-QE_BLK with a fixed stride -- the  \
+             * predictor sees a regular pattern, and the four unswitched column \
+             * loops stay intact. */                                            \
+            if (j == qeNext) {                                                  \
+                vst1q_u8(blockMax + qeBlk * SIMD_WIDTH8, imax_vec);             \
+                qeBlk++; qeNext += QE_BLK;                                      \
+            }                                                                   \
         }
+
+        int qeNext = QE_BLK - 1, qeBlk = 0;
+        j = 0;
+        if (i < minLen1) {
+            /* No lane has begun reference padding and no column below jsplit
+             * carries query padding: the mask is provably all-zero here. */
+            for (; j < jdummy; j++)
+                KSWV_NEON_U8_CELL(false, zero_vec, false)
+            for (; j < jsplit; j++)
+                KSWV_NEON_U8_CELL(false, zero_vec, true)
+        } else {
+            /* Reference half only; loop-invariant across j. */
+            const uint8x16_t rowboundary = vtstq_u8(s1, highbit_vec);
+            for (; j < jdummy; j++)
+                KSWV_NEON_U8_CELL(true, rowboundary, false)
+            for (; j < jsplit; j++)
+                KSWV_NEON_U8_CELL(true, rowboundary, true)
+        }
+        for (; j < ncol; j++)
+            KSWV_NEON_U8_CELL(true, vtstq_u8(vorrq_u8(s1, s2), highbit_vec), true)
+#undef KSWV_NEON_U8_CELL
+
+        /* Close the final (possibly partial) block. imax_vec is now the row max,
+         * so this entry always compares equal below, which is what guarantees
+         * the block walk terminates with every active lane found. When ncol is a
+         * multiple of QE_BLK this rewrites the last complete block with the same
+         * value. */
+        vst1q_u8(blockMax + ((ncol - 1) / QE_BLK) * SIMD_WIDTH8, imax_vec);
 
         /* Block I - row max tracking */
         if (i > 0)
@@ -696,7 +961,61 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         /* Update te/qe only for active lanes (imax > gmax AND not frozen) */
         te_vec_lo = vbslq_s16(cmp_lo_16, i_vec, te_vec_lo);
         te_vec_hi = vbslq_s16(cmp_hi_16, i_vec, te_vec_hi);
-        qe_vec = vbslq_u8(cmp0_active, iqe_vec, qe_vec);
+
+        /* Query end (qe) of this row's max. The inner loop used to carry it
+         * cell by cell -- a compare against the running row max, a blend of
+         * the column index, and the counter feeding that blend, three of the
+         * seventeen SIMD ALU ops -- on every cell of every row. But qe is only
+         * ever CONSUMED on a row that advances some lane's global max, which
+         * instrumenting wgs-5M puts at 18.9 % of rows. So recover it here
+         * instead, from the QE_BLK checkpoints: take the first block whose
+         * running max equals the row max, and scan only that block's columns
+         * for the first H1 cell equal to it. Restricting the scan to the
+         * block(s) that can hold the max cuts it to a fraction of the row
+         * (QE_BLK's comment carries the measured factor), which is what keeps
+         * the amortised cost well under the 3 ops per cell removed above.
+         *
+         * Identical by construction. The per-cell form blended iqe on a STRICT
+         * `h11 > running row max`, so what it computed was
+         * min{ j : H1[j+1] == imax } -- exactly what this scan returns. Every
+         * column in [0, ncol) is written to H1 on every row (the jsplit ranges
+         * partition the width, they do not skip any of it), so the scan never
+         * reads a cell left over from an earlier row. Pad columns participate
+         * in column order in both forms, so a row max attained only by a
+         * carried-forward pad column still reports that pad column. Lanes that
+         * did not advance get a garbage index, discarded by the same vbsl the
+         * per-cell form already relied on. */
+        if (neon_movemask_u8(cmp0_active))
+        {
+            uint8x16_t iqe_vec = vdupq_n_u8(0xFF);
+            uint8x16_t foundBlk = zero_vec;
+            const uint8_t *colIdx = this->colIdx8;
+            const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;
+            for (int b = 0; b < nblocks; b++) {
+                /* blockMax[b] is the running row max after block b, so it is
+                 * non-decreasing in b. `reached` marks lanes whose max was
+                 * already attained by the end of this block; `newly` narrows
+                 * that to active lanes seeing it for the FIRST time, whose
+                 * first occurrence of the max therefore lies inside block b. */
+                uint8x16_t reached = vceqq_u8(vld1q_u8(blockMax + b * SIMD_WIDTH8), imax_vec);
+                uint8x16_t newly = vandq_u8(vbicq_u8(reached, foundBlk), cmp0_active);
+                foundBlk = vorrq_u8(foundBlk, reached);
+                if (neon_movemask_u8(newly)) {
+                    const int j0 = b * QE_BLK;
+                    const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol;
+                    uint8x16_t got = zero_vec;
+                    for (int j2 = j0; j2 < j1; j2++) {
+                        uint8x16_t eq = vandq_u8(
+                            vceqq_u8(vld1q_u8(H1 + (j2 + 1) * SIMD_WIDTH8), imax_vec), newly);
+                        uint8x16_t first = vbicq_u8(eq, got);
+                        iqe_vec = vbslq_u8(first, vld1q_u8(colIdx + j2 * SIMD_WIDTH8), iqe_vec);
+                        got = vorrq_u8(got, eq);
+                    }
+                }
+                if (!vmaxvq_u8(vbicq_u8(cmp0_active, foundBlk))) break;
+            }
+            qe_vec = vbslq_u8(cmp0_active, iqe_vec, qe_vec);
+        }
 
         /* Check end score threshold */
         uint8x16_t cmp_end = vcgeq_u8(gmax_vec, endsc_vec);
@@ -958,8 +1277,7 @@ void kswv::kswvBatchWrapper16(SeqPair *pairArray,
 #else
                 seq2 = seqBufQer + sp.idq;
 #endif
-                int quanta = (sp.len2 + 8 - 1) / 8;
-                quanta *= 8;
+                int quanta = query_quantum16(sp.len2);
                 for (k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k] == AMBIG_ ? AMBQ16 : seq2[k]);
@@ -975,8 +1293,7 @@ void kswv::kswvBatchWrapper16(SeqPair *pairArray,
             for (j = 0; j < SIMD_WIDTH16; j++)
             {
                 SeqPair sp = pairArray[i + j];
-                int quanta = (sp.len2 + 8 - 1) / 8;
-                quanta *= 8;
+                int quanta = query_quantum16(sp.len2);
                 for (k = quanta; k <= maxLen2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = 0xFFFF;
@@ -1156,18 +1473,28 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
         int16x8_t l_vec   = zero_vec;
         int16x8_t i_vec   = vdupq_n_s16((int16_t)i);
 
-        /* Rank-1 freed-cell override (issue 173). s1 is loop-invariant, so
-         * hoist the per-row fr_ref comparison. The 16-bit kernel has NO shift
-         * bias (m11 = h00 + sbt directly), so the biased match constant is
-         * just temp8[0] (== w_match), sign-extended to int16. !HasFreed → both
-         * this and the per-cell block compile out. */
-        int16x8_t frread_vec16, frread2_vec16, match_vec16, rowfreed16, rowfreed2_16;
+        /* Rank-1 freed-cell override (issue 173 + TAPS neutral), folded into ONE
+         * per-row target base active_frread16 — the u16 analog of
+         * kswv_neon_u8_impl's active_frread. A lane whose ref is fr_ref frees
+         * against fr_read, a lane whose ref is fr_ref2 frees against fr_read2 (the
+         * two ref-side compares are mutually exclusive), and every other lane gets
+         * a sentinel no s2 ever equals. u16 s2 ∈ {0-3, AMBQ16=16, DUMMY3=26,
+         * 0xFFFF pad}, so FREED_INACTIVE16 is safe here; 0xFFFF, the pad, would
+         * NOT be — the u8 path picks FREED_INACTIVE8 over its own 0xFF pad on
+         * the same reasoning. The 16-bit kernel has NO shift bias (m11 = h00 +
+         * sbt directly), so the freed value is just fr_val: fr_val == w_match
+         * (GENOMIC/COLLAPSED) equals temp8[0], NEUTRAL (fr_val==0) scores the
+         * conversion as 0. Sign-extended to int16. When !HasFreed, this and the
+         * per-cell block below compile out. */
+        int16x8_t freedval_vec16, active_frread16;
         if (HasFreed) {
-            frread_vec16  = vdupq_n_s16((int16_t)fr_read);
-            frread2_vec16 = vdupq_n_s16((int16_t)fr_read2);
-            match_vec16   = vdupq_n_s16((int16_t)temp8[0]);
-            rowfreed16    = vreinterpretq_s16_u16(vceqq_s16(s1, vdupq_n_s16((int16_t)fr_ref)));
-            rowfreed2_16  = vreinterpretq_s16_u16(vceqq_s16(s1, vdupq_n_s16((int16_t)fr_ref2)));
+            freedval_vec16 = vdupq_n_s16((int16_t)fr_val);
+            uint16x8_t rowfreed16   = vceqq_s16(s1, vdupq_n_s16((int16_t)fr_ref));
+            uint16x8_t rowfreed2_16 = vceqq_s16(s1, vdupq_n_s16((int16_t)fr_ref2));
+            active_frread16 = vbslq_s16(rowfreed2_16, vdupq_n_s16((int16_t)fr_read2),
+                                        vdupq_n_s16((int16_t)FREED_INACTIVE16));
+            active_frread16 = vbslq_s16(rowfreed16,  vdupq_n_s16((int16_t)fr_read),
+                                        active_frread16);
         }
 
         for (int j = 0; j < ncol; j++) {
@@ -1185,17 +1512,13 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
             int8x8_t   sbt8 = vqtbl2_s8(perm_vec, idx8);
             int16x8_t  sbt  = vmovl_s8(sbt8);
 
-            /* Rank-1 freed-cell override (issue 173): where row==fr_ref and
-             * col==fr_read, force the match score. Real bases 0-3; fr_read ∈
-             * {0,3}; padding/ambig (DUMMY3/0xFFFF/AMBQ16) never equal fr_read,
-             * so vceqq is naturally false for them. */
+            /* Rank-1 freed-cell override (issue 173 + TAPS neutral): force the
+             * freed score where this column's read base equals the row's active
+             * freed base (built once per row in active_frread16 above). One compare
+             * + one blend; FREED_INACTIVE16 lanes never match a real s2 so they
+             * pass through. */
             if (HasFreed) {
-                int16x8_t freed  = vandq_s16(
-                    rowfreed16, vreinterpretq_s16_u16(vceqq_s16(s2, frread_vec16)));
-                sbt = vbslq_s16(vreinterpretq_u16_s16(freed), match_vec16, sbt);
-                int16x8_t freed2 = vandq_s16(
-                    rowfreed2_16, vreinterpretq_s16_u16(vceqq_s16(s2, frread2_vec16)));
-                sbt = vbslq_s16(vreinterpretq_u16_s16(freed2), match_vec16, sbt);
+                sbt = vbslq_s16(vceqq_s16(s2, active_frread16), freedval_vec16, sbt);
             }
 
             /* Boundary: high bit set in (s1 | s2) indicates padding. */
@@ -1500,7 +1823,9 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
     uint8_t endsc[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
 
     const __m256i zero_vec = _mm256_setzero_si256();
-    const __m256i one_vec  = _mm256_set1_epi8(1);
+
+    /* Per-row running-max checkpoints; see kswv_neon_u8_impl. */
+    alignas(64) uint8_t blockMax[QE_MAXBLK * SIMD_WIDTH8];
 
     /* Score lookup table (16 bytes). Indexed by (s1 ^ s2). */
     int8_t temp[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
@@ -1540,6 +1865,19 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
     const __m256i e_ins_vec  = _mm256_set1_epi8((char)this->e_ins);
     const __m256i oe_ins_vec = _mm256_set1_epi8((char)(this->o_ins + this->e_ins));
     const __m256i five_vec   = _mm256_set1_epi8((char)DUMMY5);
+
+    /* First column any lane can hold the DUMMY5 query pad. Below it the
+     * cmpeq+blendv pair that tests for it cannot fire, so it is elided --
+     * same derivation and byte-identity argument as the NEON kernel.
+     * Unlike the boundary-mask hoist noted in the loop below, this REMOVES a
+     * live vector (five_vec is dead in the cheap body) rather than pinning
+     * one, so it does not provoke the AVX2 register-file spill that made the
+     * boundary hoist a regression on this tier.
+     *
+     * ncol as the cap, not jsplit: this kernel has no jsplit range to subdivide,
+     * so the cap is a no-op here (compute_jdummy starts at ncol and only ever
+     * lowers it). */
+    const int jdummy_a2 = compute_jdummy(p, SIMD_WIDTH8, ncol, ncol);
     const __m256i cmax_vec   = _mm256_set1_epi8((char)255);
 
     __m256i gmax_vec   = zero_vec;
@@ -1591,83 +1929,107 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
         __m256i e11 = zero_vec;
         __m256i s1  = _mm256_loadu_si256((const __m256i*)(seq1SoA + i * SIMD_WIDTH8));
         imax_vec    = zero_vec;
-        __m256i iqe_vec = _mm256_set1_epi8((char)0xFF);
-        __m256i l_vec = zero_vec;
         __m256i i_vec_s16 = _mm256_set1_epi16((int16_t)i);
 
-        /* Rank-1 freed-cell override (issue 173, bisulfite OT/OB). The freed
-         * cell scores (s1==fr_ref, s2==fr_read) as a true match. s1 is
+        /* Freed-cell override (issue 173, bisulfite OT/OB + TAPS neutral). The
+         * freed cell (s1==fr_ref, s2==fr_read) scores fr_val. s1 is
          * loop-invariant across the inner j loop, so hoist the per-row
          * comparison here; per-cell only the s2 compare + blend remains.
-         * match256 is the kernel's OWN biased match entry (temp[0] already
-         * includes +shift) so the freed cell scores byte-identically to a real
-         * match in the biased u8 domain. When !HasFreed, all of this and the
-         * per-cell block below compile out (identical codegen to today). */
-        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC sets the
-         * mirror == primary so the second blend is idempotent. */
-        __m256i frread256, frread2_256, match256, rowfreed, rowfreed2;
+         * freedval256 is fr_val biased by +shift into the u8 domain (same bias
+         * temp[] carries): fr_val==w_match (GENOMIC/COLLAPSED) equals temp[0]
+         * exactly, NEUTRAL (fr_val==0) scores the conversion as 0 after unbiasing.
+         * When !HasFreed, all of this and the per-cell block below compile out
+         * (identical codegen to today). */
+        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC/NEUTRAL set
+         * the mirror == primary so the second blend is idempotent. Both cells score
+         * the same fr_val, so one freedval256 covers the folded target below. */
+        __m256i freedval256, active_frread;
         if (HasFreed) {
-            frread256  = _mm256_set1_epi8((char)fr_read);
-            frread2_256= _mm256_set1_epi8((char)fr_read2);
-            match256   = _mm256_set1_epi8((char)temp[0]);
-            rowfreed   = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref));
-            rowfreed2  = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref2));
+            freedval256 = _mm256_set1_epi8((char)(fr_val + shift));
+            __m256i rowfreed  = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref));
+            __m256i rowfreed2 = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref2));
+            /* One per-lane freed target: fr_read where ref==fr_ref, fr_read2 where
+             * ref==fr_ref2, else FREED_INACTIVE8 (no s2 value — 0-3/5/8 or the
+             * 0xFF pad — ever equals it). The two ref tests are mutually exclusive.
+             * Collapses the per-cell freed path to one cmpeq + one blendv (see
+             * NEON variant). */
+            active_frread = avx2_blendv_u8(rowfreed2, _mm256_set1_epi8((char)fr_read2),
+                                           _mm256_set1_epi8((char)FREED_INACTIVE8));
+            active_frread = avx2_blendv_u8(rowfreed,  _mm256_set1_epi8((char)fr_read),
+                                           active_frread);
         }
 
-        for (int j = 0; j < ncol; j++) {
-            __m256i h00 = _mm256_loadu_si256((const __m256i*)(H0 + j * SIMD_WIDTH8));
-            __m256i s2  = _mm256_loadu_si256((const __m256i*)(seq2SoA + j * SIMD_WIDTH8));
-            __m256i f11 = _mm256_loadu_si256((const __m256i*)(F + (j + 1) * SIMD_WIDTH8));
+#define KSWV_AVX2_U8_CELL(NEED_DUMMY) \
+{ \
+            __m256i h00 = _mm256_loadu_si256((const __m256i*)(H0 + j * SIMD_WIDTH8)); \
+            __m256i s2  = _mm256_loadu_si256((const __m256i*)(seq2SoA + j * SIMD_WIDTH8)); \
+            __m256i f11 = _mm256_loadu_si256((const __m256i*)(F + (j + 1) * SIMD_WIDTH8)); \
+ \
+            __m256i xor_val = _mm256_xor_si256(s1, s2); \
+            __m256i sbt     = _mm256_shuffle_epi8(permSft, xor_val); \
+ \
+            if (NEED_DUMMY) { \
+                __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec); \
+                sbt = avx2_blendv_u8(cmpq, sft_vec, sbt); \
+            } \
+ \
+            /* Apply the freed-cell override: force the biased freed score \
+             * (fr_val + shift) where this column's read base equals the row's \
+             * active freed base (active_frread, built once per row above). One \
+             * cmpeq + one blendv; FREED_INACTIVE8 lanes never match any s2 value \
+             * (0-3/5/8 or the 0xFF pad) so they pass through. */ \
+            if (HasFreed) { \
+                sbt = _mm256_blendv_epi8(sbt, freedval256, \
+                                         _mm256_cmpeq_epi8(s2, active_frread)); \
+            } \
+ \
+            /* High bit of (s1 | s2) indicates boundary (padding 0xFF). \
+             * Sign compare against zero gives 0xFF wherever high bit is \
+             * set in the u8 byte. NB: the jsplit-bounded hoist that NEON and \
+             * AVX-512 use below their group's first padded query column \
+             * regresses here — AVX2's 16-register file spills once the mask is \
+             * loop-invariant (however computed), so this tier keeps the \
+             * per-cell s1|s2 form over the whole row. Never hoist the s2 half \
+             * away on any tier: query columns past a lane's quantum DO carry \
+             * bit 7 (see the query-padding contract at the top of this file). */ \
+            __m256i or_val      = _mm256_or_si256(s1, s2); \
+            __m256i is_boundary = _mm256_cmpgt_epi8(zero_vec, or_val); \
+ \
+            __m256i m11 = _mm256_adds_epu8(h00, sbt); \
+            m11 = avx2_blendv_u8(is_boundary, zero_vec, m11); \
+            m11 = _mm256_subs_epu8(m11, sft_vec); \
+ \
+            __m256i h11 = _mm256_max_epu8(m11, e11); \
+            h11 = _mm256_max_epu8(h11, f11); \
+ \
+            /* Row max only; the query-end column is recovered after the row. \
+             * See the rescan below kswv_neon_u8_impl's equivalent. */ \
+            imax_vec = _mm256_max_epu8(imax_vec, h11); \
+ \
+            __m256i gapE = _mm256_subs_epu8(h11, oe_ins_vec); \
+            e11 = _mm256_subs_epu8(e11, e_ins_vec); \
+            e11 = _mm256_max_epu8(gapE, e11); \
+ \
+            __m256i gapD = _mm256_subs_epu8(h11, oe_del_vec); \
+            __m256i f21  = _mm256_subs_epu8(f11, e_del_vec); \
+            f21 = _mm256_max_epu8(gapD, f21); \
+ \
+            _mm256_storeu_si256((__m256i*)(H1 + (j + 1) * SIMD_WIDTH8), h11); \
+            _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH8), f21); \
+            if (j == qeNext) { \
+                _mm256_store_si256((__m256i*)(blockMax + qeBlk * SIMD_WIDTH8), imax_vec); \
+                qeBlk++; qeNext += QE_BLK; \
+            } \
+}
+        int qeNext = QE_BLK - 1, qeBlk = 0;
+        int j = 0;
+        for (; j < jdummy_a2; j++) KSWV_AVX2_U8_CELL(false)
+        for (; j < ncol; j++)      KSWV_AVX2_U8_CELL(true)
+#undef KSWV_AVX2_U8_CELL
 
-            __m256i xor_val = _mm256_xor_si256(s1, s2);
-            __m256i sbt     = _mm256_shuffle_epi8(permSft, xor_val);
-
-            __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec);
-            sbt = avx2_blendv_u8(cmpq, sft_vec, sbt);
-
-            /* Apply the rank-1 freed-cell override: where the row is fr_ref and
-             * this column is fr_read, force the biased match score. Real bases
-             * are 0-3 and fr_read ∈ {0,3}; padding/ambig (DUMMY5/0xFF/AMBQ)
-             * never equal fr_read, so cmpeq is naturally false for them — no
-             * extra masking needed. Mirrors bandedSWA SBT_PREPASS8_RANK1. */
-            if (HasFreed) {
-                __m256i freed  = _mm256_and_si256(rowfreed,
-                                                  _mm256_cmpeq_epi8(s2, frread256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed);
-                __m256i freed2 = _mm256_and_si256(rowfreed2,
-                                                  _mm256_cmpeq_epi8(s2, frread2_256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed2);
-            }
-
-            /* High bit of (s1 | s2) indicates boundary (padding 0xFF).
-             * Sign compare against zero gives 0xFF wherever high bit is
-             * set in the u8 byte. */
-            __m256i or_val      = _mm256_or_si256(s1, s2);
-            __m256i is_boundary = _mm256_cmpgt_epi8(zero_vec, or_val);
-
-            __m256i m11 = _mm256_adds_epu8(h00, sbt);
-            m11 = avx2_blendv_u8(is_boundary, zero_vec, m11);
-            m11 = _mm256_subs_epu8(m11, sft_vec);
-
-            __m256i h11 = _mm256_max_epu8(m11, e11);
-            h11 = _mm256_max_epu8(h11, f11);
-
-            __m256i cmp0 = avx2_cmpgt_u8(h11, imax_vec);
-            imax_vec = _mm256_max_epu8(imax_vec, h11);
-            iqe_vec  = avx2_blendv_u8(cmp0, l_vec, iqe_vec);
-
-            __m256i gapE = _mm256_subs_epu8(h11, oe_ins_vec);
-            e11 = _mm256_subs_epu8(e11, e_ins_vec);
-            e11 = _mm256_max_epu8(gapE, e11);
-
-            __m256i gapD = _mm256_subs_epu8(h11, oe_del_vec);
-            __m256i f21  = _mm256_subs_epu8(f11, e_del_vec);
-            f21 = _mm256_max_epu8(gapD, f21);
-
-            _mm256_storeu_si256((__m256i*)(H1 + (j + 1) * SIMD_WIDTH8), h11);
-            _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH8), f21);
-            l_vec = _mm256_add_epi8(l_vec, one_vec);
-        }
+        /* Close the final (possibly partial) block; see kswv_neon_u8_impl. */
+        _mm256_store_si256((__m256i*)(blockMax + ((ncol - 1) / QE_BLK) * SIMD_WIDTH8),
+                           imax_vec);
 
         /* Block I - rowMax tracking. Same shape as NEON. */
         if (i > 0) {
@@ -1706,7 +2068,43 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
 
         te_vec_lo = avx2_blendv_u8(cmp_lo_16, i_vec_s16, te_vec_lo);
         te_vec_hi = avx2_blendv_u8(cmp_hi_16, i_vec_s16, te_vec_hi);
-        qe_vec    = avx2_blendv_u8(cmp0_active, iqe_vec, qe_vec);
+
+        /* Deferred query-end recovery; see the rescan in kswv_neon_u8_impl for
+         * the full derivation of why this is identical to the per-cell form. */
+        const int active_msk = _mm256_movemask_epi8(cmp0_active);
+        if (active_msk)
+        {
+            __m256i iqe_vec = _mm256_set1_epi8((char)0xFF);
+            __m256i foundBlk = zero_vec;
+            const uint8_t *colIdx = this->colIdx8;
+            const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;
+            for (int b = 0; b < nblocks; b++) {
+                __m256i reached = _mm256_cmpeq_epi8(
+                    _mm256_load_si256((const __m256i*)(blockMax + b * SIMD_WIDTH8)), imax_vec);
+                __m256i newly = _mm256_and_si256(
+                    _mm256_andnot_si256(foundBlk, reached), cmp0_active);
+                foundBlk = _mm256_or_si256(foundBlk, reached);
+                if (_mm256_movemask_epi8(newly)) {
+                    const int j0 = b * QE_BLK;
+                    const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol;
+                    __m256i got = zero_vec;
+                    for (int j2 = j0; j2 < j1; j2++) {
+                        __m256i eq = _mm256_and_si256(
+                            _mm256_cmpeq_epi8(
+                                _mm256_loadu_si256((const __m256i*)(H1 + (j2 + 1) * SIMD_WIDTH8)),
+                                imax_vec),
+                            newly);
+                        iqe_vec = avx2_blendv_u8(
+                            _mm256_andnot_si256(got, eq),
+                            _mm256_loadu_si256((const __m256i*)(colIdx + j2 * SIMD_WIDTH8)),
+                            iqe_vec);
+                        got = _mm256_or_si256(got, eq);
+                    }
+                }
+                if ((_mm256_movemask_epi8(foundBlk) & active_msk) == active_msk) break;
+            }
+            qe_vec = avx2_blendv_u8(cmp0_active, iqe_vec, qe_vec);
+        }
 
         /* End-score check + freeze update. */
         __m256i cmp_end = avx2_cmpge_u8(gmax_vec, endsc_vec);
@@ -1897,7 +2295,7 @@ void kswv::kswvBatchWrapper8_avx2(SeqPair *pairArray,
         for (int j = 0; j < SIMD_WIDTH8; j++) {
             SeqPair sp = pairArray[i + j];
             uint8_t *seq2 = seqBufQer + sp.idq;
-            int quanta = ((sp.len2 + 16 - 1) / 16) * 16;
+            int quanta = query_quantum8(sp.len2);
             for (int k = 0; k < sp.len2; k++)
                 mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k] == AMBIG_ ? AMBQ : seq2[k]);
             for (int k = sp.len2; k < quanta; k++)
@@ -1906,7 +2304,7 @@ void kswv::kswvBatchWrapper8_avx2(SeqPair *pairArray,
         }
         for (int j = 0; j < SIMD_WIDTH8; j++) {
             SeqPair sp = pairArray[i + j];
-            int quanta = ((sp.len2 + 16 - 1) / 16) * 16;
+            int quanta = query_quantum8(sp.len2);
             for (int k = quanta; k <= maxLen2; k++)
                 mySeq2SoA[k * SIMD_WIDTH8 + j] = 0xFF;
         }
@@ -2070,20 +2468,27 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
         __m256i l_vec   = zero_vec;
         __m256i i_vec   = _mm256_set1_epi16((int16_t)i);
 
-        /* Rank-1 freed-cell override (issue 173). s1 is loop-invariant, so
-         * hoist the per-row fr_ref comparison. The 16-bit kernel has NO shift
-         * bias (m11 = h00 + sbt directly), so the biased match constant is
-         * just temp8[0] (== w_match), sign-extended to int16. !HasFreed → both
-         * this and the per-cell block compile out. */
-        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC sets the
-         * mirror == primary so the second blend is idempotent. */
-        __m256i frread256, frread2_256, match256, rowfreed, rowfreed2;
+        /* Rank-1 freed-cell override (issue 173 + TAPS neutral), folded into ONE
+         * per-row target base active_frread — the u16 analog of kswv256_u8_impl's
+         * active_frread. A lane whose ref is fr_ref frees against fr_read, a lane
+         * whose ref is fr_ref2 frees against fr_read2 (the two ref-side compares
+         * are mutually exclusive), and every other lane gets a sentinel no real s2
+         * ever equals. u16 s2 ∈ {0-3, AMBQ16=16, DUMMY3=26, 0xFFFF pad}, so FREED_INACTIVE16
+         * is safe here. cmpeq_epi16 produces whole-int16 masks, so the byte-wise
+         * blendv selects whole lanes correctly. The 16-bit kernel has NO shift bias
+         * (m11 = h00 + sbt directly), so the freed value is just fr_val: fr_val ==
+         * w_match (GENOMIC/COLLAPSED) equals temp8[0], NEUTRAL (fr_val==0) scores
+         * the conversion as 0. !HasFreed → this and the per-cell block compile
+         * out. */
+        __m256i freedval256, active_frread;
         if (HasFreed) {
-            frread256  = _mm256_set1_epi16((int16_t)fr_read);
-            frread2_256= _mm256_set1_epi16((int16_t)fr_read2);
-            match256   = _mm256_set1_epi16((int16_t)temp8[0]);
-            rowfreed   = _mm256_cmpeq_epi16(s1, _mm256_set1_epi16((int16_t)fr_ref));
-            rowfreed2  = _mm256_cmpeq_epi16(s1, _mm256_set1_epi16((int16_t)fr_ref2));
+            freedval256 = _mm256_set1_epi16((int16_t)fr_val);
+            __m256i rowfreed  = _mm256_cmpeq_epi16(s1, _mm256_set1_epi16((int16_t)fr_ref));
+            __m256i rowfreed2 = _mm256_cmpeq_epi16(s1, _mm256_set1_epi16((int16_t)fr_ref2));
+            active_frread = _mm256_blendv_epi8(_mm256_set1_epi16((int16_t)FREED_INACTIVE16),
+                                               _mm256_set1_epi16((int16_t)fr_read2), rowfreed2);
+            active_frread = _mm256_blendv_epi8(active_frread,
+                                               _mm256_set1_epi16((int16_t)fr_read), rowfreed);
         }
 
         for (int j = 0; j < ncol; j++) {
@@ -2100,19 +2505,14 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
             __m256i sbt_b   = _mm256_blendv_epi8(sbt_lo, sbt_hi, hi_sel);
             __m256i sbt     = _mm256_srai_epi16(_mm256_slli_epi16(sbt_b, 8), 8);
 
-            /* Rank-1 freed-cell override (issue 173): where row==fr_ref and
-             * col==fr_read, force the match score. Real bases 0-3; fr_read ∈
-             * {0,3}; padding/ambig (DUMMY3/0xFFFF/AMBQ16) never equal fr_read,
-             * so cmpeq is naturally false for them. _mm256_cmpeq_epi16 produces
-             * an all-ones/all-zeros int16 mask, so the byte-wise blendv selects
-             * whole int16 lanes correctly. */
+            /* Rank-1 freed-cell override (issue 173 + TAPS neutral): force the
+             * freed score where this column's read base equals the row's active
+             * freed base (built once per row in active_frread above). One cmpeq +
+             * one blendv; FREED_INACTIVE16 lanes never match a real s2 so they
+             * pass through. cmpeq_epi16 gives whole-int16 masks, so the byte-wise
+             * blendv is lane-correct. */
             if (HasFreed) {
-                __m256i freed  = _mm256_and_si256(rowfreed,
-                                                  _mm256_cmpeq_epi16(s2, frread256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed);
-                __m256i freed2 = _mm256_and_si256(rowfreed2,
-                                                  _mm256_cmpeq_epi16(s2, frread2_256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed2);
+                sbt = _mm256_blendv_epi8(sbt, freedval256, _mm256_cmpeq_epi16(s2, active_frread));
             }
 
             /* Boundary: high bit set in (s1 | s2) marks padding (0xFFFF). */
@@ -2327,7 +2727,7 @@ void kswv::kswvBatchWrapper16_avx2(SeqPair *pairArray,
         for (int j = 0; j < SIMD_WIDTH16; j++) {
             SeqPair sp = pairArray[i + j];
             uint8_t *seq2 = seqBufQer + sp.idq;
-            int quanta = ((sp.len2 + 8 - 1) / 8) * 8;
+            int quanta = query_quantum16(sp.len2);
             for (int k = 0; k < sp.len2; k++)
                 mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k] == AMBIG_ ? AMBQ16 : seq2[k]);
             for (int k = sp.len2; k < quanta; k++)
@@ -2336,7 +2736,7 @@ void kswv::kswvBatchWrapper16_avx2(SeqPair *pairArray,
         }
         for (int j = 0; j < SIMD_WIDTH16; j++) {
             SeqPair sp = pairArray[i + j];
-            int quanta = ((sp.len2 + 8 - 1) / 8) * 8;
+            int quanta = query_quantum16(sp.len2);
             for (int k = quanta; k <= maxLen2; k++)
                 mySeq2SoA[k * SIMD_WIDTH16 + j] = 0xFFFF;
         }
@@ -2497,8 +2897,7 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
                 seq2 = seqBufQer + sp.idq;
 #endif
                 // assert(sp.len2 < this->maxQerLen);
-                int quanta = (sp.len2 + 16 - 1) / 16;  // based on SSE-8 bit lane
-                quanta *= 16;                          // for matching the output of bwa-mem
+                int quanta = query_quantum8(sp.len2);
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG_? AMBQ:seq2[k]);
@@ -2513,8 +2912,7 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
                 SeqPair sp = pairArray[i + j];
-                int quanta = (sp.len2 + 16 - 1) / 16;  // based on SSE2-8 bit lane
-                quanta *= 16;
+                int quanta = query_quantum8(sp.len2);
                 for(k = quanta; k <= maxLen2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = 0xFF;
@@ -2610,6 +3008,9 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
 
     __m512i zero512 = _mm512_setzero_si512();
     __m512i one512  = _mm512_set1_epi8(1);
+
+    /* Per-row running-max checkpoints; see kswv_neon_u8_impl. */
+    alignas(64) uint8_t blockMax[QE_MAXBLK * SIMD_WIDTH8];
     
     m_b = n_b = 0; b = 0;
 
@@ -2708,6 +3109,29 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
     _mm512_store_si512((__m512i *)(H0), zero512);
     _mm512_store_si512((__m512i *)(H1), zero512);
 
+    /* First column any lane pads with the 0xFF query sentinel, i.e.
+     * min(query_quantum8(len2)) over the group -- see the derivation in
+     * kswv_neon_u8_impl. Below it the boundary mask reduces to the per-row
+     * high_bit(s1); at and above it the full per-cell form is required. A
+     * uniform-length group gets jsplit == ncol and never runs the per-cell
+     * form -- common in phase 0, but see the phase-1 caveat on the NEON
+     * derivation: len2 = qe + 1 makes phase-1 groups ragged regardless of input
+     * lengths, so they do run it. (No minLen1 range here: unlike NEON's vbsl,
+     * the AVX-512 blend is a masked move that costs the same whether or not the
+     * mask is empty, so splitting the reference half out as well buys
+     * nothing.) */
+    int jsplit = ncol;
+    for (int l = 0; l < SIMD_WIDTH8; l++) {
+        const int quanta = query_quantum8(p[l].len2);
+        if (quanta < jsplit) jsplit = quanta;
+    }
+
+    /* First column any lane can hold the DUMMY5 query pad, so the cmp+blend
+     * for it can be elided below this. Same derivation and same byte-identity
+     * argument as the NEON kernel above; clamped to jsplit because it only
+     * subdivides the [0, jsplit) range. */
+    const int jdummy = compute_jdummy(p, SIMD_WIDTH8, ncol, jsplit);
+
     int i, limit = nrow;
     for (i=0; i < nrow; i++)
     {
@@ -2719,43 +3143,78 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
         s1 = _mm512_load_si512((__m512i *)(seq1SoA + (i + 0) * SIMD_WIDTH8));
         h10 = zero512;
         imax512 = zero512;
-        __m512i iqe512 = _mm512_set1_epi8(-1);
 
-        /* Rank-1 freed-cell override (issue 173, bisulfite OT/OB). s1 is
+        /* Freed-cell override (issue 173, bisulfite OT/OB + TAPS neutral). s1 is
          * loop-invariant across the inner j loop, so hoist the per-row fr_ref
-         * comparison here; MAIN_SAM_CODE8_OPT consumes rowfreed512/frread512/
-         * match512 per cell when HasFreed. match512 is the kernel's OWN biased
-         * match entry (temp[0] already includes +shift), so the freed cell
-         * scores byte-identically to a real match in the biased u8 domain.
+         * comparisons here; MAIN_SAM_CODE8_OPT consumes active_frread512/
+         * freedval512 per cell when HasFreed. freedval512 is the freed cell's
+         * score (fr_val) biased by +shift into the u8 domain; fr_val==w_match
+         * (GENOMIC/COLLAPSED) reproduces the biased match entry temp[0] exactly,
+         * while NEUTRAL (fr_val==0) scores the conversion as 0 after unbiasing.
          * When !HasFreed, this and the per-cell block in the macro compile out
          * (identical codegen to today). Mirrors bandedSWA's blessed forms. */
-        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC sets the
-         * mirror == primary so the second blend is idempotent. */
-        __m512i frref512, frread512, frread2_512, match512;
-        __mmask64 rowfreed512 = 0, rowfreed2_512 = 0;
+        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC/NEUTRAL set
+         * the mirror == primary so the second blend is idempotent. Both cells score
+         * the same fr_val, so one freedval512 covers the folded target below. */
+        __m512i freedval512, active_frread512;
         if (HasFreed) {
-            frref512   = _mm512_set1_epi8((char)fr_ref);
-            frread512  = _mm512_set1_epi8((char)fr_read);
-            frread2_512= _mm512_set1_epi8((char)fr_read2);
-            match512   = _mm512_set1_epi8((char)temp[0]);
-            rowfreed512  = _mm512_cmpeq_epi8_mask(s1, frref512);
-            rowfreed2_512= _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8((char)fr_ref2));
+            freedval512 = _mm512_set1_epi8((char)(fr_val + shift));
+            __mmask64 rowfreed512  = _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8((char)fr_ref));
+            __mmask64 rowfreed2_512= _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8((char)fr_ref2));
+            /* One per-lane freed target: fr_read where ref==fr_ref, fr_read2 where
+             * ref==fr_ref2, else FREED_INACTIVE8 (no s2 value — 0-3/5/8 or the
+             * 0xFF pad — ever equals it). The two ref tests are mutually
+             * exclusive; the macro then does a single per-cell cmpeq + blend. */
+            active_frread512 = _mm512_mask_blend_epi8(rowfreed2_512,
+                                   _mm512_set1_epi8((char)FREED_INACTIVE8), _mm512_set1_epi8((char)fr_read2));
+            active_frread512 = _mm512_mask_blend_epi8(rowfreed512,
+                                   active_frread512, _mm512_set1_epi8((char)fr_read));
         }
 
-        __m512i l512 = zero512;
-        for (j=0; j<ncol; j++)
-        {
-            __m512i f11, s2, f21;
-            h00 = _mm512_load_si512((__m512i *)(H0 + j * SIMD_WIDTH8));  // check for col "0"
-            s2  = _mm512_load_si512((__m512i *)(seq2SoA + (j) * SIMD_WIDTH8));
-            f11 = _mm512_load_si512((__m512i *)(F + (j+1) * SIMD_WIDTH8));
+        /* Reference-side half of the boundary mask; loop-invariant across j. */
+        const __mmask64 rowboundary512 = _mm512_movepi8_mask(s1);
 
-            MAIN_SAM_CODE8_OPT(s1, s2, h00, h11, e11, f11, f21, max512, sft512);
-
-            _mm512_store_si512((__m512i *)(H1 + (j + 1) * SIMD_WIDTH8), h11);  // check for col "0"
-            _mm512_store_si512((__m512i *)(F + (j + 1)* SIMD_WIDTH8), f21);
-            l512 = _mm512_add_epi8(l512, one512);
+#define KSWV_AVX512_U8_CELL(BND, NEED_DUMMY)                                        \
+        {                                                                           \
+            __m512i f11, s2, f21;                                                   \
+            h00 = _mm512_load_si512((__m512i *)(H0 + j * SIMD_WIDTH8));             \
+            s2  = _mm512_load_si512((__m512i *)(seq2SoA + (j) * SIMD_WIDTH8));      \
+            f11 = _mm512_load_si512((__m512i *)(F + (j+1) * SIMD_WIDTH8));          \
+                                                                                    \
+            MAIN_SAM_CODE8_OPT(s1, s2, h00, h11, e11, f11, f21, max512, sft512,     \
+                               (BND), (NEED_DUMMY));                                \
+                                                                                    \
+            _mm512_store_si512((__m512i *)(H1 + (j + 1) * SIMD_WIDTH8), h11);       \
+            _mm512_store_si512((__m512i *)(F + (j + 1)* SIMD_WIDTH8), f21);         \
+            if (j == qeNext) {                                                      \
+                _mm512_store_si512((__m512i *)(blockMax + qeBlk * SIMD_WIDTH8),      \
+                                   imax512);                                        \
+                qeBlk++; qeNext += QE_BLK;                                          \
+            }                                                                       \
         }
+
+        int qeNext = QE_BLK - 1, qeBlk = 0;
+        /* Below jsplit the two forms are equal, so the meth (HasFreed)
+         * instantiation keeps the per-cell one: hoisting there pins a third
+         * live k-reg against the two freed masks and measured slightly slower.
+         * Above jsplit, OR the already-computed s1 half with the s2 half as
+         * masks rather than re-ORing the vectors -- a kord instead of a vpord,
+         * off the contended vector ports. */
+        for (j = 0; j < jdummy; j++)
+            KSWV_AVX512_U8_CELL(HasFreed
+                ? _mm512_movepi8_mask(_mm512_or_si512(s1, s2))
+                : rowboundary512, false)
+        for (; j < jsplit; j++)
+            KSWV_AVX512_U8_CELL(HasFreed
+                ? _mm512_movepi8_mask(_mm512_or_si512(s1, s2))
+                : rowboundary512, true)
+        for (; j < ncol; j++)
+            KSWV_AVX512_U8_CELL(rowboundary512 | _mm512_movepi8_mask(s2), true)
+#undef KSWV_AVX512_U8_CELL
+
+        /* Close the final (possibly partial) block; see kswv_neon_u8_impl. */
+        _mm512_store_si512((__m512i *)(blockMax + ((ncol - 1) / QE_BLK) * SIMD_WIDTH8),
+                           imax512);
 
         // Block I
         if (i > 0)
@@ -2779,7 +3238,39 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
         gmax512 = _mm512_mask_blend_epi8(cmp0, gmax512, imax512);
         te512 = _mm512_mask_blend_epi16((__mmask32)cmp0, te512,  i512);
         te512_ = _mm512_mask_blend_epi16((__mmask32) (cmp0 >> SIMD_WIDTH16), te512_,  i512);
-        qe512 = _mm512_mask_blend_epi8(cmp0, qe512,  iqe512);
+        /* Deferred query-end recovery over the QE_BLK checkpoints; see
+         * kswv_neon_u8_impl for the derivation. `found` and the per-block
+         * masks are k-regs here, so a block that holds no active lane's max
+         * costs one compare, one kandn and one kor. */
+        if (cmp0)
+        {
+            __m512i iqe512 = _mm512_set1_epi8(-1);
+            __mmask64 foundBlk = 0;
+            const uint8_t *colIdx = this->colIdx8;
+            const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;
+            for (int b = 0; b < nblocks; b++) {
+                __mmask64 reached = _mm512_cmpeq_epu8_mask(
+                    _mm512_load_si512((__m512i *)(blockMax + b * SIMD_WIDTH8)), imax512);
+                __mmask64 newly = reached & ~foundBlk & cmp0;
+                foundBlk |= reached;
+                if (newly) {
+                    const int j0 = b * QE_BLK;
+                    const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol;
+                    __mmask64 got = 0;
+                    for (int j2 = j0; j2 < j1; j2++) {
+                        __mmask64 eq = _mm512_cmpeq_epu8_mask(
+                            _mm512_load_si512((__m512i *)(H1 + (j2 + 1) * SIMD_WIDTH8)),
+                            imax512) & newly;
+                        iqe512 = _mm512_mask_blend_epi8(
+                            eq & ~got, iqe512,
+                            _mm512_loadu_si512((const __m512i *)(colIdx + j2 * SIMD_WIDTH8)));
+                        got |= eq;
+                    }
+                }
+                if ((foundBlk & cmp0) == cmp0) break;
+            }
+            qe512 = _mm512_mask_blend_epi8(cmp0, qe512, iqe512);
+        }
         
         cmp0 = _mm512_cmpge_epu8_mask(gmax512, endsc512);
         cmp0 &= endsc_msk_a;
@@ -3094,8 +3585,7 @@ void kswv::kswvBatchWrapper16(SeqPair *pairArray,
 
 
                 // int quanta = 8 - sp.len2 % 8;  // based on SSE-16 bit lane
-                int quanta = (sp.len2 + 8 - 1)/8;  // based on SSE-16 bit lane
-                quanta *= 8;
+                int quanta = query_quantum16(sp.len2);
                 assert(sp.len2 < this->maxQerLen);
                 for(k = 0; k < sp.len2; k++)
                 {
@@ -3112,8 +3602,7 @@ void kswv::kswvBatchWrapper16(SeqPair *pairArray,
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
                 SeqPair sp = pairArray[i + j];
-                int quanta = (sp.len2 + 8 - 1)/8;  // based on SSE2-16 bit lane
-                quanta *= 8;
+                int quanta = query_quantum16(sp.len2);
                 for(k = quanta; k <= maxLen2; k++)
                 {
                     // mySeq2SoA[k * SIMD_WIDTH16 + j] = DUMMY2_;
@@ -3304,22 +3793,25 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
         imax512 = zero512;
         __m512i iqe512 = _mm512_set1_epi16(-1);
 
-        /* Rank-1 freed-cell override (issue 173). s1 is loop-invariant, so
-         * hoist the per-row fr_ref comparison; MAIN_SAM_CODE16_OPT consumes
-         * rowfreed512/frread512/match512 per cell when HasFreed. The 16-bit
-         * kernel has NO shift bias (m11 = h00 + sbt directly), so the biased
-         * match constant is just temp[0] (== w_match). !HasFreed → this and the
-         * per-cell block in the macro compile out. */
-        __m512i frread512, frread2_512, match512;
-        __mmask32 rowfreed512 = 0, rowfreed2_512 = 0;
+        /* Rank-1 freed-cell override (issue 173 + TAPS neutral), folded into ONE
+         * per-row target base active_frread512 — the u16 analog of
+         * kswv512_u8_impl's active_frread (consumed by MAIN_SAM_CODE16_OPT).
+         * fr_read where ref==fr_ref, fr_read2 where ref==fr_ref2 (mutually
+         * exclusive), else a sentinel no real s2 equals: u16 s2 ∈ {0-3, AMBQ16=16,
+         * DUMMY3=26, 0xFFFF pad}, so FREED_INACTIVE16 is safe. The 16-bit kernel has NO shift
+         * bias (m11 = h00 + sbt directly), so the freed value is just fr_val:
+         * fr_val == w_match (GENOMIC/COLLAPSED) equals temp[0], while NEUTRAL
+         * (fr_val==0) scores the conversion as 0. !HasFreed → this and the per-cell
+         * block in the macro compile out. */
+        __m512i freedval512, active_frread512;
         if (HasFreed) {
-            __m512i frref512  = _mm512_set1_epi16((int16_t)fr_ref);
-            __m512i frref2512 = _mm512_set1_epi16((int16_t)fr_ref2);
-            frread512  = _mm512_set1_epi16((int16_t)fr_read);
-            frread2_512= _mm512_set1_epi16((int16_t)fr_read2);
-            match512   = _mm512_set1_epi16((int16_t)temp[0]);
-            rowfreed512  = _mm512_cmpeq_epi16_mask(s1, frref512);
-            rowfreed2_512= _mm512_cmpeq_epi16_mask(s1, frref2512);
+            freedval512 = _mm512_set1_epi16((int16_t)fr_val);
+            __mmask32 rowfreed512  = _mm512_cmpeq_epi16_mask(s1, _mm512_set1_epi16((int16_t)fr_ref));
+            __mmask32 rowfreed2_512= _mm512_cmpeq_epi16_mask(s1, _mm512_set1_epi16((int16_t)fr_ref2));
+            active_frread512 = _mm512_mask_blend_epi16(rowfreed2_512,
+                                   _mm512_set1_epi16((int16_t)FREED_INACTIVE16), _mm512_set1_epi16((int16_t)fr_read2));
+            active_frread512 = _mm512_mask_blend_epi16(rowfreed512,
+                                   active_frread512, _mm512_set1_epi16((int16_t)fr_read));
         }
 
         __m512i l512 = zero512;

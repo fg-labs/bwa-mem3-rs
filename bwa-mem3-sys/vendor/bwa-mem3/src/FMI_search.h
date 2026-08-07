@@ -69,6 +69,32 @@ static inline int _mm_countbits_64(unsigned long x) {
 }
 #endif
 
+/* One-hot position masks: entry [i] has the top `i` bits set (entry [0] == 0),
+ * i.e. one_hot_mask_array[i] == (one_hot_mask_array[i-1] >> 1) | 0x8000...
+ * for i in 1..63. The FMI-index lifetime constant is identical on every path,
+ * so it lives inline here as a file-scope table rather than a heap allocation
+ * reached through a per-object pointer: this removes a dependent load in the
+ * (~10^9-call) backwardExt/GET_OCC hot path. Values are byte-identical to the
+ * former runtime-computed array. */
+static const uint64_t one_hot_mask_array[64] = {
+    0x0000000000000000ULL, 0x8000000000000000ULL, 0xc000000000000000ULL, 0xe000000000000000ULL,
+    0xf000000000000000ULL, 0xf800000000000000ULL, 0xfc00000000000000ULL, 0xfe00000000000000ULL,
+    0xff00000000000000ULL, 0xff80000000000000ULL, 0xffc0000000000000ULL, 0xffe0000000000000ULL,
+    0xfff0000000000000ULL, 0xfff8000000000000ULL, 0xfffc000000000000ULL, 0xfffe000000000000ULL,
+    0xffff000000000000ULL, 0xffff800000000000ULL, 0xffffc00000000000ULL, 0xffffe00000000000ULL,
+    0xfffff00000000000ULL, 0xfffff80000000000ULL, 0xfffffc0000000000ULL, 0xfffffe0000000000ULL,
+    0xffffff0000000000ULL, 0xffffff8000000000ULL, 0xffffffc000000000ULL, 0xffffffe000000000ULL,
+    0xfffffff000000000ULL, 0xfffffff800000000ULL, 0xfffffffc00000000ULL, 0xfffffffe00000000ULL,
+    0xffffffff00000000ULL, 0xffffffff80000000ULL, 0xffffffffc0000000ULL, 0xffffffffe0000000ULL,
+    0xfffffffff0000000ULL, 0xfffffffff8000000ULL, 0xfffffffffc000000ULL, 0xfffffffffe000000ULL,
+    0xffffffffff000000ULL, 0xffffffffff800000ULL, 0xffffffffffc00000ULL, 0xffffffffffe00000ULL,
+    0xfffffffffff00000ULL, 0xfffffffffff80000ULL, 0xfffffffffffc0000ULL, 0xfffffffffffe0000ULL,
+    0xffffffffffff0000ULL, 0xffffffffffff8000ULL, 0xffffffffffffc000ULL, 0xffffffffffffe000ULL,
+    0xfffffffffffff000ULL, 0xfffffffffffff800ULL, 0xfffffffffffffc00ULL, 0xfffffffffffffe00ULL,
+    0xffffffffffffff00ULL, 0xffffffffffffff80ULL, 0xffffffffffffffc0ULL, 0xffffffffffffffe0ULL,
+    0xfffffffffffffff0ULL, 0xfffffffffffffff8ULL, 0xfffffffffffffffcULL, 0xfffffffffffffffeULL,
+};
+
 #define \
 GET_OCC(pp, c, occ_id_pp, y_pp, occ_pp, one_hot_bwt_str_c_pp, match_mask_pp) \
                 int64_t occ_id_pp = pp >> CP_SHIFT; \
@@ -88,6 +114,22 @@ typedef struct smem_struct
     int64_t k, l, s;
 }SMEM;
 
+/* Reusable scratch for FMI_search::sortSMEMs' rid counting sort. Hoisted out of
+ * the per-batch malloc/free + memcpy (audit SEED-15): the caller owns one of
+ * these per worker thread (see mem_cache in bwamem.h) and passes it in on every
+ * batch, so the count/offset array (`cnt`) and the stable-scatter buffer (`tmp`)
+ * are allocated once and grown on demand instead of allocated and freed per
+ * call. Zero-initialize the struct before first use (all-NULL, zero caps); the
+ * owner frees `cnt`/`tmp` with _mm_free at teardown (both NULL-safe). One
+ * instance is single-threaded scratch — never share it across threads. */
+typedef struct smem_sort_scratch
+{
+    int64_t *cnt;     /* counting-sort count/offset array; >= observed rid range */
+    int64_t  cntCap;  /* allocated capacity of cnt, in int64_t entries           */
+    SMEM    *tmp;     /* stable-scatter output buffer; >= observed SMEM count     */
+    int64_t  tmpCap;  /* allocated capacity of tmp, in SMEM entries              */
+}SmemSortScratch;
+
 #define SAL_PFD 16
 
 #ifndef SMEM_LOCKSTEP_N
@@ -103,6 +145,44 @@ typedef struct smem_struct
 #ifndef BWTSEED_LOCKSTEP_N
 #define BWTSEED_LOCKSTEP_N 8
 #endif
+
+/* Smallest slice of an index array a parallel-load worker is given. The load is
+ * memory-bandwidth bound, so below this the per-thread create/join overhead is
+ * a larger share of the work than the bandwidth it unlocks. */
+#define FMI_PREAD_MIN_CHUNK (8UL << 20)
+
+/* Number of workers to split an `nbytes` index-array read across, given the
+ * caller's requested `nthreads`.
+ *
+ * Never returns more than `nthreads` when `nthreads` is positive, and never so
+ * many that a chunk would fall below FMI_PREAD_MIN_CHUNK -- except for the
+ * unavoidable single-worker case where `nbytes` is itself below the floor. A
+ * non-positive `nthreads` clamps UP to 1: the result is always >= 1, since the
+ * caller divides `nbytes` by it. Small references and a large BWA3_LOAD_THREADS
+ * are what push against the floor; on a GB-scale index the load's own 8-worker
+ * cap binds first.
+ *
+ * Exposed (rather than kept file-local with the pread machinery) so the chunk
+ * arithmetic is unit-testable without a real index on disk. */
+int fmi_pread_worker_count(size_t nbytes, int nthreads);
+
+/* Bytes to request from a single pread() call, given how many remain in this
+ * worker's chunk. macOS fails a pread() whose count exceeds INT_MAX with EINVAL,
+ * so a chunk larger than 2GiB can never be read in one call -- and with the
+ * 8-worker load cap that is every index over ~17.2GB.
+ *
+ * Exposed (rather than kept file-local with the pread machinery) so the clamp
+ * is unit-testable without materialising a multi-GB file. */
+size_t fmi_pread_request_size(size_t remaining);
+
+/* Read the next `nbytes` of `fp` into `dst` using up to `nthreads` pread
+ * workers, then leave the stream positioned exactly past them so a following
+ * sequential read (the trailing sentinel index) still lands correctly.
+ *
+ * Aborts the process on a read error or short file. Exposed alongside the
+ * worker count so the chunk-splitting and the stream postcondition are
+ * unit-testable against a synthetic file. */
+void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads);
 
 class FMI_search: public indexEle
 {
@@ -137,7 +217,9 @@ class FMI_search: public indexEle
      * --meth uses this for the SEED index: seeding needs the FM-index + bns
      * (for the seed->original remap) but never the seed pac — extension/scoring
      * runs against the ORIGINAL pac (meth_orig_pac). Saves ~1.6 GB on hg38. */
-    void load_index(bool load_pac = true);
+    /* n_threads: worker count for the big-array disk reads (capped internally,
+     * overridable via BWA3_LOAD_THREADS). Default 1 preserves prior behavior. */
+    void load_index(bool load_pac = true, int n_threads = 1);
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
@@ -237,7 +319,8 @@ class FMI_search: public indexEle
                    int64_t numTotalSmem[],
                    int32_t numReads,
                    int32_t readlength,
-                   int nthreads);
+                   int nthreads,
+                   SmemSortScratch &scratch);
     int64_t get_sa_entry(int64_t pos);
     void get_sa_entries(int64_t *posArray,
                         int64_t *coordArray,
@@ -268,8 +351,6 @@ private:
         uint32_t *sa_ls_word;
         int8_t *sa_ms_byte;
         CP_OCC *cp_occ;
-
-        uint64_t *one_hot_mask_array;
 
         /* If non-NULL, cp_occ / sa_ms_byte / sa_ls_word point into a shared
          * memory mapping owned by the shm segment rather than being

@@ -33,6 +33,7 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 #include "simd_dispatch.h"
 #include "version.h"
 #include "bwa_shm.h"
+#include <time.h>   /* clock_gettime, nanosleep: proc_freq calibration */
 
 #ifdef USE_MIMALLOC
 #include <mimalloc.h>
@@ -71,14 +72,77 @@ static void append_pg_cl_arg(kstring_t *pg, const char *arg)
     }
 }
 
+// Measure the __rdtsc() tick rate (ticks per second) that every timing
+// report divides by: display_stats(), the `index` "Total time taken" line,
+// and the `mem` profiling trailer.
+//
+// This used to be `tim = __rdtsc(); sleep(1); proc_freq = __rdtsc() - tim;`,
+// which spent a full second of wall time on EVERY invocation -- including
+// `version`, `shm -l`, and plain usage errors, none of which ever read
+// proc_freq. Invisible next to a real alignment run, but it dominates the
+// test suite: run_unit_tests.sh spawns ~60 short bwa-mem3 processes, so it
+// spent ~60 s of its 74 s asleep against under 5 s of real CPU work.
+//
+// Measure over a short window instead and divide by the wall time
+// CLOCK_MONOTONIC reports for that same window. Both clocks track wall
+// time -- the TSC is invariant on every x86-64 this targets, and __rdtsc()
+// reads the fixed-rate CNTVCT_EL0 on arm64 -- so a couple of milliseconds
+// is plenty. Residual error is the nanosecond-scale cost of the counter
+// reads spread over the window (well under 0.1%), far below the precision
+// the timing reports claim. It is also no less representative than the old
+// sleep: a sleeping core sits at its lowest P-state, so on the parts whose
+// TSC is *not* invariant, sleep(1) measured precisely the frequency the
+// aligner never runs at.
+static uint64_t calibrate_proc_freq(void)
+{
+    // 5 ms, doubling per retry. nanosleep() returns early when a signal
+    // arrives; we divide by the *measured* elapsed time rather than the
+    // requested one, so a short window is still usable -- but if it came
+    // back too short to divide by with any precision, try again on a
+    // longer one.
+    const long base_window_ns = 5L * 1000 * 1000;
+    const int max_attempts = 4;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        struct timespec window = {0, base_window_ns << attempt};
+        // Zero-initialized so that a failing clock_gettime() -- which
+        // CLOCK_MONOTONIC does not do in practice, but which would
+        // otherwise leave these indeterminate -- yields elapsed == 0 and
+        // falls into the retry below rather than reading uninitialized
+        // memory and dividing by garbage.
+        struct timespec t0 = {0, 0}, t1 = {0, 0};
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        uint64_t c0 = __rdtsc();
+        nanosleep(&window, NULL);
+        uint64_t c1 = __rdtsc();
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        double elapsed = (double)(t1.tv_sec - t0.tv_sec)
+                       + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
+        if (elapsed >= 1e-4 && c1 > c0)
+            return (uint64_t)((double)(c1 - c0) / elapsed + 0.5);
+    }
+    // Not reachable in practice (it would take max_attempts consecutive
+    // windows cut short to under 100 us). Say so on stderr rather than
+    // silently returning a bogus rate: without this, a pathological
+    // environment -- nanosleep() blocked by a seccomp filter, a process
+    // under relentless signal pressure -- would print implausible timings
+    // with nothing explaining why. stderr only, so the SAM on stdout is
+    // unaffected.
+    fprintf(stderr, "[W::%s] could not calibrate the processor tick rate in "
+                    "%d attempts; timing reports will be meaningless.\n",
+            __func__, max_attempts);
+    // Return 1 rather than 0 so the reports print implausible seconds
+    // instead of dividing by zero.
+    return 1;
+}
+
 int main(int argc, char* argv[])
 {
     bwamem3_simd_init();
 
     // ---------------------------------
-    uint64_t tim = __rdtsc();
-    sleep(1);
-    proc_freq = __rdtsc() - tim;
+    proc_freq = calibrate_proc_freq();
 
     int ret = -1;
     if (argc < 2) return usage();
@@ -190,6 +254,55 @@ int main(int argc, char* argv[])
     else if (strcmp(argv[1], "version") == 0)
     {
         puts(PACKAGE_VERSION);
+        /* Report the compiler that built this binary. bwa-mem3 is markedly
+         * faster when built with clang than with g++ (see the Makefile's
+         * build-time note and docs/src/best-practices/build.md), so surfacing
+         * the compiler here makes it trivial to confirm which toolchain a
+         * given binary came from. Purely factual — one token, easy to parse. */
+        /* Order matters: both Intel front-ends impersonate another toolchain.
+         * icpx (oneAPI, LLVM-based) also defines __clang__, and icpc (Classic)
+         * also defines __GNUC__ to match the host GCC's ABI — so the Intel
+         * checks must come FIRST or an Intel build reports as clang/gcc. The
+         * Makefile has real `ifeq ($(CXX), icpc)` / `icpx` flag branches, so
+         * these are builds we actually ship flags for. */
+#if defined(__INTEL_LLVM_COMPILER)
+        /* Two encodings, split on 1000000 the way CMake's
+         * Modules/Compiler/IntelLLVM-DetermineCompiler.cmake does:
+         *   >= 1000000: 8-digit VVVVRRPP (2021.2.0 and later),
+         *               e.g. 20250100 -> 2025.1.0
+         *   <  1000000: 6-digit VVVVRP  (pre-2021.2.0),
+         *               e.g. 202110   -> 2021.1.0 */
+#  if __INTEL_LLVM_COMPILER >= 1000000
+        fprintf(stdout, "Compiler: icpx %d.%d.%d\n",
+                __INTEL_LLVM_COMPILER / 10000,
+                (__INTEL_LLVM_COMPILER / 100) % 100,
+                __INTEL_LLVM_COMPILER % 100);
+#  else
+        fprintf(stdout, "Compiler: icpx %d.%d.%d\n",
+                __INTEL_LLVM_COMPILER / 100,
+                (__INTEL_LLVM_COMPILER / 10) % 10,
+                __INTEL_LLVM_COMPILER % 10);
+#  endif
+#elif defined(__INTEL_COMPILER)
+        /* Year-based version (e.g. 2021) plus the update number. Every icpc
+         * the Makefile targets defines __INTEL_COMPILER_UPDATE, but guard it
+         * anyway: on a pre-15.0 icc it is undefined, and an undefined macro in
+         * an argument list is an undeclared identifier, not a zero. */
+#  if defined(__INTEL_COMPILER_UPDATE)
+        fprintf(stdout, "Compiler: icpc %d.%d\n",
+                __INTEL_COMPILER, __INTEL_COMPILER_UPDATE);
+#  else
+        fprintf(stdout, "Compiler: icpc %d\n", __INTEL_COMPILER);
+#  endif
+#elif defined(__clang__)
+        fprintf(stdout, "Compiler: clang %d.%d.%d\n",
+                __clang_major__, __clang_minor__, __clang_patchlevel__);
+#elif defined(__GNUC__)
+        fprintf(stdout, "Compiler: gcc %d.%d.%d\n",
+                __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
+#elif defined(__VERSION__)
+        fprintf(stdout, "Compiler: %s\n", __VERSION__);
+#endif
         bwamem3_print_version_simd(stdout);
 #ifdef USE_MIMALLOC
         {

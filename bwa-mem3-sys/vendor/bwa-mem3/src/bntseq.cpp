@@ -122,7 +122,7 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 	int i;
 	int scanres;
 	bns = (bntseq_t*)calloc(1, sizeof(bntseq_t));
-	assert(bns != 0);
+	xassert(bns != NULL, "out of memory: bns");
 	{ // read .ann
 		fp = xopen(fname = ann_filename, "r");
 		scanres = fscanf(fp, "%lld%d%u", &xx, &bns->n_seqs, &bns->seed);
@@ -130,7 +130,10 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 		if (scanres != 3) goto badread;
 		bns->l_pac = xx;
 		bns->anns = (bntann1_t*)calloc(bns->n_seqs, sizeof(bntann1_t));
-        assert(bns->anns != NULL);
+        // A zero-sequence .ann is degenerate but not an allocation failure:
+        // calloc(0, ...) is free to return NULL, so only a non-empty request
+        // coming back NULL means we are out of memory.
+        xassert(bns->n_seqs == 0 || bns->anns != NULL, "out of memory: bns->anns");
 		for (i = 0; i < bns->n_seqs; ++i) {
 			bntann1_t *p = bns->anns + i;
 			char *q = str;
@@ -168,7 +171,7 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 		xassert(l_pac == bns->l_pac && n_seqs == bns->n_seqs, "inconsistent .ann and .amb files.");
         if(bns->n_holes){
             bns->ambs = (bntamb1_t*)calloc(bns->n_holes, sizeof(bntamb1_t));
-            assert(bns->ambs != NULL);
+            xassert(bns->ambs != NULL, "out of memory: bns->ambs");
         }
         else{
             bns->ambs = 0;
@@ -185,6 +188,7 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 	{ // open .pac
 		bns->fp_pac = xopen(pac_filename, "rb");
 	}
+	bns_build_pos2rid(bns); // SAM-A3: build the position->rid acceleration table once
 	return bns;
 
  badread:
@@ -211,7 +215,7 @@ bntseq_t *bns_restore(const char *prefix)
 		int c, i, absent;
 		khint_t k;
 		h = kh_init(str);
-        assert(h != NULL);
+        xassert(h != NULL, "out of memory: bns name hash");
 		for (i = 0; i < bns->n_seqs; ++i) {
 			k = kh_put(str, h, bns->anns[i].name, &absent);
 			kh_val(h, k) = i;
@@ -251,6 +255,7 @@ void bns_destroy(bntseq_t *bns)
 	else {
 		int i;
 		if (bns->fp_pac) err_fclose(bns->fp_pac);
+		free(bns->pos2rid_bucket); // SAM-A3: free(NULL) is a no-op when never built
 		free(bns->ambs);
 		for (i = 0; i < bns->n_seqs; ++i) {
 			free(bns->anns[i].name);
@@ -272,7 +277,7 @@ static uint8_t *add1(const kseq_t *seq, bntseq_t *bns, uint8_t *pac, int64_t *m_
 	if (bns->n_seqs == *m_seqs) {
 		*m_seqs <<= 1;
 		bns->anns = (bntann1_t*)realloc(bns->anns, *m_seqs * sizeof(bntann1_t));
-        assert(bns->anns != NULL);
+        xassert(bns->anns != NULL, "out of memory: bns->anns");
 	}
 	p = bns->anns + bns->n_seqs;
 	p->name = strdup((char*)seq->name.s);
@@ -329,14 +334,14 @@ int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only)
 	// initialization
 	seq = kseq_init(fp_fa);
 	bns = (bntseq_t*)calloc(1, sizeof(bntseq_t));
-    assert(bns != NULL);
+    xassert(bns != NULL, "out of memory: bns");
 	bns->seed = 11; // fixed seed for random generator
 	srand48(bns->seed);
 	m_seqs = m_holes = 8; m_pac = 0x10000;
 	bns->anns = (bntann1_t*)calloc(m_seqs, sizeof(bntann1_t));
-    assert(bns->anns != NULL);
+    xassert(bns->anns != NULL, "out of memory: bns->anns");
 	bns->ambs = (bntamb1_t*)calloc(m_holes, sizeof(bntamb1_t));
-    assert(bns->ambs != NULL);
+    xassert(bns->ambs != NULL, "out of memory: bns->ambs");
 	pac = (uint8_t*) calloc(m_pac/4, 1);
 	if (pac == NULL) { perror("Allocation of pac failed"); exit(EXIT_FAILURE); }
 	q = bns->ambs;
@@ -393,20 +398,76 @@ int bwa_fa2pac(int argc, char *argv[])
 	return 0;
 }
 
+/* SAM-A3: build the coarse position->rid bucket table. bucket[b] is the
+ * largest rid whose anns[rid].offset <= (b << BNS_POS2RID_SHIFT), i.e. the
+ * contig that covers the first position of bucket b. Because anns[].offset is
+ * monotonically increasing, a single linear merge over contigs fills the whole
+ * table in O(n_buckets + n_seqs).
+ *
+ * The table carries one extra trailing entry past the last in-range bucket so
+ * that bns_pos2rid can always read bucket[b + 1]; that pair brackets the answer
+ * and is what bounds the lookup (see bns_pos2rid). */
+void bns_build_pos2rid(bntseq_t *bns)
+{
+	int64_t n_buckets, b;
+	int rid;
+	if (bns == NULL || bns->pos2rid_bucket != NULL) return; // NULL or already built
+	if (bns->l_pac <= 0 || bns->n_seqs <= 0) return;        // leave NULL: fall back to binary search
+	n_buckets = (bns->l_pac >> BNS_POS2RID_SHIFT) + 1;
+	bns->pos2rid_bucket = (int32_t*)calloc((size_t)n_buckets + 1, sizeof(int32_t));
+	if (bns->pos2rid_bucket == NULL) return;                // OOM: fall back to binary search
+	rid = 0;
+	for (b = 0; b <= n_buckets; ++b) { // <=: fill the trailing bracket entry too
+		int64_t pos = b << BNS_POS2RID_SHIFT;
+		while (rid + 1 < bns->n_seqs && bns->anns[rid + 1].offset <= pos) ++rid;
+		bns->pos2rid_bucket[b] = rid;
+	}
+}
+
 int bns_pos2rid(const bntseq_t *bns, int64_t pos_f)
 {
-	int left, mid, right;
 	if (pos_f >= bns->l_pac) return -1;
-	left = 0; mid = 0; right = bns->n_seqs;
-	while (left < right) { // binary search
-		mid = (left + right) >> 1;
-		if (pos_f >= bns->anns[mid].offset) {
-			if (mid == bns->n_seqs - 1) break;
-			if (pos_f < bns->anns[mid+1].offset) break; // bracketed
-			left = mid + 1;
-		} else right = mid;
+	if (bns->pos2rid_bucket != NULL) { // SAM-A3: O(1) bucket bracket + bounded search
+		int lo, hi;
+		// Negative pos_f clamps to bucket 0, matching the binary-search branch
+		// below (which returns rid 0 for any pos_f < anns[0].offset).
+		int64_t b = pos_f < 0? 0 : (pos_f >> BNS_POS2RID_SHIFT);
+		// bucket[b] is the last contig starting at or before this bucket's
+		// first position, so anns[bucket[b]].offset <= pos_f; bucket[b+1] is
+		// the last one starting at or before the NEXT bucket's first position,
+		// which pos_f is below. So the answer is bracketed by [lo, hi], and
+		// hi - lo is just the number of contig starts inside this bucket
+		// window. The common case (no contig starts inside the window) has
+		// lo == hi and returns without touching anns[] at all.
+		lo = bns->pos2rid_bucket[b];
+		hi = bns->pos2rid_bucket[b + 1];
+		// Narrow to the largest rid with anns[rid].offset <= pos_f. This is
+		// the exact same predicate the binary search resolves, so the returned
+		// rid is byte-identical (including on-offset boundaries and, since
+		// offsets are strictly increasing, ties resolve to the largest index).
+		// Searching rather than scanning keeps a reference packed with many
+		// sub-bucket-width contigs (panels, transcriptomes) logarithmic in the
+		// bucket's contig count instead of linear in it.
+		while (lo < hi) {
+			int mid = lo + ((hi - lo + 1) >> 1); // round up: mid > lo, so this terminates
+			if (bns->anns[mid].offset <= pos_f) lo = mid;
+			else hi = mid - 1;
+		}
+		return lo;
 	}
-	return mid;
+	{ // fallback: exact original binary search (bns without a built table)
+		int left, mid, right;
+		left = 0; mid = 0; right = bns->n_seqs;
+		while (left < right) { // binary search
+			mid = (left + right) >> 1;
+			if (pos_f >= bns->anns[mid].offset) {
+				if (mid == bns->n_seqs - 1) break;
+				if (pos_f < bns->anns[mid+1].offset) break; // bracketed
+				left = mid + 1;
+			} else right = mid;
+		}
+		return mid;
+	}
 }
 
 int bns_intv2rid(const bntseq_t *bns, int64_t rb, int64_t re)
@@ -471,6 +532,40 @@ int bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id)
 	return ctx.nn;
 }
 
+/* Byte->4-base lookup tables for the 2-bit packed `.pac`.
+ *
+ * A packed byte holds 4 bases, most-significant-first, matching `_get_pac`:
+ * for a global position `p`, the base occupies bits `(~p & 3) << 1 .. +1`, so
+ * the base at intra-byte position `j` (j == p & 3) is `(byte >> ((3-j)<<1)) & 3`.
+ *
+ *   fwd[byte][j] = base at intra-byte position j  (forward order, j = 0..3)
+ *   rev[byte][j] = 3 - base at intra-byte position (3-j)  (reverse strand:
+ *                  bases emitted high-position-first and base-complemented,
+ *                  i.e. rev[byte][j] = 3 - ((byte >> (j<<1)) & 3))
+ *
+ * The tables are `const` and populated exactly once at first use; the
+ * function-local static gives C++11 thread-safe initialization with no
+ * per-call rebuild.
+ */
+namespace {
+struct Pac2Nt4Lut {
+	uint8_t fwd[256][4];
+	uint8_t rev[256][4];
+	Pac2Nt4Lut() {
+		for (int b = 0; b < 256; ++b) {
+			for (int j = 0; j < 4; ++j) {
+				fwd[b][j] = (uint8_t)((b >> ((3 - j) << 1)) & 3);
+				rev[b][j] = (uint8_t)(3 - ((b >> (j << 1)) & 3));
+			}
+		}
+	}
+};
+const Pac2Nt4Lut &pac2nt4_lut() {
+	static const Pac2Nt4Lut lut;
+	return lut;
+}
+}  // namespace
+
 void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
                       int64_t beg, int64_t end,
                       uint8_t *dst, int64_t *len_out)
@@ -484,13 +579,29 @@ void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
 		if (beg >= l_pac) { // reverse strand
 			int64_t beg_f = (l_pac<<1) - 1 - end;
 			int64_t end_f = (l_pac<<1) - 1 - beg;
-			for (k = end_f; k > beg_f; --k) {
-				dst[l++] = 3 - _get_pac(pac, k);
+			const uint8_t (*rev)[4] = pac2nt4_lut().rev;
+			k = end_f;
+			// leading partial bases until k is the last base of its byte
+			for (; k > beg_f && (k & 3) != 3; --k) dst[l++] = 3 - _get_pac(pac, k);
+			// whole packed bytes: expand 4 rev-complemented bases per indexed load
+			for (; k - 4 >= beg_f; k -= 4) {
+				const uint8_t *q = rev[pac[k >> 2]];
+				dst[l++] = q[0]; dst[l++] = q[1]; dst[l++] = q[2]; dst[l++] = q[3];
 			}
+			// trailing partial bases
+			for (; k > beg_f; --k) dst[l++] = 3 - _get_pac(pac, k);
 		} else { // forward strand
-			for (k = beg; k < end; ++k) {
-				dst[l++] = _get_pac(pac, k);
+			const uint8_t (*fwd)[4] = pac2nt4_lut().fwd;
+			k = beg;
+			// leading partial bases until k is byte-aligned
+			for (; k < end && (k & 3) != 0; ++k) dst[l++] = _get_pac(pac, k);
+			// whole packed bytes: expand 4 bases per indexed load
+			for (; k + 4 <= end; k += 4) {
+				const uint8_t *q = fwd[pac[k >> 2]];
+				dst[l++] = q[0]; dst[l++] = q[1]; dst[l++] = q[2]; dst[l++] = q[3];
 			}
+			// trailing partial bases
+			for (; k < end; ++k) dst[l++] = _get_pac(pac, k);
 		}
 	} else {
 		*len_out = 0; // if bridging the forward-reverse boundary, return nothing
@@ -536,6 +647,7 @@ namespace {
 struct PacFetchScratch {
     uint8_t *buf = nullptr;
     int64_t  cap = 0;
+    int64_t  prev_len = 0;  // length of the window currently held in buf (debug poison only)
     ~PacFetchScratch() { free(buf); }
 };
 }  // namespace
@@ -562,8 +674,8 @@ uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t 
 		 * (extension consumes rseq within the chain iteration; both mate-rescue
 		 * sites copy the window into seqBufRef immediately). This is a convention,
 		 * NOT enforceable as an in-function assert (the function cannot observe a
-		 * caller's later deref). The NDEBUG poison-fill below is a best-effort
-		 * detector: it 0xFF's the prior window so a stale read trips the byte-
+		 * caller's later deref). The BWA_MEM3_DEBUG_POISON poison-fill below is a
+		 * best-effort detector: it 0xFF's the prior window so a stale read trips the byte-
 		 * identity / BAM-cmp golden gate rather than silently mis-scoring.
 		 * seqb (the caller's scratch) is intentionally left untouched. */
 		static thread_local PacFetchScratch t_pf;
@@ -588,13 +700,30 @@ uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t 
 			t_pf.buf = nb; t_pf.cap = need;
 		}
 		(void)seqb;
-#ifndef NDEBUG
-		if (t_pf.buf && t_pf.cap > 0) memset(t_pf.buf, 0xFF, (size_t)t_pf.cap); /* poison prior window */
+		/* Poisoning the prior window is a DEBUG aid, not production behaviour. It was
+		 * gated on `#ifndef NDEBUG`, but this build never defines NDEBUG, so it ran in
+		 * every shipped binary -- and it memset the whole high-water `cap`, not the
+		 * `need` bytes actually about to be written. On a 5M-pair PE run that is tens of
+		 * millions of ~1 KB memsets (tens of GB of stores) whose result is immediately
+		 * overwritten by bns_get_seq_into below.
+		 *
+		 * Now opt-in via BWA_MEM3_DEBUG_POISON so it cannot silently return. Poison the
+		 * FULL prior window (`t_pf.prev_len`, recorded after the last fetch), not the
+		 * current `need`: the point is to catch a caller that stale-reads the previous
+		 * window, which may be LONGER than this fetch -- scoping to `need` would leave
+		 * the prior window's tail (bytes need..prev_len) un-poisoned and stale reads
+		 * there undetected. prev_len is always <= cap by construction, so this stays in
+		 * bounds. Byte-identical: production never defines the macro, so nothing runs. */
+#ifdef BWA_MEM3_DEBUG_POISON
+		if (t_pf.buf && t_pf.prev_len > 0) memset(t_pf.buf, 0xFF, (size_t)t_pf.prev_len); /* poison prior window */
 #endif
 		/* Fetch with the already-clamped [b, e) so the bytes written stay in
 		 * lock-step with `need` (the buffer size). bns_get_seq_into re-derives
 		 * the same clamp, so this is byte-identical to passing [beg, end). */
 		bns_get_seq_into(l_pac, pac, b, e, t_pf.buf, len);
+#ifdef BWA_MEM3_DEBUG_POISON
+		t_pf.prev_len = *len;  /* record this window's length so the NEXT call poisons all of it */
+#endif
 		return (*len > 0) ? t_pf.buf : 0;
 	}
 	if (end < beg) end ^= beg, beg ^= end, end ^= beg; // if end is smaller, swap
