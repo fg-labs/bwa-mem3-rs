@@ -219,7 +219,8 @@ fn meth_cli_parity_supplementary_is_hard_clipped() {
     );
 
     // FLAG is compared too: `bwa-rs mem --meth` applies upstream's bwameth
-    // default bundle (`fastmap.cpp:1513-1527`), whose `MEM_F_NO_MULTI` decides
+    // default bundle (`mem_opt_apply_meth_defaults`, `bwamem.cpp:504`), whose
+    // `MEM_F_NO_MULTI` decides
     // whether the split arm is marked secondary (0x100) or supplementary
     // (0x800). Records are already sorted by flag in `recs_named`.
     assert_eq!(

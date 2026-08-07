@@ -243,7 +243,8 @@ extern "C" void bwa_shim_opts_fill_meth_mat(mem_opt_t *opts) {
 extern "C" void bwa_shim_opts_fill_scmat(mem_opt_t *opts) {
     if (!opts) return;
     bwa_fill_scmat(opts->a, opts->b, opts->mat);
-    /* Unconditional, mirroring fastmap.cpp:1531-1535: the meth matrices are
+    /* Unconditional, mirroring main_mem (fastmap.cpp:2726, :2730): the meth
+     * matrices are
      * copies of opts->mat, so a stale pair would silently ignore the new
      * scores the moment --meth is enabled. Harmless outside --meth, where
      * mat_ot / mat_ob are never read. */

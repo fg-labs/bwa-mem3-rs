@@ -425,11 +425,21 @@ const char *shim_compat_hd_line(const mem_opt_t *opt) {
  *
  * The `opt0` sentinel is upstream's "did the user set this explicitly" mask
  * (non-zero field == user supplied). A zeroed one means "nothing was set", so
- * every default applies -- which is what this crate's callers want, since the
- * bundle must be applied BEFORE any -A/-B/-T/-L/-U the caller then sets. That
- * ordering requirement is the reason this takes no mask: expressing it would
- * mean tracking per-field "was set" state on MemOpts, and the simpler contract
- * is "call this first".
+ * every default applies. Taking no mask is the deliberate simplification:
+ * expressing one would mean tracking per-field "was set" state on MemOpts.
+ *
+ * That makes the ordering contract asymmetric, in three ways:
+ *
+ *   - `a` and `meth_scoring` are INPUTS -- the constants are expressed in units
+ *     of `a`, and the -B branch keys off the resolved scoring mode -- so both
+ *     must be set BEFORE this call.
+ *   - `T`, `pen_clip5`, `pen_clip3` and `pen_unpaired` are written
+ *     unconditionally (the empty mask says nobody set them), so a caller
+ *     wanting its own must set them AFTER.
+ *   - `b` is written only under COLLAPSED. GENOMIC and NEUTRAL are
+ *     variant-aware and keep bwa's default, because their mirror cell must stay
+ *     a real mismatch (bwamem.cpp:511-515), so a caller-set -B survives the
+ *     bundle under those two modes and is clobbered under COLLAPSED.
  *
  * Refilling the matrices is part of the operation, not the caller's job: the
  * COLLAPSED branch can change opt->b, and a stale mat/mat_ot/mat_ob would

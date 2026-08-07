@@ -116,36 +116,6 @@ fn run_shm(action: ShmAction) -> Result<()> {
     }
 }
 
-/// Apply the bwameth-compatibility defaults `bwa-mem3 mem --meth` applies,
-/// so `bwa-rs mem --meth` is a drop-in for it.
-///
-/// Delegates to [`MemOpts::apply_meth_defaults`], which calls bwa-mem3's own
-/// `mem_opt_apply_meth_defaults`. This used to be a hand-ported copy of the
-/// bundle, and it had already drifted: upstream scales every constant by the
-/// match score `a` (bwameth quotes them at `a == 1`), and the copy applied them
-/// flat, so `--meth` with a non-default `-A` silently discarded it. Upstream
-/// factored the bundle into a callable helper precisely so out-of-tree callers
-/// would stop replicating it — see gotcha #13.
-///
-/// `-C` (`copy_comment`) is part of upstream's bundle but is deliberately
-/// omitted: it is a field on `fastmap.cpp`'s local worker struct, not on
-/// `mem_opt_t`, and it only governs FASTQ comment passthrough, which this
-/// crate never populates (`copy_pairs_to_seqs` leaves `bseq1_t::comment`
-/// null). Nothing to mirror.
-///
-/// Upstream guards each knob with `if (!opt0.<knob>)` — apply the default only
-/// when the user did not pass the corresponding flag. The helper is told
-/// nothing was set, which is correct here because `bwa-rs mem` exposes none of
-/// them as options (only `-k`, which is not in the bundle).
-///
-/// **If any of these is ever added to the CLI**, note the ordering is not the
-/// same for all of them: `-A` must be applied *before* this call (the bundle's
-/// constants scale by it), while `-T`, `-B`, `-U`, and `-L` must be applied
-/// *after* it or they will be silently overwritten under `--meth`.
-fn apply_meth_defaults(opts: &mut MemOpts) {
-    opts.apply_meth_defaults();
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_mem(
     prefix: &std::path::Path,
@@ -171,7 +141,29 @@ fn run_mem(
     opts.set_pe(true);
     if meth {
         opts.set_meth(true);
-        apply_meth_defaults(&mut opts);
+        // The bwameth-compatibility bundle `bwa-mem3 mem --meth` applies, so
+        // `bwa-rs mem --meth` is a drop-in for it. This calls bwa-mem3's own
+        // `mem_opt_apply_meth_defaults` rather than reproducing the list: it
+        // used to be a hand-ported copy and had already drifted, applying
+        // bwameth's constants flat where upstream scales each by the match
+        // score (see gotcha #13, and `MemOpts::apply_meth_defaults`).
+        //
+        // `-C` (`copy_comment`) is part of upstream's bundle but is deliberately
+        // not mirrored: it lives on `fastmap.cpp`'s local worker struct, not on
+        // `mem_opt_t`, and governs only FASTQ comment passthrough, which this
+        // crate never populates (`copy_pairs_to_seqs` leaves `bseq1_t::comment`
+        // null).
+        //
+        // Upstream applies each knob only when the user did not pass the
+        // corresponding flag; the helper is told nothing was set, which is
+        // correct here because `bwa-rs mem` exposes none of them (only `-k`,
+        // which is not in the bundle). If any IS added, mind the asymmetry:
+        // `-A` must be applied BEFORE this call (the constants scale by it),
+        // while `-T`, `-U` and `-L` must be applied AFTER or they are silently
+        // overwritten. `-B` is the awkward one: the bundle writes it only under
+        // COLLAPSED scoring, so it must come after under COLLAPSED but survives
+        // the call under GENOMIC/NEUTRAL.
+        opts.apply_meth_defaults();
     }
     if let Some(k) = min_seed_len {
         opts.set_min_seed_len(k);
@@ -339,19 +331,21 @@ mod tests {
     use super::*;
     use bwa_mem3_rs::MethScoring;
 
-    /// Pins every knob in the `--meth` bundle against upstream's list at
-    /// `fastmap.cpp:1513-1527`.
+    /// Pins every knob in the `--meth` bundle against upstream's list in
+    /// `mem_opt_apply_meth_defaults` (`bwamem.cpp:504`, called from
+    /// `fastmap.cpp:2699`).
     ///
     /// Worth having as a value-by-value assertion rather than relying on the
     /// CLI-parity tests: only `-M` changes output on any fixture we have, so a
     /// wrong `T`, clip penalty, or unpaired penalty would sail through every
-    /// other test in the suite. On a vendor refresh, diff that block and
-    /// update both it and this test together.
+    /// other test in the suite. On a vendor refresh, diff that function and
+    /// update both it and this test together — find it by name, since the line
+    /// numbers move on most refreshes.
     #[test]
     fn meth_defaults_match_upstreams_bwameth_bundle() {
         let mut opts = MemOpts::new().unwrap();
         opts.set_meth(true);
-        apply_meth_defaults(&mut opts);
+        opts.apply_meth_defaults();
 
         assert_eq!(opts.minimum_score(), 40, "bwameth -T 40");
         assert_eq!(opts.clip_penalty(), (10, 10), "bwameth -L 10,10");
@@ -383,7 +377,7 @@ mod tests {
         opts.set_meth(true);
         // Before the call: `a` is an input the constants are scaled by.
         opts.set_match_score(3);
-        apply_meth_defaults(&mut opts);
+        opts.apply_meth_defaults();
 
         assert_eq!(opts.minimum_score(), 120, "bwameth -T 40, scaled by a=3");
         assert_eq!(
@@ -402,6 +396,87 @@ mod tests {
             "bwameth -B 2 under COLLAPSED, scaled by a=3 (default b is 4, so \
              an unscaled result would read 2 and a stale one 4)"
         );
+
+        // The scalar fields above are not what the Smith-Waterman kernels read
+        // — they read the matrices, which the shim rebuilds after applying the
+        // bundle precisely because the COLLAPSED branch moves `b`. Assert the
+        // rebuild happened, or dropping either refill from
+        // `shim_opts_apply_meth_defaults` would leave every assertion above
+        // passing while alignments scored with the pre-bundle penalty.
+        let mat = opts.scoring_matrix();
+        assert_eq!(mat[0], 3, "mat diagonal is +a; a stale matrix would read 1");
+        assert_eq!(
+            mat[1], -6,
+            "mat off-diagonal is -b; unscaled would read -2, stale -4"
+        );
+
+        // The meth matrices are copies of `mat` with the conversion cells
+        // freed, so it is their ORDINARY off-diagonal that pins the second
+        // refill. The conversion and mirror cells are derived from `a` and the
+        // scoring mode alone — never from `b` — and `set_match_score` above
+        // already filled them, so asserting only those would pass even with
+        // `mem_opt_fill_meth_mat` deleted from the shim. Verified by mutation:
+        // dropping that call leaves the cells below at the pre-bundle -4.
+        let (mat_ot, mat_ob) = opts.meth_scoring_matrices();
+        assert_eq!(
+            mat_ot[1], -6,
+            "mat_ot off-diagonal tracks -b through mem_opt_fill_meth_mat; \
+             a stale copy would read -4"
+        );
+        assert_eq!(mat_ob[1], -6, "mat_ob off-diagonal likewise");
+
+        // The freed cells themselves: +a under COLLAPSED, mirror cell included.
+        // Indexed by (ref base, read base) over A,C,G,T,N — the same row-major
+        // 5x5 addressing upstream's mem_opt_fill_meth_mat writes.
+        const A: usize = 0;
+        const C: usize = 1;
+        const G: usize = 2;
+        const T: usize = 3;
+        let cell = |reference: usize, read: usize| reference * 5 + read;
+        assert_eq!(mat_ot[cell(C, T)], 3, "OT C->T conversion cell is +a");
+        assert_eq!(mat_ob[cell(G, A)], 3, "OB G->A conversion cell is +a");
+        assert_eq!(
+            mat_ot[cell(T, C)],
+            3,
+            "COLLAPSED frees the OT mirror cell (ref T / read C) too"
+        );
+    }
+
+    /// `b` is the one knob the bundle writes *conditionally*, which is what
+    /// makes the ordering contract asymmetric even within the "set after"
+    /// group: upstream applies bwameth's `-B 2` only under COLLAPSED and leaves
+    /// GENOMIC/NEUTRAL on bwa's default, because both are variant-aware and
+    /// their mirror cell must stay a real mismatch (`bwamem.cpp:511-515`).
+    ///
+    /// So a caller-set `-B` *survives* the bundle under GENOMIC and NEUTRAL and
+    /// is *overwritten* under COLLAPSED. Pinned here because the ordering docs
+    /// on `MemOpts::apply_meth_defaults` and the shim assert exactly this, and
+    /// nothing else would catch them drifting back to "always overwritten".
+    #[test]
+    fn mismatch_penalty_is_overwritten_only_under_collapsed() {
+        for scoring in [MethScoring::Genomic, MethScoring::Neutral] {
+            let mut opts = MemOpts::new().unwrap();
+            opts.set_meth(true);
+            opts.set_meth_scoring(scoring);
+            opts.set_mismatch_penalty(7);
+            opts.apply_meth_defaults();
+            assert_eq!(
+                opts.mismatch_penalty(),
+                7,
+                "{scoring:?} is variant-aware, so the bundle must leave -B alone"
+            );
+        }
+
+        // COLLAPSED (the default) overwrites it with bwameth's 2 * a.
+        let mut opts = MemOpts::new().unwrap();
+        opts.set_meth(true);
+        opts.set_mismatch_penalty(7);
+        opts.apply_meth_defaults();
+        assert_eq!(
+            opts.mismatch_penalty(),
+            2,
+            "COLLAPSED applies bwameth's lenient -B 2, clobbering the caller's"
+        );
     }
 
     /// GENOMIC deliberately keeps bwa's `-B 4`; it is the one mode-dependent
@@ -411,7 +486,7 @@ mod tests {
         let mut opts = MemOpts::new().unwrap();
         opts.set_meth(true);
         opts.set_meth_scoring(MethScoring::Genomic);
-        apply_meth_defaults(&mut opts);
+        opts.apply_meth_defaults();
 
         assert_eq!(
             opts.mismatch_penalty(),
