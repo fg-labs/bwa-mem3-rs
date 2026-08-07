@@ -59,12 +59,12 @@ report_section() { printf '\n## %s\n\n' "$1"; }
 
 # The committed (pre-refresh) content of a vendored path, or empty if it is new.
 old_file() {
-    git -C "$REPO_ROOT" show "HEAD:$1" 2>/dev/null || true
+    git -C "$REPO_ROOT" show "HEAD:$1" 2> /dev/null || true
 }
 
 # The working-tree (post-refresh) content of a path, or empty if it is gone.
 new_file() {
-    cat "$REPO_ROOT/$1" 2>/dev/null || true
+    cat "$REPO_ROOT/$1" 2> /dev/null || true
 }
 
 # The pruned-subtree paths from scripts/vendor-drop-subtrees.txt, one per
@@ -90,7 +90,10 @@ new_file() {
 # the gate can never be cleared.
 drop_subtrees() {
     local list="$REPO_ROOT/scripts/vendor-drop-subtrees.txt"
-    [ -f "$list" ] || { echo "ERROR: missing $list" >&2; exit 1; }
+    [ -f "$list" ] || {
+        echo "ERROR: missing $list" >&2
+        exit 1
+    }
     local line
     while IFS= read -r line; do
         line="${line%%#*}"
@@ -123,8 +126,8 @@ drop_subtrees() {
 gitmodules_new_submodules() {
     local old="$1" new="$2"
     local old_paths new_paths added dropped
-    old_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$old" 2>/dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
-    new_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$new" 2>/dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
+    old_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$old" 2> /dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
+    new_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$new" 2> /dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
     added="$(comm -13 <(printf '%s\n' "$old_paths") <(printf '%s\n' "$new_paths") | grep -v '^$' || true)"
     [ -n "$added" ] || return 0
     dropped="$(drop_subtrees | sort -u)"
@@ -161,7 +164,7 @@ struct_body() {
 # enum_bodies below), nothing about a flag's meaning depends on where among
 # its siblings it is declared.
 flag_defines() {
-    grep -E '^[[:space:]]*#define[[:space:]]+MEM_F_[A-Z0-9_]+[[:space:]]+' "$1" 2>/dev/null \
+    grep -E '^[[:space:]]*#define[[:space:]]+MEM_F_[A-Z0-9_]+[[:space:]]+' "$1" 2> /dev/null \
         | mawk '{ print $2, $3 }' | sort || true
 }
 
@@ -194,7 +197,7 @@ enum_bodies() {
         /(^|[^a-zA-Z_])enum([^a-zA-Z_]|$)/ { in_enum = 1 }
         in_enum { print }
         in_enum && /;/ { in_enum = 0 }
-    ' "$1" 2>/dev/null || true
+    ' "$1" 2> /dev/null || true
 }
 
 # The definition of a C/C++ function, from its signature line to the first
@@ -327,7 +330,8 @@ check_build() {
 # Check 1 (hard gate): a new submodule makes a refresh commit wrong.
 check_gitmodules() {
     local old new
-    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
+    old="$(mktemp_tracked)"
+    new="$(mktemp_tracked)"
     old_file "$VENDOR/.gitmodules" > "$old"
     new_file "$VENDOR/.gitmodules" > "$new"
     local added
@@ -375,15 +379,17 @@ check_gitmodules() {
 check_structs() {
     report_section "3. \`mem_opt_t\` / \`mem_pestat_t\` layout"
     local old new o n s
-    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
+    old="$(mktemp_tracked)"
+    new="$(mktemp_tracked)"
     old_file "$VENDOR/src/bwamem.h" > "$old"
     new_file "$VENDOR/src/bwamem.h" > "$new"
     local any=0
     for s in mem_opt_t mem_pestat_t; do
-        o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
+        o="$(mktemp_tracked)"
+        n="$(mktemp_tracked)"
         struct_body "$old" "$s" > "$o"
         struct_body "$new" "$s" > "$n"
-        if ! diff -q "$o" "$n" >/dev/null; then
+        if ! diff -q "$o" "$n" > /dev/null; then
             any=1
             # Backticks below are literal markdown, not command substitution.
             # shellcheck disable=SC2016
@@ -422,14 +428,16 @@ check_structs() {
 check_flags_and_enums() {
     report_section "4. \`MEM_F_*\` flags and \`bwamem.h\` enums"
     local old new o n
-    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
+    old="$(mktemp_tracked)"
+    new="$(mktemp_tracked)"
     old_file "$VENDOR/src/bwamem.h" > "$old"
     new_file "$VENDOR/src/bwamem.h" > "$new"
 
-    o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
+    o="$(mktemp_tracked)"
+    n="$(mktemp_tracked)"
     flag_defines "$old" > "$o"
     flag_defines "$new" > "$n"
-    if diff -q "$o" "$n" >/dev/null; then
+    if diff -q "$o" "$n" > /dev/null; then
         printf 'Flag set unchanged.\n\n'
     else
         # Backticks below are literal markdown, not command substitution.
@@ -453,10 +461,11 @@ check_flags_and_enums() {
     fi
     rm -f "$o" "$n"
 
-    o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
+    o="$(mktemp_tracked)"
+    n="$(mktemp_tracked)"
     enum_bodies "$old" > "$o"
     enum_bodies "$new" > "$n"
-    if diff -q "$o" "$n" >/dev/null; then
+    if diff -q "$o" "$n" > /dev/null; then
         printf 'Enum values unchanged.\n'
     else
         printf '### Enum values changed\n\n```diff\n'
@@ -509,13 +518,15 @@ check_call_site_contracts() {
     printf 'changed argument meaning is silent even with an identical signature\n'
     printf '(gotchas #8 and #12).\n\n'
     local entry fn path old new o n changed=0
-    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
+    old="$(mktemp_tracked)"
+    new="$(mktemp_tracked)"
     for entry in "${UPSTREAM_CONTRACTS[@]}"; do
         fn="${entry%%:*}"
         path="${entry#*:}"
         old_file "$VENDOR/$path" > "$old"
         new_file "$VENDOR/$path" > "$new"
-        o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
+        o="$(mktemp_tracked)"
+        n="$(mktemp_tracked)"
         function_body "$old" "$fn" > "$o"
         function_body "$new" "$fn" > "$n"
         if [ ! -s "$n" ]; then
@@ -526,7 +537,7 @@ check_call_site_contracts() {
             printf 'It was renamed, moved, or removed upstream. Find where it\n'
             # shellcheck disable=SC2016
             printf 'went and update `UPSTREAM_CONTRACTS` in this script.\n\n'
-        elif ! diff -q "$o" "$n" >/dev/null; then
+        elif ! diff -q "$o" "$n" > /dev/null; then
             changed=1
             # shellcheck disable=SC2016
             printf '### `%s` changed (`%s`)\n\n```diff\n' "$fn" "$path"
@@ -547,7 +558,7 @@ check_call_site_contracts() {
             # ever split across a name-then-newline-then-"(" shape, this
             # would miss it and this comment's claim would need revisiting.
             # Paths are shown repo-relative, not as $REPO_ROOT's absolute path.
-            grep -rn -A3 -E "${fn}[[:space:]]*\\(" "$REPO_ROOT/bwa-mem3-sys/shim/" 2>/dev/null \
+            grep -rn -A3 -E "${fn}[[:space:]]*\\(" "$REPO_ROOT/bwa-mem3-sys/shim/" 2> /dev/null \
                 | sed "s|^$REPO_ROOT/||" \
                 || printf '(no direct call site in shim/ -- see gotcha #12 if this\nfunction is mirrored rather than called directly)\n'
             printf '```\n\n'
@@ -565,13 +576,14 @@ check_call_site_contracts() {
 check_source_inventory() {
     report_section "6. Source inventory"
     local o n
-    o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
+    o="$(mktemp_tracked)"
+    n="$(mktemp_tracked)"
     # 2>/dev/null: a first-ever-vendored src/ (no HEAD:$VENDOR/src to show)
     # makes git print a raw "fatal: Not a valid object name" to stderr, which
     # would otherwise land in the middle of the markdown report.
-    git -C "$REPO_ROOT" ls-tree --name-only "HEAD:$VENDOR/src" 2>/dev/null | grep -E '\.(c|cpp)$' | sort > "$o" || true
+    git -C "$REPO_ROOT" ls-tree --name-only "HEAD:$VENDOR/src" 2> /dev/null | grep -E '\.(c|cpp)$' | sort > "$o" || true
     (cd "$VENDOR_ABS/src" && ls) | grep -E '\.(c|cpp)$' | sort > "$n" || true
-    if diff -q "$o" "$n" >/dev/null; then
+    if diff -q "$o" "$n" > /dev/null; then
         printf 'No TUs added or removed.\n\n'
     else
         printf '```diff\n'
@@ -604,7 +616,7 @@ check_source_inventory() {
     # exists to prevent, so a stale pattern must be loud, not silent.
     local name entries
     entries="$(mawk '/(let|const)[[:space:]]+skip_common|SKIP_COMMON/,/\];/' "$REPO_ROOT/bwa-mem3-sys/build.rs" \
-                 | grep -oE '"[a-zA-Z_0-9]+\.cpp"' | tr -d '"' || true)"
+        | grep -oE '"[a-zA-Z_0-9]+\.cpp"' | tr -d '"' || true)"
     if [ -z "$entries" ]; then
         printf 'Extraction matched nothing -- the skip_common pattern in\n'
         printf 'check_source_inventory (scripts/bwa-mem3-drift-report.sh) is\n'
@@ -631,10 +643,12 @@ check_source_inventory() {
 check_dependencies() {
     report_section "7. Upstream build dependencies"
     local old new o n
-    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
+    old="$(mktemp_tracked)"
+    new="$(mktemp_tracked)"
     old_file "$VENDOR/Makefile" > "$old"
     new_file "$VENDOR/Makefile" > "$new"
-    o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
+    o="$(mktemp_tracked)"
+    n="$(mktemp_tracked)"
     # The anchor covers indirect dependency variables, not just LIBS/LDLIBS/
     # LDFLAGS themselves: LIBS_EXTRA, LIBSAIS_OPENMP_LIBS, and
     # MIMALLOC_LDFLAGS are all real Makefile variables (verified against the
@@ -645,7 +659,7 @@ check_dependencies() {
     # check exists to catch.
     grep -E '^[[:space:]]*[A-Za-z_]*(LIBS|LDLIBS|LDFLAGS)[A-Za-z_]*[[:space:]]*[+:]?=|pkg-config|\./configure' "$old" | sort -u > "$o" || true
     grep -E '^[[:space:]]*[A-Za-z_]*(LIBS|LDLIBS|LDFLAGS)[A-Za-z_]*[[:space:]]*[+:]?=|pkg-config|\./configure' "$new" | sort -u > "$n" || true
-    if diff -q "$o" "$n" >/dev/null; then
+    if diff -q "$o" "$n" > /dev/null; then
         # Backticks below are literal markdown, not command substitution.
         # shellcheck disable=SC2016
         printf 'No change to `LIBS` / `pkg-config` / `./configure`.\n'
@@ -675,10 +689,12 @@ check_dependencies() {
 check_new_opts() {
     report_section "8. New \`mem_opt_t\` fields vs. the Rust API"
     local old new o n field
-    old="$(mktemp_tracked)"; new="$(mktemp_tracked)"
+    old="$(mktemp_tracked)"
+    new="$(mktemp_tracked)"
     old_file "$VENDOR/src/bwamem.h" > "$old"
     new_file "$VENDOR/src/bwamem.h" > "$new"
-    o="$(mktemp_tracked)"; n="$(mktemp_tracked)"
+    o="$(mktemp_tracked)"
+    n="$(mktemp_tracked)"
     struct_body "$old" mem_opt_t > "$o"
     struct_body "$new" mem_opt_t > "$n"
     local added
@@ -697,7 +713,10 @@ check_new_opts() {
     while IFS= read -r field; do
         # Counted, not silently skipped: a blank added line is non-declaration
         # text like any other, and the tally below claims to cover all of it.
-        [ -n "$field" ] || { skipped_comments=$((skipped_comments + 1)); continue; }
+        [ -n "$field" ] || {
+            skipped_comments=$((skipped_comments + 1))
+            continue
+        }
         # Drop comment lines before classifying. The diff yields every added
         # line of the struct body, and mem_opt_t carries multi-line block
         # comments -- v0.8.0's meth-scoring note alone runs ~20 lines. Their
@@ -709,22 +728,29 @@ check_new_opts() {
         case "${field#"${field%%[![:space:]]*}"}" in
             # A leading literal `*` covers both a block-comment continuation
             # line and its closing `*/`.
-            '*'*|'/*'*|'//'*) skipped_comments=$((skipped_comments + 1)); continue ;;
+            '*'* | '/*'* | '//'*)
+                skipped_comments=$((skipped_comments + 1))
+                continue
+                ;;
         esac
         case "$field" in
             *';'*) ;;
-            *) skipped_comments=$((skipped_comments + 1)); continue ;;
+            *)
+                skipped_comments=$((skipped_comments + 1))
+                continue
+                ;;
         esac
         case "$field" in
-            *"NOT a user option"*|*"runtime state"*|*derived*)
+            *"NOT a user option"* | *"runtime state"* | *derived*)
                 # Backticks below are literal markdown, not command substitution.
                 # shellcheck disable=SC2016
-                printf -- '- `%s` — skip (upstream marks it internal)\n' "$field" ;;
+                printf -- '- `%s` — skip (upstream marks it internal)\n' "$field"
+                ;;
             *)
                 local name
                 name="$(printf '%s' "$field" | sed 's/;.*//' | mawk '{print $NF}' | tr -d '*')"
                 case "$name" in
-                    ''|/*)
+                    '' | /*)
                         # Nothing usable to check: an empty extraction (a
                         # whitespace-only or comment-only field line) or a
                         # name starting with "/" (a stray comment fragment
@@ -732,7 +758,8 @@ check_new_opts() {
                         # feed it to grep -- flag for a human instead of
                         # guessing.
                         # shellcheck disable=SC2016
-                        printf -- '- `%s` — could not extract a field name; check manually\n' "$field" ;;
+                        printf -- '- `%s` — could not extract a field name; check manually\n' "$field"
+                        ;;
                     *)
                         # -F (fixed-string): $name is used as a literal
                         # identifier, not a regex. An added array field like
@@ -741,14 +768,16 @@ check_new_opts() {
                         # character from the class {2,5} -- silently matching
                         # an unrelated `mat_ot2` in opts.rs and misreporting
                         # "already referenced". -F treats it literally.
-                        if grep -qF "$name" "$REPO_ROOT/bwa-mem3-rs/src/opts.rs" 2>/dev/null; then
+                        if grep -qF "$name" "$REPO_ROOT/bwa-mem3-rs/src/opts.rs" 2> /dev/null; then
                             # shellcheck disable=SC2016
                             printf -- '- `%s` — already referenced in `opts.rs`\n' "$field"
                         else
                             # shellcheck disable=SC2016
                             printf -- '- `%s` — **consider exposing** on `MemOpts`\n' "$field"
-                        fi ;;
-                esac ;;
+                        fi
+                        ;;
+                esac
+                ;;
         esac
     done <<< "$added"
     # Report the count rather than dropping them silently: a reader who knows
@@ -801,7 +830,7 @@ check_release_notes() {
     # space-separated list of tag names, not a single path or token.
     for t in $tags; do
         printf '### %s\n\n' "$t"
-        gh api "repos/fg-labs/bwa-mem3/releases/tags/$t" --jq '.body' 2>/dev/null \
+        gh api "repos/fg-labs/bwa-mem3/releases/tags/$t" --jq '.body' 2> /dev/null \
             | sed 's/^/> /' || printf '> (release notes unavailable)\n'
         printf '\n'
     done
@@ -810,7 +839,7 @@ check_release_notes() {
 # Check 11: what CI structurally cannot verify.
 print_manual_checklist() {
     report_section "Manual checklist (CI cannot do these)"
-    cat <<'EOF'
+    cat << 'EOF'
 Green CI is necessary but **not sufficient**. Before merging:
 
 - [ ] Byte-parity against a real index. The PhiX-scale parity targets run in

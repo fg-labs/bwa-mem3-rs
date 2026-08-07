@@ -8,15 +8,30 @@ source "$here/../bwa-mem3-drift-report.sh"
 
 pass=0
 fail=0
-check() { if [ "$2" = "$3" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1 — expected '$2', got '$3'" >&2; fi; }
+check() { if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
+    fail=$((fail + 1))
+    echo "FAIL: $1 — expected '$2', got '$3'" >&2
+fi; }
 # -F (fixed-string): callers pass literal markdown snippets (backticks,
 # `**bold**`, `[i]`-shaped code fragments), and BRE would otherwise
 # misinterpret `[...]` as a bracket expression or a leading `**` as an
 # invalid repetition operator with no preceding element.
-contains() { if printf '%s' "$2" | grep -qF -- "$3"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1 — '$3' not found in output" >&2; fi; }
-absent() { if printf '%s' "$2" | grep -qF -- "$3"; then fail=$((fail+1)); echo "FAIL: $1 — '$3' unexpectedly present" >&2; else pass=$((pass+1)); fi; }
-check_true()  { if "$@" >/dev/null 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: expected success: $*" >&2; fi; }
-check_false() { if "$@" >/dev/null 2>&1; then fail=$((fail+1)); echo "FAIL: expected failure: $*" >&2; else pass=$((pass+1)); fi; }
+contains() { if printf '%s' "$2" | grep -qF -- "$3"; then pass=$((pass + 1)); else
+    fail=$((fail + 1))
+    echo "FAIL: $1 — '$3' not found in output" >&2
+fi; }
+absent() { if printf '%s' "$2" | grep -qF -- "$3"; then
+    fail=$((fail + 1))
+    echo "FAIL: $1 — '$3' unexpectedly present" >&2
+else pass=$((pass + 1)); fi; }
+check_true() { if "$@" > /dev/null 2>&1; then pass=$((pass + 1)); else
+    fail=$((fail + 1))
+    echo "FAIL: expected success: $*" >&2
+fi; }
+check_false() { if "$@" > /dev/null 2>&1; then
+    fail=$((fail + 1))
+    echo "FAIL: expected failure: $*" >&2
+else pass=$((pass + 1)); fi; }
 
 tmp="$(mktemp -d)"
 # Both directories, and the same three signals the sourced script uses: bash
@@ -72,7 +87,9 @@ gm_scratch="$tmp/gitmodules-fixture"
 mkdir -p "$gm_scratch/bwa-mem3-sys/vendor/bwa-mem3" "$gm_scratch/scripts"
 printf '# fixture prune list\next/htslib\next/mimalloc\n' > "$gm_scratch/scripts/vendor-drop-subtrees.txt"
 
-save_repo_root="$REPO_ROOT"; save_vendor="$VENDOR"; save_vendor_abs="$VENDOR_ABS"
+save_repo_root="$REPO_ROOT"
+save_vendor="$VENDOR"
+save_vendor_abs="$VENDOR_ABS"
 REPO_ROOT="$gm_scratch"
 VENDOR="bwa-mem3-sys/vendor/bwa-mem3"
 VENDOR_ABS="$REPO_ROOT/$VENDOR"
@@ -101,7 +118,7 @@ git() {
 }
 
 # (A) a path ALREADY on the drop list must NOT trip the gate.
-cat > "$VENDOR_ABS/.gitmodules" <<'EOF'
+cat > "$VENDOR_ABS/.gitmodules" << 'EOF'
 [submodule "ext/kept"]
 	path = ext/kept
 [submodule "ext/htslib"]
@@ -120,8 +137,8 @@ contains "I-2: ...and check_gitmodules reports no new submodules instead" "$out"
 gitmodules_new_submodules_unfiltered_buggy() {
     local old="$1" new="$2"
     local old_paths new_paths
-    old_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$old" 2>/dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
-    new_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$new" 2>/dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
+    old_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$old" 2> /dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
+    new_paths="$(grep -oE '^[[:space:]]*path[[:space:]]*=[[:space:]]*[^[:space:]]+' "$new" 2> /dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//' | sort -u || true)"
     comm -13 <(printf '%s\n' "$old_paths") <(printf '%s\n' "$new_paths") | grep -v '^$' || true
 }
 printf '%s' "$STUB_GITMODULES_OLD" > "$tmp/gm-old-a"
@@ -129,7 +146,7 @@ out_unfixed="$(gitmodules_new_submodules_unfiltered_buggy "$tmp/gm-old-a" "$VEND
 contains "MUTATION (expected red): the ORIGINAL unfiltered helper wrongly reports an already-pruned submodule as new" "$out_unfixed" "ext/htslib"
 
 # (B) a path NOT on the drop list must still trip the gate.
-cat > "$VENDOR_ABS/.gitmodules" <<'EOF'
+cat > "$VENDOR_ABS/.gitmodules" << 'EOF'
 [submodule "ext/kept"]
 	path = ext/kept
 [submodule "ext/newthing"]
@@ -150,10 +167,12 @@ out_overfiltered="$(gitmodules_new_submodules_overfiltered_buggy "$tmp/gm-old-a"
 check "MUTATION (expected red): a blanket-empty filter would ALSO silence the NOT-pruned case, unlike the real fix (see case B above)" "" "$out_overfiltered"
 
 unset -f git
-REPO_ROOT="$save_repo_root"; VENDOR="$save_vendor"; VENDOR_ABS="$save_vendor_abs"
+REPO_ROOT="$save_repo_root"
+VENDOR="$save_vendor"
+VENDOR_ABS="$save_vendor_abs"
 
 # --- struct_body: anonymous typedef must extract (mem_pestat_t's shape) ---
-cat > "$tmp/hdr.h" <<'EOF'
+cat > "$tmp/hdr.h" << 'EOF'
 typedef struct mem_opt_t {
     int a, b;
     int w;
@@ -210,7 +229,7 @@ git() {
 # (a) vendor clean -> nothing was refreshed.
 STUB_VENDOR_STATUS=""
 STUB_ALL_STATUS=""
-err="$(assert_refreshed_tree 2>&1 1>/dev/null)" || true
+err="$(assert_refreshed_tree 2>&1 1> /dev/null)" || true
 check_false assert_refreshed_tree
 contains "clean tree: nothing-refreshed message" "$err" "nothing was refreshed"
 
@@ -226,13 +245,13 @@ rc=0
 bash -c '
     source "$here/../bwa-mem3-drift-report.sh"
     assert_refreshed_tree
-' >/dev/null 2>&1 || rc=$?
+' > /dev/null 2>&1 || rc=$?
 check "vendor-only-dirty tree: bare statement under errexit does not abort" "0" "$rc"
 
 # (c) vendor dirty, plus a non-vendor file dirty -> files-outside message.
 STUB_VENDOR_STATUS=" M bwa-mem3-sys/vendor/bwa-mem3/foo.c"
 STUB_ALL_STATUS=$' M bwa-mem3-sys/vendor/bwa-mem3/foo.c\n M Cargo.toml'
-err="$(assert_refreshed_tree 2>&1 1>/dev/null)" || true
+err="$(assert_refreshed_tree 2>&1 1> /dev/null)" || true
 check_false assert_refreshed_tree
 contains "extra dirty file: files-outside message" "$err" "files outside"
 contains "extra dirty file: names the offending path" "$err" "Cargo.toml"
@@ -240,7 +259,7 @@ contains "extra dirty file: names the offending path" "$err" "Cargo.toml"
 unset -f git
 
 # --- flag_defines: extracts MEM_F_* name/value pairs ---
-cat > "$tmp/flags.h" <<'EOF'
+cat > "$tmp/flags.h" << 'EOF'
 /* MEM_F_* flag bits (from bwamem.h). */
 #define MEM_F_PE             0x2
 #define MEM_F_NOPAIRING      0x4
@@ -258,7 +277,7 @@ absent "flag_defines ignores unrelated defines" "$out" "SOMETHING_ELSE"
 # check) would silently miss seed_order_t entirely — none of its members
 # (SEED_ORDER_*) start with MEM_ — which is exactly the enum opts.rs's
 # SeedOrder mirrors, so that gap would defeat the check's own stated purpose.
-cat > "$tmp/mixed.h" <<'EOF'
+cat > "$tmp/mixed.h" << 'EOF'
 typedef struct mem_opt_t {
     int a;
 } mem_opt_t;
@@ -287,13 +306,13 @@ absent "enum_bodies does not leak a following struct's fields" "$out" "int low;"
 # construction), sorting an enum's member lines would hide a reorder that
 # silently renumbers every unlabeled member after it. Two files with the same
 # two members in opposite order must come back as two DIFFERENT exact strings.
-cat > "$tmp/enumA.h" <<'EOF'
+cat > "$tmp/enumA.h" << 'EOF'
 typedef enum {
     SEED_ORDER_OFF = 0,
     SEED_ORDER_GLOBAL_LONGEST = 1
 } seed_order_t;
 EOF
-cat > "$tmp/enumB.h" <<'EOF'
+cat > "$tmp/enumB.h" << 'EOF'
 typedef enum {
     SEED_ORDER_GLOBAL_LONGEST = 1,
     SEED_ORDER_OFF = 0
@@ -305,7 +324,7 @@ out="$(enum_bodies "$tmp/enumB.h")"
 check "enum_bodies output B keeps source order (reordered vs A)" "$(printf 'typedef enum {\n    SEED_ORDER_GLOBAL_LONGEST = 1,\n    SEED_ORDER_OFF = 0\n} seed_order_t;')" "$out"
 
 # --- function_body: single-line signature, straight-line extraction ---
-cat > "$tmp/fb1.cpp" <<'EOF'
+cat > "$tmp/fb1.cpp" << 'EOF'
 void unrelated_before() {
     int x = 1;
 }
@@ -327,7 +346,7 @@ absent "function_body: does not bleed into the following function" "$out" "int y
 absent "function_body: does not bleed in the preceding function" "$out" "int x = 1;"
 
 # --- function_body: signature spanning two lines (worker_alloc's real shape) ---
-cat > "$tmp/fb2.cpp" <<'EOF'
+cat > "$tmp/fb2.cpp" << 'EOF'
 void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads,
                    int32_t nthreads)
 {
@@ -339,7 +358,7 @@ contains "function_body: multi-line signature captured" "$out" "int32_t nthreads
 contains "function_body: multi-line signature body captured" "$out" "w.nthreads = nthreads;"
 
 # --- function_body: a forward declaration (ends in ';') must not trigger ---
-cat > "$tmp/fb3.cpp" <<'EOF'
+cat > "$tmp/fb3.cpp" << 'EOF'
 void mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns);
 
 void mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns)
@@ -355,7 +374,7 @@ out="$(function_body "$tmp/fb1.cpp" totally_absent_name)"
 check "function_body: absent name yields empty output" "" "$out"
 
 # --- function_body: a macro invocation of the same name at column 0 must not trigger ---
-cat > "$tmp/fb4.cpp" <<'EOF'
+cat > "$tmp/fb4.cpp" << 'EOF'
 #define WRAP_IT(x) worker_alloc(x)
 
 void worker_alloc(int a)
@@ -374,7 +393,7 @@ absent "function_body: does not capture the macro line itself" "$out" "WRAP_IT"
 # with the call's first physical line ending in a comma (not a semicolon) —
 # which satisfies "contains name( and isn't semicolon-terminated" just as
 # well as a real definition unless the scan also requires column 0.
-cat > "$tmp/fb5.cpp" <<'EOF'
+cat > "$tmp/fb5.cpp" << 'EOF'
 void some_earlier_function(worker_t *w)
 {
     for (int i = 0; i < 10; i++)
@@ -440,19 +459,19 @@ fixture="$tmp/fixture"
 # not a silent empty string).
 export fixture
 mkdir -p "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src" \
-         "$fixture/bwa-mem3-sys/shim" \
-         "$fixture/bwa-mem3-rs/src"
+    "$fixture/bwa-mem3-sys/shim" \
+    "$fixture/bwa-mem3-rs/src"
 
-cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/foo.cpp" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/foo.cpp" << 'EOF'
 void foo(int a, int b)
 {
     int original_marker = 1;
 }
 EOF
-cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/keep.cpp" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/keep.cpp" << 'EOF'
 void keep_fn() {}
 EOF
-cat > "$fixture/bwa-mem3-sys/shim/dummy.cpp" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/shim/dummy.cpp" << 'EOF'
 // See gotcha #12 for how foo's return value is used downstream.
 void call_it()
 {
@@ -460,7 +479,7 @@ void call_it()
         4);
 }
 EOF
-cat > "$fixture/bwa-mem3-sys/build.rs" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/build.rs" << 'EOF'
 fn main() {
     let skip_common: &[&str] = &[
         "foo.cpp",
@@ -470,12 +489,12 @@ fn main() {
     ];
 }
 EOF
-cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" << 'EOF'
 typedef struct mem_opt_t {
     int w;
 } mem_opt_t;
 EOF
-cat > "$fixture/bwa-mem3-rs/src/opts.rs" <<'EOF'
+cat > "$fixture/bwa-mem3-rs/src/opts.rs" << 'EOF'
 // existing_field is already wired up.
 pub struct MemOpts { existing_field: i32 }
 EOF
@@ -485,7 +504,7 @@ EOF
 # this fixture commit signed, and it dies with "fatal: failed to write commit
 # object" whenever the signing agent is locked or unavailable. CI has no signing
 # config, so the failure reproduces only on a developer machine.
-( cd "$fixture" && git init -q \
+(cd "$fixture" && git init -q \
     && git -c user.email=t@t -c user.name=t add \
         bwa-mem3-sys/vendor/bwa-mem3/src/foo.cpp \
         bwa-mem3-sys/vendor/bwa-mem3/src/keep.cpp \
@@ -493,7 +512,7 @@ EOF
         bwa-mem3-sys/build.rs \
         bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h \
         bwa-mem3-rs/src/opts.rs \
-    && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m init )
+    && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m init)
 
 REPO_ROOT="$fixture"
 VENDOR="bwa-mem3-sys/vendor/bwa-mem3"
@@ -505,7 +524,7 @@ out="$(check_call_site_contracts)"
 contains "check 5: unchanged contract reported as such" "$out" "No change to any tracked contract"
 
 # --- check 5: changed body surfaces the diff AND the shim call site ---
-cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/foo.cpp" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/foo.cpp" << 'EOF'
 void foo(int a, int b)
 {
     int original_marker = 1;
@@ -562,7 +581,7 @@ bash -c '
     UPSTREAM_CONTRACTS=("foo:src/foo.cpp")
     check_call_site_contracts >/dev/null
     echo reached
-' >/dev/null 2>&1 || rc=$?
+' > /dev/null 2>&1 || rc=$?
 check "check 5: a changed contract does not abort the caller" "0" "$rc"
 
 # --- check 5: NOT FOUND when UPSTREAM_CONTRACTS names the wrong file ---
@@ -614,7 +633,7 @@ cp "$fixture/bwa-mem3-sys/build.rs" "$tmp/build.rs.let-style"
 
 # First: confirm the WIDENED anchor (shipped fix) copes with a rename to
 # `const SKIP_COMMON` gracefully, with no warning needed.
-cat > "$fixture/bwa-mem3-sys/build.rs" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/build.rs" << 'EOF'
 fn main() {
     const SKIP_COMMON: &[&str] = &[
         "foo.cpp",
@@ -630,7 +649,7 @@ absent "check 6: a renamed binding the widened anchor DOES match does not warn" 
 # Second: a rename the widened anchor can't anticipate either (e.g. neither
 # `let`/`const skip_common` nor `SKIP_COMMON`) must trigger the loud warning
 # instead of silently printing nothing.
-cat > "$fixture/bwa-mem3-sys/build.rs" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/build.rs" << 'EOF'
 fn main() {
     static UNANTICIPATED_RENAME: &[&str] = &[
         "foo.cpp",
@@ -643,7 +662,7 @@ contains "check 6: an anchor-defeating rename triggers the loud warning, not sil
 # MUTATION (expected red): reproduce the ORIGINAL, unwidened `/let
 # skip_common/` anchor (no guard) against the const-SKIP_COMMON fixture from
 # above and confirm it goes silent -- exactly the reviewer's demonstration.
-cat > "$fixture/bwa-mem3-sys/build.rs" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/build.rs" << 'EOF'
 fn main() {
     const SKIP_COMMON: &[&str] = &[
         "foo.cpp",
@@ -654,7 +673,7 @@ EOF
 check_source_inventory_original_anchor() {
     local entries
     entries="$(mawk '/let skip_common/,/\];/' "$fixture/bwa-mem3-sys/build.rs" \
-                 | grep -oE '"[a-zA-Z_0-9]+\.cpp"' | tr -d '"' || true)"
+        | grep -oE '"[a-zA-Z_0-9]+\.cpp"' | tr -d '"' || true)"
     if [ -z "$entries" ]; then
         printf 'nothing printed after the header (exit 0, no warning)\n'
     else
@@ -668,14 +687,14 @@ contains "MUTATION (expected red): original /let skip_common/ anchor goes silent
 cp "$tmp/build.rs.let-style" "$fixture/bwa-mem3-sys/build.rs"
 
 # --- check 6: a newly-added .cpp not yet tracked at HEAD is reported ---
-cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/new_dep.cpp" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/new_dep.cpp" << 'EOF'
 void new_dep_fn() {}
 EOF
 out="$(check_source_inventory)"
 contains "check 6: a new untracked .cpp is reported in the inventory diff" "$out" "new_dep.cpp"
 
 # --- check 8: new field triage (skip / already-referenced / consider-exposing) ---
-cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" << 'EOF'
 typedef struct mem_opt_t {
     int w;
     int existing_field; // consider
@@ -697,7 +716,7 @@ contains "check 8: unreferenced new field says consider exposing" "$out" "consid
 # declarations. A continuation line ends with a plausible last token ("frees",
 # "mismatches"), so it survived the name extraction and got a verdict attached,
 # burying the real fields.
-cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" << 'EOF'
 typedef struct mem_opt_t {
     int w;
     /* Multi-line note about the scoring matrix:
@@ -725,7 +744,7 @@ check "check 8: every skipped line is counted, including the blank one" \
 # Restore the triage fixture: the next block snapshots bwamem.h into
 # $tmp/bwamem_with_new_fields.h, and the mutation test further down asserts on
 # `new_score` from that snapshot.
-cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" << 'EOF'
 typedef struct mem_opt_t {
     int w;
     int existing_field; // consider
@@ -736,7 +755,7 @@ EOF
 
 # --- check 8: no new fields -> trivial "no new fields" message ---
 cp "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" "$tmp/bwamem_with_new_fields.h"
-cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" <<'EOF'
+cat > "$fixture/bwa-mem3-sys/vendor/bwa-mem3/src/bwamem.h" << 'EOF'
 typedef struct mem_opt_t {
     int w;
 } mem_opt_t;
@@ -775,7 +794,7 @@ bash -c '
         printf "unreachable: %s\n" "$added"
     }
     check_new_opts_unfixed
-' >/dev/null 2>&1 || rc=$?
+' > /dev/null 2>&1 || rc=$?
 check "MUTATION (expected red): check_new_opts without || true aborts instead of reporting" "1" "$rc"
 
 # The FIXED check_new_opts, same fixture, must not abort and must report.
@@ -826,7 +845,7 @@ VENDOR_ABS="$orig_vendor_abs"
 # fatal error: 'version.h' file not found, wrapped in cargo's generic
 # "failed to run custom build command" line the way a real `cargo build`
 # failure actually shapes it) ---
-cat > "$tmp/fatal_error.log" <<'EOF'
+cat > "$tmp/fatal_error.log" << 'EOF'
    Compiling bwa-mem3-sys v0.1.1 (/repo/bwa-mem3-sys)
 warning: bwa-mem3-sys@0.1.1: /repo/target/debug/build/bwa-mem3-sys-abc/out/build/bwa-mem3/src/fastmap.cpp:47:10: fatal error: 'version.h' file not found
 warning: bwa-mem3-sys@0.1.1: #include "version.h"
@@ -848,7 +867,7 @@ contains "format_build_failure: the real captured fatal-error line is surfaced" 
 contains "format_build_failure: fatal error is caught by the filter itself (belt-and-braces)" "$out" "Lines matching known error patterns"
 
 # --- synthetic: rustc E0308 with a `-->` pointer line ---
-cat > "$tmp/rustc.log" <<'EOF'
+cat > "$tmp/rustc.log" << 'EOF'
    Compiling bwa-mem3-rs v0.1.1
 error[E0308]: mismatched types
   --> bwa-mem3-rs/src/opts.rs:42:9
@@ -861,7 +880,7 @@ contains "format_build_failure: rustc E0308 diagnostic is surfaced" "$out" "E030
 contains "format_build_failure: rustc's --> pointer line is surfaced" "$out" "opts.rs:42:9"
 
 # --- synthetic: clang's plain (non-fatal) ": error:" behind a cargo wrapper ---
-cat > "$tmp/clang.log" <<'EOF'
+cat > "$tmp/clang.log" << 'EOF'
 error: failed to run custom build command for bwa-mem3-sys
   --- stderr
   cargo:warning=bwamem.cpp:123:5: error: use of undeclared identifier "foo"
@@ -870,7 +889,7 @@ out="$(format_build_failure "$tmp/clang.log" 101)"
 contains "format_build_failure: clang's ': error:' diagnostic is surfaced" "$out" "use of undeclared identifier"
 
 # --- synthetic: a linker error ---
-cat > "$tmp/ld.log" <<'EOF'
+cat > "$tmp/ld.log" << 'EOF'
 error: failed to run custom build command for bwa-mem3-sys
   = note: Undefined symbols for architecture arm64:
   "_mem_matesw", referenced from:
@@ -884,7 +903,7 @@ contains "format_build_failure: linker 'ld:' line is surfaced" "$out" "symbol(s)
 # This is what the structural fix exists for: the filtered-hits section
 # says so honestly, and the unconditional raw tail still shows the actual
 # failure text regardless.
-cat > "$tmp/nomatch.log" <<'EOF'
+cat > "$tmp/nomatch.log" << 'EOF'
    Compiling bwa-mem3-sys v0.1.1
 some completely unrecognized failure shape
 the build tool gave up for reasons unknown
@@ -928,7 +947,7 @@ contains "format_build_failure (fixed): real fatal-error diagnostic is present w
 # literal `[1m[33m` inside the markdown fence.
 # --------------------------------------------------------------------------
 esc=$'\033'
-cat > "$tmp/dup_ansi.log" <<EOF
+cat > "$tmp/dup_ansi.log" << EOF
 ${esc}[1m${esc}[33mwarning${esc}[0m: bwa-mem3-sys@0.2.0: /w/shim/a.cpp:65:22: error: no member named 'chain_ar'
 ${esc}[1m${esc}[33mwarning${esc}[0m: bwa-mem3-sys@0.2.0: /w/shim/a.cpp:68:7: error: no member named 'seedBuf'
   cargo:warning=/w/shim/a.cpp:65:22: error: no member named 'chain_ar'

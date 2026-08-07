@@ -35,17 +35,23 @@ mkdir -p "$(dirname "$DST")"
 # Subtrees to prune, read from the shared list so the drift report and this
 # script cannot disagree about what a pruned tree looks like.
 DROP_LIST="$(dirname "$0")/vendor-drop-subtrees.txt"
-[ -f "$DROP_LIST" ] || { echo "ERROR: missing $DROP_LIST" >&2; exit 1; }
+[ -f "$DROP_LIST" ] || {
+    echo "ERROR: missing $DROP_LIST" >&2
+    exit 1
+}
 DROP_SUBTREES=()
 while IFS= read -r line; do
-    line="${line%%#*}"                       # strip comments
+    line="${line%%#*}" # strip comments
     line="$(printf '%s' "$line" | tr -d '[:space:]')"
     # Normalised identically to drop_subtrees() in bwa-mem3-drift-report.sh --
     # see the note there on why a trailing slash is load-bearing for the gate.
     while [ "${line%/}" != "$line" ]; do line="${line%/}"; done
     [ -n "$line" ] && DROP_SUBTREES+=("$line")
 done < "$DROP_LIST"
-[ "${#DROP_SUBTREES[@]}" -gt 0 ] || { echo "ERROR: $DROP_LIST has no entries" >&2; exit 1; }
+[ "${#DROP_SUBTREES[@]}" -gt 0 ] || {
+    echo "ERROR: $DROP_LIST has no entries" >&2
+    exit 1
+}
 
 if [ -n "$SRC" ]; then
     # Copy from a local working tree at the given hash (submodules initialized).
@@ -95,7 +101,7 @@ rm -f "$DST/.gitattributes"
 echo "$HASH" > bwa-mem3-sys/vendor/COMMIT
 
 # Verify MATE_SORT=0 default (see spec "Pairing without patching upstream").
-if ! grep -E '^CPPFLAGS\+?=.*-DMATE_SORT=0' "$DST/Makefile" >/dev/null; then
+if ! grep -E '^CPPFLAGS\+?=.*-DMATE_SORT=0' "$DST/Makefile" > /dev/null; then
     echo "ERROR: vendored Makefile does not have -DMATE_SORT=0; shim semantics would diverge." >&2
     exit 1
 fi

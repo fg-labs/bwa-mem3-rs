@@ -121,11 +121,17 @@ release_tags() {
 #      its (possibly empty, on failure) output.
 vendored_version() {
     local tags="${1:-}" current_sha t resolved rc
-    [ -f "$COMMIT_FILE" ] || { echo "ERROR: missing $COMMIT_FILE" >&2; return 1; }
+    [ -f "$COMMIT_FILE" ] || {
+        echo "ERROR: missing $COMMIT_FILE" >&2
+        return 1
+    }
     current_sha="$(tr -d '[:space:]' < "$COMMIT_FILE")"
 
     [ -n "$tags" ] || tags="$(release_tags)"
-    [ -n "$tags" ] || { echo "ERROR: no releases found for $UPSTREAM_REPO" >&2; return 1; }
+    [ -n "$tags" ] || {
+        echo "ERROR: no releases found for $UPSTREAM_REPO" >&2
+        return 1
+    }
 
     while IFS= read -r t; do
         rc=0
@@ -146,18 +152,30 @@ main() {
     local forced_tag=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            --tag) forced_tag="${2:?--tag needs a value}"; shift 2 ;;
-            *) echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
+            --tag)
+                forced_tag="${2:?--tag needs a value}"
+                shift 2
+                ;;
+            *)
+                echo "ERROR: unknown argument: $1" >&2
+                exit 2
+                ;;
         esac
     done
 
-    [ -f "$COMMIT_FILE" ] || { echo "ERROR: missing $COMMIT_FILE" >&2; exit 1; }
+    [ -f "$COMMIT_FILE" ] || {
+        echo "ERROR: missing $COMMIT_FILE" >&2
+        exit 1
+    }
     local current_sha
     current_sha="$(tr -d '[:space:]' < "$COMMIT_FILE")"
 
     local tags
     tags="$(release_tags)"
-    [ -n "$tags" ] || { echo "ERROR: no releases found for $UPSTREAM_REPO" >&2; exit 1; }
+    [ -n "$tags" ] || {
+        echo "ERROR: no releases found for $UPSTREAM_REPO" >&2
+        exit 1
+    }
 
     # Reverse-look-up vendor/COMMIT in the release list. Stronger than reading
     # a version marker out of the tree: it also catches an upstream RETAG,
@@ -230,7 +248,8 @@ main() {
     fi
 
     local out
-    out=$(cat <<EOF
+    out=$(
+        cat << EOF
 current_version=$current_version
 current_sha=$current_sha
 latest_version=$latest_version
@@ -239,7 +258,7 @@ missed_tags=$missed
 needs_bump=$needs_bump
 forced=$forced
 EOF
-)
+    )
     printf '%s\n' "$out"
     [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s\n' "$out" >> "$GITHUB_OUTPUT"
     return 0
