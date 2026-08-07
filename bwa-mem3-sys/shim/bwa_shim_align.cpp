@@ -456,6 +456,24 @@ static inline uint32_t bwa_cigar_to_bam(uint32_t op) {
     return (len << 4) | bam_o;
 }
 
+/* Mirror of upstream's `add_cigar` clip rewrite (bwamem.cpp:2410-2421).
+ * bwa-mem3 HARD-clips supplementary records by default: on a 2nd+ emitted
+ * record (`which != 0`) every clip opcode becomes H, and S otherwise --
+ * unless -Y (MEM_F_SOFTCLIP) or the alignment is on an ALT contig, in which
+ * case the soft clip stands. `mem_reg2aln` only ever writes S (bwamem.cpp:
+ * 2735,2743 build `clip<<4 | 3`), so it is this rewrite, not the aligner,
+ * that produces every H the CLI emits.
+ *
+ * Opcodes here are bwa's MIDSH table (S=3, H=4), NOT the BAM spec's; feed the
+ * result through bwa_cigar_to_bam before writing it. */
+static inline uint32_t bwa_apply_clip_mode(uint32_t cig, const mem_opt_t *opt,
+                                           int is_alt, int which) {
+    uint32_t o = cig & 0xf;
+    if (!(opt->flag & MEM_F_SOFTCLIP) && !is_alt && (o == 3 || o == 4))
+        o = which ? 4 : 3;
+    return (cig & ~(uint32_t) 0xf) | o;
+}
+
 /* ASCII base complement (A<->T, C<->G, case-insensitive); anything else -> N.
  * Used to build the D3 (--meth) XM:Z seq_text in emitted-SEQ orientation. */
 static inline char ascii_complement(char b) {
@@ -551,15 +569,24 @@ static void emit_sa_tag(uint8_t **buf, size_t *len, size_t *cap,
     buf_append(buf, len, cap, &zero, 1);
 }
 
-/* Emit MC:Z aux (mate CIGAR) from a mate mem_aln_t. */
+/* Emit MC:Z aux (mate CIGAR) from a mate mem_aln_t.
+ *
+ * `which` is the EMITTING record's index, not the mate's: upstream builds
+ * MC:Z through the same `add_cigar` helper and hands it the record's own
+ * `which` (bwamem.cpp:2583), so on a supplementary record the mate's clips
+ * are rendered hard even though the mate itself is a primary. Mirrored here
+ * deliberately -- it looks like an upstream quirk, and reproducing it is the
+ * point. `m->is_alt` (not the record's) gates it, matching `add_cigar`'s use
+ * of the mem_aln_t it was passed. */
 static void emit_mc_tag(uint8_t **buf, size_t *len, size_t *cap,
-                        const mem_aln_t *m) {
+                        const mem_opt_t *opt, const mem_aln_t *m, int which) {
     uint8_t header[3] = {'M', 'C', 'Z'};
     buf_append(buf, len, cap, header, 3);
     char tmp[32];
     for (int i = 0; i < m->n_cigar; ++i) {
+        uint32_t cig = bwa_apply_clip_mode(m->cigar[i], opt, m->is_alt, which);
         int n = snprintf(tmp, sizeof(tmp), "%u%c",
-                         m->cigar[i] >> 4, "MIDSH"[m->cigar[i] & 0xf]);
+                         cig >> 4, "MIDSH"[cig & 0xf]);
         buf_append(buf, len, cap, tmp, n);
     }
     uint8_t zero = 0;
@@ -624,15 +651,31 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
         mate_rid = eff_rid; mate_pos = eff_pos; mate_is_rev = eff_is_rev;
     }
 
-    /* Emitted-SEQ range: hard-clipped (H) ends are dropped for supplementary
-     * records, so the emitted sequence is a subset of s->seq. Computed up front
-     * because the --meth XM:Z tag below needs it. bwa-mem3 H opcode = 4 (not 5
-     * as in the BAM spec). */
+    /* Emitted-SEQ range: hard-clipped ends are dropped, so the emitted
+     * sequence is a subset of s->seq. Computed up front because the --meth
+     * XM:Z tag below needs it.
+     *
+     * The predicate is upstream's (bwamem.cpp:2548-2551, 2562-2565): trim on a
+     * supplementary (`which != 0`) unless -Y or an ALT alignment, keyed off the
+     * clip opcode being S *or* H. This previously tested for H alone, which
+     * `mem_reg2aln` never emits (it writes `clip<<4 | 3`, always S), so the
+     * branch was dead and every supplementary carried a full-length SEQ.
+     *
+     * No is_rev swap here, despite upstream swapping which end qb/qe take
+     * (bwamem.cpp:2563-2565): these are offsets into s->seq on the forward
+     * path and offsets from the read's far end on the reverse path, because
+     * the reverse emitter indexes `s->seq[l_seq - 1 - (seq_start + i)]`. That
+     * already maps seq_start onto upstream's `qe` and seq_end onto its `qb`,
+     * so adding a swap would double-correct. */
+    int clip_hard = (n_cigar > 0 && which
+                     && !(opt->flag & MEM_F_SOFTCLIP) && !p->is_alt);
     int seq_start = 0;
     int seq_end = l_seq;
-    if (n_cigar > 0) {
-        if ((p->cigar[0] & 0xf) == 4)             seq_start = (int)(p->cigar[0] >> 4);
-        if ((p->cigar[n_cigar - 1] & 0xf) == 4)   seq_end -= (int)(p->cigar[n_cigar - 1] >> 4);
+    if (clip_hard) {
+        uint32_t first_op = p->cigar[0] & 0xf;
+        uint32_t last_op  = p->cigar[n_cigar - 1] & 0xf;
+        if (first_op == 3 || first_op == 4) seq_start = (int)(p->cigar[0] >> 4);
+        if (last_op  == 3 || last_op  == 4) seq_end  -= (int)(p->cigar[n_cigar - 1] >> 4);
     }
     int emit_len = seq_end - seq_start;
     if (emit_len < 0) emit_len = 0;
@@ -646,7 +689,7 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
         const char *md = (const char *)(p->cigar + p->n_cigar);
         aux_put_Z(&aux, &aux_len, &aux_cap, "MD", md);
     }
-    if (m && m->n_cigar) emit_mc_tag(&aux, &aux_len, &aux_cap, m);
+    if (m && m->n_cigar) emit_mc_tag(&aux, &aux_len, &aux_cap, opt, m, which);
     if (p->score >= 0) aux_put_i(&aux, &aux_len, &aux_cap, "AS", p->score);
     if (p->sub >= 0)   aux_put_i(&aux, &aux_len, &aux_cap, "XS", p->sub);
     if (bwa_rg_id[0])  aux_put_Z(&aux, &aux_len, &aux_cap, "RG", bwa_rg_id);
@@ -695,7 +738,13 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
                             : s->meth_orig_seq[seq_start + i];
                     }
                     seq_text[emit_len] = '\0';
-                    for (int i = 0; i < n_cigar; ++i) bam_cig[i] = bwa_cigar_to_bam(p->cigar[i]);
+                    /* Same clip rewrite as the emitted CIGAR below: the XM:Z
+                     * builder walks this alongside `seq_text`, which is the
+                     * hard-clipped span, so the two must agree on whether the
+                     * clip consumes query bases. */
+                    for (int i = 0; i < n_cigar; ++i)
+                        bam_cig[i] = bwa_cigar_to_bam(
+                            bwa_apply_clip_mode(p->cigar[i], opt, p->is_alt, which));
                     char *xm = meth_build_xm(bns, pac, p->rid, (int64_t)p->pos,
                                              is_top, bam_cig, n_cigar, seq_text, emit_len);
                     if (xm) aux_put_Z(&aux, &aux_len, &aux_cap, "XM", xm);
@@ -801,7 +850,8 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
     *w++ = 0;
 
     for (int i = 0; i < n_cigar; ++i) {
-        uint32_t c = bwa_cigar_to_bam(p->cigar[i]);
+        uint32_t c = bwa_cigar_to_bam(
+            bwa_apply_clip_mode(p->cigar[i], opt, p->is_alt, which));
         memcpy(w, &c, 4); w += 4;
     }
 
