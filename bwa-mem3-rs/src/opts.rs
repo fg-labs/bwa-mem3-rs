@@ -141,6 +141,11 @@ impl MemOpts {
                 o.pen_clip3 = 5;
             }
         }
+        // Every preset changes `b`, so the matrices derived from it are stale
+        // until rebuilt -- the same coupling the `a`/`b` setters maintain.
+        // Upstream does this too, re-running bwa_fill_scmat after parsing -x
+        // (fastmap.cpp:1531).
+        unsafe { sys::bwa_shim_opts_fill_scmat(self.handle) };
         self
     }
 
@@ -194,9 +199,14 @@ impl MemOpts {
     pub fn match_score(&self) -> i32 {
         unsafe { (*self.handle).a }
     }
+    /// Set the match score (`-A`).
+    ///
+    /// Rebuilds the scoring matrices, which several alignment paths read
+    /// instead of `a`/`b` directly — see [`Self::set_mismatch_penalty`].
     pub fn set_match_score(&mut self, v: i32) -> &mut Self {
         unsafe {
             (*self.handle).a = v;
+            sys::bwa_shim_opts_fill_scmat(self.handle);
         }
         self
     }
@@ -205,9 +215,19 @@ impl MemOpts {
     pub fn mismatch_penalty(&self) -> i32 {
         unsafe { (*self.handle).b }
     }
+    /// Set the mismatch penalty (`-B`).
+    ///
+    /// Rebuilds the scoring matrices. This is not optional bookkeeping:
+    /// `a`/`b` are read directly by some paths (`bwamem.cpp:2200`, `:2296`,
+    /// `:3449`, `:4130`, ...) while the Smith-Waterman kernels read only
+    /// `opt->mat`, so writing the field alone leaves the two disagreeing —
+    /// the score would change for MAPQ and heuristics but not for alignment
+    /// itself. Upstream always pairs the write with `bwa_fill_scmat`
+    /// (`fastmap.cpp:1531-1535`).
     pub fn set_mismatch_penalty(&mut self, v: i32) -> &mut Self {
         unsafe {
             (*self.handle).b = v;
+            sys::bwa_shim_opts_fill_scmat(self.handle);
         }
         self
     }
@@ -580,6 +600,65 @@ mod tests {
     // Only the tests match on the variant; a module-level import would be
     // dead in a non-test build and trip clippy's -D unused-imports.
     use crate::error::Error;
+
+    /// Reading `mat` requires reaching through the raw handle: it is not part
+    /// of the safe surface, and these tests are the only consumer.
+    fn scoring_matrix(o: &MemOpts) -> [i8; 25] {
+        unsafe { (*o.handle).mat }
+    }
+
+    #[test]
+    fn changing_the_mismatch_penalty_rebuilds_the_scoring_matrix() {
+        let mut o = MemOpts::new().unwrap();
+        // mem_opt_init defaults: a=1, b=4, so off-diagonal cells are -4.
+        assert_eq!(
+            scoring_matrix(&o)[1],
+            -4,
+            "unexpected default mismatch cell"
+        );
+
+        o.set_mismatch_penalty(2);
+
+        assert_eq!(o.mismatch_penalty(), 2);
+        assert_eq!(
+            scoring_matrix(&o)[1],
+            -2,
+            "set_mismatch_penalty must rebuild opt->mat, not just write opt->b -- \
+             the SW kernels read only the matrix"
+        );
+    }
+
+    #[test]
+    fn changing_the_match_score_rebuilds_the_scoring_matrix() {
+        let mut o = MemOpts::new().unwrap();
+        assert_eq!(scoring_matrix(&o)[0], 1, "unexpected default match cell");
+
+        o.set_match_score(3);
+
+        assert_eq!(o.match_score(), 3);
+        assert_eq!(
+            scoring_matrix(&o)[0],
+            3,
+            "set_match_score must rebuild opt->mat"
+        );
+    }
+
+    #[test]
+    fn rebuilding_the_scoring_matrix_refreshes_the_meth_matrices() {
+        let mut o = MemOpts::new().unwrap();
+        o.set_meth(true);
+        o.set_mismatch_penalty(2);
+
+        // mat_ot is a copy of mat with the C->T cell freed to a match, so its
+        // ordinary off-diagonal cells must track the new penalty. A stale copy
+        // would silently keep -4 and ignore the caller's scoring.
+        let mat_ot = unsafe { (*o.handle).mat_ot };
+        assert_eq!(
+            mat_ot[1], -2,
+            "the bisulfite matrices are copies of opt->mat and must be refilled \
+             whenever it is rebuilt (mem_opt_fill_meth_mat's own contract)"
+        );
+    }
 
     #[test]
     fn construct_defaults() {
