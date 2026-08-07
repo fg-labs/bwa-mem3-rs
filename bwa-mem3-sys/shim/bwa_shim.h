@@ -61,6 +61,16 @@ void              bwa_shim_opts_fill_scmat(mem_opt_t *opts);
  * Returns 0 on success, non-zero if the key is unknown. */
 int bwa_shim_opts_set_int(mem_opt_t *opts, const char *key, int value);
 
+/* The @HD header line the active output-compatibility target calls for, without
+ * a trailing newline, or NULL when the target emits no @HD.
+ *
+ * A caller writing its own SAM/BAM header must use this rather than a literal
+ * of its own: `compat_target_t` is the one place that decides output shaping,
+ * and upstream collapsed three drifted @HD literals into it for exactly that
+ * reason (fg-labs/bwa-mem3#288). The string is static storage owned by the
+ * compat table; do not free it. */
+const char *bwa_shim_compat_hd_line(const mem_opt_t *opts);
+
 /* PE-stats lifecycle. `pestat_zero` returns a zeroed 4-orientation array. */
 mem_pestat_t *bwa_shim_pestat_zero(void);
 void                 bwa_shim_pestat_free(mem_pestat_t *pestat);

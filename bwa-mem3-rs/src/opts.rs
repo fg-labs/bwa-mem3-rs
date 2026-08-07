@@ -116,6 +116,30 @@ impl MemOpts {
         Ok(MemOpts { handle })
     }
 
+    /// The `@HD` header line the active output-compatibility target calls for
+    /// (no trailing newline), or `None` when that target emits no `@HD`.
+    ///
+    /// A caller writing its own SAM/BAM header should use this instead of a
+    /// literal. bwa-mem3's `compat_target_t` is the single place that decides
+    /// output shaping, and upstream folded three hand-written `@HD` literals
+    /// into it after they drifted apart (fg-labs/bwa-mem3#288); a fourth
+    /// literal here would reintroduce exactly that. This crate's own CLI got it
+    /// wrong before this accessor existed, emitting `@HD VN:1.6 SO:unknown`
+    /// against the reference `@HD VN:1.5 SO:unsorted GO:query`.
+    ///
+    /// The default target (`off`, bwa-mem3's native output) emits one; that is
+    /// the only target reachable today, since this crate exposes no `--compat`
+    /// selector.
+    pub fn compat_hd_line(&self) -> Option<&str> {
+        let p = unsafe { sys::bwa_shim_compat_hd_line(self.handle) };
+        if p.is_null() {
+            return None;
+        }
+        // Static storage owned by bwa-mem3's compat table; valid for the
+        // process lifetime, so borrowing it for `&self` is sound.
+        unsafe { std::ffi::CStr::from_ptr(p) }.to_str().ok()
+    }
+
     /// Apply a bwa-mem3 `-x` preset on top of current values.
     #[must_use]
     pub fn with_mode(self, mode: Mode) -> Self {

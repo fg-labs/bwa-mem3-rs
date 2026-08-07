@@ -394,6 +394,25 @@ int64_t shim_align_idx_contig_len(void *opaque, size_t i) {
     return shim_header_bns(opaque)->anns[i].len;
 }
 
+/* The @HD line the selected compat target wants, or NULL when it suppresses
+ * @HD entirely (bwa-mem2 emits none; see compat_target.cpp).
+ *
+ * This must be read from the target rather than spelled out by the caller.
+ * Upstream consolidated three hardcoded @HD literals into the single
+ * BWAMEM3_DEFAULT_HD_LINE macro precisely because they had drifted apart
+ * (fg-labs/bwa-mem3#288: the SAM-text writer said "VN:1.5 SO:unsorted
+ * GO:query" while the BAM writers said "VN:1.6 SO:unsorted"), so a fourth
+ * literal living in this crate's Rust header writer would recreate the bug
+ * upstream just finished fixing -- and it did: bwa-rs emitted
+ * "@HD VN:1.6 SO:unknown" against the CLI's "@HD VN:1.5 SO:unsorted GO:query".
+ *
+ * `compat` is set by mem_opt_init, but it is a pointer on a struct callers can
+ * memset, so it is NULL-checked like the emit_mq / emit_hn gates. */
+const char *shim_compat_hd_line(const mem_opt_t *opt) {
+    if (opt == NULL || opt->compat == NULL || !opt->compat->emit_hd) return NULL;
+    return opt->compat->hd_line;
+}
+
 /* ------------------ Helpers ------------------ */
 
 static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,

@@ -203,7 +203,7 @@ fn run_mem(
     };
     let mut bgzf_writer = bgzf::io::Writer::new(out);
 
-    write_bam_header(&mut bgzf_writer, &idx)?;
+    write_bam_header(&mut bgzf_writer, &idx, &opts)?;
 
     // Buffers: we accumulate full Record structures so lifetime-free
     // ownership is easy. Each inner Vec holds name + seq + qual.
@@ -291,10 +291,29 @@ fn open_fastq(path: &std::path::Path) -> Result<Box<dyn BufRead>> {
 
 /// Emit a minimal BAM header: magic + l_text + @HD + @SQ lines +
 /// n_ref + per-ref (l_name + name + NUL + l_ref).
-fn write_bam_header<W: Write>(w: &mut W, idx: &BwaIndex) -> Result<()> {
+///
+/// # Compat-target coverage
+///
+/// `compat_target_t` (bwa-mem3 v0.9.0) has five output-shaping switches. This
+/// writer honors `emit_hd` / `hd_line` via [`MemOpts::compat_hd_line`]; the
+/// record emitter honors `emit_mq` and `emit_hn`. The fifth, `read_sidecar`,
+/// is **deliberately not implemented**: it makes bwa-mem3 load an optional
+/// `<prefix>.hdr` / `<baseprefix>.dict` alongside the index and merge its
+/// richer `@SQ` (`M5`/`AS`/`UR`/`SP`) plus any `@CO`/`@RG` into the header
+/// (`bwa_load_hdr_from_index`, bwa.cpp:987). That is header *provenance*
+/// metadata, not alignment output — every record this crate emits is
+/// unaffected — and a partial merge that got lh3/bwa#348's precedence rules
+/// subtly wrong would be worse than a header that is honestly minimal. So:
+/// with a sidecar present next to the index, this header is a strict subset of
+/// what `bwa-mem3 mem` would write. Records still match byte for byte.
+fn write_bam_header<W: Write>(w: &mut W, idx: &BwaIndex, opts: &MemOpts) -> Result<()> {
     // Build the SAM header text.
     let mut text = String::new();
-    text.push_str("@HD\tVN:1.6\tSO:unknown\n");
+    // From the compat target, never a literal: see MemOpts::compat_hd_line.
+    if let Some(hd) = opts.compat_hd_line() {
+        text.push_str(hd);
+        text.push('\n');
+    }
     for (name, len) in idx.contigs() {
         text.push_str(&format!("@SQ\tSN:{name}\tLN:{len}\n"));
     }

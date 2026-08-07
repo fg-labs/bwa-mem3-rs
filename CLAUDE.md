@@ -292,6 +292,49 @@ Consequences:
   comparator plus pdqsort. It is unrelated to the above and still not a parity
   option: it yields a different, non-bwa-mem2-compatible surviving set.
 
+### 15. `compat_target_t` has five switches; this crate honors four
+
+v0.9.0 moved output shaping into a data table (`vendor/bwa-mem3/src/compat_target.h`,
+`compat_target.cpp`). Every consumer reads a field off `opt->compat` instead of
+testing a flag, so a switch nobody reads is a silent divergence — that is exactly
+how `HN:i` went missing under `--meth` (gotcha #11) and `MQ:i` went missing
+everywhere.
+
+`mem_opt_init` always sets `opt->compat`, and this crate exposes no `--compat`
+selector, so the only reachable row is `COMPAT_TARGET_OFF` — which turns
+**everything on**: `emit_hd=1`, `read_sidecar=1`, `emit_mq=1`, `emit_hn=1`.
+"Default target" does not mean "nothing to do".
+
+| field | honored | where |
+|---|---|---|
+| `emit_hd` / `hd_line` | yes | `MemOpts::compat_hd_line` → `write_bam_header` |
+| `emit_mq` | yes | `append_bam_record` |
+| `emit_hn` | yes | `append_bam_record` |
+| `read_sidecar` | **no — deliberate** | see below |
+
+`emit_hd` was a live bug until it was wired up: `write_bam_header` hardcoded
+`@HD VN:1.6 SO:unknown` while the CLI emitted `@HD VN:1.5 SO:unsorted GO:query`
+(`BWAMEM3_DEFAULT_HD_LINE`). That is the same failure upstream fixed in #288 by
+folding three drifted literals into one macro — we were a fourth. Read the line
+off the target; never spell it out. `bwa-mem3-rs-cli/tests/header_parity.rs`
+pins it.
+
+`read_sidecar` is **not** implemented, by decision. It makes bwa-mem3 load an
+optional `<prefix>.hdr` / `<baseprefix>.dict` next to the index
+(`bwa_load_hdr_from_index`, `bwa.cpp:987`) and merge its richer `@SQ`
+(`M5`/`AS`/`UR`/`SP`) plus `@CO`/`@RG` into the header, with lh3/bwa#348's
+precedence rules. It is header provenance, not alignment output — **no emitted
+record changes** — and a half-right merge is worse than an honestly minimal
+header. Consequence: with a sidecar present, `bwa-rs`'s header is a strict
+subset of the CLI's. Records still match byte for byte. (Note the naming rule:
+for `ref.fasta` the fallback is `ref.dict`, *not* `ref.fasta.dict` — the GATK
+hg38 bundle ships the latter, so that index has no sidecar as far as bwa-mem3 is
+concerned.)
+
+**On every refresh**, diff `compat_target.h` for new fields and
+`compat_target.cpp` for changes to the `off` row. A new switch will compile
+clean and read as "off" everywhere.
+
 ## Commit / PR conventions
 
 - Conventional Commits; sign with `-S`; see `CONTRIBUTING.md`.
