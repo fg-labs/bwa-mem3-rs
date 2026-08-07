@@ -198,6 +198,49 @@ copy, so `z[0] != 0`).
   three failed attempts, commit with `--no-gpg-sign` and note it in the
   commit message for re-signing later.
 
+### Merging a PR that another PR is stacked on
+
+**Never pass `--delete-branch` when merging the base of a stacked PR.**
+Deleting a branch closes every PR that targets it, and a PR closed that way
+**cannot be reopened** — `reopenPullRequest` fails, and recreating the base
+branch does not help, so the stacked work needs a brand-new PR number. This
+happened to #42 (auto-closed two seconds after #40 merged; reopened as #45).
+
+Merge the base *without* `--delete-branch`, retarget the stacked PR with
+`gh pr edit <n> --base main`, then delete the branch as a separate step.
+
+**Record the base tip as a SHA before deleting the branch.** The restack below
+needs it, and the branch name will not resolve once it is gone:
+
+```bash
+OLD_BASE=$(git rev-parse origin/<base-branch>)   # BEFORE the branch is deleted
+```
+
+Restacking afterward is its own trap: squash-merging does not share commit
+identity with the branch, so the stacked PR shows the base PR's commits again
+and `git rebase` tries to replay them. `--onto` moves only the commits after
+`$OLD_BASE` — which is the stacked PR's own commits *provided* the branch was
+cut from that tip; check `git log --oneline $OLD_BASE..HEAD` first and confirm
+it lists what you expect.
+
+Verify by comparing the PR's own **patch** before and after, not its tree — the
+tree is against a different base, so comparing trees proves nothing:
+
+```bash
+git switch <stacked-branch>
+git diff "$OLD_BASE" HEAD > /tmp/old.patch    # capture BEFORE rebasing
+git fetch origin main
+git rebase --onto origin/main "$OLD_BASE"
+git diff origin/main HEAD   > /tmp/new.patch
+diff /tmp/old.patch /tmp/new.patch
+```
+
+The two patches are often byte-identical, but they need not be: rebasing onto a
+base that touched nearby lines can legitimately shift hunk headers, line
+numbers, file modes, or rename metadata while preserving the change itself.
+Read whatever differs and satisfy yourself it is incidental — do not assume
+only blob-hash lines may move.
+
 ## Updating upstream
 
 See `CONTRIBUTING.md` → "Updating the vendored `bwa-mem3` source."
