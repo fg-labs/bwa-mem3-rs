@@ -144,14 +144,18 @@ fn apply_meth_defaults(opts: &mut MemOpts) {
     opts.set_unpaired_penalty(100); // bwameth -U 100
     opts.set_minimum_score(40); // bwameth -T 40
     opts.set_mark_split_secondary(true); // -M
-                                         // COLLAPSED is the default scoring mode and the bwameth drop-in; its
-                                         // lenient -B 2 pairs with the two-cell matrix. GENOMIC deliberately
-                                         // keeps bwa's -B 4 (variant-aware), so this is mode-dependent —
-                                         // the only knob in the bundle that is.
-                                         // An `Err` here means the vendored bwa-mem3 reports a scoring mode this
-                                         // crate does not know (v0.8.0 adds NEUTRAL). Skipping the COLLAPSED
-                                         // default is the right response: applying bwameth's lenient -B 2 to an
-                                         // unrecognised mode would be a guess about semantics we do not have.
+
+    // COLLAPSED only, matching upstream (bwamem.cpp:511-515): its lenient -B 2
+    // pairs with the two-cell matrix, while GENOMIC and NEUTRAL are both
+    // variant-aware and deliberately keep bwa's default -B, because their
+    // mirror cell must stay a real mismatch. This is the one mode-dependent
+    // knob in the bundle.
+    //
+    // An `Err` falls through for the same reason it would be wrong to guess:
+    // it means the vendored bwa-mem3 reports a scoring mode this crate does
+    // not map, and applying bwameth's -B 2 to unknown semantics is a guess.
+    // `MethScoring::try_from` errors rather than defaulting precisely so that
+    // case stays visible instead of silently reading as COLLAPSED.
     if matches!(opts.meth_scoring(), Ok(MethScoring::Collapsed)) {
         opts.set_mismatch_penalty(2);
     }

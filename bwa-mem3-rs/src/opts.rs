@@ -70,6 +70,12 @@ pub enum MethScoring {
     /// mismatch, so genuine variants still score as mismatches (variant-aware,
     /// truthful NM/MD).
     Genomic = 1,
+    /// Like [`Genomic`](Self::Genomic), but the conversion cell scores `0` —
+    /// tolerated rather than rewarded. Added in bwa-mem3 v0.9.0 and made the
+    /// automatic default for TAPS chemistry, where conversions are ~20-30×
+    /// rarer than under em-seq so a full match over-credits spurious C→T
+    /// alignments.
+    Neutral = 2,
 }
 
 impl TryFrom<i32> for MethScoring {
@@ -78,13 +84,15 @@ impl TryFrom<i32> for MethScoring {
     /// Map the raw `mem_meth_scoring` value to a [`MethScoring`].
     ///
     /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) for
-    /// a value bwa-mem3 does not define. bwa-mem3 v0.8.0 adds
-    /// `MEM_METH_SCORING_NEUTRAL = 2`, which previously read back as
-    /// [`MethScoring::Collapsed`].
+    /// a value bwa-mem3 does not define. This deliberately does not fall back
+    /// to a default: a silent fallback is what made
+    /// `MEM_METH_SCORING_NEUTRAL = 2` read back as
+    /// [`MethScoring::Collapsed`] before it was mapped here.
     fn try_from(v: i32) -> std::result::Result<Self, Self::Error> {
         match v {
             0 => Ok(MethScoring::Collapsed),
             1 => Ok(MethScoring::Genomic),
+            2 => Ok(MethScoring::Neutral),
             other => Err(crate::Error::UnrecognizedEnum {
                 kind: "meth_scoring",
                 value: other,
@@ -884,20 +892,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_meth_scoring_value_is_an_error_not_collapsed() {
-        // bwa-mem3 v0.8.0 adds MEM_METH_SCORING_NEUTRAL = 2. Before this
-        // change it read back as Collapsed. Variant-matched for the same
-        // reason as the seed-order test above.
-        let err = MethScoring::try_from(2).unwrap_err();
+    fn neutral_meth_scoring_maps_to_its_own_variant() {
+        // bwa-mem3 v0.9.0 uses MEM_METH_SCORING_NEUTRAL = 2 as the automatic
+        // default for TAPS chemistry, so it is a value the vendored library
+        // really produces. Before it was mapped it read back as Collapsed,
+        // which silently mis-described the scoring in use.
+        assert_eq!(MethScoring::try_from(2).unwrap(), MethScoring::Neutral);
+    }
+
+    #[test]
+    fn unknown_meth_scoring_value_is_an_error_not_a_fallback() {
+        // The guarantee is that an unrecognized value ERRORS rather than
+        // collapsing to a default -- checked at a value bwa-mem3 does not
+        // define, so this keeps testing the guarantee as upstream adds modes.
+        let err = MethScoring::try_from(3).unwrap_err();
         assert!(
             matches!(
                 err,
                 Error::UnrecognizedEnum {
                     kind: "meth_scoring",
-                    value: 2
+                    value: 3
                 }
             ),
-            "expected UnrecognizedEnum{{ kind: \"meth_scoring\", value: 2 }}, got: {err:?}"
+            "expected UnrecognizedEnum{{ kind: \"meth_scoring\", value: 3 }}, got: {err:?}"
         );
     }
 

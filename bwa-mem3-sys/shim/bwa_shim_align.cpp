@@ -22,6 +22,7 @@
 #include "bwa.h"
 #include "bwamem.h"
 #include "compat_target.h"  /* compat_target_t::emit_hn — see the HN gate below */
+#include "utils.h"          /* xassert — survives NDEBUG, unlike assert */
 #include "FMI_search.h"
 #include "meth_xm.h"   /* meth_build_xm — D3 (--meth) XM:Z tag */
 
@@ -103,9 +104,15 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
     w.chain_scratch = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
     w.seed_scratch  = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
 
-    assert(w.seed_scratch  != NULL);
-    assert(w.regs          != NULL);
-    assert(w.chain_scratch != NULL);
+    /* xassert, not assert: these are ALLOCATION failures, and plain assert
+     * compiles out under NDEBUG -- turning an OOM into a null deref in exactly
+     * the build most likely to be memory-pressured. Upstream made the same
+     * switch in v0.9.0's worker_alloc (fastmap.cpp:306, :341-342). The argument
+     * preconditions above stay `assert`: those are programmer errors, not
+     * runtime conditions. */
+    xassert(w.seed_scratch  != NULL, "out of memory: w.seed_scratch");
+    xassert(w.regs          != NULL, "out of memory: w.regs");
+    xassert(w.chain_scratch != NULL, "out of memory: w.chain_scratch");
 
     w.seed_scratch_size = BATCH_SIZE * AVG_SEEDS_PER_READ;
 
@@ -126,10 +133,10 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
         w.mmc.wsize_buf_ref[l*CACHE_LINE] = wsize * MAX_SEQ_LEN_REF;
         w.mmc.wsize_buf_qer[l*CACHE_LINE] = wsize * MAX_SEQ_LEN_QER;
 
-        assert(w.mmc.seqBufLeftRef[l*CACHE_LINE]  != NULL);
-        assert(w.mmc.seqBufLeftQer[l*CACHE_LINE]  != NULL);
-        assert(w.mmc.seqBufRightRef[l*CACHE_LINE] != NULL);
-        assert(w.mmc.seqBufRightQer[l*CACHE_LINE] != NULL);
+        xassert(w.mmc.seqBufLeftRef[l*CACHE_LINE]  != NULL, "out of memory: seqBufLeftRef");
+        xassert(w.mmc.seqBufLeftQer[l*CACHE_LINE]  != NULL, "out of memory: seqBufLeftQer");
+        xassert(w.mmc.seqBufRightRef[l*CACHE_LINE] != NULL, "out of memory: seqBufRightRef");
+        xassert(w.mmc.seqBufRightQer[l*CACHE_LINE] != NULL, "out of memory: seqBufRightQer");
     }
 
     for(int l=0; l<nthreads; l++) {
@@ -138,9 +145,9 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
         w.mmc.seqPairArrayRight128[l] = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.wsize[l] = wsize;
 
-        assert(w.mmc.seqPairArrayAux[l] != NULL);
-        assert(w.mmc.seqPairArrayLeft128[l] != NULL);
-        assert(w.mmc.seqPairArrayRight128[l] != NULL);
+        xassert(w.mmc.seqPairArrayAux[l] != NULL, "out of memory: seqPairArrayAux");
+        xassert(w.mmc.seqPairArrayLeft128[l] != NULL, "out of memory: seqPairArrayLeft128");
+        xassert(w.mmc.seqPairArrayRight128[l] != NULL, "out of memory: seqPairArrayRight128");
     }
 
     // SMEM buffers (matchArray / min_intv_ar / query_pos_ar / enc_qdb / rid)
