@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
       - uses: prefix-dev/setup-pixi@8ca4608ef7f4daeb54f5205b20d0b7cb42f11143 # v0.8.1
         with:
-          pixi-version: v0.66.0
+          pixi-version: v0.71.0
           manifest-path: bwa-mem3-py/pixi.toml
           cache: true
       - name: Ruff format + lint
@@ -62,7 +62,7 @@ jobs:
           workspaces: bwa-mem3-py
       - uses: prefix-dev/setup-pixi@8ca4608ef7f4daeb54f5205b20d0b7cb42f11143 # v0.8.1
         with:
-          pixi-version: v0.66.0
+          pixi-version: v0.71.0
           manifest-path: bwa-mem3-py/pixi.toml
           cache: true
       - name: Build & install editable extension
@@ -118,7 +118,7 @@ jobs:
           echo "BWA_MEM3_BIN=/tmp/bwa-mem3/bwa-mem3" >> "$GITHUB_ENV"
       - uses: prefix-dev/setup-pixi@8ca4608ef7f4daeb54f5205b20d0b7cb42f11143 # v0.8.1
         with:
-          pixi-version: v0.66.0
+          pixi-version: v0.71.0
           manifest-path: bwa-mem3-py/pixi.toml
           cache: true
       - name: Build & install editable extension
