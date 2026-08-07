@@ -21,6 +21,7 @@
 
 #include "bwa.h"
 #include "bwamem.h"
+#include "compat_target.h"  /* compat_target_t::emit_hn — see the HN gate below */
 #include "FMI_search.h"
 #include "meth_xm.h"   /* meth_build_xm — D3 (--meth) XM:Z tag */
 
@@ -410,6 +411,18 @@ static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
              * CIGAR/NM/MD and the XM call string. Same orientation as seq. */
             if (meth_mode) {
                 s->meth_orig_seq = strdup(s->seq);
+                /* v0.9.0: read-number chemistry, consumed by the seed filter in
+                 * meth_seed_to_orig (bwamem.cpp:1878-1881), which drops any seed
+                 * whose genomic strand does not match the read's. R1 = OT = 1,
+                 * R2 = OB = 0, exactly as upstream's ingest sets it
+                 * (fastmap.cpp:820).
+                 *
+                 * Leaving it unset is NOT inert: the field is zero from the
+                 * calloc, and 0 is the VALID value for OB, so the filter runs
+                 * and silently discards every R1 seed. The filter only
+                 * self-disables at < 0. That presented as exactly half the
+                 * reads unmapped -- every R1, no R2. */
+                s->meth_base_ot = (k == 0) ? 1 : 0;
                 char from = (k == 0) ? 'C' : 'G';
                 char to   = (k == 0) ? 'T' : 'A';
                 for (int j = 0; j < s->l_seq; ++j) {
@@ -763,19 +776,21 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
     if (p->XA) aux_put_Z(&aux, &aux_len, &aux_cap, "XA", p->XA);
     /* HN: total # of hits clustered with this primary under XA_drop_ratio
      * (set by mem_gen_alt above). -1 is upstream's "not computed" sentinel
-     * (bwamem.h / bwamem.cpp's mem_reg2aln), so guard >= 0 exactly as
-     * upstream's generic SAM writer does (bwamem.cpp:2615). Also gate on
-     * !meth_mode: under --meth, mem_aln2sam short-circuits into
-     * meth_bam.cpp's meth_mem_aln_to_bam instead of that generic writer, and
-     * that function never emits HN — so upstream's real --meth output has no
-     * HN:i regardless of whether mem_gen_alt computed one. The guard is
-     * `!meth_mode`, not "check the SAM writer specifically", because
-     * mem_aln2sam's meth branch returns before reaching either non-meth
-     * writer (bwamem.cpp:2423-2447): plain SAM (bwamem.cpp:2615) AND
-     * --bam-mode's writer (bam_writer.cpp:464-466) both emit HN under the
-     * identical `HN >= 0` predicate, so !meth_mode alone is the exact
-     * condition, not merely a sufficient one. */
-    if (!opt->meth_mode && p->HN >= 0) aux_put_i(&aux, &aux_len, &aux_cap, "HN", p->HN);
+     * (bwamem.h / bwamem.cpp's mem_reg2aln), so guard >= 0.
+     *
+     * v0.9.0 replaced the old `!meth_mode` condition. That condition existed
+     * because upstream's --meth writer (meth_bam.cpp) never emitted HN, so
+     * suppressing it was how we matched the CLI. As of v0.9.0 BOTH writers
+     * emit it under a compat-target switch -- meth_bam.cpp:663 and
+     * bam_writer.cpp:458 use the identical `p.HN >= 0 && opt->compat->emit_hn`
+     * -- and COMPAT_TARGET_OFF (the default, "bwa-mem3's native output") sets
+     * emit_hn = 1. Keeping the old gate left HN off every --meth record while
+     * the CLI emitted it.
+     *
+     * `compat` is set by mem_opt_init, but it is a pointer on a struct callers
+     * can memset, so it is NULL-checked rather than trusted. */
+    if (p->HN >= 0 && opt->compat != NULL && opt->compat->emit_hn)
+        aux_put_i(&aux, &aux_len, &aux_cap, "HN", p->HN);
 
     /* D3 (--meth) Bismark tags. XR:Z (read conversion) on every record; XG:Z
      * (genome strand) and XM:Z (per-base methylation call) on mapped records.
@@ -1160,7 +1175,18 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
             continue;
         }
         if (!(opt->flag & MEM_F_ALL))
-            XA[k] = mem_gen_alt(opt, bns, pac, &a[k], s[k].l_seq, s[k].seq, &HN[k]);
+            /* v0.9.0 added the trailing `meth_orig_query`, which mem_gen_alt
+             * forwards to mem_reg2aln for every XA sub-entry so they regenerate
+             * under the same NM/MD policy as the primary record. It DEFAULTS TO
+             * NULL, so omitting it compiles and silently keeps the legacy
+             * regen: each XA sub-entry is then scored against the PROJECTED
+             * (C->T / G->A) read, and its NM counts every bisulfite conversion.
+             * That showed up as `XA:Z:phix,+1201,100M,20;` where the CLI emits
+             * `...,0;`. Pass it exactly as upstream does (bwamem.cpp:3237);
+             * s[k].meth_orig_seq is NULL outside --meth, which selects the same
+             * legacy behavior the non-meth path always had. */
+            XA[k] = mem_gen_alt(opt, bns, pac, &a[k], s[k].l_seq, s[k].seq, &HN[k],
+                                s[k].meth_orig_seq);
         lists[k] = (mem_aln_t *) calloc(a[k].n, sizeof(mem_aln_t));
         emit[k] = (bool *) malloc(a[k].n * sizeof(bool));
         n_lists[k] = (int)a[k].n;
