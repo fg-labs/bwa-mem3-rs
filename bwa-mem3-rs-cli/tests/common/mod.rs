@@ -154,15 +154,17 @@ pub fn samtools_view(bam: &Path) -> Vec<String> {
 }
 
 /// Aux tag keys that differ between the shim and upstream's SAM writer *by
-/// design* — the same asymmetries the doc comment on [`record_key_fields`]
-/// already calls out — so they must not surface in that function's `TAGS:`
+/// design*, and so must not surface in [`record_key_fields`]' `TAGS:`
 /// key-presence component. Add a key here, with a comment justifying it,
 /// rather than special-casing it inline.
 ///
-/// - `MQ`: upstream emits `MQ:i:<mate mapq>` whenever a mate pointer is
-///   present (`bwamem.cpp`'s SAM writer); the shim never emits it. This is a
-///   deliberate, documented shim/upstream difference, not a regression.
-const DELIBERATELY_ASYMMETRIC_TAG_KEYS: &[&str] = &["MQ"];
+/// **Currently empty, and worth keeping that way.** Every entry is a hole in
+/// the parity suite: a key listed here is subtracted from the comparison on
+/// both sides, so a genuine divergence involving it cannot fail a test. The
+/// list previously held `MQ`, which upstream emits on every record with a mate
+/// and the shim did not; the shim now emits it too, so the exemption is gone
+/// rather than merely justified.
+const DELIBERATELY_ASYMMETRIC_TAG_KEYS: &[&str] = &[];
 
 /// Extract the tag key from one aux field, requiring the SAM `TAG:TYPE:VALUE`
 /// shape (a 2-character tag, a 1-character type code, then the value, which
@@ -170,11 +172,12 @@ const DELIBERATELY_ASYMMETRIC_TAG_KEYS: &[&str] = &["MQ"];
 ///
 /// Validating rather than falling back to "the whole field is the key" is
 /// load-bearing for the parity comparison, not defensive tidiness: a
-/// truncated field reduces to a *plausible* key, and a bare `MQ` would reduce
-/// to the key `MQ` and then be dropped by
-/// [`DELIBERATELY_ASYMMETRIC_TAG_KEYS`] — so a corrupt record would compare
-/// equal to a clean one and the parity check would pass on it. Fail fast for
-/// the same reason the ≥11-column assert in [`record_key_fields`] does.
+/// truncated field reduces to a *plausible* key — and if that key is ever
+/// listed in [`DELIBERATELY_ASYMMETRIC_TAG_KEYS`] it would then be dropped, so
+/// a corrupt record would compare equal to a clean one and the parity check
+/// would pass on it. (That list is empty today, which removes the specific
+/// hazard but not the reason to validate.) Fail fast for the same reason the
+/// ≥11-column assert in [`record_key_fields`] does.
 fn aux_tag_key<'a>(field: &'a str, sam_line: &str) -> &'a str {
     let mut parts = field.splitn(3, ':');
     let (Some(key), Some(ty), Some(_value)) = (parts.next(), parts.next(), parts.next()) else {
@@ -191,21 +194,19 @@ fn aux_tag_key<'a>(field: &'a str, sam_line: &str) -> &'a str {
 /// qname, flag, rname, pos, mapq, cigar, and the `NM`/`MD`/`XG`/`XR`/`XM`/`XA`
 /// tags. These are the semantically meaningful fields the shim reproduces
 /// byte-for-byte; SEQ/QUAL/RNEXT/PNEXT/TLEN and the shim's own aux ordering
-/// (which deliberately omits `MQ:i` and places the Bismark tags differently
-/// from upstream's SAM writer) are excluded on purpose.
+/// (which places the Bismark tags differently from upstream's SAM writer) are
+/// excluded on purpose.
 ///
 /// The key also appends a sorted `TAGS:<key,key,...>` component listing every
 /// aux tag *key* present on the record, not just the six compared above,
-/// except for [`DELIBERATELY_ASYMMETRIC_TAG_KEYS`] (currently just `MQ`).
+/// except for [`DELIBERATELY_ASYMMETRIC_TAG_KEYS`] (currently empty).
 /// Without the `TAGS:` component, a record carrying an extra tag this
 /// reduction does not inspect (e.g. a newly-emitted upstream `XB`) would
 /// reduce to the same key as a record without it, so a vendor bump that
 /// starts emitting a new tag would pass every parity test unnoticed. The
-/// exclusion list keeps that check from firing on asymmetries that are
-/// already known and intentional — `MQ` is emitted by upstream's SAM writer
-/// whenever a mate pointer is present but never by the shim, so without the
-/// exclusion every paired parity test would read as a mismatch. Only the set
-/// of keys is compared — values of uncompared tags stay out of scope, and
+/// exclusion list exists to keep that check from firing on asymmetries that
+/// are known and intentional, and is currently empty — the shim emits every
+/// tag upstream does. Only the set of keys is compared — values of uncompared tags stay out of scope, and
 /// aux ordering stays unpinned, same as before.
 ///
 /// Callers compare the returned keys as *sorted vectors* — preserving record

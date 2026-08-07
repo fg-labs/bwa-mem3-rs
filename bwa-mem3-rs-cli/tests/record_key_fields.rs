@@ -43,19 +43,23 @@ fn tag_order_does_not_change_the_key() {
 }
 
 #[test]
-fn deliberately_asymmetric_tags_do_not_change_the_key() {
-    // Upstream's SAM writer emits MQ:i whenever a mate pointer is present
-    // (i.e. on essentially every record of a properly-paired alignment);
-    // the shim never emits it. That asymmetry is by design, not a
-    // regression, so a record with MQ:i and an otherwise-identical record
-    // without it must still reduce to the same key -- otherwise every
-    // paired parity test would read as a mismatch on a machine that has the
-    // real bwa-mem3 CLI installed.
+fn an_allowlisted_tag_would_not_change_the_key() {
+    // DELIBERATELY_ASYMMETRIC_TAG_KEYS is empty today: the shim emits every tag
+    // upstream does, MQ:i included. This pins the MECHANISM rather than any
+    // particular tag, so it keeps working if an entry is ever added -- and, more
+    // usefully, it documents what adding one costs. A listed key is subtracted
+    // from the comparison on both sides, so a real divergence involving it can
+    // no longer fail a parity test.
+    //
+    // With an empty list, a record carrying an extra tag MUST change the key --
+    // that is the property the suite depends on, and the assertion below is the
+    // one that would break first if the list silently regrew.
     let with_mq = format!("{BASE}\tMQ:i:60");
-    assert_eq!(
+    assert_ne!(
         record_key_fields(BASE),
         record_key_fields(&with_mq),
-        "MQ:i differs between the shim and upstream by design and must not change the key"
+        "with an empty exclusion list, an extra tag must change the key -- \
+         otherwise a divergence on that tag cannot fail any parity test"
     );
 }
 

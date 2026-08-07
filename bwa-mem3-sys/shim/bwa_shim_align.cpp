@@ -770,6 +770,18 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
         aux_put_Z(&aux, &aux_len, &aux_cap, "MD", md);
     }
     if (m && m->n_cigar) emit_mc_tag(&aux, &aux_len, &aux_cap, opt, m, which);
+    /* MQ: the mate's MAPQ. Gated on `m` alone -- NOT `m->n_cigar` like MC:Z
+     * above -- so it is emitted even when the mate is unmapped, matching
+     * upstream exactly (bwamem.cpp:3484, bam_writer.cpp:395, meth_bam.cpp:585,
+     * which all use `m && opt->compat->emit_mq`). Emitted here, between MC and
+     * AS, because this crate's aux order mirrors upstream's write order.
+     *
+     * Not a bwa-mem3 invention: bwa emits MQ (bwamem.c:935, lh3/bwa#330) and
+     * bwa-mem2 does not, having forked at 0.7.17 before that landed -- hence
+     * the compat switch, whose default target (COMPAT_TARGET_OFF) sets
+     * emit_mq = 1. */
+    if (m && opt->compat != NULL && opt->compat->emit_mq)
+        aux_put_i(&aux, &aux_len, &aux_cap, "MQ", m->mapq);
     if (p->score >= 0) aux_put_i(&aux, &aux_len, &aux_cap, "AS", p->score);
     if (p->sub >= 0)   aux_put_i(&aux, &aux_len, &aux_cap, "XS", p->sub);
     if (bwa_rg_id[0])  aux_put_Z(&aux, &aux_len, &aux_cap, "RG", bwa_rg_id);
