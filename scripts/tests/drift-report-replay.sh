@@ -20,7 +20,7 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 
 # A shallow clone would not have $PRE_BUMP_REF's history available to
 # `git worktree add`; fill it in rather than failing partway through.
-if ! git -C "$repo_root" rev-parse --quiet --verify "${PRE_BUMP_REF}^{commit}" >/dev/null; then
+if ! git -C "$repo_root" rev-parse --quiet --verify "${PRE_BUMP_REF}^{commit}" > /dev/null; then
     echo "=== $PRE_BUMP_REF not found locally; unshallowing ===" >&2
     git -C "$repo_root" fetch --unshallow
 fi
@@ -40,22 +40,22 @@ work="$(mktemp -d)"
 # a path under /tmp that later `git worktree list` calls keep reporting.
 # bwa-mem3-drift-report.sh traps the same three signals for the same reason.
 cleanup() {
-    git -C "$repo_root" worktree remove --force "$work/tree" >/dev/null 2>&1 || true
+    git -C "$repo_root" worktree remove --force "$work/tree" > /dev/null 2>&1 || true
     rm -rf "$work"
 }
 trap cleanup EXIT INT TERM
 
 echo "=== Creating a worktree at $PRE_BUMP_REF ==="
-git -C "$repo_root" worktree add --detach "$work/tree" "$PRE_BUMP_REF" >/dev/null
+git -C "$repo_root" worktree add --detach "$work/tree" "$PRE_BUMP_REF" > /dev/null
 
 # Copy the CURRENT scripts in. The worktree predates them, and the report must
 # be the version under test — but note it will read the worktree's build.rs,
 # where fastmap.cpp is not yet in skip_common. That is deliberate: it is what
 # the report would have seen at the time.
 cp "$repo_root/scripts/bwa-mem3-drift-report.sh" \
-   "$repo_root/scripts/refresh-bwa-mem3.sh" \
-   "$repo_root/scripts/vendor-drop-subtrees.txt" \
-   "$work/tree/scripts/"
+    "$repo_root/scripts/refresh-bwa-mem3.sh" \
+    "$repo_root/scripts/vendor-drop-subtrees.txt" \
+    "$work/tree/scripts/"
 
 # The pre-bump prune list must not include entries the bump introduced, or the
 # replay cannot rediscover them. ext/zlib-ng is the finding we are testing for.
@@ -126,11 +126,11 @@ expect() { # expect <description> <pattern>
 # `NEW_SUBMODULE` and bare `worker_alloc` both matched boilerplate and could
 # not fail. They are anchored on the finding's own form instead: the gate's
 # bare marker line, and check 5's `### <fn> changed|NOT FOUND` heading.
-expect "flags the new ext/zlib-ng submodule"      "zlib-ng"
-expect "emits the hard-gate marker"               '^NEW_SUBMODULE$'
-expect "reports mem_opt_t layout drift"           "mem_opt_t\` changed"
-expect "names a new mem_opt_t field"               "smem_dedup|min_ext_len|band_start"
-expect "reports the new .c reader TUs"            "fast_reader"
+expect "flags the new ext/zlib-ng submodule" "zlib-ng"
+expect "emits the hard-gate marker" '^NEW_SUBMODULE$'
+expect "reports mem_opt_t layout drift" "mem_opt_t\` changed"
+expect "names a new mem_opt_t field" "smem_dedup|min_ext_len|band_start"
+expect "reports the new .c reader TUs" "fast_reader"
 # mem_kernel1_core, NOT worker_alloc: this assertion exists to prove check 5
 # emits a real contract finding, and worker_alloc cannot serve that purpose
 # here because its body is byte-identical across this replay's two endpoints
@@ -140,10 +140,10 @@ expect "reports the new .c reader TUs"            "fast_reader"
 # run. mem_kernel1_core is the shim's main entry point and did change.
 # shellcheck disable=SC2016 # backticks are literal markdown in the report,
 # not command substitution -- single quotes are what keeps them that way.
-expect "reports an upstream contract change"      '^### `mem_kernel1_core` (changed|NOT FOUND)'
+expect "reports an upstream contract change" '^### `mem_kernel1_core` (changed|NOT FOUND)'
 # Unconditional by design: this one asserts the checklist section is present at
 # all, not that a particular finding fired.
-expect "includes the manual checklist"            "Manual checklist"
+expect "includes the manual checklist" "Manual checklist"
 
 # Ordering, not just presence: the workflow caps an issue/PR body at 60000
 # bytes and truncation takes the tail, while a real report runs well past that
@@ -160,24 +160,26 @@ summary_line="$(grep -n '^## Summary$' "$report" | head -1 | cut -d: -f1)"
 checklist_line="$(grep -n '^## Manual checklist' "$report" | head -1 | cut -d: -f1)"
 first_check_line="$(grep -n '^## 1\.' "$report" | head -1 | cut -d: -f1)"
 if [ -n "$summary_line" ] && [ -n "$checklist_line" ] && [ -n "$first_check_line" ] \
-   && [ "$summary_line" -lt "$checklist_line" ] \
-   && [ "$checklist_line" -lt "$first_check_line" ]; then
+    && [ "$summary_line" -lt "$checklist_line" ] \
+    && [ "$checklist_line" -lt "$first_check_line" ]; then
     pass=$((pass + 1))
     echo "  ok: manual checklist sits between the summary and section 1 (survives body truncation)"
 else
     fail=$((fail + 1))
     echo "  FAIL: expected summary < checklist < section 1, got ${summary_line:-?} / ${checklist_line:-?} / ${first_check_line:-?} — truncation would drop the checklist" >&2
 fi
-expect "includes release notes for a missed tag"  "v0.5.0"
+expect "includes release notes for a missed tag" "v0.5.0"
 
 echo "=== Synthetic prune: removing a needed header must fail the build check ==="
 rm -rf "$work/tree/bwa-mem3-sys/vendor/bwa-mem3/ext/pdqsort"
 synth="$work/synthetic.md"
 (cd "$work/tree" && scripts/bwa-mem3-drift-report.sh) > "$synth" 2>&1 || true
 if grep -q "Build FAILED" "$synth"; then
-    pass=$((pass + 1)); echo "  ok: pruning ext/pdqsort fails the build check"
+    pass=$((pass + 1))
+    echo "  ok: pruning ext/pdqsort fails the build check"
 else
-    fail=$((fail + 1)); echo "  FAIL: build check did not notice a missing needed header" >&2
+    fail=$((fail + 1))
+    echo "  FAIL: build check did not notice a missing needed header" >&2
 fi
 
 echo
