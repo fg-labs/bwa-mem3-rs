@@ -55,7 +55,7 @@ Our shim delegates the paired-end decision to upstream's `mem_pair_resolve` (exp
 
 ### 2. `mem_opt_t` / `mem_pestat_t` layouts are mirrored in two places
 
-They're in `shim/bwa_shim_types.h` (what bindgen reads) and in upstream's `bwamem.h` (what `bwa_shim_align.cpp` includes). Both must stay byte-identical — the shim allocates the real struct via upstream's `mem_opt_init()`, so any field-order/size drift silently corrupts the offsets Rust reads/writes through the bindgen view. **`shim/bwa_shim_layout_assert.cpp` guards this**: it `#include`s the POD under renamed tags (`#define mem_opt_t pod_mem_opt_t`) and then the real `bwamem.h`, and `static_assert`s `offsetof`/`sizeof` field by field, so drift fails `cargo build`. (The bindgen `bindgen_test_layout_mem_opt_t` test only checks the Rust struct against the C compiler's view of the *POD copy*, **not** the POD against upstream — that gap is what the guard TU closes.) The same TU also `static_assert`s the `MEM_F_*` flag *values* the POD hardcodes against upstream's, since bindgen's `allowlist_var("MEM_F_.*")` reads only the POD and would never notice a renumbered flag on its own. On `refresh-bwa-mem3.sh`, diff `vendor/bwa-mem3/src/bwamem.h` around lines 95–156 (`mem_opt_t`) and 239–243 (`mem_pestat_t`); if either changed, update `shim/bwa_shim_types.h` **and** the field list in `bwa_shim_layout_assert.cpp` to match.
+They're in `shim/bwa_shim_types.h` (what bindgen reads) and in upstream's `bwamem.h` (what `bwa_shim_align.cpp` includes). Both must stay byte-identical — the shim allocates the real struct via upstream's `mem_opt_init()`, so any field-order/size drift silently corrupts the offsets Rust reads/writes through the bindgen view. **`shim/bwa_shim_layout_assert.cpp` guards this**: it `#include`s the POD under renamed tags (`#define mem_opt_t pod_mem_opt_t`) and then the real `bwamem.h`, and `static_assert`s `offsetof`/`sizeof` field by field, so drift fails `cargo build`. (The bindgen `bindgen_test_layout_mem_opt_t` test only checks the Rust struct against the C compiler's view of the *POD copy*, **not** the POD against upstream — that gap is what the guard TU closes.) The same TU also `static_assert`s the `MEM_F_*` flag *values* the POD hardcodes against upstream's, since bindgen's `allowlist_var("MEM_F_.*")` reads only the POD and would never notice a renumbered flag on its own. On `refresh-bwa-mem3.sh`, diff `vendor/bwa-mem3/src/bwamem.h` around lines 182–295 (`mem_opt_t`) and 297–301 (`mem_pestat_t`) — the ranges move on most refreshes, so locate them by the `} mem_opt_t;` / `} mem_pestat_t;` closers rather than trusting these numbers; if either changed, update `shim/bwa_shim_types.h` **and** the field list in `bwa_shim_layout_assert.cpp` to match.
 
 ### 3. macOS deployment target mismatch → SIGBUS at test-binary startup
 
@@ -106,6 +106,18 @@ file-local copies of just `worker_alloc` / `worker_free` in
 on every vendor refresh (the buffer set must match what `mem_kernel1_core` /
 `mem_kernel2_core` expect).
 
+**They are no longer verbatim.** As of v0.9.0 upstream sizes `chain_scratch` /
+`seed_scratch` (renamed from `chain_ar` / `seedBuf`) as `nthreads * BATCH_SIZE`
+and indexes them by `tid`, because it fused its two `kt_for` passes into
+`worker_bwt_aln` so chains no longer outlive a work item. This crate's public
+API **is** that barrier — `seed_batch` → `extend_batch` — so our copy keeps the
+pre-0.9.0 `nreads` sizing and `seq_id` indexing. The kernels take both arrays as
+parameters and index them `[0, nseq)`, and `tid` selects only `mmc`, so a
+caller-owned per-read array stays valid. Upstream renamed the fields precisely
+so out-of-tree callers would fail to compile here rather than silently run off
+the end; do **not** take the compiler's `auxSeedBuf` did-you-mean, which is a
+vestigial member nothing allocates.
+
 `runsimd.cpp` is gone in bwa-mem3 v0.2.0 — the multi-binary launcher (`bwa-mem3.<tier>` companions) was replaced by single-binary SIMD dispatch in `simd_dispatch.cpp`. The build no longer needs to skip an unguarded `main()`.
 
 ### 9. Per-tier kernel build on x86_64 (v0.2.0+)
@@ -149,11 +161,25 @@ size, pairing, `mem_reg2aln`, output rids, and the reported contigs
 (`shim_header_bns` returns the original `bns` so the BAM header matches the
 emitted rids). Per read the shim retains the unconverted bases in
 `bseq1_t.meth_orig_seq` and projects `seq` in place (R1 C→T, R2 G→A) before
-seeding; `mem_reg2aln` takes `meth_orig_seq` so NM/MD/CIGAR reflect the
-original read, and `append_bam_record` emits Bismark `XR:Z` (read conversion,
+seeding. It must also set **`bseq1_t.meth_base_ot`** (R1 = OT = 1, R2 = OB = 0):
+that field feeds the seed-chemistry filter in `meth_seed_to_orig`, which drops
+any seed whose genomic strand disagrees with the read's. Leaving it zero is not
+inert — `0` is the *valid* encoding for OB, so the filter runs and silently
+discards every R1 seed (it only self-disables at `< 0`). `mem_reg2aln` and
+`mem_gen_alt` both take `meth_orig_seq` so NM/MD/CIGAR — and every `XA:Z`
+sub-entry's NM — reflect the original read rather than the projected one, and `append_bam_record` emits Bismark `XR:Z` (read conversion,
 from R1/R2), `XG:Z` (genome strand, from `mem_aln_t.meth_hypothesis`), and
 `XM:Z` (via upstream `meth_build_xm`, which is compiled — only `meth_bam.cpp`,
-the htslib writer, is excluded). All meth code is gated on `opt->meth_mode` /
+the htslib writer, is excluded; it takes a `meth_chem_t` chemistry argument as
+of v0.9.0, sourced from `opt->meth_chem`).
+
+`HN:i` **is** emitted under `--meth` as of v0.9.0. It previously was not, because
+upstream's meth writer never emitted it; v0.9.0 put both writers behind a
+compat-target switch (`p.HN >= 0 && opt->compat->emit_hn`, `meth_bam.cpp:663` /
+`bam_writer.cpp:458`) and `COMPAT_TARGET_OFF` — the default native-output
+target — sets `emit_hn = 1`. The shim gates on the same expression. Note the
+same struct carries `emit_mq = 1`, which bears on the `MQ:i` tag this crate
+deliberately never emits (`DELIBERATELY_ASYMMETRIC_TAG_KEYS`). All meth code is gated on `opt->meth_mode` /
 non-NULL `meth_orig_*`, so the non-meth path is unchanged. Output matches the
 CLI byte-for-byte on every record including secondaries/`XA:Z`
 (`bwa-mem3-rs-cli/tests/meth_e2e.rs` pins this), because `pair_and_emit`
@@ -188,6 +214,36 @@ would surface the old primary as an extra record and demote the `z[k]`
 pair-primary to a `0x800` supplementary. `cli_parity_pair_select.rs` pins this
 (two near-identical motif copies + a mate that anchors R1 to the lower-scoring
 copy, so `z[0] != 0`).
+
+### 13. Upstream's defaulted parameters are a silent-breakage surface
+
+Several `bwamem.h` functions the shim calls take C++ **default arguments**, and
+upstream keeps adding them:
+
+| function | defaulted param(s) |
+|---|---|
+| `mem_gen_alt` | `meth_orig_query` |
+| `mem_reg2aln` | `meth_orig_query` |
+| `mem_kernel1_core` / `mem_kernel2_core` | `meth_orig_bns`, `meth_orig_pac` |
+| `mem_matesw` / `mem_matesw_batch_post` | `ms_orig`, `mat`, `mate_meth_ot` |
+
+A new one **compiles clean at every existing call site** and silently selects
+the legacy path. The same hazard applies to new `bseq1_t` / `mem_opt_t` fields
+the caller is expected to populate: they come up zero from a `calloc`, and zero
+is often a meaningful value rather than an "unset" sentinel.
+
+The v0.9.0 bump hit this three times — `bseq1_t::meth_base_ot` (unset ⇒ every R1
+seed discarded), `mem_gen_alt`'s `meth_orig_query` (unset ⇒ every `XA:Z`
+sub-entry's NM counted bisulfite conversions), and the `HN` compat switch. None
+produced a warning, and the non-meth suite stayed green throughout.
+
+**On every refresh**, grep `bwamem.h` for `= NULL)` / `= -1)` / `= NULL,` /
+`= -1,` and check each against the shim's call sites, then diff `bwa.h`'s
+`bseq1_t` for new fields. Where upstream exposes a helper that encapsulates the
+policy (`mem_proper_pair_extra_flag`, `mem_opt_apply_meth_defaults`,
+`mem_aln_ref_string`), prefer calling it over replicating it — a replicated
+policy is a twin that drifts, and upstream factors these out precisely because
+its own twins drifted.
 
 ## Commit / PR conventions
 
