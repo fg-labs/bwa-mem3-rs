@@ -456,6 +456,24 @@ static inline uint32_t bwa_cigar_to_bam(uint32_t op) {
     return (len << 4) | bam_o;
 }
 
+/* Mirror of upstream's `add_cigar` clip rewrite (bwamem.cpp:2410-2421).
+ * bwa-mem3 HARD-clips supplementary records by default: on a 2nd+ emitted
+ * record (`which != 0`) every clip opcode becomes H, and S otherwise --
+ * unless -Y (MEM_F_SOFTCLIP) or the alignment is on an ALT contig, in which
+ * case the soft clip stands. `mem_reg2aln` only ever writes S (bwamem.cpp:
+ * 2735,2743 build `clip<<4 | 3`), so it is this rewrite, not the aligner,
+ * that produces every H the CLI emits.
+ *
+ * Opcodes here are bwa's MIDSH table (S=3, H=4), NOT the BAM spec's; feed the
+ * result through bwa_cigar_to_bam before writing it. */
+static inline uint32_t bwa_apply_clip_mode(uint32_t cig, const mem_opt_t *opt,
+                                           int is_alt, int which) {
+    uint32_t o = cig & 0xf;
+    if (!(opt->flag & MEM_F_SOFTCLIP) && !is_alt && (o == 3 || o == 4))
+        o = which ? 4 : 3;
+    return (cig & ~(uint32_t) 0xf) | o;
+}
+
 /* ASCII base complement (A<->T, C<->G, case-insensitive); anything else -> N.
  * Used to build the D3 (--meth) XM:Z seq_text in emitted-SEQ orientation. */
 static inline char ascii_complement(char b) {
@@ -551,33 +569,67 @@ static void emit_sa_tag(uint8_t **buf, size_t *len, size_t *cap,
     buf_append(buf, len, cap, &zero, 1);
 }
 
-/* Emit MC:Z aux (mate CIGAR) from a mate mem_aln_t. */
+/* Emit MC:Z aux (mate CIGAR) from a mate mem_aln_t.
+ *
+ * `which` is the EMITTING record's index, not the mate's: upstream builds
+ * MC:Z through the same `add_cigar` helper and hands it the record's own
+ * `which` (bwamem.cpp:2583), so on a supplementary record the mate's clips
+ * are rendered hard even though the mate itself is a primary. Mirrored here
+ * deliberately -- it looks like an upstream quirk, and reproducing it is the
+ * point. `m->is_alt` (not the record's) gates it, matching `add_cigar`'s use
+ * of the mem_aln_t it was passed. */
 static void emit_mc_tag(uint8_t **buf, size_t *len, size_t *cap,
-                        const mem_aln_t *m) {
+                        const mem_opt_t *opt, const mem_aln_t *m, int which) {
     uint8_t header[3] = {'M', 'C', 'Z'};
     buf_append(buf, len, cap, header, 3);
     char tmp[32];
     for (int i = 0; i < m->n_cigar; ++i) {
+        uint32_t cig = bwa_apply_clip_mode(m->cigar[i], opt, m->is_alt, which);
         int n = snprintf(tmp, sizeof(tmp), "%u%c",
-                         m->cigar[i] >> 4, "MIDSH"[m->cigar[i] & 0xf]);
+                         cig >> 4, "MIDSH"[cig & 0xf]);
         buf_append(buf, len, cap, tmp, n);
     }
     uint8_t zero = 0;
     buf_append(buf, len, cap, &zero, 1);
 }
 
-/* Compute tlen between two aligned mem_aln_t. */
+/* Compute TLEN between two aligned mem_aln_t, mirroring upstream's SAM writer
+ * (bwamem.cpp:2532-2539).
+ *
+ * Upstream takes each mate's OUTERMOST coordinate in its own direction -- the
+ * leftmost base on the forward strand, the rightmost on the reverse -- and
+ * signs the difference by which comes first, with a unit nudge that makes the
+ * two mates' values exact negations of each other:
+ *
+ *     p0   = pos + (is_rev ? rlen - 1 : 0)
+ *     tlen = -(p0 - p1 + sgn(p0 - p1))
+ *
+ * This is NOT the span between the pair's outer edges, which is what this
+ * function used to return. The two agree on a canonical FR pair -- all any
+ * fixture produced -- and diverge everywhere else. On a fully-overlapping
+ * pair the span's `a_begin <= b_begin` sign test is true for BOTH mates, so
+ * both got a positive TLEN and the pair violated the SAM requirement that
+ * they sum to zero; on a contained pair the span reports the outer length
+ * rather than the insert.
+ *
+ * `a_ref_len`/`b_ref_len` come from cigar_ref_len(), which sums the same M/D
+ * opcodes as upstream's get_rlen() (bwamem.cpp:2768-2777).
+ *
+ * Returns 0 when either mate is unplaced, the two are on different contigs,
+ * or either lacks a CIGAR. That last guard is upstream's `m->n_cigar == 0 ||
+ * p->n_cigar == 0` and is what zeroes TLEN on a half-mapped pair: upstream
+ * reaches it because its mate-coordinate rewrite sets `n_cigar = 0` on the
+ * copied side, while this runs on the pre-rewrite mem_aln_t, where the same
+ * pair is caught one line earlier by `rid < 0`. Both guards are kept so the
+ * result matches on either path. */
 static int32_t compute_tlen(const mem_aln_t *a, int a_ref_len,
                             const mem_aln_t *b, int b_ref_len) {
     if (!a || !b || a->rid < 0 || b->rid < 0 || a->rid != b->rid) return 0;
-    int64_t a_begin = a->pos;
-    int64_t b_begin = b->pos;
-    int64_t a_end = a->pos + a_ref_len;
-    int64_t b_end = b->pos + b_ref_len;
-    int64_t begin = a_begin < b_begin ? a_begin : b_begin;
-    int64_t end   = a_end   > b_end   ? a_end   : b_end;
-    int64_t tlen  = end - begin;
-    return a_begin <= b_begin ? (int32_t)tlen : -(int32_t)tlen;
+    if (a->n_cigar == 0 || b->n_cigar == 0) return 0;
+    int64_t p0 = a->pos + (a->is_rev ? (int64_t) a_ref_len - 1 : 0);
+    int64_t p1 = b->pos + (b->is_rev ? (int64_t) b_ref_len - 1 : 0);
+    int64_t nudge = (p0 > p1) ? 1 : (p0 < p1 ? -1 : 0);
+    return (int32_t) -(p0 - p1 + nudge);
 }
 
 /* Append one packed BAM record to `out`'s buffer. `opt`/`pac`/`is_r2` are used
@@ -624,15 +676,31 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
         mate_rid = eff_rid; mate_pos = eff_pos; mate_is_rev = eff_is_rev;
     }
 
-    /* Emitted-SEQ range: hard-clipped (H) ends are dropped for supplementary
-     * records, so the emitted sequence is a subset of s->seq. Computed up front
-     * because the --meth XM:Z tag below needs it. bwa-mem3 H opcode = 4 (not 5
-     * as in the BAM spec). */
+    /* Emitted-SEQ range: hard-clipped ends are dropped, so the emitted
+     * sequence is a subset of s->seq. Computed up front because the --meth
+     * XM:Z tag below needs it.
+     *
+     * The predicate is upstream's (bwamem.cpp:2548-2551, 2562-2565): trim on a
+     * supplementary (`which != 0`) unless -Y or an ALT alignment, keyed off the
+     * clip opcode being S *or* H. This previously tested for H alone, which
+     * `mem_reg2aln` never emits (it writes `clip<<4 | 3`, always S), so the
+     * branch was dead and every supplementary carried a full-length SEQ.
+     *
+     * No is_rev swap here, despite upstream swapping which end qb/qe take
+     * (bwamem.cpp:2563-2565): these are offsets into s->seq on the forward
+     * path and offsets from the read's far end on the reverse path, because
+     * the reverse emitter indexes `s->seq[l_seq - 1 - (seq_start + i)]`. That
+     * already maps seq_start onto upstream's `qe` and seq_end onto its `qb`,
+     * so adding a swap would double-correct. */
+    int clip_hard = (n_cigar > 0 && which
+                     && !(opt->flag & MEM_F_SOFTCLIP) && !p->is_alt);
     int seq_start = 0;
     int seq_end = l_seq;
-    if (n_cigar > 0) {
-        if ((p->cigar[0] & 0xf) == 4)             seq_start = (int)(p->cigar[0] >> 4);
-        if ((p->cigar[n_cigar - 1] & 0xf) == 4)   seq_end -= (int)(p->cigar[n_cigar - 1] >> 4);
+    if (clip_hard) {
+        uint32_t first_op = p->cigar[0] & 0xf;
+        uint32_t last_op  = p->cigar[n_cigar - 1] & 0xf;
+        if (first_op == 3 || first_op == 4) seq_start = (int)(p->cigar[0] >> 4);
+        if (last_op  == 3 || last_op  == 4) seq_end  -= (int)(p->cigar[n_cigar - 1] >> 4);
     }
     int emit_len = seq_end - seq_start;
     if (emit_len < 0) emit_len = 0;
@@ -646,7 +714,7 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
         const char *md = (const char *)(p->cigar + p->n_cigar);
         aux_put_Z(&aux, &aux_len, &aux_cap, "MD", md);
     }
-    if (m && m->n_cigar) emit_mc_tag(&aux, &aux_len, &aux_cap, m);
+    if (m && m->n_cigar) emit_mc_tag(&aux, &aux_len, &aux_cap, opt, m, which);
     if (p->score >= 0) aux_put_i(&aux, &aux_len, &aux_cap, "AS", p->score);
     if (p->sub >= 0)   aux_put_i(&aux, &aux_len, &aux_cap, "XS", p->sub);
     if (bwa_rg_id[0])  aux_put_Z(&aux, &aux_len, &aux_cap, "RG", bwa_rg_id);
@@ -695,7 +763,13 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
                             : s->meth_orig_seq[seq_start + i];
                     }
                     seq_text[emit_len] = '\0';
-                    for (int i = 0; i < n_cigar; ++i) bam_cig[i] = bwa_cigar_to_bam(p->cigar[i]);
+                    /* Same clip rewrite as the emitted CIGAR below: the XM:Z
+                     * builder walks this alongside `seq_text`, which is the
+                     * hard-clipped span, so the two must agree on whether the
+                     * clip consumes query bases. */
+                    for (int i = 0; i < n_cigar; ++i)
+                        bam_cig[i] = bwa_cigar_to_bam(
+                            bwa_apply_clip_mode(p->cigar[i], opt, p->is_alt, which));
                     char *xm = meth_build_xm(bns, pac, p->rid, (int64_t)p->pos,
                                              is_top, bam_cig, n_cigar, seq_text, emit_len);
                     if (xm) aux_put_Z(&aux, &aux_len, &aux_cap, "XM", xm);
@@ -801,7 +875,8 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
     *w++ = 0;
 
     for (int i = 0; i < n_cigar; ++i) {
-        uint32_t c = bwa_cigar_to_bam(p->cigar[i]);
+        uint32_t c = bwa_cigar_to_bam(
+            bwa_apply_clip_mode(p->cigar[i], opt, p->is_alt, which));
         memcpy(w, &c, 4); w += 4;
     }
 
