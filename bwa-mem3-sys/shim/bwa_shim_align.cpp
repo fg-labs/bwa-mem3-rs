@@ -1265,18 +1265,24 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
     }
 
     /* No-pairing branch 0x2 decision (mirrors mem_sam_pe's post-resolve block):
-     * when mem_pair_resolve didn't take the paired branch, check the top
-     * region of each side via mem_infer_dir and OR 0x2 into extra_flag if
-     * the inferred distance falls within pes[dir].low..high. */
+     * when mem_pair_resolve didn't take the paired branch, decide the
+     * proper-pair bit from the two sides' regions.
+     *
+     * v0.9.0 factored this out of mem_sam_pe into mem_proper_pair_extra_flag
+     * explicitly so "this block and its verbatim twin cannot drift apart"
+     * (bwamem_pair.cpp:352-357). This shim was a THIRD twin, so call the one
+     * definition rather than keep replicating it.
+     *
+     * It also settles which region the bit derives from: v0.9.0 restored the
+     * top-scoring a[0] as the default and made the emitted a[which] opt-in via
+     * --proper-pair-from-emitted. Our previous hand-rolled copy used a[0] and so
+     * already matched the new default -- but only by coincidence, and it could
+     * not honour the option at all. */
     if (!paired && (opt->flag & MEM_F_PE) && !(opt->flag & MEM_F_NOPAIRING)
         && a[0].n > 0 && a[1].n > 0
         && n_lists[0] > 0 && n_lists[1] > 0
         && lists[0][0].rid >= 0 && lists[0][0].rid == lists[1][0].rid) {
-        int64_t dist;
-        int dir = mem_infer_dir(bns->l_pac, a[0].a[0].rb, a[1].a[0].rb, &dist);
-        if (!pes[dir].failed && dist >= pes[dir].low && dist <= pes[dir].high) {
-            extra_flag |= 0x2;
-        }
+        extra_flag |= mem_proper_pair_extra_flag(opt, bns->l_pac, a, z, pes);
     }
 
     /* Apply extra_flag (0x1 paired + optional 0x2 proper-pair) to every
