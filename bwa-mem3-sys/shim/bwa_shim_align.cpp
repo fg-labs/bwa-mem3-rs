@@ -54,6 +54,12 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
     assert(nreads >= 0);
     assert(nthreads > 0);
 
+    /* Mirrors upstream's clamp (fastmap.cpp:280): the assert above compiles out
+     * under NDEBUG, and kt_for makes the same input safe by clamping rather
+     * than refusing. Ours does not size anything from nthreads except the mmc
+     * loops below, but agreeing with upstream costs nothing. */
+    if (nthreads < 1) nthreads = 1;
+
     // Record the thread count on the worker so worker_free can validate the
     // paired call and the per-thread loops can never walk past the slots
     // populated here.
@@ -62,20 +68,49 @@ static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int3
     int32_t memSize = nreads;
 
     /* Mem allocation section for core kernels */
-    w.regs = NULL; w.chain_ar = NULL; w.seedBuf = NULL;
+    w.regs = NULL; w.chain_scratch = NULL; w.seed_scratch = NULL;
+    /* Vestigial in v0.9.0 (see the note below); zero them so worker_free and
+     * any future upstream code cannot act on an indeterminate pointer. */
+    w.auxSeedBuf = NULL; w.auxSeedBufSize = 0;
 
     w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
-    w.chain_ar = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
-    w.seedBuf = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
 
-    assert(w.seedBuf  != NULL);
-    assert(w.regs     != NULL);
-    assert(w.chain_ar != NULL);
+    /* DELIBERATE DIVERGENCE from upstream's v0.9.0 worker_alloc, which sizes
+     * these as `nthreads * BATCH_SIZE` and indexes them by `tid`.
+     *
+     * Upstream could shrink them because it fused its two kt_for passes into
+     * `worker_bwt_aln`: with seeding and extension on the same reads in one
+     * work item, chains are dead the moment the item ends, so a per-thread
+     * window suffices. It renamed `chain_ar`/`seedBuf` to `chain_scratch`/
+     * `seed_scratch` precisely so out-of-tree callers still doing
+     * `w.chain_ar + seq_id` would fail to compile instead of running off the
+     * end (fastmap.cpp:309-334, bwamem.h:481-485).
+     *
+     * This crate IS such a caller, by design: its public API is the phase
+     * split (`seed_batch` -> `extend_batch`), which is exactly the barrier
+     * upstream removed, so chains and their seeds MUST survive between the two
+     * calls for every read in the batch. We therefore keep the pre-0.9.0
+     * nreads sizing and seq_id indexing. The kernels take both arrays as
+     * parameters and index them [0, nseq), and `tid` is used only for `mmc`,
+     * so a caller-owned per-read array remains valid.
+     *
+     * Do NOT "fix" the field names to `auxSeedBuf`/`auxSeedBufSize` as the
+     * compiler's did-you-mean suggests: those are vestigial worker_t members
+     * that nothing allocates (every real `auxSeedBuf` upstream is a local in
+     * test_and_merge, bwamem.cpp:894). Taking that suggestion compiles and
+     * then dereferences an unallocated pointer. */
+    w.chain_scratch = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
+    w.seed_scratch  = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
 
-    w.seedBufSize = BATCH_SIZE * AVG_SEEDS_PER_READ;
+    assert(w.seed_scratch  != NULL);
+    assert(w.regs          != NULL);
+    assert(w.chain_scratch != NULL);
 
-    /* SWA mem allocation */
-    int64_t wsize = BATCH_SIZE * SEEDS_PER_READ;
+    w.seed_scratch_size = BATCH_SIZE * AVG_SEEDS_PER_READ;
+
+    /* SWA mem allocation. NOTE the basis changed in v0.9.0: upstream now sizes
+     * this from AVG_SEEDS_PER_READ, not SEEDS_PER_READ (fastmap.cpp:380). */
+    int64_t wsize = BATCH_SIZE * AVG_SEEDS_PER_READ;
     for(int l=0; l<nthreads; l++)
     {
         w.mmc.seqBufLeftRef[l*CACHE_LINE]  = (uint8_t *)
@@ -137,9 +172,9 @@ static void worker_free(worker_t &w, int32_t nthreads)
     // Catch mismatched alloc/free pairs before they drive out-of-bounds frees.
     assert(w.nthreads == nthreads);
 
-    free(w.chain_ar);
+    free(w.chain_scratch);
     free(w.regs);
-    free(w.seedBuf);
+    free(w.seed_scratch);
 
     for(int l=0; l<nthreads; l++) {
         _mm_free(w.mmc.seqBufLeftRef[l*CACHE_LINE]);
@@ -770,8 +805,16 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
                     for (int i = 0; i < n_cigar; ++i)
                         bam_cig[i] = bwa_cigar_to_bam(
                             bwa_apply_clip_mode(p->cigar[i], opt, p->is_alt, which));
+                    /* v0.9.0 added the chemistry selector. It flips only the
+                     * methylated/unmethylated polarity of the call, never the
+                     * CpG/CHG/CHH context classification, and comes off
+                     * mem_opt_t exactly as upstream's own writer sources it
+                     * (meth_bam.cpp:526). mem_opt_init defaults it to
+                     * METH_CHEM_EMSEQ, so this is unchanged behavior unless a
+                     * caller sets it. */
                     char *xm = meth_build_xm(bns, pac, p->rid, (int64_t)p->pos,
-                                             is_top, bam_cig, n_cigar, seq_text, emit_len);
+                                             is_top, bam_cig, n_cigar, seq_text, emit_len,
+                                             (meth_chem_t) opt->meth_chem);
                     if (xm) aux_put_Z(&aux, &aux_len, &aux_cap, "XM", xm);
                 }
                 free(seq_text);
@@ -962,15 +1005,26 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
     for (int seq_id = 0; seq_id < s->n_seqs; seq_id += BATCH_SIZE) {
         int batch_size = s->n_seqs - seq_id;
         if (batch_size > BATCH_SIZE) batch_size = BATCH_SIZE;
-        int seedBufSz = s->w.seedBufSize;
+        /* Upstream v0.9.0 dropped this tail adjustment (bwamem.cpp's worker_bwt)
+         * because its per-thread window has no remainder to grant. Ours does --
+         * the buffer really is nreads-sized (see worker_alloc) -- so the grant
+         * is still well-defined, and keeping it preserves this crate's
+         * pre-0.9.0 behavior exactly. Upstream documents the difference as
+         * output-dead either way: on overflow chain_add_one_seed falls back to
+         * calloc and flags the chain, which only the capacity-growth ladder
+         * reads, so a chain's contents are unchanged. */
+        int seedBufSz = s->w.seed_scratch_size;
         if (batch_size < BATCH_SIZE) {
             seedBufSz = (memSize - seq_id) * AVG_SEEDS_PER_READ;
         }
         mem_kernel1_core(s->w.fmi, s->w.opt,
                          s->w.seqs + seq_id,
                          batch_size,
-                         s->w.chain_ar + seq_id,
-                         s->w.seedBuf + (size_t)seq_id * AVG_SEEDS_PER_READ,
+                         /* seq_id-indexed, NOT `+ tid * BATCH_SIZE`: this
+                          * crate keeps the per-read arrays the phase split
+                          * needs (see worker_alloc). */
+                         s->w.chain_scratch + seq_id,
+                         s->w.seed_scratch + (size_t)seq_id * AVG_SEEDS_PER_READ,
                          seedBufSz,
                          &s->w.mmc,
                          0 /* tid */,
@@ -981,9 +1035,9 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
 
 void shim_seeds_free(ShimSeeds *s) {
     if (!s) return;
-    if (s->w.chain_ar) {
+    if (s->w.chain_scratch) {
         /* chains allocated by mem_kernel1_core; their inner seed arrays live in
-         * w.seedBuf which alloc_worker owns. No extra freeing needed here. */
+         * w.seed_scratch which worker_alloc owns. No extra freeing needed here. */
     }
     free_seqs(s->seqs, s->n_seqs);
     /* s->ref_string is borrowed from BwaShimIndex; do not free. */
@@ -1020,7 +1074,7 @@ static void run_se_extension(ShimSeeds *s) {
                          s->w.seqs + seq_id,
                          s->w.regs + seq_id,
                          batch_size,
-                         s->w.chain_ar + seq_id,
+                         s->w.chain_scratch + seq_id,
                          &s->w.mmc,
                          s->w.ref_string,
                          0 /* tid */,
