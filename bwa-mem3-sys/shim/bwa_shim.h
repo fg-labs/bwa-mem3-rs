@@ -46,6 +46,17 @@ void              bwa_shim_opts_free(mem_opt_t *opts);
  * base matrix per opts->meth_scoring. Call after changing meth_scoring. */
 void              bwa_shim_opts_fill_meth_mat(mem_opt_t *opts);
 
+/* Rebuild the 5x5 scoring matrix from opts->a / opts->b, then refresh the
+ * bisulfite matrices derived from it. Call after changing either score.
+ *
+ * Writing `a`/`b` alone leaves the crate incoherent: several code paths read
+ * them directly (bwamem.cpp:2200, 2296, 3449, 4130, ...) while the SW kernels
+ * read only opts->mat, which still encodes the previous values. Upstream
+ * always pairs the two (bwa_fill_scmat then mem_opt_fill_meth_mat --
+ * fastmap.cpp:1531-1535), and mem_opt_fill_meth_mat's own contract comment
+ * requires it after EVERY rebuild of opts->mat. */
+void              bwa_shim_opts_fill_scmat(mem_opt_t *opts);
+
 /* Set common single-integer fields; one function per semantically-distinct knob.
  * Returns 0 on success, non-zero if the key is unknown. */
 int bwa_shim_opts_set_int(mem_opt_t *opts, const char *key, int value);

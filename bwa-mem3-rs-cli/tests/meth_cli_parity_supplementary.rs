@@ -27,12 +27,8 @@ mod common;
 use common::{random_dna, record_key_fields, samtools_view, Rng};
 use std::process::Command;
 
-/// A record's clipping plus its Bismark tags.
-///
-/// `flag` is deliberately NOT part of the equality used for parity below: see
-/// [`clipping`] and the comment at its call site. It is kept for selecting the
-/// non-primary record and for debug output.
-#[derive(Debug)]
+/// A record's FLAG, clipping, and Bismark tags -- all compared for parity.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct MethRec {
     flag: u32,
     cigar: String,
@@ -40,39 +36,6 @@ struct MethRec {
     xm: Option<String>,
     xg: Option<String>,
     xr: Option<String>,
-}
-
-/// The FLAG-free projection of a record that this test compares.
-///
-/// FLAG is excluded because `bwa-rs` and the CLI genuinely disagree on it
-/// under `--meth`, for a reason unrelated to the clipping this test pins: the
-/// CLI applies upstream's bwameth default bundle (`fastmap.cpp:1513-1527`),
-/// which includes `MEM_F_NO_MULTI`, so it marks the split arm secondary
-/// (`0x100`) where `bwa-rs` marks it supplementary (`0x800`). `fastmap.cpp` is
-/// excluded from the build, so none of that bundle was ever ported. Tracked in
-/// https://github.com/fg-labs/bwa-mem3-rs/issues/41 and fixed separately --
-/// folding it in here would mean changing `T`, three penalties, and a flag for
-/// every meth user from a PR about clipping.
-///
-/// Everything the clip rewrite actually touches -- CIGAR, emitted SEQ length,
-/// and the Bismark tags computed over that SEQ -- IS compared.
-#[derive(PartialEq, Eq, Debug)]
-struct Clipping {
-    cigar: String,
-    seq_len: usize,
-    xm: Option<String>,
-    xg: Option<String>,
-    xr: Option<String>,
-}
-
-fn clipping(r: &MethRec) -> Clipping {
-    Clipping {
-        cigar: r.cigar.clone(),
-        seq_len: r.seq_len,
-        xm: r.xm.clone(),
-        xg: r.xg.clone(),
-        xr: r.xr.clone(),
-    }
 }
 
 fn tag(fields: &[&str], key: &str) -> Option<String> {
@@ -100,11 +63,10 @@ fn recs_named(lines: &[String], qname: &str) -> Vec<MethRec> {
             }
         })
         .collect();
-    // Total order, not FLAG alone: records sharing a FLAG would otherwise
-    // compare in each aligner's emission order. `MethRec` cannot derive `Ord`
-    // here because it deliberately does not derive `PartialEq` either, so the
-    // key is spelled out.
-    out.sort_by(|a, b| (a.flag, &a.cigar, a.seq_len).cmp(&(b.flag, &b.cigar, b.seq_len)));
+    // Total order (derived, so FLAG then CIGAR then the rest), not FLAG alone:
+    // records sharing a FLAG would otherwise compare in each aligner's
+    // emission order.
+    out.sort();
     out
 }
 
@@ -256,46 +218,33 @@ fn meth_cli_parity_supplementary_is_hard_clipped() {
         supp.seq_len
     );
 
-    // FLAG excluded -- see [`Clipping`] and issue #41. Sorted by CIGAR so the
-    // comparison does not depend on the emission order.
-    let mut cli_clip: Vec<Clipping> = cli_split.iter().map(clipping).collect();
-    let mut rs_clip: Vec<Clipping> = rs_split.iter().map(clipping).collect();
-    cli_clip.sort_by(|a, b| a.cigar.cmp(&b.cigar));
-    rs_clip.sort_by(|a, b| a.cigar.cmp(&b.cigar));
+    // FLAG is compared too: `bwa-rs mem --meth` applies upstream's bwameth
+    // default bundle (`fastmap.cpp:1513-1527`), whose `MEM_F_NO_MULTI` decides
+    // whether the split arm is marked secondary (0x100) or supplementary
+    // (0x800). Records are already sorted by flag in `recs_named`.
     assert_eq!(
-        cli_clip, rs_clip,
-        "split0 under --meth: clipping or Bismark tags diverge from the \
+        cli_split, rs_split,
+        "split0 under --meth: FLAG, clipping, or Bismark tags diverge from the \
          bwa-mem3 CLI"
     );
 
-    // Whole-record parity over every OTHER read. split0 is excluded because
-    // `record_key_fields` compares FLAG, which diverges for the reason in
-    // [`Clipping`] (issue #41) -- the exclusion is that one known difference,
-    // not a blanket opt-out, so a regression on any other read still fails
-    // here. Sorted vectors (not sets): preserve record multiplicity so a
-    // duplicated or missing record diverges even when the key set matches.
-    let key_fields = |lines: &[String]| {
-        let mut v: Vec<String> = lines
-            .iter()
-            .filter(|l| l.split('\t').next() != Some("split0"))
-            .map(|l| record_key_fields(l))
-            .collect();
-        v.sort();
-        v
-    };
-    // Non-empty guard, as `meth_e2e` does at its equivalent comparison: the
-    // filter above drops `split0`, and nothing else here asserts the 40 `ok{i}`
-    // pairs produced anything. Without this, a run where they all failed to
-    // align would compare two empty vectors and pass, making the claim above
-    // -- that a regression on any other read still fails here -- untrue.
-    let cli_key_fields = key_fields(&cli_lines);
+    // Whole-record parity over every read, `split0` included: the FLAG
+    // divergence that once forced an exclusion here is what this PR fixes.
+    //
+    // Sorted vectors (not sets): preserve record multiplicity so a duplicated
+    // or missing record diverges even when the distinct key set matches. The
+    // non-empty guard mirrors `meth_e2e` -- without it a run where nothing
+    // aligned would compare two empty vectors and pass.
+    let mut cli_recs: Vec<String> = cli_lines.iter().map(|l| record_key_fields(l)).collect();
+    let mut rs_recs: Vec<String> = rs_lines.iter().map(|l| record_key_fields(l)).collect();
+    cli_recs.sort();
+    rs_recs.sort();
     assert!(
-        !cli_key_fields.is_empty(),
-        "the reference aligner produced no records outside the split read"
+        !cli_recs.is_empty(),
+        "the reference aligner produced no records at all"
     );
     assert_eq!(
-        cli_key_fields,
-        key_fields(&rs_lines),
-        "bwa-rs meth records diverge from the bwa-mem3 CLI outside the split read"
+        cli_recs, rs_recs,
+        "bwa-rs meth records diverge from the bwa-mem3 CLI on a split read"
     );
 }

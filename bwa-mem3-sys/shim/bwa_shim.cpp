@@ -42,6 +42,10 @@
  * need the shim_align_* bridge declarations. */
 mem_opt_t *mem_opt_init(void);  /* C++ linkage, matches bwamem.h */
 void mem_opt_fill_meth_mat(mem_opt_t *opt);  /* C++ linkage, matches bwamem.h */
+/* C linkage, unlike its neighbours above: bwa.h declares this one inside an
+ * `extern "C"` block (bwa.h:94,106), so the mangled name would not resolve
+ * (see CLAUDE.md gotcha #5). */
+extern "C" void bwa_fill_scmat(int a, int b, int8_t mat[25]);
 
 extern "C" {
     struct ShimReadPair {
@@ -215,6 +219,16 @@ extern "C" void bwa_shim_opts_free(mem_opt_t *opts) {
  * meth matrices stay consistent (see MemOpts::set_meth / set_meth_scoring). */
 extern "C" void bwa_shim_opts_fill_meth_mat(mem_opt_t *opts) {
     if (opts) mem_opt_fill_meth_mat(opts);
+}
+
+extern "C" void bwa_shim_opts_fill_scmat(mem_opt_t *opts) {
+    if (!opts) return;
+    bwa_fill_scmat(opts->a, opts->b, opts->mat);
+    /* Unconditional, mirroring fastmap.cpp:1531-1535: the meth matrices are
+     * copies of opts->mat, so a stale pair would silently ignore the new
+     * scores the moment --meth is enabled. Harmless outside --meth, where
+     * mat_ot / mat_ob are never read. */
+    mem_opt_fill_meth_mat(opts);
 }
 
 extern "C" int bwa_shim_opts_set_int(mem_opt_t *opts, const char *key, int value) {
