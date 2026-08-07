@@ -171,6 +171,28 @@ impl MemOpts {
         self
     }
 
+    /// Mark shorter split hits as secondary rather than supplementary (`-M`).
+    ///
+    /// With this set, the 2nd+ emitted record of a split read carries `0x100`
+    /// instead of `0x800` — Picard-compatible output. `bwa-mem3 mem` sets it
+    /// under `--meth`, so anything aiming for byte-parity with the CLI in
+    /// bisulfite mode needs it too (see [`MemOpts::set_meth`]).
+    pub fn set_mark_split_secondary(&mut self, v: bool) -> &mut Self {
+        let o = unsafe { &mut *self.handle };
+        if v {
+            o.flag |= sys::MEM_F_NO_MULTI as i32;
+        } else {
+            o.flag &= !(sys::MEM_F_NO_MULTI as i32);
+        }
+        self
+    }
+
+    /// Whether shorter split hits are marked secondary (`-M`).
+    #[must_use]
+    pub fn mark_split_secondary(&self) -> bool {
+        unsafe { (*self.handle).flag & sys::MEM_F_NO_MULTI as i32 != 0 }
+    }
+
     // ---------- field accessors ----------
 
     #[must_use]
@@ -256,6 +278,13 @@ impl MemOpts {
         self
     }
 
+    /// The 5'/3' clipping penalties (`-L`), in the order
+    /// [`set_clip_penalty`](Self::set_clip_penalty) takes them.
+    #[must_use]
+    pub fn clip_penalty(&self) -> (i32, i32) {
+        unsafe { ((*self.handle).pen_clip5, (*self.handle).pen_clip3) }
+    }
+
     #[must_use]
     pub fn minimum_score(&self) -> i32 {
         unsafe { (*self.handle).T }
@@ -315,6 +344,12 @@ impl MemOpts {
             (*self.handle).pen_unpaired = v;
         }
         self
+    }
+
+    /// The penalty for not pairing two mates (`-U`).
+    #[must_use]
+    pub fn unpaired_penalty(&self) -> i32 {
+        unsafe { (*self.handle).pen_unpaired }
     }
 
     // ---------- bwa-mem3 0.6.0 opt-in knobs ----------
@@ -658,6 +693,16 @@ mod tests {
             "the bisulfite matrices are copies of opt->mat and must be refilled \
              whenever it is rebuilt (mem_opt_fill_meth_mat's own contract)"
         );
+    }
+
+    #[test]
+    fn mark_split_secondary_round_trips() {
+        let mut o = MemOpts::new().unwrap();
+        assert!(!o.mark_split_secondary(), "-M is off by default");
+        o.set_mark_split_secondary(true);
+        assert!(o.mark_split_secondary());
+        o.set_mark_split_secondary(false);
+        assert!(!o.mark_split_secondary());
     }
 
     #[test]

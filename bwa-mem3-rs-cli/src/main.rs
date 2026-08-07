@@ -9,7 +9,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bwa_mem3_rs::{align_batch, shm, BwaIndex, MemOpts, ReadPair};
+use bwa_mem3_rs::{align_batch, shm, BwaIndex, MemOpts, MethScoring, ReadPair};
 use clap::{Parser, Subcommand};
 use flate2::read::MultiGzDecoder;
 use noodles_bgzf as bgzf;
@@ -116,6 +116,47 @@ fn run_shm(action: ShmAction) -> Result<()> {
     }
 }
 
+/// Apply the bwameth-compatibility defaults `bwa-mem3 mem --meth` applies,
+/// so `bwa-rs mem --meth` is a drop-in for it.
+///
+/// Mirrors `fastmap.cpp:1513-1527` in the vendored source. This lives in
+/// the CLI, not in `MemOpts::set_meth`, because that is where upstream
+/// puts it: `fastmap.cpp` IS bwa-mem3's CLI, and a library setter that
+/// silently rewrote `T` and three penalties would be a surprising thing
+/// for a `set_meth(true)` call to do. Library callers wanting CLI parity
+/// should apply the same block.
+///
+/// Upstream guards each knob with `if (!opt0.<knob>)` — apply the default
+/// only when the user did not pass the corresponding flag. That guard is
+/// vacuous here because `bwa-rs mem` exposes none of these as options
+/// (only `-k`, which is not in the bundle), so there is no user value to
+/// preserve. **If any of `-T`, `-B`, `-U`, or `-L` is ever added to the
+/// CLI, the matching default below must become conditional on it**, or the
+/// flag will be silently ignored under `--meth`.
+///
+/// `-C` (`copy_comment`) is part of upstream's bundle but is deliberately
+/// omitted: it is a field on `fastmap.cpp`'s local worker struct, not on
+/// `mem_opt_t`, and it only governs FASTQ comment passthrough, which this
+/// crate never populates (`copy_pairs_to_seqs` leaves `bseq1_t::comment`
+/// null). Nothing to mirror.
+fn apply_meth_defaults(opts: &mut MemOpts) {
+    opts.set_clip_penalty(10, 10); // bwameth -L 10,10
+    opts.set_unpaired_penalty(100); // bwameth -U 100
+    opts.set_minimum_score(40); // bwameth -T 40
+    opts.set_mark_split_secondary(true); // -M
+                                         // COLLAPSED is the default scoring mode and the bwameth drop-in; its
+                                         // lenient -B 2 pairs with the two-cell matrix. GENOMIC deliberately
+                                         // keeps bwa's -B 4 (variant-aware), so this is mode-dependent —
+                                         // the only knob in the bundle that is.
+                                         // An `Err` here means the vendored bwa-mem3 reports a scoring mode this
+                                         // crate does not know (v0.8.0 adds NEUTRAL). Skipping the COLLAPSED
+                                         // default is the right response: applying bwameth's lenient -B 2 to an
+                                         // unrecognised mode would be a guess about semantics we do not have.
+    if matches!(opts.meth_scoring(), Ok(MethScoring::Collapsed)) {
+        opts.set_mismatch_penalty(2);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_mem(
     prefix: &std::path::Path,
@@ -141,6 +182,7 @@ fn run_mem(
     opts.set_pe(true);
     if meth {
         opts.set_meth(true);
+        apply_meth_defaults(&mut opts);
     }
     if let Some(k) = min_seed_len {
         opts.set_min_seed_len(k);
@@ -283,3 +325,55 @@ fn write_bam_header<W: Write>(w: &mut W, idx: &BwaIndex) -> Result<()> {
 // Silence unused warnings when Read isn't touched directly (noodles handles it).
 #[allow(dead_code)]
 fn _ensure_read_trait_in_scope<R: Read>(_: R) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins every knob in the `--meth` bundle against upstream's list at
+    /// `fastmap.cpp:1513-1527`.
+    ///
+    /// Worth having as a value-by-value assertion rather than relying on the
+    /// CLI-parity tests: only `-M` changes output on any fixture we have, so a
+    /// wrong `T`, clip penalty, or unpaired penalty would sail through every
+    /// other test in the suite. On a vendor refresh, diff that block and
+    /// update both it and this test together.
+    #[test]
+    fn meth_defaults_match_upstreams_bwameth_bundle() {
+        let mut opts = MemOpts::new().unwrap();
+        opts.set_meth(true);
+        apply_meth_defaults(&mut opts);
+
+        assert_eq!(opts.minimum_score(), 40, "bwameth -T 40");
+        assert_eq!(opts.clip_penalty(), (10, 10), "bwameth -L 10,10");
+        assert_eq!(opts.unpaired_penalty(), 100, "bwameth -U 100");
+        assert!(opts.mark_split_secondary(), "-M");
+        assert_eq!(
+            opts.mismatch_penalty(),
+            2,
+            "bwameth -B 2 under the default COLLAPSED scoring"
+        );
+    }
+
+    /// GENOMIC deliberately keeps bwa's `-B 4`; it is the one mode-dependent
+    /// knob in the bundle, and the rest must still apply.
+    #[test]
+    fn genomic_meth_scoring_keeps_the_default_mismatch_penalty() {
+        let mut opts = MemOpts::new().unwrap();
+        opts.set_meth(true);
+        opts.set_meth_scoring(MethScoring::Genomic);
+        apply_meth_defaults(&mut opts);
+
+        assert_eq!(
+            opts.mismatch_penalty(),
+            4,
+            "GENOMIC is variant-aware and keeps bwa's -B 4"
+        );
+        assert_eq!(
+            opts.minimum_score(),
+            40,
+            "the rest of the bundle still applies"
+        );
+        assert!(opts.mark_split_secondary());
+    }
+}
