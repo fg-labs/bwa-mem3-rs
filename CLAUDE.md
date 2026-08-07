@@ -245,30 +245,52 @@ policy (`mem_proper_pair_extra_flag`, `mem_opt_apply_meth_defaults`,
 policy is a twin that drifts, and upstream factors these out precisely because
 its own twins drifted.
 
-### 14. `XA:Z` sub-entry ORDER can differ from the CLI on tied hits
+### 14. Byte parity requires matching the CLI's insert-size cohort
 
-Byte-parity against the CLI holds for the `XA:Z` *set*, not always its order. On
-a 2,000-pair hg38 fixture: 26 of 27 `XA`-bearing records byte-identical, 1 with
-the same five entries in a different order, 0 with a different set. The two
-swapped entries had equal NM.
+**Parity is exact when the batch is.** Measured on a 20,000-pair hg38 fixture
+(chr20:2–4 Mb, 150 bp, insert 400, ~1% substitutions), `bwa-rs` vs `bwa-mem3 mem
+-t 1`, with the batch sized so both sides estimate one insert-size model over
+the same reads: **40,000 of 40,000 records byte-identical**, including all 367
+`XA`-bearing records (166 of them multi-hit). Zero order differences, zero set
+differences. The `XA:Z` string matches exactly.
 
-This is upstream's, not ours. With the default `alnreg_sort_fast == 0` the
-surviving alnreg set "is defined by the *permutation* klib's unstable introsort
-happens to produce" (`bwamem.cpp:560-575`), and upstream measured that sort
-tying on ~0.98% of calls over 186M regions. When the comparator sees a tie the
-resulting order is not determined by the input alone, so two processes linking
-the same `mem_gen_alt` can legitimately disagree.
+Split the cohort instead — `--batch-size 1024`, which is `bwa-rs`'s **default**,
+giving 20 batches against the CLI's single chunk — and the same fixture yields 48
+records whose `XA` holds the same entries in a different order, 42 with a
+different `RNAME`/`POS`/`RNEXT`/`PNEXT`, and 84 with a different flag. That is
+the whole divergence, and it is a property of how the caller batched, not of the
+shim.
 
-Practical consequences:
+`mem_pestat` runs per batch, and its output feeds mate rescue; rescued regions
+are **appended** to the read's alnreg array, and `mem_gen_alt` emits `XA`
+sub-entries in array order (`bwamem_extra.cpp:132-200` walks `i` over `a->n` and
+appends to `aln[r]`). So a different insert-size model can reorder the array —
+and therefore the `XA` string — while leaving the entry set alone. The equal-NM
+swaps that look like a sort tie are this.
 
-- A parity assertion over `XA:Z` must compare the entry **set**, not the string,
-  unless the fixture is known tie-free. The PhiX-scale suites happen to be, which
-  is why they compare strings and pass.
-- Do not "fix" this in the shim. The regions, coordinates, CIGARs and NMs all
-  match; only the order of equal-NM entries moves.
+To match the CLI, make the batch one cohort: the CLI's chunk is `-K` bases ×
+threads (600 Kbase of reads is a single chunk at `-t 1`), so size `--batch-size`
+to cover the same reads, or pass a shared model via `align_batch`'s `pestat_in`.
+`estimate_pestat` exists for exactly this.
+
+**An earlier revision of this gotcha blamed klib's unstable introsort; that was
+wrong.** Both binaries are self-deterministic — repeated runs of each are
+byte-identical — so identical inputs cannot be producing different permutations.
+Upstream says as much at `bwamem.cpp:560-575`: `ks_introsort` is
+*input-order-dependent*, which makes it deterministic for a given array, not
+random. Upstream's ~0.98%-of-calls tie measurement is about substituting a
+*different* sort, not about two processes running the same one disagreeing. Do
+not cite it as a parity excuse.
+
+Consequences:
+
+- A parity assertion may compare the `XA:Z` **string**, provided the fixture
+  aligns the cohorts. The PhiX suites do (one batch), which is why they pass.
+- If a parity test ever does show an `XA` order difference, the first thing to
+  check is the batch/cohort split, not the sort.
 - `opt->alnreg_sort_fast` (v0.9.0, `--fast`) swaps in a strict-total-order
-  comparator plus pdqsort, which makes the order deterministic — but it is a
-  different, non-bwa-mem2-compatible surviving set, so it is not a parity fix.
+  comparator plus pdqsort. It is unrelated to the above and still not a parity
+  option: it yields a different, non-bwa-mem2-compatible surviving set.
 
 ## Commit / PR conventions
 
