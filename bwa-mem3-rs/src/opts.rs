@@ -140,6 +140,48 @@ impl MemOpts {
         unsafe { std::ffi::CStr::from_ptr(p) }.to_str().ok()
     }
 
+    /// Apply bwa-mem3's bwameth-compatibility defaults for `--meth`, as
+    /// `bwa-mem3 mem --meth` applies them: `-L 10,10`, `-U 100`, `-T 40`, `-M`,
+    /// and (COLLAPSED scoring only) `-B 2`.
+    ///
+    /// Each constant is **scaled by the match score** `a`, because bwameth
+    /// quotes them at bwa's default `a == 1` and bwa scales every other
+    /// score-derived default the same way. Applying them flat would silently
+    /// discard a non-default match score: `--meth` with `-A 2` would leave the
+    /// minimum score at 40 while the alignment scores it gates had doubled. At
+    /// the default `a == 1` the scaling is a no-op.
+    ///
+    /// This calls bwa-mem3's own `mem_opt_apply_meth_defaults` rather than
+    /// reproducing the bundle, so it cannot drift from upstream, and it refills
+    /// the scoring matrices afterwards (the COLLAPSED branch can change `b`).
+    ///
+    /// # Ordering
+    ///
+    /// The knobs involved are not symmetric, so the order matters in both
+    /// directions:
+    ///
+    /// **Set before** — these are *inputs*:
+    /// - [`set_match_score`](Self::set_match_score), since every constant is
+    ///   expressed in units of it;
+    /// - [`set_meth_scoring`](Self::set_meth_scoring), since the `-B 2` branch
+    ///   keys off the resolved mode.
+    ///
+    /// **Set after** — these are *overwritten* unconditionally, because
+    /// upstream's "the user set this" mask is passed empty:
+    /// [`set_minimum_score`](Self::set_minimum_score),
+    /// [`set_clip_penalty`](Self::set_clip_penalty),
+    /// [`set_unpaired_penalty`](Self::set_unpaired_penalty).
+    ///
+    /// **Set after, but only under [`MethScoring::Collapsed`]** —
+    /// [`set_mismatch_penalty`](Self::set_mismatch_penalty). The bundle's
+    /// `-B 2` applies to COLLAPSED alone; [`Genomic`](MethScoring::Genomic) and
+    /// [`Neutral`](MethScoring::Neutral) are variant-aware and keep bwa's
+    /// default, so under those two a `-B` set *before* the call survives it.
+    pub fn apply_meth_defaults(&mut self) -> &mut Self {
+        unsafe { sys::bwa_shim_opts_apply_meth_defaults(self.handle) };
+        self
+    }
+
     /// Apply a bwa-mem3 `-x` preset on top of current values.
     #[must_use]
     pub fn with_mode(self, mode: Mode) -> Self {
@@ -176,7 +218,7 @@ impl MemOpts {
         // Every preset changes `b`, so the matrices derived from it are stale
         // until rebuilt -- the same coupling the `a`/`b` setters maintain.
         // Upstream does this too, re-running bwa_fill_scmat after parsing -x
-        // (fastmap.cpp:1531).
+        // (fastmap.cpp:2726, in main_mem).
         unsafe { sys::bwa_shim_opts_fill_scmat(self.handle) };
         self
     }
@@ -277,13 +319,39 @@ impl MemOpts {
     /// `opt->mat`, so writing the field alone leaves the two disagreeing —
     /// the score would change for MAPQ and heuristics but not for alignment
     /// itself. Upstream always pairs the write with `bwa_fill_scmat`
-    /// (`fastmap.cpp:1531-1535`).
+    /// (`fastmap.cpp:2726`, in `main_mem`).
     pub fn set_mismatch_penalty(&mut self, v: i32) -> &mut Self {
         unsafe {
             (*self.handle).b = v;
             sys::bwa_shim_opts_fill_scmat(self.handle);
         }
         self
+    }
+
+    /// The 5×5 substitution matrix (`opt->mat`) the Smith-Waterman kernels
+    /// actually score with, row-major over `A,C,G,T,N`.
+    ///
+    /// Derived from `a`/`b` by `bwa_fill_scmat`: the diagonal is `+a`, the
+    /// off-diagonal `-b`, and every ambiguous-base cell `-1`. Exposed because
+    /// several paths read `a`/`b` directly while the kernels read only this,
+    /// so it is the only way to observe whether the two agree — see
+    /// [`set_mismatch_penalty`](Self::set_mismatch_penalty).
+    #[must_use]
+    pub fn scoring_matrix(&self) -> [i8; 25] {
+        unsafe { (*self.handle).mat }
+    }
+
+    /// The per-hypothesis bisulfite matrices `(mat_ot, mat_ob)`, as rebuilt by
+    /// `mem_opt_fill_meth_mat`. Only read under [`set_meth`](Self::set_meth).
+    ///
+    /// Each is a copy of [`scoring_matrix`](Self::scoring_matrix) with the
+    /// conversion cell freed — `OT` frees ref-C/read-T, `OB` ref-G/read-A —
+    /// to `+a` under `Collapsed`/`Genomic` or `0` under `Neutral`.
+    /// `Collapsed` additionally frees the mirror cell, making C/T (and G/A)
+    /// mutually interchangeable.
+    #[must_use]
+    pub fn meth_scoring_matrices(&self) -> ([i8; 25], [i8; 25]) {
+        unsafe { ((*self.handle).mat_ot, (*self.handle).mat_ob) }
     }
 
     pub fn set_gap_open(&mut self, del: i32, ins: i32) -> &mut Self {

@@ -53,8 +53,8 @@ void              bwa_shim_opts_fill_meth_mat(mem_opt_t *opts);
  * them directly (bwamem.cpp:2200, 2296, 3449, 4130, ...) while the SW kernels
  * read only opts->mat, which still encodes the previous values. Upstream
  * always pairs the two (bwa_fill_scmat then mem_opt_fill_meth_mat --
- * fastmap.cpp:1531-1535), and mem_opt_fill_meth_mat's own contract comment
- * requires it after EVERY rebuild of opts->mat. */
+ * fastmap.cpp:2726 and :2730, in main_mem), and mem_opt_fill_meth_mat's own
+ * contract comment requires it after EVERY rebuild of opts->mat. */
 void              bwa_shim_opts_fill_scmat(mem_opt_t *opts);
 
 /* Set common single-integer fields; one function per semantically-distinct knob.
@@ -70,6 +70,25 @@ int bwa_shim_opts_set_int(mem_opt_t *opts, const char *key, int value);
  * reason (fg-labs/bwa-mem3#288). The string is static storage owned by the
  * compat table; do not free it. */
 const char *bwa_shim_compat_hd_line(const mem_opt_t *opts);
+
+/* Apply bwa-mem3's bwameth-compatibility defaults for `--meth`, then refill the
+ * scoring matrices (the bundle can change `b`, so they would otherwise be
+ * stale).
+ *
+ * Wraps upstream's `mem_opt_apply_meth_defaults`, so the constants scale with
+ * the match score `a` exactly as upstream scales them.
+ *
+ * Ordering is not symmetric across the knobs involved:
+ *   - `a` (`-A`) is an INPUT -- the constants are expressed in units of it --
+ *     so set it BEFORE calling. So is `meth_scoring`: the `-B` branch keys off
+ *     the resolved mode.
+ *   - `T`/`pen_clip5`/`pen_clip3`/`pen_unpaired` (`-T`/`-L`/`-U`) are
+ *     OVERWRITTEN unconditionally, because upstream's "user set this" mask is
+ *     passed empty, so set any of those AFTER or they are silently clobbered.
+ *   - `b` (`-B`) is overwritten ONLY under COLLAPSED scoring. GENOMIC and
+ *     NEUTRAL keep bwa's default (bwamem.cpp:511-515), so a caller-set `-B`
+ *     survives the bundle under those two modes. */
+void bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts);
 
 /* PE-stats lifecycle. `pestat_zero` returns a zeroed 4-orientation array. */
 mem_pestat_t *bwa_shim_pestat_zero(void);
