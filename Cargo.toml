@@ -12,7 +12,7 @@ members = ["bwa-mem3-sys", "bwa-mem3-rs", "bwa-mem3-rs-cli", "bwa-mem3-py"]
 default-members = ["bwa-mem3-sys", "bwa-mem3-rs", "bwa-mem3-rs-cli"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
