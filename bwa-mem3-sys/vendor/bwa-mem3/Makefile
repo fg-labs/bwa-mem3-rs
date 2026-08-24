@@ -71,6 +71,88 @@ else
     endif
 endif
 
+# ---- Compiler version floor -------------------------------------------------
+# bwa-mem3's shipping and benchmarked builds use clang-19 (bioconda forces
+# clang; the performance benchmark suite builds with clang-19). Older toolchains
+# produce materially slower binaries: clang-19 is ~5% faster than gcc-15 and
+# ~15%+ faster than gcc-11 on ARM (~5-16% on x86), because older compilers emit
+# redundant SIMD ops (e.g. extra blend mask-broadcasts) that a modern clang
+# already elides. To keep an accidentally-slow build from being mistaken for
+# bwa-mem3 being slow, a bare `make` on a below-floor compiler FAILS. Deliberate
+# builds on old toolchains (packagers on older distros, compatibility CI, A/B
+# tests) opt out with ALLOW_UNSUPPORTED_COMPILER=1.
+#
+# Thresholds are overridable (?=) so a distro/packager can set its own policy.
+# Apple clang has its own, lower floor because its version numbers do not track
+# upstream LLVM.
+CLANG_MIN      ?= 19
+GCC_MIN        ?= 15
+APPLECLANG_MIN ?= 15
+
+# The floor gates *builds* — clean-only goals invoke no compiler (they just
+# `rm` artifacts) and so must not require a floor-passing toolchain. Without
+# this, `make clean` on GNU make's default CXX (`g++`, i.e. gcc-13 on Ubuntu
+# 24.04) trips the parse-time $(error) below and aborts — breaking both
+# contributor cleanups and any CI step that runs `make clean` before a build
+# with a pinned CXX (e.g. the kswv ASan steps in proto-neon-kswv.yml, which
+# `make clean` bare, then `make ... CXX="ccache clang++-19"`). Enforce only when
+# a real build is requested: a bare `make` (empty MAKECMDGOALS → the default
+# build goal) or any goal list containing a non-clean target still enforces it;
+# a goal list of clean targets only is exempt.
+FLOOR_EXEMPT_GOALS := clean pgo-clean profile-clean lto-clean
+ifeq ($(strip $(MAKECMDGOALS)),)
+    ENFORCE_COMPILER_FLOOR := 1
+else ifeq ($(strip $(filter-out $(FLOOR_EXEMPT_GOALS),$(MAKECMDGOALS))),)
+    ENFORCE_COMPILER_FLOOR :=
+else
+    ENFORCE_COMPILER_FLOOR := 1
+endif
+
+ifeq ($(ENFORCE_COMPILER_FLOOR),1)
+ifneq ($(ALLOW_UNSUPPORTED_COMPILER),1)
+    # Family from the --version banner; major from -dumpversion (gcc/clang/Apple
+    # clang all report a usable "<major>[.minor.patch]" there). If $(CXX) can't
+    # be probed (missing, or an unrecognized toolchain), CXX_KIND stays empty and
+    # the floor is not enforced — fail open, never block an unknown-but-working CXX.
+    CXX_VER_1ST  := $(shell $(CXX) --version 2>/dev/null | head -1)
+    CXX_VER_FULL := $(shell $(CXX) --version 2>/dev/null)
+    CXX_MAJOR    := $(shell $(CXX) -dumpversion 2>/dev/null | cut -d. -f1)
+    ifneq (,$(findstring Apple clang,$(CXX_VER_1ST)))
+        CXX_KIND  := Apple clang
+        CXX_FLOOR := $(APPLECLANG_MIN)
+    else ifneq (,$(findstring clang,$(CXX_VER_1ST)))
+        CXX_KIND  := clang
+        CXX_FLOOR := $(CLANG_MIN)
+    else ifneq (,$(findstring Free Software Foundation,$(CXX_VER_FULL)))
+        CXX_KIND  := gcc
+        CXX_FLOOR := $(GCC_MIN)
+    else
+        CXX_KIND  :=
+    endif
+    ifneq ($(CXX_KIND),)
+    ifneq (,$(CXX_MAJOR))
+    ifeq ($(shell test $(CXX_MAJOR) -lt $(CXX_FLOOR) 2>/dev/null && echo old),old)
+        $(info )
+        $(info bwa-mem3: unsupported compiler -- $(CXX_KIND) $(CXX_MAJOR) is below the floor ($(CXX_KIND) >= $(CXX_FLOOR)).)
+        $(info )
+        $(info   Modern compilers are REQUIRED for performance. clang-19 -- what bioconda and the)
+        $(info   performance benchmarks ship -- is ~5% faster than gcc-15 and ~15%+ faster than gcc-11)
+        $(info   on ARM (~5-16% on x86); older compilers emit redundant SIMD ops a modern clang elides.)
+        $(info   An old-compiler build is needlessly slow and must not be benchmarked as representative.)
+        $(info )
+        $(info   Fix (recommended): install clang >= $(CLANG_MIN) and build with `make CXX=clang++ CC=clang`.)
+        $(info   Or gcc >= $(GCC_MIN) (acceptable, ~5% slower on ARM).)
+        $(info   Override (packagers / compat CI / deliberate A/B on old toolchains):)
+        $(info       make ALLOW_UNSUPPORTED_COMPILER=1 ...)
+        $(info )
+        $(error unsupported compiler: $(CXX_KIND) $(CXX_MAJOR) < $(CXX_FLOOR); set ALLOW_UNSUPPORTED_COMPILER=1 to override)
+    endif
+    endif
+    endif
+endif
+endif
+# -----------------------------------------------------------------------------
+
 # AddressSanitizer support for catching kswv rowMax / SIMD store overruns
 # in regression tests (e.g. kswv_nrow_zero_test). Opt-in with `make ASAN=1 ...`
 # Forces USE_MIMALLOC off: mimalloc's malloc override interposes before asan
@@ -153,8 +235,38 @@ ifneq ($(IS_ARM),)
     SSE2NEON_INCLUDES = -Iext/sse2neon
     CPPFLAGS += $(SSE2NEON_FLAGS)
     INCLUDES += $(SSE2NEON_INCLUDES)
-    # Apple Silicon uses 128-byte cache lines
-    CPPFLAGS += -DCACHE_LINE_BYTES=128
+    # CPU tuning. Default is generic/portable scheduling — safe for any ARM core
+    # including Apple Silicon, and what portable release binaries should ship.
+    # Set ARM_CPU=<name> for a core-tuned build, e.g. ARM_CPU=neoverse-v2
+    # (Graviton4) or ARM_CPU=native (match the build host). This goes in CPPFLAGS
+    # (not ARCH_FLAGS) because ARCH_FLAGS is reset with `=` in the arch=arm64
+    # branch below; CPPFLAGS uses `+=` and reaches every compile line.
+    ifneq ($(ARM_CPU),)
+        CPPFLAGS += -mcpu=$(ARM_CPU)
+    endif
+    # Cache-line size used as the minimum SIMD allocation alignment. Apple
+    # Silicon uses 128-byte lines; Neoverse/Graviton use 64. Default 128 —
+    # over-aligning on a 64-byte core is harmless. A tuned build overrides it
+    # with ARM_CACHE_LINE=64.
+    ARM_CACHE_LINE ?= 128
+    # Reject unsupported alignments before they reach CACHE_LINE_BYTES. An
+    # invalid value would make SIMD_ALIGNED_ALLOC call posix_memalign with a bad
+    # alignment, which returns EINVAL/NULL and is then dereferenced unchecked in
+    # the kswv constructor. CACHE_LINE_BYTES must be exactly one supported value:
+    # guard the token count first ($(filter) matches per word, so a multi-token
+    # value like "64 128" would slip past a bare membership test; this also
+    # rejects empty), then the value itself. The supported values are the
+    # $(filter) PATTERN and the user value is the text, not the reverse: a user
+    # value used as the pattern could carry a `%` wildcard (e.g. ARM_CACHE_LINE=%)
+    # that matches everything and passes the check. Fail at parse time with a
+    # clear message instead of building a broken binary.
+    ifneq ($(words $(ARM_CACHE_LINE)),1)
+        $(error ARM_CACHE_LINE must be a single value, 64 or 128 (got '$(ARM_CACHE_LINE)'))
+    endif
+    ifeq ($(filter 64 128,$(ARM_CACHE_LINE)),)
+        $(error ARM_CACHE_LINE must be 64 or 128 (got '$(ARM_CACHE_LINE)'))
+    endif
+    CPPFLAGS += -DCACHE_LINE_BYTES=$(ARM_CACHE_LINE)
     # Link Accelerate framework on macOS for potential BLAS/vecLib usage
     ifeq ($(UNAME_S),Darwin)
         LIBS_EXTRA = -framework Accelerate
@@ -321,9 +433,9 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/meth_xm.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
-			src/bwa_shm.o src/simd_dispatch.o \
+			src/bwa_shm.o src/bwa_hugepages.o src/simd_dispatch.o \
 			src/fast_reader.o src/fast_reader_bseq.o src/fr_fastq.o src/stage_prof.o \
-			src/smem_dedup.o
+			src/smem_dedup.o src/lockstep_width.o
 
 # Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
 # and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
@@ -745,6 +857,8 @@ test-binaries: $(BWA_LIB) $(HTS_LIB)
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
+	    ARM_CPU='$(ARM_CPU)' \
+	    ARM_CACHE_LINE='$(or $(ARM_CACHE_LINE),128)' \
 	    HTSLIB_static_LIBS='$(HTSLIB_static_LIBS)' \
 	    HTSLIB_static_LDFLAGS='$(HTSLIB_static_LDFLAGS)'
 
@@ -826,6 +940,29 @@ fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $
 fr_fastq_bench: src/fr_fastq.c src/fast_reader.c test/fr_fastq_bench.c $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_bench.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
+# Regression: bseq_read_fast must not overrun its buffer in paired-end mode when
+# the initial capacity estimate is odd (a paired iteration writes two records
+# but capacity is checked once). Always built with ASan so the overflowing write
+# aborts on regression; links only the reader TUs (no bwa-mem3 build), like
+# fr_fastq_diff_test. Built and run per-row by the CI matrix (ci.yml).
+bseq_read_pe_oob_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_pe_oob_test.c $(FAST_READER_TEST_DEP)
+	$(CC) -O1 -g -fsanitize=address -fno-omit-frame-pointer -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_pe_oob_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+
+# Coverage for bseq_read_fast's copy_comment/-C gate (bseq1_t.comment set only
+# when the caller asked AND the record had a comment), across SE/PE. The parser
+# is covered by fr_fastq_diff_test; this drives the adapter. Reader TUs only.
+bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_comment_copy_test.c $(FAST_READER_TEST_DEP)
+	$(CC) -O2 -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_comment_copy_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+# kvec_alloc_fail_test -- forces the backing realloc to fail and asserts kvec.h's
+# growth macros abort loudly (SIGABRT + an out-of-memory diagnostic) instead of
+# leaking the old buffer and writing through the NULL that realloc returns.
+# Header-only (kvec.h is standalone), so it links no bwa-mem3 objects, needs no
+# index, and runs on every CI row. Forked: the abort is contained so the parent
+# asserts *how* the child died -- a regression (a NULL-deref SIGSEGV, or silent
+# continuation) fails the test rather than taking the process down with it.
+kvec_alloc_fail_test: test/kvec_alloc_fail_test.c src/kvec.h
+	$(CC) -O2 -Wall -Wextra -Isrc test/kvec_alloc_fail_test.c -o $@
+
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 
 # Run the in-tree tests via the unit-test harness in test/, plus the
@@ -842,10 +979,11 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 # Note: depends on `bwa-mem3` so version_banner.sh has a binary to grep —
 # previously `test:` only built the test harness binaries, not the main
 # executable.
-test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) bwa-mem3
+test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
 	for t in $(STANDALONE_TESTS_IN_TEST_TARGET); do echo "./$$t"; ./$$t || exit 1; done
+	./kvec_alloc_fail_test
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 	./test/regression/ndebug_gate_lint_selftest.sh
@@ -998,7 +1136,7 @@ $(ZLIBNG_LIB):
 	cd $(ZLIBNG_BUILD) && cmake $(ZLIBNG_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) bwa-mem3.arm64
+	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS) $(LIBSAIS_OBJS:.o=.d)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean
