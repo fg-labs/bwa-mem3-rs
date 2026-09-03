@@ -46,6 +46,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #  include <cstdint>
 #endif
 #include "fastmap.h"
+#include "read_memo.h"
 #include "FMI_search.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
@@ -55,6 +56,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "version.h"
 #include <sys/resource.h>
 #include "bwa_shm.h"
+#include "bwa_hugepages.h"
 #include "fast_reader_bseq.h"
 
 #if AFF && (__linux__)
@@ -289,6 +291,8 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
 
     /* Mem allocation section for core kernels */
     w.regs = NULL; w.chain_scratch = NULL; w.seed_scratch = NULL;
+    w.memo = NULL;   /* [dedup-reads] armed per-chunk by mem_process_seqs when the
+                      * controller latches ON; NULL elsewhere (unarmed = no memo) */
 
     /* regs is genuinely chunk-lifetime, and the only nreads-sized allocation
      * left here: it is filled by the align pass, read by mem_pestat, and
@@ -663,7 +667,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         ret->read_arena = aux->cohort_arena;
         ret->seqs = aux->legacy_reader
             ? bseq_read_orig(slice_target, &ret->n_seqs, aux->ks, aux->ks2, &sz, &ret->read_arena)
-            : bseq_read_fast(slice_target, &ret->n_seqs, aux->frks, aux->frks2, &sz, &ret->read_arena);
+            : bseq_read_fast(slice_target, &ret->n_seqs, aux->frks, aux->frks2, &sz, &ret->read_arena, aux->copy_comment);
         aux->cohort_arena = ret->read_arena;
 
         /* A short read means the input ran out, which ends the cohort early. */
@@ -1117,16 +1121,28 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         double sp_w0 = sp_enabled() ? sp_wall() : 0.0;
         long sp_wbytes = 0;
 
+        /* L17: hoist the chunk-constant writer/mode selectors out of the
+         * per-record loop. opt->meth_mode and opt->flag never change within a
+         * chunk, and neither writer pointer is reassigned during output; the
+         * loop body only calls bam_writer_write/free, which touch records, not
+         * these. Without this the compiler must reload aux->opt->meth_mode (a
+         * two-level deref) and the g_meth_bam_writer global after every external
+         * write call. Byte-identical (same control flow, same values). */
+        const int   out_meth_mode = aux->opt->meth_mode;
+        const int   out_flag_pe   = (aux->opt->flag & MEM_F_PE);
+        meth_bam_writer_t *const out_meth_bw = g_meth_bam_writer;
+        struct bam_writer_s *const out_bam_bw = aux->bam_writer;
+
         for (int i = 0; i < ret->n_seqs; )
         {
             int group_size = 1;
-            if (aux->opt->meth_mode && (aux->opt->flag & MEM_F_PE)
+            if (out_meth_mode && out_flag_pe
                 && i + 1 < ret->n_seqs
                 && strcmp(ret->seqs[i].name, ret->seqs[i+1].name) == 0) {
                 group_size = 2;
             }
 
-            if (aux->opt->meth_mode && g_meth_bam_writer != NULL) {
+            if (out_meth_mode && out_meth_bw != NULL) {
                 /* Gather all bam1_t* in the QNAME group, propagate QC fail, emit. */
                 int total = 0;
                 for (int k = 0; k < group_size; ++k) total += ret->seqs[i+k].n_bams;
@@ -1143,18 +1159,18 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                     meth_bam_group_propagate_qcfail(group, total);
                     for (int j = 0; j < total; ++j) {
 #ifndef DISABLE_OUTPUT
-                        if (meth_bam_writer_write(g_meth_bam_writer, group[j]) < 0)
+                        if (meth_bam_writer_write(out_meth_bw, group[j]) < 0)
                             err_fatal(__func__, "failed to write meth BAM record");
 #endif
                         bam_writer_free(group[j]);
                     }
                     free(group);
                 }
-            } else if (aux->bam_writer != NULL) {
+            } else if (out_bam_bw != NULL) {
                 for (int k = 0; k < group_size; ++k) {
                     for (int j = 0; j < ret->seqs[i+k].n_bams; ++j) {
 #ifndef DISABLE_OUTPUT
-                        if (bam_writer_write(aux->bam_writer, (struct bam1_t *)ret->seqs[i+k].bams[j]) < 0)
+                        if (bam_writer_write(out_bam_bw, (struct bam1_t *)ret->seqs[i+k].bams[j]) < 0)
                             err_fatal(__func__, "failed to write BAM record");
 #endif
                         bam_writer_free((struct bam1_t *)ret->seqs[i+k].bams[j]);
@@ -1549,9 +1565,14 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -y INT        seed occurrence for the 3rd round seeding [%ld]\n", (long)opt->max_mem_intv);
     fprintf(stderr, "    -c INT        skip seeds with more than INT occurrences [%d]\n", opt->max_occ);
     fprintf(stderr, "    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10%% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]\n");
+    fprintf(stderr, "    --dedup STR   extension-DP job dedup: 'off', 'on' (dedup identical jobs within each batch), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode (@PG excluded, it embeds argv) [auto]\n");
+    fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
+    fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
     fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT do not run at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
+    fprintf(stderr, "    --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical full-width extension; also disables the certified band); overrides --adaptive-band and the --adaptive-band that --fast enables\n");
+    fprintf(stderr, "    --no-band-cert  disable the certified adaptive extension band (on by default): run the full-width extension ladder for every pair instead of the narrow-probe-plus-certificate. The certified band is byte-identical to full-width, so on a plain run this only removes the speedup; it has no effect under --fast, --adaptive-band, or --no-adaptive-band (which already disable the certified band). Escape hatch / A-B handle [%s]\n", opt->band_cert? "on":"off");
     fprintf(stderr, "    --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [%s]\n", opt->mate_concordant_window? (opt->mate_concordant_window<0? "auto":"fixed") : "off");
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
@@ -1569,12 +1590,15 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  so it can lose alignments; NOT part of --fast [off]\n");
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
+    fprintf(stderr, "    --hic         map Hi-C reads; equivalent to -5SP (note: -P alone still runs\n");
+    fprintf(stderr, "                  mate rescue -- use --hic or -5SP to skip it too) [off]\n");
     fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup --rescue-kmer=6\n");
     fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 20 --adaptive-band\n");
     fprintf(stderr, "                  --extend-mate-concordant (under --meth: --max-extend-chains 10,\n");
     fprintf(stderr, "                  -s 2). Opt-in; explicit\n");
     fprintf(stderr, "                  flags override where applicable; --smem-dedup,\n");
-    fprintf(stderr, "                  --skip-contained-ext and --adaptive-band are always enabled.\n");
+    fprintf(stderr, "                  --skip-contained-ext and --adaptive-band are enabled\n");
+    fprintf(stderr, "                  (pass --no-adaptive-band to keep exact extension under --fast).\n");
     fprintf(stderr, "                  Also switches the alignment-region dedup sort to a strict\n");
     fprintf(stderr, "                  total order (faster, but resolves equal-end-position ties\n");
     fprintf(stderr, "                  differently from bwa-mem2, which the default reproduces).\n");
@@ -1655,7 +1679,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   -I FLOAT[,FLOAT[,INT[,INT]]]\n");
     fprintf(stderr, "                 specify the mean, standard deviation (10%% of the mean if absent), max\n");
     fprintf(stderr, "                 (4 sigma from the mean if absent) and min of the insert size distribution.\n");
-    fprintf(stderr, "                 FR orientation only. [inferred]\n");
+    fprintf(stderr, "                 Sets the FR distribution only and skips inference, so FF/RF/RR get none:\n");
+    fprintf(stderr, "                 no proper-pair flag or mate rescue there. As in bwa/bwa-mem2. [inferred]\n");
     fprintf(stderr, "Methylation (--meth) options:\n");
     fprintf(stderr, "   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware\n");
     fprintf(stderr, "                 record emission (XM:Z/XG:Z/XR:Z). Output is SAM text by default,\n");
@@ -1791,6 +1816,7 @@ int main_mem(int argc, char *argv[])
     char        *p, *rg_line               = 0, *hdr_line = 0;
     const char  *mode                      = 0;
     int          fast                      = 0;
+    int          want_huge_pages           = 0;
     /* --chunk-cap: upper bound (bases) on the default `chunk_size * n_threads`
      * batch size. 0 = off, which is the DEFAULT and matches bwa and bwa-mem2
      * exactly (both compute `chunk_size * n_threads` with no cap). Capping
@@ -1799,6 +1825,10 @@ int main_mem(int argc, char *argv[])
      * task_size block below. */
     int64_t      chunk_cap                 = 0;
     int          chunk_cap_set             = 0;
+    /* --no-adaptive-band: user opted out of adaptive banded-SW extension. Tracked
+     * separately so the opt-out beats both an explicit --adaptive-band (either
+     * order) and the --adaptive-band that --fast would otherwise turn on. */
+    int          no_adaptive_band          = 0;
     /* --cohort-slices: how many geometric slices to read the FIRST batch in, so
      * compute can start before the whole batch has been read. Byte-identical --
      * the batch (pestat cohort) boundary is unchanged, only the physical read
@@ -1934,8 +1964,11 @@ int main_mem(int argc, char *argv[])
         OPT_SEED_ORDER,
         OPT_SMEM_DEDUP,
         OPT_FAST,
+        OPT_HUGE_PAGES,
         OPT_SKIP_CONTAINED_EXT,
         OPT_ADAPTIVE_BAND,
+        OPT_NO_ADAPTIVE_BAND,
+        OPT_NO_BAND_CERT,
         OPT_EXTEND_MATE_CONCORDANT,
         OPT_COMPAT,
         OPT_CHUNK_CAP,
@@ -1945,9 +1978,12 @@ int main_mem(int argc, char *argv[])
         OPT_RESCUE_SKIP,
         OPT_COHORT_RAMP_RATIO,
         OPT_COHORT_RAMP_FIRST,
+        OPT_HIC,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
+        OPT_DEDUP,
+        OPT_DEDUP_READS,
         OPT_HELP,
     };
     static struct option long_opts[] = {
@@ -1955,9 +1991,14 @@ int main_mem(int argc, char *argv[])
         {"min-ext-len",              required_argument, 0, OPT_MIN_EXT_LEN},
         {"max-extend-chains",        required_argument, 0, OPT_MAX_EXTEND_CHAINS},
         {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
+        {"dedup",                    required_argument, 0, OPT_DEDUP},
+        {"dedup-reads",              required_argument, 0, OPT_DEDUP_READS},
         {"fast",                     no_argument,       0, OPT_FAST},
+        {"huge-pages",               no_argument,       0, OPT_HUGE_PAGES},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
+        {"no-adaptive-band",         no_argument,       0, OPT_NO_ADAPTIVE_BAND},
+        {"no-band-cert",             no_argument,       0, OPT_NO_BAND_CERT},
         {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
         {"chunk-cap",                required_argument, 0, OPT_CHUNK_CAP},
         {"cohort-slices",            required_argument, 0, OPT_COHORT_SLICES},
@@ -1976,6 +2017,7 @@ int main_mem(int argc, char *argv[])
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
         {"compat",                   required_argument, 0, OPT_COMPAT},
         {"legacy-reader",            no_argument,       0, OPT_LEGACY_READER},
+        {"hic",                      no_argument,       0, OPT_HIC},
 #ifdef STAGE_PROF
         {"profile",                  required_argument, 0, OPT_PROFILE},
 #endif
@@ -1985,6 +2027,8 @@ int main_mem(int argc, char *argv[])
 #ifdef STAGE_PROF
     const char *profile_path = NULL;   /* --profile <path>: stage_prof TSV output */
 #endif
+    const char *dedup_mode_arg = NULL; /* --dedup <off|on|auto>; resolved via mem_dedup_configure after getopt */
+    const char *dedup_reads_mode_arg = NULL; /* --dedup-reads <off|on|auto>; resolved via mem_dedup_reads_configure after getopt */
     while ((c = getopt_long(argc, argv, "51qpaMCSPVYjuk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
                             long_opts, NULL)) >= 0)
     {
@@ -2017,6 +2061,19 @@ int main_mem(int argc, char *argv[])
         else if (c == 'Y') opt->flag |= MEM_F_SOFTCLIP;
         else if (c == 'V') opt->flag |= MEM_F_REF_HDR;
         else if (c == '5') opt->flag |= MEM_F_PRIMARY5 | MEM_F_KEEP_SUPP_MAPQ; // always apply MEM_F_KEEP_SUPP_MAPQ with -5
+        /* --hic: exactly -5SP, no more. Set here rather than deferred like
+         * --fast because there is no opt0 interaction to resolve -- these are
+         * plain flag bits, so ORing them at parse time composes with -5/-S/-P
+         * in any order, and `--hic -P` stays idempotent.
+         *
+         * -S is the letter that matters and the one a reader is least likely
+         * to infer: mate rescue runs BEFORE the pairing bail-out in mem_sam_pe
+         * (bwamem_pair.cpp -- the MEM_F_NO_RESCUE block precedes the
+         * MEM_F_NOPAIRING goto), so -P alone skips pairing while leaving the
+         * full rescue SW in place. Note minibwa gates rescue inside pairing
+         * instead, so its --hic is -5P; the flag letters differ but the
+         * intended behavior is the same, which is the point of the alias. */
+        else if (c == OPT_HIC) opt->flag |= MEM_F_PRIMARY5 | MEM_F_KEEP_SUPP_MAPQ | MEM_F_NO_RESCUE | MEM_F_NOPAIRING;
         else if (c == 'q') opt->flag |= MEM_F_KEEP_SUPP_MAPQ;
         else if (c == 'u') opt->flag |= MEM_F_XB;
         else if (c == 'c') opt->max_occ = atoi(optarg), opt0.max_occ = 1;
@@ -2243,7 +2300,33 @@ int main_mem(int argc, char *argv[])
             opt->compat = t;
         }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
+        else if (c == OPT_DEDUP) {
+            /* Reject an explicit-but-empty CLI value (`--dedup=` / `--dedup ''`):
+             * mem_dedup_configure() treats an empty mode_arg as "no CLI value" and
+             * falls back to BWAMEM3_DEDUP, so without this guard a malformed flag
+             * would silently inherit the env instead of being fatal. */
+            if (!*optarg) {
+                fprintf(stderr, "ERROR: --dedup: expected off|on|auto, got empty value\n");
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            dedup_mode_arg = optarg;
+        }
+        else if (c == OPT_DEDUP_READS) {
+            /* Reject an explicit-but-empty CLI value, same as --dedup: an empty
+             * mode_arg reads as "no CLI value" in mem_dedup_reads_configure() and
+             * would silently inherit BWAMEM3_DEDUP_READS instead of being fatal. */
+            if (!*optarg) {
+                fprintf(stderr, "ERROR: --dedup-reads: expected off|on|auto, got empty value\n");
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            dedup_reads_mode_arg = optarg;
+        }
         else if (c == OPT_FAST) fast = 1;
+        else if (c == OPT_HUGE_PAGES) want_huge_pages = 1;
         else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
         else if (c == OPT_RESCUE_KMER) {
             /* Validated rather than atoi'd for the same reason as --chunk-cap
@@ -2355,7 +2438,15 @@ int main_mem(int argc, char *argv[])
             }
         }
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
-        else if (c == OPT_ADAPTIVE_BAND) opt->band_start = ADAPTIVE_BAND_START;
+        else if (c == OPT_ADAPTIVE_BAND) { if (!no_adaptive_band) opt->band_start = ADAPTIVE_BAND_START; opt->band_cert = 0; }
+        else if (c == OPT_NO_ADAPTIVE_BAND) { no_adaptive_band = 1; opt->band_start = 0; opt->band_cert = 0; }  /* disable adaptive
+                                                               * banding entirely: aggressive band off
+                                                               * AND certified band off -> exact
+                                                               * full-width extension, by construction. */
+        else if (c == OPT_NO_BAND_CERT) opt->band_cert = 0;   /* opt out of the certified adaptive
+                                                               * band -> full-width exact ladder;
+                                                               * output stays byte-identical, only
+                                                               * slower. Escape hatch + test A/B. */
         else if (c == OPT_EXTEND_MATE_CONCORDANT) {
             /* bare flag = auto (-1, use the estimated insert-size high bound);
              * =INT = fixed window in bp; =0 = off. */
@@ -2402,6 +2493,8 @@ int main_mem(int argc, char *argv[])
     }
 
     if (opt->n_threads < 1) opt->n_threads = 1;
+    mem_dedup_configure(dedup_mode_arg);   /* --dedup CLI > env BWAMEM3_DEDUP > default 'auto'; fatal on bad value */
+    mem_dedup_reads_configure(dedup_reads_mode_arg); /* --dedup-reads CLI > env BWAMEM3_DEDUP_READS > default 'auto'; fatal on bad value */
     /* A stray word on the command line slides silently into a positional slot.
      * Two spellings invite it:
      *   --meth taps        (optional argument: getopt_long only binds it with '=')
@@ -2619,9 +2712,16 @@ int main_mem(int argc, char *argv[])
                                                           * bwa-mem2 on equal-`re` ties) */
         opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
                                                           * meth-gated internally) */
-        opt->band_start = ADAPTIVE_BAND_START;           /* --adaptive-band: no-op on short reads
+        if (!no_adaptive_band)
+            opt->band_start = ADAPTIVE_BAND_START;        /* --adaptive-band: no-op on short reads
                                                           * (8-bit tier untouched), ~25% faster on
-                                                          * long-read (SBX/HiFi/ONT) runs. */
+                                                          * long-read (SBX/HiFi/ONT) runs.
+                                                          * --no-adaptive-band opts back out, keeping
+                                                          * band_start=0 (exact extension) here. */
+        opt->band_cert  = 0;                             /* --fast opts out of the certified (byte-identical)
+                                                          * band: either the aggressive band_start heuristic
+                                                          * above is in force, or --no-adaptive-band opted
+                                                          * back out to exact full-width extension. */
         /* --extend-mate-concordant (meth only): the top-5 chain cap regresses
          * bisulfite PE placement. Mechanism (instrumented on 50k sim-meth-place
          * pairs vs truth): NOT chain-dropping -- in 89% of regressions the read's
@@ -2698,6 +2798,13 @@ int main_mem(int argc, char *argv[])
          * -A (bwameth's constants assume a==1) and can be unit-tested. */
         mem_opt_apply_meth_defaults(opt, &opt0);
         aux.copy_comment = 1;          /* -C, needed for YS:Z/YC:Z passthrough */
+        /* The certified adaptive band is a non-meth optimization: --meth extension
+         * scores against the original 4-letter reference through per-strand
+         * asymmetric matrices, and its reads are short (no band win to reclaim), so
+         * keep the exact full-width ladder here rather than reason about the
+         * certificate under the meth matrices. (Also avoids the safety-envelope
+         * downgrade note firing on every --meth run.) */
+        opt->band_cert = 0;
     }
 
     /* Under --meth, NM/MD are derived from the scoring matrix (a column is a
@@ -2728,6 +2835,21 @@ int main_mem(int argc, char *argv[])
      * we just rebuilt, so -A/-B and the -x presets reach meth scoring (they set
      * opt->a/opt->b above; without this the meth matrices keep init-time defaults). */
     mem_opt_fill_meth_mat(opt);
+
+    /* Certified adaptive band: apply the narrow probe only inside the parameter
+     * envelope where the extension kernel's early-termination heuristics are
+     * provably quiescent (see mem_band_cert_params_safe). Outside it -- small
+     * -d/zdrop, large -L clip penalties, a custom -A/-B matrix scoring above the
+     * match reward -- fall back to the exact full-width ladder so output stays
+     * byte-identical for any parameters. Default parameters are inside the
+     * envelope, so this never fires on a plain run. Checked after the matrices are
+     * final because the envelope depends on max(mat). */
+    if (opt->band_cert && !mem_band_cert_params_safe(opt)) {
+        opt->band_cert = 0;
+        fprintf(stderr, "[M::%s] extension parameters (-d/-L/-A/-B/-O/-E) are outside the "
+                        "certified-band safety envelope; using exact full-width extension\n",
+                __func__);
+    }
 
     /* In --meth (D3) the canonical UX is "bwa-mem3 mem --meth ref.fa": we
      * auto-append ".meth" to find the converted SEED FM-index built by
@@ -2815,15 +2937,19 @@ int main_mem(int argc, char *argv[])
          * anywhere else in the run -- it changes MAPQ on rescued reads, so which way
          * it resolved has to be on the record. It applies under --meth too (the
          * anchor scan collapses to 3 letters there), so it is on both branches. */
+        /* Report the RESOLVED adaptive-band state: --no-adaptive-band opts back out
+         * (band_start=0), and like --rescue-kmer=0 that off-state is otherwise
+         * invisible in the run record, so spell it out on the audit line. */
+        const char *adaptive_band_label = opt->band_start ? "--adaptive-band" : "--no-adaptive-band";
         if (opt->meth_mode)
             /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
              * intentionally omitted from the meth audit line to reflect the effective levers.
-             * --adaptive-band is set unconditionally and applies under --meth, so it stays. */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
+             * --adaptive-band applies under --meth, so it stays (unless opted out). */
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d %s -s %d --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->split_width, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d %s --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         /* --fast also caps the batch size, which keeps the read/compute/write
          * pipeline overlapped at high -t. It re-partitions the input and so is not
          * byte-identical -- which --fast already is not -- hence it rides here
@@ -2854,6 +2980,10 @@ int main_mem(int argc, char *argv[])
     uint64_t tim = __rdtsc();
 
     fprintf(stderr, "* Ref file: %s\n", ref_prefix);
+    /* Opt-in --huge-pages: reserve 1 GB pages for the index BEFORE it is
+     * allocated below, so the FM-index / SA arrays land on them. Safe no-op when
+     * the host has no reserved 1 GB pool. See bwa_hugepages.{h,cpp}, issue #402. */
+    if (want_huge_pages) bwamem_reserve_huge_pages(ref_prefix);
     aux.fmi = new FMI_search(ref_prefix);
     /* D3 dual-index: the FM-index AND its BNS/PAC come from the `.meth` SEED prefix.
      * The seed BNS is required to decode seed positions into (seed contig, local pos,
@@ -2868,6 +2998,24 @@ int main_mem(int argc, char *argv[])
     aux.fmi->load_index(/*load_pac=*/!opt->meth_mode, /*n_threads=*/opt->n_threads);
     aux.shm_base = aux.fmi->shm_attached_base();
     tprof[FMI][0] += __rdtsc() - tim;
+
+#if SMEM_LOCKSTEP_N > 1
+    /* Resolve the phase-2 SMEM lockstep width once, before the seeding workers
+     * spawn: how many reads' FM-index walks the driver keeps in flight. Defaults
+     * to the compile-time SMEM_LOCKSTEP_N; BWA3_SMEM_LOCKSTEP_N pins an explicit
+     * value, and BWA3_SMEM_LOCKSTEP_PROBE opts into a startup memory-level-
+     * parallelism probe that chases the just-loaded cp_occ checkpoint array
+     * (opaque here: base, block count, block stride, and the byte offset of a
+     * 64-bit word per block). Width changes scheduling only, never output. */
+    bwa3_init_smem_lockstep_width(
+        aux.fmi->cp_occ_data(),
+        aux.fmi->cp_occ_size_bytes() / (int64_t)sizeof(CP_OCC),
+        sizeof(CP_OCC),
+        offsetof(CP_OCC, one_hot_bwt_str));
+    if (bwa_verbose >= 3)
+        fprintf(stderr, "[M::%s] phase-2 SMEM lockstep width: %d\n",
+                __func__, g_smem_lockstep_n);
+#endif
 
     /* D3: load the ORIGINAL reference's bns/pac as resident handles for the
      * (future) extension/scoring phase — distinct from the seed FM-index above.

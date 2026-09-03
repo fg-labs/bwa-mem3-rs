@@ -29,6 +29,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "bwamem.h"
+#include "read_memo.h"     /* --dedup-reads whole-read-pair memoization (Phase 1: measure-only) */
 #include "meth_xm.h"   /* meth_chem_t for the --meth chemistry default */
 #include "FMI_search.h"
 #include "smem_dedup.h"
@@ -37,9 +38,14 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "u8vec_scratch.h"
 #include "kvec.h"          /* kvec_t/kv_push/kv_resize used directly below */
 #include "pdqsort_wrap.h"
+#include "robin_hood.h"    /* per-batch DP-job dedup: missidx candidate map */
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
+#include <errno.h>         /* errno/ERANGE: full-string parse of the dedup env knobs */
 #include <strings.h>       /* strcasecmp in mem_opt_parse_meth_tags */
-#include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock */
+#include <atomic>          /* net-cycles auto-dedup controller state */
+#include <chrono>          /* net-cycles auto-dedup controller timing */
+#include <cmath>           /* std::isfinite: reject nan/inf BWAMEM3_DEDUP_Z */
+#include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock; net-cycles Welford state */
 #include <string>          /* BWAMEM3_DUMP_PAIRS per-batch row buffer */
 
 #include "sam_encode.h"
@@ -82,6 +88,32 @@ static_assert(sizeof(mem_chain_t) == 48,
               "sizeof(mem_chain_t) feeds klib kbtree node fan-out; changing it moves default "
               "output at chain_cmp .pos ties. Repack fields into the bitfield word, don't append.");
 
+/* RAII holder for the per-thread persistent chaining B-tree used in
+ * mem_chain_seeds. The tree is init'd once per thread (not once per read) and
+ * kb_reset between reads to remove per-read kb_init/kb_destroy malloc churn;
+ * this destructor kb_destroy's it at thread exit so the thread_local stays
+ * leak-clean under ASan, matching the house-style u8vec_scratch_t. */
+namespace {
+struct ChnTreeScratch {
+    kbtree_t(chn) *t;
+    ChnTreeScratch() : t(kb_init(chn, KB_DEFAULT_SIZE + 8)) {} // +8, counters in chain
+    ~ChnTreeScratch() { if (t) kb_destroy(chn, t); }
+    ChnTreeScratch(const ChnTreeScratch&) = delete;
+    ChnTreeScratch& operator=(const ChnTreeScratch&) = delete;
+};
+} // namespace
+
+/* #309: `w` shares its 32-bit word with kept:2, is_alt:1 and meth_hypothesis:2.
+ * Narrowing `w` to make room for something else is the drift this catches --
+ * mem_chain_weight() saturates at MEM_CHAIN_W_MAX, so a narrower field would
+ * silently start wrapping again. Widening it past the word is caught by the
+ * sizeof assert above; this one catches the other direction. */
+static_assert(MEM_CHAIN_W_BITS + 2 + 1 + 2 == 32,
+              "mem_chain_t's bitfield word is full: w + kept + is_alt + meth_hypothesis must be "
+              "exactly 32 bits. If w is narrowed, MEM_CHAIN_W_MAX follows it and mem_chain_weight "
+              "keeps saturating correctly -- but re-check that the new max still exceeds any "
+              "reachable chain weight (bounded by query length).");
+
 #define intv_lt1(a, b) ((((uint64_t)(a).m) <<32 | ((uint64_t)(a).n)) < (((uint64_t)(b).m) <<32 | ((uint64_t)(b).n)))  // trial
 KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 
@@ -118,10 +150,13 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  *   - len1 >= len2 (target >= query) : the gscore (query-end) capture is
  *     byte-identical to scalar only when the query-end column lies on/left of
  *     the main diagonal. See smithWaterman128_8 gscore capture.
- *   - w <= BSW8_MAX_W (= 127)     : every band/position quantity is encoded
- *     as a diagonal offset d = j - i in [-w, +w], which fits signed int8
- *     only for w <= 127. The default opt->w = 100 qualifies; wide-band
- *     retries (w doubling to 200/400/800) do NOT and fall back to 16-bit.
+ *   - w <= BSW8_MAX_W (= 124)     : the band/position quantities are encoded as
+ *     signed-int8 diagonal offsets spanning [-(w+1), w+3] (the band-grow term
+ *     `myband+1` and the tail-trim term `index+2`, which reaches w+3). The
+ *     positive edge w+3 must fit signed int8, so w <= 124; at w >= 125 it wraps
+ *     past +127, the band collapses and lanes die mid-alignment. The default
+ *     opt->w = 100 qualifies; wide-band retries (w doubling to 200/400/800) do
+ *     NOT and fall back to 16-bit.
  *   - zdrop + maxStep <= 253      : zdrop is broadcast into the DP as a byte
  *     (_mm256_set1_epi8), so it must fit one, and the maxStep headroom keeps the
  *     z-drop comparison from wrapping at the top of the range. The DP body AND
@@ -142,7 +177,11 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  * the bin to be in range; that is a histogram-sizing constraint, NOT the tier
  * decision. Pairs failing this envelope fall through to the existing 16-bit
  * (then scalar) buckets exactly as before. */
-#define BSW8_MAX_W 127                 /* max band: diagonal offset d=j-i must fit signed int8 */
+#define BSW8_MAX_W 124                 /* max band: the diagonal-offset encoding spans
+                                          [-(w+1), w+3] (band-grow `myband+1`, tail-trim
+                                          `index+2` reaching w+3), all int8, so w <= 124.
+                                          At w>=125 the positive edge wraps past +127:
+                                          the band collapses and lanes die mid-alignment. */
 #define BSW8_MAX_ZDROP_STEP 253        /* zdrop is broadcast into the DP as a byte
                                           (_mm256_set1_epi8), so it must fit one, and the
                                           max_step headroom keeps the z-drop comparison from
@@ -295,12 +334,175 @@ KSORT_INIT(mem_flt, mem_chain_t, flt_lt)
  * retrying to that band while a diagonal-hugging pair (chain_band=0) accepts in
  * one tight pass. The 8-bit tier stays at opt->w (its int8 diagonal encoding caps
  * at 127, and short extensions are sub-band so gain nothing). tight_band keeps its
- * ungapped-estimate accept-early role. band_start<=0 (default): INIT_W==opt->w and
- * ACCEPT_PAIR reduces to the original condition -> byte-identical. */
-#define INIT_W(w) (opt->band_start > 0 ? min_(opt->band_start, (w)) : (w))
+ * ungapped-estimate accept-early role. band_start<=0 with band_cert off: INIT_W==opt->w and
+ * ACCEPT_PAIR reduces to the original full-width condition -> byte-identical.
+ *
+ * NOTE: the DEFAULT is now the sound band_cert path below (band_cert=1), which narrows to
+ * ADAPTIVE_BAND_START and is byte-identical via a per-pair certificate. This band_start path is
+ * the separate opt-in AGGRESSIVE narrowing selected by --adaptive-band / --fast (band_cert=0),
+ * which trades byte-identity for more speed via the max_off "converged" heuristic above. */
+/* ------------------------------------------------------------------------
+ * Sound (byte-identical) adaptive extension band  [opt->band_cert, default on]
+ *
+ * Runs one narrow probe at ADAPTIVE_BAND_START and finalizes only the pairs it can
+ * PROVE are already optimal there; every other pair falls through to the standard
+ * ceiling ladder and is scored exactly as the non-adaptive path scores it. So the
+ * output is bit-for-bit identical to a full-width extension, while the proven-narrow
+ * pairs skip the wide DP.
+ *
+ * Certificate: a gapped alignment reaching diagonal offset d costs >= o_min + d*e_min,
+ * so its best possible score is h0 + min_len*a - o_min - d*e_min. That can tie-or-beat
+ * the achieved score S only for d <= floor((h0 + min_len*a - o_min - S)/e_min) =: d_max.
+ * If the width-w band covers every such offset (w >= d_max) no tying/better alignment
+ * exists beyond w -> the width-w cell set (hence the optimal score) matches the ceiling.
+ * Recall of the optimal score is 100% by construction. */
+static inline bool band_cert_ok(int S, int h0, int len1, int len2, int w, const mem_opt_t *opt) {
+    int min_len = len1 < len2 ? len1 : len2;
+    int o_min = opt->o_del < opt->o_ins ? opt->o_del : opt->o_ins;
+    int e_min = opt->e_del < opt->e_ins ? opt->e_del : opt->e_ins;
+    if (e_min <= 0) return false;
+    long num = (long)h0 + (long)min_len * opt->a - o_min - (long)S;
+    if (num < 0) return true;                 /* no gapped alt can even tie */
+    long d_max = num / e_min;                  /* largest offset that could tie/beat S */
+    return (long)w >= d_max;                   /* band covers all tying offsets */
+}
+/* Rung count: narrowing tiers (init_w < opt->w) get one extra rung so the narrow probe
+ * sits ahead of the full ceiling ladder [opt->w, 2w, 4w, 8w]. */
+static inline int band_cert_nband(int init_w, const mem_opt_t *opt) {
+    return (init_w < opt->w) ? MAX_BAND_TRY + 1 : MAX_BAND_TRY;
+}
+/* Width per rung: narrowing tiers -> [init_w, opt->w, 2w, 4w, 8w]; already-wide tiers ->
+ * the standard ladder [opt->w, 2w, 4w, 8w]. */
+static inline int32_t band_cert_width(int init_w, int i, const mem_opt_t *opt) {
+    if (init_w < opt->w) return (i == 0) ? (int32_t)init_w : (int32_t)(opt->w << (i - 1));
+    return (int32_t)(opt->w << i);
+}
+/* Accept: at the narrow probe (w < opt->w) finalize only on the certificate AND the clip
+ * guard (the pair must reach the query end within the clip penalty of the local max, so a
+ * band-truncated gscore cannot drive the clip-vs-extend choice at bwamem.cpp's clip
+ * branch). Uncertified pairs fall to w >= opt->w and use the standard ceiling-ladder
+ * accept clause -> identical to the non-adaptive path.
+ *
+ * GAP2 (the "restore" at each retry site): before this accept test the caller runs
+ * `prev = a->score; a->score = sp->score;`, so the narrow probe overwrites a->score with
+ * the width-w0 score. For a pair that fails to certify here, the retry loops restore
+ * `a->score = prev` so the opt->w rung reads the pre-probe a->score as its `prev` -- exactly
+ * what the non-adaptive ladder reads -- and the `score == prev` converged-accept fires
+ * identically. The narrow rung writes no other a->* field before acceptance, so restoring
+ * a->score fully un-pollutes the ladder. */
+static inline bool band_cert_accept(int sc, int pv, int mo, int w, int tb, int i, int nband,
+                                    const SeqPair *sp, const mem_opt_t *opt) {
+    if (w < opt->w) {
+        /* Left extensions clip on pen_clip5, right on pen_clip3; this accept is shared by both
+         * directions, so guard with the smaller penalty -> the strictest threshold, which can only
+         * under-certify (widen), never wrongly certify, under an asymmetric -L. */
+        int pen_clip = opt->pen_clip5 < opt->pen_clip3 ? opt->pen_clip5 : opt->pen_clip3;
+        /* Anchor the certificate on S - pen_clip, not S. band_cert_ok(S) alone only proves the
+         * LOCAL max S (and its qle/tle) is band-invariant; a certified branch-B pair, however,
+         * finalizes with the query-END gscore VALUE and gtle (truesc = gscore, rb -= gtle). Those
+         * are a max over the last query row and can still grow when the band widens -- unless we
+         * prove no out-of-band cell reaches even S - pen_clip. Since an accepted pair has
+         * gscore > S - pen_clip (branch B), certifying at S - pen_clip forces every out-of-band
+         * cell (incl. last-row) below the narrow gscore, so gscore's value, gtle, AND the
+         * clip-vs-extend decision (threshold S - pen_clip5/pen_clip3 >= S - pen_clip) are all
+         * band-invariant. This subsumes the old separate clip guard's soundness role. */
+        if (!band_cert_ok(sc - pen_clip, sp->h0, sp->len1, sp->len2, w, opt)) return false;
+        return sp->gscore > 0 && sp->gscore > sc - pen_clip;
+    }
+    return (i + 1 == nband) || (tb > 0 && w >= tb) || (sc == pv || mo < ((w >> 1) + (w >> 2)));
+}
+static inline int band_cert_mat_max(const int8_t *mat) {
+    int mx = mat[0];
+    for (int k = 1; k < 25; ++k) if (mat[k] > mx) mx = mat[k];
+    return mx;
+}
+/* Runtime safety envelope for the certified adaptive band.
+ *
+ * band_cert_ok proves the OPTIMAL SCORE (and, with the S - pen_clip anchor, the
+ * accepted pair's gscore value / gtle / clip decision) is band-invariant. It does
+ * NOT bound the extension kernel's early-termination CONTROL FLOW: the zdrop break,
+ * the all-zero-row (m==0) break, and the band-edge shrink read cells (out-of-band,
+ * and in-band cells near the edge whose out-of-band neighbours differ between a
+ * narrow and a wide run) that the certificate does not pin. In principle the narrow
+ * probe and the full-width run can therefore terminate at different rows and report
+ * a different gscore/gtle. On real reads this does not manifest even far from
+ * default parameters, but it is only PROVABLY absent inside a parameter envelope
+ * where those heuristics cannot diverge; outside it we fall back to the exact
+ * full-width ladder (byte-identical for any -d/-L/-O/-E/-A/-B).
+ *
+ * Each condition is conservative -- it can only DISABLE the probe, never wrongly
+ * enable it -- and default parameters are inside the envelope (so this is a no-op
+ * at defaults and the ~3% win is preserved):
+ *   - e_min > 0                                 division guard.
+ *   - max(mat) <= opt->a                        the certificate uses opt->a as the
+ *       per-column ceiling (num = h0 + min_len*a - ...); a custom or meth matrix
+ *       scoring above a would break that bound. opt->a >= max(mat) keeps it a valid
+ *       (conservative) ceiling, so band_cert_ok needs no matrix argument.
+ *   - max(pen_clip5,pen_clip3) < o_min + e_min  no gapped path can reach within a
+ *       clip penalty of the local max, closing the clip/gtle tie channel on either
+ *       extension direction.
+ *   - zdrop > o_min + (2*w0+1)*e_max + w0*a      a certified pair wastes <= w0*e_min
+ *       and its optimal excursion is <= w0; this bounds the running-max lead an
+ *       out-of-band cell can give the wide run, so neither run can zdrop where the
+ *       other survives. Default zdrop=100 clears the default bound of 67.
+ *   - (opt->w>>1)+(opt->w>>2) > w0 + 1 + (opt->a-1)/e_min   a certified pair finalizes
+ *       at the narrow rung with a->w = max(a->w_init=opt->w, w0) = opt->w. The full-width
+ *       ladder must reach the same a->w, i.e. accept the pair at its first rung (w=opt->w)
+ *       via the max_off heuristic max_off < (w>>1)+(w>>2). max_off advances only on a cell
+ *       that beats the running max (bandedSWA.cpp: `if (m > max) max_off = max(max_off,
+ *       |mj-i|)`), and that running max is propped by the optimal path itself; combined
+ *       with the certificate bounding gains, every record-setting offset on the wide run
+ *       is < w0 + 1 + (a-pen_clip-1)/e_min <= w0 + 1 + (a-1)/e_min. Requiring the rung
+ *       threshold to exceed that guarantees rung-1 acceptance, so a->w converges on both
+ *       paths (else it would diverge -- opt->w vs a widened value -- feeding mem_patch_reg
+ *       / mem_reg2aln). A within-w0 pair meets it at defaults; a custom small -w
+ *       (opt->w ~ 21..26) or a large -A can fail it, and we fall back to the exact ladder.
+ *       Default opt->w=100, a=1 -> 75 > 21. */
+/* Envelope check at an arbitrary probe width w0. The two w0-dependent conditions (the
+ * zdrop margin and the a->w first-rung-accept condition) TIGHTEN monotonically as w0 grows,
+ * so `_w(opt, W) == 1` implies `_w(opt, W') == 1` for every W' <= W. The startup gate below
+ * evaluates this at w0 = ADAPTIVE_BAND_START = 20; the certified probe rung re-evaluates it
+ * at each wider bucket ceiling (Gate B) so it may only route a pair to a wider band when the
+ * control-flow envelope still provably holds AT that band. The parameter-only conditions
+ * (e_min>0, a_max<=a, pen_clip<o_min+e_min) are w0-independent and carry over unchanged. */
+static int mem_band_cert_params_safe_w(const mem_opt_t *opt, int w0) {
+    int o_min = min_(opt->o_del, opt->o_ins);
+    int e_min = min_(opt->e_del, opt->e_ins);
+    int e_max = max_(opt->e_del, opt->e_ins);
+    int pen_clip_max = max_(opt->pen_clip5, opt->pen_clip3);
+    if (e_min <= 0) return 0;
+    int a_max = band_cert_mat_max(opt->mat);
+    if (opt->meth_mode) {
+        a_max = max_(a_max, max_(band_cert_mat_max(opt->mat_ot), band_cert_mat_max(opt->mat_ob)));
+    }
+    if (a_max > opt->a) return 0;
+    if (pen_clip_max >= o_min + e_min) return 0;
+    long zmargin = (long)o_min + (long)(2 * w0 + 1) * e_max + (long)w0 * opt->a;
+    if ((long)opt->zdrop <= zmargin) return 0;
+    if ((opt->w >> 1) + (opt->w >> 2) <= w0 + 1 + (opt->a - 1) / e_min) return 0;
+    return 1;
+}
+int mem_band_cert_params_safe(const mem_opt_t *opt) {
+    return mem_band_cert_params_safe_w(opt, ADAPTIVE_BAND_START);
+}
+#define BAND_NBAND(init_w) (opt->band_cert ? band_cert_nband((init_w), opt) : MAX_BAND_TRY)
+#define BAND_WIDTH(init_w,i) (opt->band_cert ? band_cert_width((init_w), (i), opt) : ((int32_t)((init_w) << (i))))
+#define INIT_W(w) (opt->band_cert ? min_(ADAPTIVE_BAND_START, (w)) \
+                   : (opt->band_start > 0 ? min_(opt->band_start, (w)) : (w)))
+/* The band_cert branch does not consult chain_band (cb): cb only gates the
+ * aggressive band_start narrowing, and band_cert is mutually exclusive with it
+ * -- band_cert=1 implies band_start=0 (the default), while --adaptive-band/--fast
+ * set band_start>0 AND band_cert=0. No CLI path enables both, so cb has no role
+ * under the certificate; band_cert_accept is a pure per-pair proof + clip guard.
+ *
+ * Implicit captures (like the sibling INIT_W/BAND_WIDTH macros): ACCEPT_PAIR reads
+ * `opt`, `sp`, and `init_w` from the calling scope in addition to its parameters --
+ * every retry-loop call site has all three in scope with those exact names. */
 #define ACCEPT_PAIR(sc,pv,mo,w,tb,cb,i) \
-    ((i)+1==MAX_BAND_TRY || ((tb)>0 && (w)>=(tb)) || \
-     (((sc)==(pv) || (mo) < ((w)>>1)+((w)>>2)) && (opt->band_start <= 0 || (w) >= (cb))))
+    (opt->band_cert \
+      ? band_cert_accept((sc),(pv),(mo),(w),(tb),(i),band_cert_nband(init_w,opt),sp,opt) \
+      : ((i)+1==MAX_BAND_TRY || ((tb)>0 && (w)>=(tb)) || \
+         (((sc)==(pv) || (mo) < ((w)>>1)+((w)>>2)) && (opt->band_start <= 0 || (w) >= (cb)))))
 //------------------------------------------------------------------
 // Alignment: Construct the alignment from a chain *
 
@@ -371,6 +573,7 @@ mem_opt_t *mem_opt_init()
     o->alnreg_sort_fast = 0;  // off by default -> bwa-mem2's dedup sort (see mem_sort_dedup_patch); set by --fast
     o->skip_contained_ext = 0;   // off by default; opt-in via --skip-contained-ext (byte-identical)
     o->band_start  = 0;   // off by default (adaptive chain-geometry band); opt-in via --adaptive-band
+    o->band_cert   = 1;   // on by default: sound (byte-identical) adaptive band via per-pair tie-break certificate
     o->split_width = 10;
     o->max_occ = 500;
     o->max_chain_gap = 10000;
@@ -585,23 +788,31 @@ PDQSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
  * worth paying there for either. */
 #define DEDUP_SORT_PDQ_MIN 9
 
+/* Geometric-growth backing for the per-thread dedup scratch buffers below.
+ * Grows `s` to hold at least `want` bytes, doubling to amortize repeated calls.
+ * realloc returns storage suitably aligned for mem_alnreg_t and the pair types.
+ * Returns the buffer, or NULL on allocation failure -- leaving the existing
+ * buffer intact so the caller can take the exact (introsort) fallback. */
+static inline void *scratch_grow(u8vec_scratch_t &s, size_t want)
+{
+    if (s.v.m < want) {
+        size_t cap = s.v.m * 2;
+        if (cap < want) cap = want;
+        uint8_t *p = (uint8_t *)realloc(s.v.a, cap);
+        if (p == NULL) return NULL;   /* keep the existing buffer intact */
+        s.v.a = p;
+        s.v.m = cap;
+    }
+    return s.v.a;
+}
+
 /* Per-thread save buffer, grown geometrically and released at thread exit. Held
- * as bytes so it can reuse the u8vec scratch holder; realloc returns storage
- * suitably aligned for mem_alnreg_t. Returns NULL only if the allocation fails,
- * in which case the caller takes the exact (introsort) path. */
+ * as bytes so it can reuse the u8vec scratch holder. Returns NULL only if the
+ * allocation fails, in which case the caller takes the exact (introsort) path. */
 static inline mem_alnreg_t *alnreg_save_buf(int n)
 {
     static thread_local u8vec_scratch_t save;
-    const size_t want = (size_t)n * sizeof(mem_alnreg_t);
-    if (save.v.m < want) {
-        size_t cap = save.v.m * 2;
-        if (cap < want) cap = want;
-        uint8_t *p = (uint8_t *)realloc(save.v.a, cap);
-        if (p == NULL) return NULL;   /* keep the existing buffer intact */
-        save.v.a = p;
-        save.v.m = cap;
-    }
-    return (mem_alnreg_t *)save.v.a;
+    return (mem_alnreg_t *)scratch_grow(save, (size_t)n * sizeof(mem_alnreg_t));
 }
 
 /* Emit `static void fn(int n, mem_alnreg_t *a)` that sorts `a` exactly as
@@ -645,6 +856,141 @@ void bwamem3_dedup_sort_by_re_exact(int n, mem_alnreg_t *a)    { ks_introsort(me
 void bwamem3_dedup_sort_by_score(int n, mem_alnreg_t *a)       { dedup_sort_by_score(n, a); }
 /* The closing by-score sort bwa-mem2 runs, i.e. the oracle for the above. */
 void bwamem3_dedup_sort_by_score_exact(int n, mem_alnreg_t *a) { ks_introsort(mem_ars, n, a); }
+
+/*----------------------------------------------------------------------------
+ * Permutation-gather dedup sorts (default path).
+ *
+ * The in-place dedup_sort_by_re/_by_score above keep bwa-mem2 parity on tied
+ * `re` (klib introsort's unstable permutation) by saving the whole array aside
+ * on every call >= DEDUP_SORT_PDQ_MIN, so a tie can be resolved by restoring and
+ * re-running ks_introsort. That 112-byte-per-element save-copy is paid on 100%
+ * of calls to cover the ~1% that actually tie.
+ *
+ * These variants remove it. They sort (key, index) pairs -- 16 or 24 bytes, not
+ * 112 -- with the SAME algorithms (pdqsort when tie-free, klib ks_introsort on a
+ * tie), so the index order is exactly the permutation the in-place sort would
+ * apply, ties included; then one gather materialises the records into a separate
+ * `dst`. Since `src` is never overwritten, the tie fallback just rebuilds and
+ * re-sorts the cheap pairs -- there is no struct save-copy. Each swap during the
+ * sort moves a pair; the records move exactly once, at the gather.
+ *
+ * `dst` differs from `src`, so mem_sort_dedup_patch alternates its two sorts
+ * src<->scratch (an A/B ping-pong) to land the final records back in the
+ * caller's own array. Byte-identity to unconditional ks_introsort is asserted in
+ * test/unit/test_alnreg_sort_dedup.cpp via the same harness as the in-place
+ * fast paths.
+ *--------------------------------------------------------------------------*/
+
+typedef struct { int64_t re;    uint32_t idx; } dedup_pair_re;
+typedef struct { int score; int64_t rb; int qb; uint32_t idx; } dedup_pair_sc;
+
+/* Pair comparators MUST mirror the record comparators' keys exactly:
+ * dedup_pre_lt == alnreg_slt2_m2 (re only); dedup_psc_lt == alnreg_slt. */
+#define dedup_pre_lt(a, b) ((a).re < (b).re)
+#define dedup_psc_lt(a, b) ((a).score > (b).score || ((a).score == (b).score && \
+                            ((a).rb < (b).rb || ((a).rb == (b).rb && (a).qb < (b).qb))))
+KSORT_INIT(dedup_pre, dedup_pair_re, dedup_pre_lt)
+KSORT_INIT(dedup_psc, dedup_pair_sc, dedup_psc_lt)
+PDQSORT_INIT(dedup_pre, dedup_pair_re, dedup_pre_lt)
+PDQSORT_INIT(dedup_psc, dedup_pair_sc, dedup_psc_lt)
+
+/* Below this the pair indirection costs more than the 112-byte moves it saves,
+ * and the in-place path pays no save-copy there anyway (< DEDUP_SORT_PDQ_MIN). */
+#define DEDUP_PERM_MIN 9
+
+/* Thread-local scratch for the (key,index) pairs and the record gather target,
+ * each grown geometrically and reused across calls (bytes-backed to share the
+ * u8vec holder). Return NULL only on allocation failure, leaving the existing
+ * buffer intact; the caller then takes the in-place path. */
+static inline void *dedup_pair_buf(size_t want)
+{
+    static thread_local u8vec_scratch_t pairs;
+    return scratch_grow(pairs, want);
+}
+static inline mem_alnreg_t *dedup_gather_buf(int n)
+{
+    static thread_local u8vec_scratch_t gather;
+    return (mem_alnreg_t *)scratch_grow(gather, (size_t)n * sizeof(mem_alnreg_t));
+}
+
+/* Sort `src` into `dst` by `re` (the default comparator), reproducing
+ * ks_introsort(mem_ars2_m2)'s array exactly. On pair-buffer OOM, falls back to an
+ * in-place introsort on a straight copy -- still byte-identical. */
+static void dedup_perm_sort_by_re(int n, const mem_alnreg_t *src, mem_alnreg_t *dst)
+{
+    /* The gather below reads `src` and writes `dst`; they must be distinct
+     * buffers. mem_sort_dedup_patch guarantees this by ping-ponging the caller
+     * array against the thread-local gather scratch (dedup_gather_buf), so `scr`
+     * owns that buffer for the whole call. Aliasing would corrupt records with
+     * no diagnostic, so catch it in all builds -- xassert fires under -DNDEBUG,
+     * unlike assert, which would compile the check out on the release path. */
+    xassert(src != dst, "dedup permutation sort requires distinct source and destination buffers");
+    dedup_pair_re *p =
+        (dedup_pair_re *)dedup_pair_buf((size_t)n * sizeof(dedup_pair_re));
+    if (p == NULL) {
+        memcpy(dst, src, (size_t)n * sizeof(*src));
+        ks_introsort(mem_ars2_m2, n, dst);
+        return;
+    }
+    for (int i = 0; i < n; ++i) { p[i].re = src[i].re; p[i].idx = (uint32_t)i; }
+    pdqsort_dedup_pre((size_t)n, p);
+    int tie = 0;
+    for (int i = 1; i < n; ++i)
+        if (!dedup_pre_lt(p[i - 1], p[i])) { tie = 1; break; }
+    if (tie) {  /* restore the pairs and reproduce introsort's permutation */
+        for (int i = 0; i < n; ++i) { p[i].re = src[i].re; p[i].idx = (uint32_t)i; }
+        ks_introsort_dedup_pre((size_t)n, p);
+    }
+    for (int i = 0; i < n; ++i) dst[i] = src[p[i].idx];  /* the single gather */
+}
+
+/* The by-score analogue, reproducing ks_introsort(mem_ars). */
+static void dedup_perm_sort_by_score(int n, const mem_alnreg_t *src, mem_alnreg_t *dst)
+{
+    xassert(src != dst, "dedup permutation sort requires distinct source and destination buffers");  /* see dedup_perm_sort_by_re: src/dst must not alias */
+    dedup_pair_sc *p =
+        (dedup_pair_sc *)dedup_pair_buf((size_t)n * sizeof(dedup_pair_sc));
+    if (p == NULL) {
+        memcpy(dst, src, (size_t)n * sizeof(*src));
+        ks_introsort(mem_ars, n, dst);
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        p[i].score = src[i].score; p[i].rb = src[i].rb; p[i].qb = src[i].qb;
+        p[i].idx = (uint32_t)i;
+    }
+    pdqsort_dedup_psc((size_t)n, p);
+    int tie = 0;
+    for (int i = 1; i < n; ++i)
+        if (!dedup_psc_lt(p[i - 1], p[i])) { tie = 1; break; }
+    if (tie) {
+        for (int i = 0; i < n; ++i) {
+            p[i].score = src[i].score; p[i].rb = src[i].rb; p[i].qb = src[i].qb;
+            p[i].idx = (uint32_t)i;
+        }
+        ks_introsort_dedup_psc((size_t)n, p);
+    }
+    for (int i = 0; i < n; ++i) dst[i] = src[p[i].idx];
+}
+
+/* Exposed for test/unit/test_alnreg_sort_dedup.cpp: thin in-place wrappers (perm
+ * into the gather scratch, then copy back) so the byte-identity harness -- which
+ * drives an in-place sort_fn -- can validate the src->dst core. The hot path in
+ * mem_sort_dedup_patch calls the core directly and never copies back. */
+void bwamem3_dedup_perm_sort_by_re(int n, mem_alnreg_t *a)
+{
+    mem_alnreg_t *tmp = dedup_gather_buf(n);
+    if (tmp == NULL) { ks_introsort(mem_ars2_m2, n, a); return; }
+    dedup_perm_sort_by_re(n, a, tmp);
+    memcpy(a, tmp, (size_t)n * sizeof(*a));
+}
+void bwamem3_dedup_perm_sort_by_score(int n, mem_alnreg_t *a)
+{
+    mem_alnreg_t *tmp = dedup_gather_buf(n);
+    if (tmp == NULL) { ks_introsort(mem_ars, n, a); return; }
+    dedup_perm_sort_by_score(n, a, tmp);
+    memcpy(a, tmp, (size_t)n * sizeof(*a));
+}
 
 #define alnreg_hlt(a, b)  ((a).score > (b).score || ((a).score == (b).score && ((a).is_alt < (b).is_alt || ((a).is_alt == (b).is_alt && (a).hash < (b).hash))))
 KSORT_INIT(mem_ars_hash, mem_alnreg_t, alnreg_hlt)
@@ -799,13 +1145,26 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
     if (mat == NULL) mat = opt->mat;
     int m, i, j;
     if (n <= 1) return n;
+
+    /* The default path reorders the 112-byte records by sorting a (key,index)
+     * permutation and gathering once, which drops the per-call save-copy the
+     * in-place tie-detection scheme pays (dedup_perm_sort_by_re/_by_score). The
+     * gather writes a DIFFERENT buffer than it reads, so the two sorts ping-pong
+     * a<->scr and the final records land back in the caller's own array `a_orig`.
+     * `scr` is the gather target, sized to the entry n; NULL disables the
+     * permutation form (small n, --fast, or scratch OOM), leaving the exact
+     * in-place behaviour. The dedup loop below operates on `a`, which the sort1
+     * swap may repoint at `scr`. */
+    mem_alnreg_t *const a_orig = a;
+    mem_alnreg_t *scr = (!opt->alnreg_sort_fast && n >= DEDUP_PERM_MIN)
+                        ? dedup_gather_buf(n) : NULL;
+
     /* Default: bwa-mem2's re-only comparator, ordered exactly as klib introsort
-     * would order it -- dedup_sort_by_re runs pdqsort and restores-and-introsorts
-     * only on a tie -- reproducing upstream's dedup outcome. --fast: strict total
-     * order + pdqsort unconditionally, which skips the save-copy and the tie scan
-     * but resolves equal-`re` ties differently. */
+     * would order it -- reproducing upstream's dedup outcome. --fast: strict total
+     * order + pdqsort unconditionally, resolving equal-`re` ties differently. */
     if (opt->alnreg_sort_fast) pdqsort_mem_ars2(n, a);       // sort by the END position, not START!
-    else                       dedup_sort_by_re(n, a);
+    else if (scr) { dedup_perm_sort_by_re(n, a, scr); mem_alnreg_t *t = a; a = scr; scr = t; }
+    else           dedup_sort_by_re(n, a);
 
     for (i = 0; i < n; ++i) a[i].n_comp = 1;
     for (i = 1; i < n; ++i)
@@ -849,8 +1208,15 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
             else ++m;
         }
     n = m;
-    if (opt->alnreg_sort_fast) pdqsort_mem_ars(n, a);
-    else                       dedup_sort_by_score(n, a);
+    if (opt->alnreg_sort_fast)                 pdqsort_mem_ars(n, a);
+    else if (scr && n >= DEDUP_PERM_MIN) { dedup_perm_sort_by_score(n, a, scr); mem_alnreg_t *t = a; a = scr; scr = t; }
+    else                                       dedup_sort_by_score(n, a);
+    /* Return the records to the caller's own buffer. With both sorts permuting
+     * (the common large-n case) the a<->scr ping-pong already leaves `a == a_orig`
+     * and this is a no-op; the copy only runs when an odd number of gathers landed
+     * the data in `scr` (e.g. dedup shrank n below DEDUP_PERM_MIN before sort2),
+     * and then only over the few surviving records. */
+    if (a != a_orig) memcpy(a_orig, a, (size_t)n * sizeof(*a));
     /* The historical post-sort exact-duplicate passes (mark then exclude regions
      * sharing (score, rb, qb)) have been removed: they are provably dead. Any two
      * regions with equal (rb, qb) have the shorter fully contained in the longer,
@@ -976,7 +1342,11 @@ int mem_chain_weight(const mem_chain_t *c)
         rend = rend > s->rbeg + s->len? rend : s->rbeg + s->len;
     }
     w = wq < wr? wq : wr;
-    return w < 1<<30? w : (1<<30)-1;
+    /* Saturate at what mem_chain_t::w can actually hold. The clamp used to be
+     * (1<<30)-1, three bits wider than the field, so a weight in [2^27, 2^30)
+     * wrapped to a small number on store instead of staying large (#309). The
+     * shared MEM_CHAIN_W_MAX keeps the two in step. */
+    return w < (int)MEM_CHAIN_W_MAX ? w : (int)MEM_CHAIN_W_MAX;
 }
 
 void mem_print_chain(const bntseq_t *bns, mem_chain_v *chn)
@@ -1410,17 +1780,24 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
     }
     else
     {
-        /* Slot 0's seeds are freed LATE. If every chain is dropped the array is
-         * never compacted, so a_[0] still holds chain 0 -- and the empty-array
-         * path below hands exactly that slot back to the caller with kept = 3
-         * (bwa-mem2 behaviour, preserved verbatim; see the CHN-6/19 note).
-         * bwa-mem2 frees those seeds here and then returns the chain pointing at
-         * the freed block, so what the caller extends depends on whether the
-         * allocator has reused it. Deferring this one free yields the same chain
-         * with its own seeds still intact -- the result bwa-mem2 produces
-         * whenever the block is untouched -- without the use-after-free. When at
-         * least one chain survives, slot 0 was either kept or overwritten by
-         * compaction, and the seeds are freed immediately after the loop. */
+        /* Slot 0's seeds are freed LATE *when the target resurrects slot 0*. If
+         * every chain is dropped the array is never compacted, so a_[0] still
+         * holds chain 0, and the empty-array path below hands exactly that slot
+         * back to the caller with kept = 3 (bwa-mem2 behaviour; see the CHN-6/19
+         * note). bwa-mem2 frees those seeds here and then returns the chain
+         * pointing at the freed block, so what the caller extends depends on
+         * whether the allocator has reused it. Deferring this one free yields the
+         * same chain with its own seeds still intact -- the result bwa-mem2
+         * produces whenever the block is untouched -- without the use-after-free.
+         * When at least one chain survives, slot 0 was either kept or overwritten
+         * by compaction, and the seeds are freed immediately after the loop.
+         *
+         * Under a target that does NOT resurrect (--compat=bwa-mem), nothing
+         * reads slot 0 again, so the deferral has nothing to protect and holding
+         * the pointer past the early return below would simply leak it. Free it
+         * in the loop, exactly as bwa does. */
+        const int resurrect_empty =
+            (opt->compat == NULL) || opt->compat->chain_flt_resurrect_empty;
         mem_seed_t *slot0_seeds = NULL;
         for (i = k = 0; i < n_chn_; ++i)
         {
@@ -1431,7 +1808,7 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
             {
                 if (c->m > SEEDS_PER_CHAIN)  // CHN-16: dead tprof[PE11] counter removed
                 {
-                    if (i == 0) slot0_seeds = c->seeds;  // may be resurrected below
+                    if (i == 0 && resurrect_empty) slot0_seeds = c->seeds;  // may be resurrected below
                     else free(c->seeds);
                 }
             }
@@ -1440,6 +1817,15 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
         // Not resurrected -- drop it now. free(NULL) when chain 0 was kept.
         if (k != 0) free(slot0_seeds);
         n_chn_ = k;
+
+        /* #310: the weight filter emptied the array. bwa reports that honestly
+         * (its tail loops are bounded by n_chn == 0, so it returns 0 and the read
+         * goes out unmapped); bwa-mem2's seqid-range machinery instead rebuilds a
+         * count of 1 and extends the chain it just rejected. Returning here is
+         * bwa's answer -- selected per target rather than unconditionally,
+         * because a `bwa-mem2` or `off` run that stopped resurrecting would no
+         * longer be the drop-in it advertises. */
+        if (n_chn_ == 0 && !resurrect_empty) return 0;
     }
 
     /* Fast path for the dominant single-chain (unique-mapper) case. With one
@@ -2092,8 +2478,15 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
         if (seq_[l].l_seq < opt->min_seed_len) continue;
         assert(matchArray[smem_ptr].rid == l);
 
-        kbtree_t(chn) *tree;
-        tree = kb_init(chn, KB_DEFAULT_SIZE + 8); // +8, due to addition of counters in chain
+        /* Per-thread persistent chaining B-tree (see ChnTreeScratch above):
+         * init once per thread, kb_reset (below) between reads instead of a
+         * per-read kb_init/kb_destroy. Byte-identical -- tree structure,
+         * comparisons, and traversal order depend only on the seeds inserted,
+         * never on node provenance, and chaining never deletes, so the reset
+         * reproduces the fresh kb_init state exactly -- and the common
+         * single-leaf-root read then does zero allocations. */
+        static thread_local ChnTreeScratch chn_scratch;
+        kbtree_t(chn) *tree = chn_scratch.t;
         mem_chain_v *chain = &chain_ar[l];
         size = 0;
 
@@ -2333,7 +2726,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
         for (i = 0; i < chain->n; ++i)
             chain->a[i].frac_rep = (float)l_rep / seq_[l].l_seq;
 
-        kb_destroy(chn, tree);
+        kb_reset(chn, tree); // reuse the tree for the next read (no destroy/re-init)
 
     } // iterations over input reads
     tprof[MEM_SA_BLOCK][tid] += __rdtsc() - tim;
@@ -2709,10 +3102,73 @@ static void worker_aln(void *data, int seq_id, int batch_size, int tid)
 }
 
 
+/* [dedup-reads] Phase 2 seed/chain stage for a work item when the memo is armed:
+ * run kernel1 on the REP pairs only, then scatter each REP's chains back to its
+ * original slot and leave DUP slots empty. Kernel2 (worker_aln) then runs
+ * UNMODIFIED over the original view -- a DUP's empty chains yield empty regs,
+ * which read_memo_copy_regs later overwrites with the REP's. The work item
+ * [seq_id, seq_id+batch_size) is pair-aligned (kt_for splits on the even
+ * BATCH_SIZE and the PE tail is even), so whole pairs move as a unit and
+ * kernel1's l^1 mate-concordant cap still pairs mates correctly. */
+static void worker_bwt_memo(worker_t *w, int seq_id, int batch_size, int tid)
+{
+    const read_memo_state *memo = w->memo;
+    bseq1_t     *seqs = w->seqs + seq_id;
+    mem_chain_v *cw   = w->chain_scratch + (size_t) tid * BATCH_SIZE;
+
+    /* D1: kernel1 converts bases ASCII->2-bit in place, but DUP reads skip
+     * kernel1 -- so convert EVERY read here (idempotent, guarded on seq[i] < 4)
+     * so worker_sam sees 2-bit bases for the DUPs too; REPs re-convert harmlessly
+     * inside kernel1. */
+    for (int l = 0; l < batch_size; ++l) {
+        char *s = seqs[l].seq;
+        const int len = seqs[l].l_seq;
+        for (int i = 0; i < len; ++i)
+            s[i] = s[i] < 4 ? s[i] : nst_nt4_table[(int) s[i]];
+    }
+
+    /* Compact REP pairs into a dense view (struct copies; seq/name/qual pointers
+     * shared). REPs preserve their relative order, so the j-th REP read maps to
+     * the j-th compacted slot. */
+    static thread_local bseq1_t compact[BATCH_SIZE];
+    int n_rep = 0;
+    for (int l = 0; l < batch_size; ++l)
+        if (memo->role[(seq_id + l) >> 1] == READ_MEMO_ROLE_REP)
+            compact[n_rep++] = seqs[l];
+
+    if (n_rep > 0)
+        mem_kernel1_core(w->fmi, w->opt, compact, n_rep, cw,
+                         w->seed_scratch + (size_t) tid * BATCH_SIZE * AVG_SEEDS_PER_READ,
+                         w->seed_scratch_size, &(w->mmc), tid,
+                         w->meth_orig_bns, w->meth_orig_pac);
+
+    /* Scatter cw[0..n_rep) back to the original slots. The j-th REP read sits at
+     * original index R[j] >= j, so a single descending pull (original slot l,
+     * compact cursor j) moves each REP's chains to its slot and empties every DUP
+     * slot, touching each slot exactly once with no aliasing / no double-free.
+     * mem_chain_seeds stamped each chain's seqid = its COMPACT index; kernel2
+     * asserts c->seqid == l and routes extension results to regs[seqid], so
+     * re-stamp seqid to the original slot after moving. */
+    int j = n_rep - 1;
+    for (int l = batch_size - 1; l >= 0; --l) {
+        if (memo->role[(seq_id + l) >> 1] == READ_MEMO_ROLE_REP) {
+            if (l != j) cw[l] = cw[j];
+            for (size_t k = 0; k < cw[l].n; ++k) cw[l].a[k].seqid = l;
+            --j;
+        } else {
+            kv_init(cw[l]);
+        }
+    }
+    xassert(j == -1, "read_memo: REP scatter cursor mismatch");
+}
+
 /* Kernel, called by threads */
 static void worker_bwt(void *data, int seq_id, int batch_size, int tid)
 {
     worker_t *w = (worker_t*) data;
+    /* Armed: compact to REP-only. VERIFY suppresses the compaction so DUP pairs
+     * align normally and worker_copy_regs can compare instead of copy. */
+    if (w->memo && !read_memo_verify()) { worker_bwt_memo(w, seq_id, batch_size, tid); return; }
     printf_(VER, "4. Calling mem_kernel1_core..%d %d\n", seq_id, tid);
 
     /* One fixed-size window per thread. The old code additionally granted the
@@ -2783,6 +3239,89 @@ static void worker_bwt_aln(void *data, int seq_id, int batch_size, int tid)
 {
     worker_bwt(data, seq_id, batch_size, tid);
     worker_aln(data, seq_id, batch_size, tid);
+}
+
+/* [dedup-reads] Phase 2: deep-copy one read's regs from its representative.
+ * mem_alnreg_t is POD (its only pointer, ->c, is dangling-by-design and NULL'd
+ * at kernel2 exit; ->hash is (re)stamped later per-read in the SAM stage), so a
+ * plain memcpy is a valid deep copy. Capacity m := n is fine -- the SAM stage's
+ * rescue kv_push appends realloc on n == m. Ownership matches worker_sam's
+ * free(w->regs[i].a): each DUP owns an independent allocation. */
+static inline void read_memo_copy_regs(mem_alnreg_v *dst, const mem_alnreg_v *src)
+{
+    free(dst->a);
+    const int n = (int) src->n;
+    if (n > 0) {
+        dst->a = (mem_alnreg_t *) malloc((size_t) n * sizeof(mem_alnreg_t));
+        xassert(dst->a != NULL, "read_memo: out of memory copying regs");
+        memcpy(dst->a, src->a, (size_t) n * sizeof(mem_alnreg_t));
+    } else {
+        dst->a = NULL;
+    }
+    dst->n = dst->m = (size_t) n;
+}
+
+/* [dedup-reads] VERIFY (BWAMEM3_DEDUP_READS_VERIFY): the first mem_alnreg_t field
+ * that differs between a duplicate's own regs and its representative's, or NULL
+ * if identical. Excludes ->c (dangling, NULL'd at kernel2 exit) and ->hash (set
+ * per-read later in the SAM stage); everything else is the position-invariant
+ * payload the memo copies. */
+static const char *read_memo_alnreg_field_diff(const mem_alnreg_t *a, const mem_alnreg_t *b)
+{
+#define RM_D(f) do { if ((a)->f != (b)->f) return #f; } while (0)
+    RM_D(rb); RM_D(re); RM_D(qb); RM_D(qe); RM_D(rid);
+    RM_D(score); RM_D(truesc); RM_D(sub); RM_D(alt_sc); RM_D(csub); RM_D(sub_n);
+    RM_D(w); RM_D(seedcov); RM_D(secondary); RM_D(secondary_all);
+    RM_D(seedlen0); RM_D(chain_n_hits); RM_D(frac_rep); RM_D(flg);
+    RM_D(meth_hypothesis); RM_D(meth_strand_hyp);
+#undef RM_D
+    if (a->n_comp != b->n_comp) return "n_comp";
+    if (a->is_alt != b->is_alt) return "is_alt";
+    return NULL;
+}
+
+/* [dedup-reads] VERIFY: assert a duplicate read's independently-computed regs
+ * equal its representative's (the position-invariance claim, on real data). */
+static void read_memo_verify_regs(const mem_alnreg_v *dup, const mem_alnreg_v *rep, int read_idx)
+{
+    if (dup->n != rep->n)
+        err_fatal(__func__, "dedup-reads VERIFY: read %d has n=%zu but its representative has n=%zu",
+                  read_idx, dup->n, rep->n);
+    for (size_t i = 0; i < dup->n; ++i) {
+        const char *f = read_memo_alnreg_field_diff(&dup->a[i], &rep->a[i]);
+        if (f)
+            err_fatal(__func__, "dedup-reads VERIFY: read %d alnreg %zu field '%s' diverges from its representative",
+                      read_idx, i, f);
+    }
+}
+
+/* [dedup-reads] Phase 2 copy pass: for each DUP pair in this work item, replicate
+ * its representative pair's post-extension regs (both mates). Runs as its own
+ * kt_for after worker_bwt_aln (all REP regs are final) and strictly before either
+ * mem_pestat site, so pairing/MAPQ see the same regs the DUP would have computed.
+ * Each DUP read is written by exactly one work item and a REP is never a DUP, so
+ * there are no write/write or read/write conflicts across threads.
+ *
+ * Under VERIFY the DUP pairs were aligned normally (worker_bwt did not compact),
+ * so instead of copying we compare each DUP's own regs to the REP's. */
+static void worker_copy_regs(void *data, int seq_id, int batch_size, int tid)
+{
+    worker_t *w = (worker_t*) data;
+    const read_memo_state *memo = w->memo;
+    const int verify = read_memo_verify();
+    for (int l = 0; l < batch_size; l += 2) {
+        const int gr = seq_id + l;                 /* global read index (pair R1) */
+        if (memo->role[gr >> 1] != READ_MEMO_ROLE_DUP) continue;
+        const int rep_r1 = (int) memo->rep_pair[gr >> 1] << 1;
+        if (verify) {
+            read_memo_verify_regs(&w->regs[gr],     &w->regs[rep_r1],     gr);
+            read_memo_verify_regs(&w->regs[gr + 1], &w->regs[rep_r1 + 1], gr + 1);
+        } else {
+            read_memo_copy_regs(&w->regs[gr],     &w->regs[rep_r1]);
+            read_memo_copy_regs(&w->regs[gr + 1], &w->regs[rep_r1 + 1]);
+        }
+    }
+    (void) tid;
 }
 
 static void worker_sam(void *data, int seqid, int batch_size, int tid)
@@ -2921,6 +3460,20 @@ void mem_align_cohort_slice(mem_opt_t *opt,
     w.seqs = seqs;
     w.regs = regs;
     w.n_processed = n_processed;
+    /* [dedup-reads] the cohort-slice align path is not memoized in this version
+     * (a DUP's representative can live in another slice, so the copy pass would
+     * have to run after all slices, before pestat in mem_pair_and_emit_cohort);
+     * keep it byte-identical by leaving the memo unarmed. Note it once under
+     * verbose so a --dedup-reads run on this path isn't silently un-accelerated. */
+    if (read_memo_mode() != READMEMO_OFF && (opt->flag & MEM_F_PE) && bwa_verbose >= 3) {
+        static bool warned = false;   /* serialized caller (pipeline step 1) */
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[dedup-reads] cohort/multi-slice align path is not "
+                    "memoized in this build; --dedup-reads has no effect here\n");
+        }
+    }
+    w.memo = NULL;
 
     uint64_t tim = __rdtsc();
     kt_for(worker_bwt_aln, &w, n);
@@ -3009,6 +3562,40 @@ void mem_process_seqs(mem_opt_t *opt,
     //int n_ = (opt->flag & MEM_F_PE) ? n : n;   // this requires n%2==0
     int n_ = n;
 
+    /* [dedup-reads] Fingerprint this chunk's read-pairs and, when armed, align
+     * each distinct pair once and copy its regs to the duplicates. read_memo_should_arm
+     * returns the latch (auto/on) and, while auto is measuring, alternates the arm
+     * decision so the A/B controller gathers both armed and unarmed samples; the
+     * measured realized cost of this chunk (align + copy) is fed back below.
+     * PE + non-meth + even n only; the cohort-slice entry paths are not memoized
+     * in this version (they stay byte-identical, unarmed).
+     * EXIT GATE: a regression pinning `--dedup-reads off == on == auto == baseline`
+     * SAM byte-identity (compat_byte_identical.sh / cohort_slice_identity.sh
+     * style), plus the BWAMEM3_DEDUP_READS_VERIFY regs-invariance instrument. */
+    static read_memo_state g_readmemo_state = { 0, NULL, NULL, 0 };
+    read_memo_result rm_r; bool rm_measure = false, rm_arm = false;
+    /* VERIFY (BWAMEM3_DEDUP_READS_VERIFY) is a correctness instrument, not a
+     * memoization mode: it must run whenever the prepass can identify DUP pairs,
+     * independently of whether the memo is armed. Force the prepass on under
+     * VERIFY even in `off` mode (and in `auto` while latched OFF, where rm_arm
+     * stays false), so the regs-invariance check actually fires instead of
+     * silently doing nothing. */
+    const bool rm_verify = read_memo_verify();
+    if ((read_memo_mode() != READMEMO_OFF || rm_verify) && (opt->flag & MEM_F_PE)
+        && !opt->meth_mode && n_ > 0 && (n_ & 1) == 0) {
+        rm_r = read_memo_prepass(opt, seqs, n_, &g_readmemo_state);
+        rm_measure = true;
+        rm_arm = read_memo_should_arm(rm_r.dup_pairs) != 0;
+    }
+    /* Set w.memo (so the per-pair pass can find DUP/REP roles) when the memo is
+     * armed OR when VERIFY needs to compare unarmed DUP pairs. Under VERIFY the
+     * compaction in worker_bwt is suppressed, so DUP pairs are aligned normally
+     * and their independently-computed regs are compared to the representative's;
+     * real memo copying stays gated on rm_arm below. */
+    const bool rm_run_pairs = rm_arm || (rm_measure && rm_verify);
+    w.memo = rm_run_pairs ? &g_readmemo_state : NULL;
+    const auto rm_t0 = std::chrono::steady_clock::now();
+
     uint64_t tim = __rdtsc();
     fprintf(stderr, "[0000] 1. Calling kt_for - worker_bwt_aln (fused)\n");
 
@@ -3024,6 +3611,27 @@ void mem_process_seqs(mem_opt_t *opt,
      * mem_pestat's barrier below is unaffected and must stay. */
     kt_for(worker_bwt_aln, &w, n_); // SMEMs (+SAL) then BSW, fused
     tprof[WORKER10][0] += __rdtsc() - tim;
+    const uint64_t rm_align_ns = rm_measure
+        ? (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - rm_t0).count()
+        : 0;
+
+    /* [dedup-reads] Copy each DUP pair's regs from its representative. Runs after
+     * the (REP-only) align pass and strictly before pestat/pairing, so the
+     * inferred insert-size distribution and every downstream stage see the same
+     * regs a full alignment would have produced. Time it: the A/B controller
+     * charges this copy cost (plus the compaction folded into the align phase
+     * above) into the armed sample, so it never latches ON when the memo's own
+     * overhead exceeds the align work saved (e.g. cheap reads at a high dup rate). */
+    uint64_t rm_copy_ns = 0;
+    if (rm_arm) {
+        const auto rm_c0 = std::chrono::steady_clock::now();
+        kt_for(worker_copy_regs, &w, n_);
+        rm_copy_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - rm_c0).count();
+    }
+    if (rm_measure)
+        read_memo_controller_observe(rm_r, rm_align_ns, rm_copy_ns, rm_arm);
 
 
     // PAIRED_END
@@ -3054,6 +3662,11 @@ void mem_process_seqs(mem_opt_t *opt,
 
     kt_for(worker_sam, &w,  n_);   // SAM
     tprof[WORKER20][0] += __rdtsc() - tim;
+
+    /* [dedup-reads] The memo points at g_readmemo_state, whose role[]/rep_pair[]
+     * describe THIS chunk only; clear it so it can never be reused by a later
+     * chunk or a different align entry path. */
+    w.memo = NULL;
 
     fprintf(stderr, "\t[0000][ M::%s] Processed %d reads in %.3f "
             "CPU sec, %.3f real sec\n",
@@ -3582,6 +4195,17 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     a.meth_hypothesis = ar->meth_hypothesis; // carry hypothesis to the output layer
     qb = ar->qb, qe = ar->qe;
     rb = ar->rb, re = ar->re;
+    /* AP6: prefetch the CIGAR-emission reference window's first pac[] cache line.
+     * bwa_gen_cigar3 -> bns_get_seq_into makes a random ~DRAM-latency load on the
+     * first pac[] byte; the ~dozens of setup instructions below (and the CIGAR-gen
+     * entry) hide it. The window-start byte differs by strand: the forward strand
+     * (rb < l_pac) reads pac[rb>>2] ascending, the reverse reads pac[((2*l_pac-1-rb)>>2)]
+     * descending (bns_get_seq_into). A prefetch is a pure hint -> byte-identical. */
+    {
+        int64_t pf_pac = (rb < bns->l_pac) ? (rb >> 2)
+                                           : (((bns->l_pac << 1) - 1 - rb) >> 2);
+        __builtin_prefetch(&pac[pf_pac], 0, 3);
+    }
     /* D3 (--meth, PR-5): output CIGAR/NM/MD must reflect the ORIGINAL read vs the
      * ORIGINAL reference in the original alphabet, so placement and gap shape are
      * expressed in real coordinates and a real (non-converting) SNP stays a
@@ -3720,6 +4344,16 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
  * Basic hit->SAM conversion *
  *****************************/
 
+/* Infer the DP band width needed to realize an alignment of the given lengths and score.
+ *
+ * The l1 == l2 early-return is the load-bearing ungapped-CIGAR fast path. On an equal-length
+ * window, closing any gap requires a balanced insertion + deletion (two gaps), so the guard
+ * returns a zero band whenever the score deficit (l1*a - score) is below the implemented
+ * two-gap threshold 2*(q + r - a): no balanced indel could recover that deficit, so the
+ * optimal alignment is provably gap-free and a zero band suffices. Emission (mem_reg2aln)
+ * feeds that 0 to bwa_gen_cigar3, which then takes bwa.cpp's no-DP equal-length block and
+ * emits a single <len>M with no ksw_global2 fill or traceback. This shortcut is what makes the
+ * common ungapped case skip the banded DP; keep it. */
 static inline int infer_bw(int l1, int l2, int score, int a, int q, int r)
 {
     int w;
@@ -3988,11 +4622,10 @@ enum BswMethTier { BSW_TIER_SCALAR, BSW_TIER_16, BSW_TIER_8 };
 /* One tier kernel call over pa[0..n). `sort_scratch` must be a SeqPair buffer
  * DISTINCT from `pa` (sortPairsLen is a counting sort that scatters through it;
  * aliasing pa would corrupt the sort). Scalar tier ignores sort_scratch. */
-static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
+static inline void bsw_score_batch(BswMethTier tier, IBandedPairWiseSW *bsw,
         SeqPair *pa, uint8_t *ref, uint8_t *qer, int n, int nthreads, int32_t w,
         SeqPair *sort_scratch, int32_t *hist)
 {
-    if (n <= 0) return;
     switch (tier) {
     case BSW_TIER_SCALAR:
         bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
@@ -4019,6 +4652,475 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
         else                 bsw->getScores16(pa, ref, qer, n, nthreads, w);
 #endif
         break;
+    }
+}
+
+struct BswJobResult { int32_t score, tle, qle, gscore, gtle, max_off; };
+
+static inline void bsw_apply_result(SeqPair &sp, const BswJobResult &r)
+{
+    sp.score = r.score; sp.tle = r.tle; sp.qle = r.qle;
+    sp.gscore = r.gscore; sp.gtle = r.gtle; sp.max_off = r.max_off;
+}
+
+enum { BSW_DEDUP_OFF = 0, BSW_DEDUP_ON = 1, BSW_DEDUP_AUTO = 2 };
+/* Parse a dedup mode string. Returns -1 on an unrecognized value. Legacy
+ * numeric values from the experimental phase are accepted for pipeline
+ * compatibility: "1"/"perbatch" -> on; "4"/"net" -> auto; "2"(crossbatch) and
+ * "3"(adaptive) were removed -- they map to auto with a warning. */
+static int bsw_parse_dedup_mode(const char *e)
+{
+    if (!strcmp(e, "0") || !strcmp(e, "off"))                            return BSW_DEDUP_OFF;
+    if (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "perbatch"))   return BSW_DEDUP_ON;
+    if (!strcmp(e, "auto") || !strcmp(e, "net") || !strcmp(e, "4"))      return BSW_DEDUP_AUTO;
+    if (!strcmp(e, "2") || !strcmp(e, "3")) {
+        fprintf(stderr, "[dedup] mode '%s' (crossbatch/adaptive) was removed; using 'auto'\n", e);
+        return BSW_DEDUP_AUTO;
+    }
+    return -1;
+}
+/* Extension-DP dedup configuration store. mode -1 means "unresolved" -- the
+ * only valid state before mem_dedup_configure() has run once; every reader
+ * goes through bsw_dedup_cfg(), which lazily resolves via mem_dedup_configure
+ * if some entry point (unit binaries, library use) never called it. */
+struct BswDedupCfg { int mode; double z; int64_t reprobe_jobs; };
+static BswDedupCfg g_dedup_cfg = { -1, 2.0, 12000000 };   /* mode -1 = unresolved */
+
+void mem_dedup_configure(const char *mode_arg)
+{
+    /* A non-empty --dedup wins outright (and overrides even an explicitly-empty
+     * BWAMEM3_DEDUP); otherwise consult the env, distinguishing "unset" (use the
+     * default) from "set but empty" (an explicit misconfiguration -> fatal, so a
+     * cleared BWAMEM3_DEDUP= cannot silently fall back to the default). An empty
+     * CLI value is rejected earlier by the getopt handler. */
+    if (mode_arg && *mode_arg) {
+        const int v = bsw_parse_dedup_mode(mode_arg);
+        if (v < 0) { fprintf(stderr, "ERROR: --dedup: expected off|on|auto, got '%s'\n", mode_arg); exit(1); }
+        g_dedup_cfg.mode = v;
+    } else {
+        const char *m = getenv("BWAMEM3_DEDUP");
+        if (m == NULL) g_dedup_cfg.mode = BSW_DEDUP_AUTO;   /* unset -> default */
+        else {
+            const int v = bsw_parse_dedup_mode(m);          /* "" -> -1 -> fatal */
+            if (v < 0) { fprintf(stderr, "ERROR: BWAMEM3_DEDUP: expected off|on|auto, got '%s'\n", m); exit(1); }
+            g_dedup_cfg.mode = v;
+        }
+    }
+    const char *z = getenv("BWAMEM3_DEDUP_Z");            /* expert knob, env-only */
+    if (z) {                                             /* set (empty -> rejected by the full-string parse) */
+        char        *end = NULL;
+        errno = 0;
+        const double zv  = strtod(z, &end);
+        /* Full-string parse: reject trailing junk ("2x") rather than silently
+         * taking the leading number, the way atof would. */
+        if (end == z || end == NULL || *end != '\0' || errno == ERANGE || !std::isfinite(zv) || zv <= 0.0) {
+            fprintf(stderr, "ERROR: BWAMEM3_DEDUP_Z: must be a finite number > 0, got '%s'\n", z);
+            exit(1);
+        }
+        g_dedup_cfg.z = zv;
+    }
+    const char *r = getenv("BWAMEM3_DEDUP_REPROBE");      /* expert knob, env-only */
+    if (r) {                                             /* set (empty -> rejected by the full-string parse) */
+        char           *end = NULL;
+        errno = 0;
+        const long long rv  = strtoll(r, &end, 10);
+        /* Full-string parse: reject trailing junk ("12M") rather than silently
+         * taking the leading number, the way atoll would. */
+        if (end == r || end == NULL || *end != '\0' || errno == ERANGE || rv < 0) {
+            fprintf(stderr, "ERROR: BWAMEM3_DEDUP_REPROBE: must be a non-negative integer number of jobs (0 = off), got '%s'\n", r);
+            exit(1);
+        }
+        g_dedup_cfg.reprobe_jobs = rv;
+    }
+}
+/* Lazy resolution for entry points that never call mem_dedup_configure()
+ * (unit binaries, library use): resolve from env/defaults on first touch. */
+static inline const BswDedupCfg &bsw_dedup_cfg(void)
+{
+    static std::once_flag once;
+    std::call_once(once, []() { if (g_dedup_cfg.mode < 0) mem_dedup_configure(NULL); });
+    return g_dedup_cfg;
+}
+static inline int bsw_dedup_mode(void)
+{
+    return bsw_dedup_cfg().mode;
+}
+
+/* ---------------------------------------------------------------------------
+ * Net-cycles adaptive dedup (BWAMEM3_DEDUP=auto): decide ON/OFF from
+ * MEASURED wall time, not a dup-rate threshold. Dedup wins exactly when the
+ * bookkeeping it adds (fingerprint + map build + result scatter) costs less
+ * than the kernel time it removes by scoring m distinct reps instead of n. Both
+ * sides are observable per batch, so the decision is the sign of a measured net:
+ *
+ *   overhead_ns = whole dedup-wrapper time  -  kernel time on the m reps
+ *   c_cell      = kernel_ns / dp_cells       (this host's real per-cell DP cost)
+ *   benefit_ns  = cells_saved * c_cell       (cells_saved = total_cells - dp_cells)
+ *   net_ns      = overhead_ns - benefit_ns   (< 0  =>  dedup won this batch)
+ *
+ * c_cell is measured, so the break-even self-calibrates to CPU / compiler /
+ * SIMD tier / substrate -- there is no magic dup-rate constant. We run dedup ON
+ * while measuring (real data is dup-rich, so ON is the productive default and
+ * pays ~zero tax; instrumenting a batch we already run is two clock reads), pool
+ * per-batch net/job across threads (Welford), and latch the moment a two-sided
+ * z-test clears |z| >= NET_Z (a dimensionless confidence level, not a rate).
+ * mean net < 0 -> latch ON (keep dedup); > 0 -> latch OFF (flip to plain score).
+ * Below NET_MIN_BATCHES we never latch (CLT warmup); past NET_MAX_JOBS with no
+ * significance the data is at break-even (cost ~0 either way) so we keep ON.
+ * The running net sum is the warmup tax in nanoseconds, reported at latch. */
+enum { NET_MEASURING = 0, NET_LATCH_ON = 1, NET_LATCH_OFF = 2 };
+static std::atomic<int>      g_net_state{NET_MEASURING};
+static const uint64_t        NET_MIN_BATCHES = 24;         /* CLT floor before any latch */
+static const uint64_t        NET_MAX_JOBS    = 3000000;    /* give up measuring past this */
+/* Confidence level for the latch, overridable (the only knob, and a benign one:
+ * a wrong value costs a little decision latency, never a wrong ON/OFF call). */
+static inline double net_z_crit(void)
+{
+    return bsw_dedup_cfg().z;
+}
+/* Periodic re-probe (C4): once latched, the controller stays ON or OFF
+ * forever unless re-checked. `g_net_incumbent` records the current latched
+ * direction (0 = none yet, i.e. still in the initial MEASURING phase) so a
+ * re-probe can tell "confirm" from "flip" apart, and `g_net_since_latch`
+ * counts jobs run under the current latch toward the next re-probe cadence
+ * (BWAMEM3_DEDUP_REPROBE jobs; cfg in C5). */
+static std::atomic<int>     g_net_incumbent{0};     /* 0 = none (initial phase) */
+static std::atomic<int64_t> g_net_since_latch{0};   /* jobs since last latch */
+static const uint64_t       NET_PROBE_MAX_JOBS = 1500000; /* probe cap -> keep incumbent */
+static inline int64_t bsw_dedup_reprobe_jobs(void); /* env BWAMEM3_DEDUP_REPROBE, default 12000000, 0=off */
+static inline void net_maybe_reprobe(int n);
+/* Pooled measurement state, guarded by g_net_mtx (held for a few doubles per
+ * instrumented batch; batches are milliseconds, so contention is negligible). */
+static std::mutex   g_net_mtx;
+static uint64_t     g_net_k    = 0;    /* instrumented batches */
+static uint64_t     g_net_jobs = 0;    /* jobs measured */
+static double       g_net_mean = 0.0;  /* Welford mean of net_ns/job */
+static double       g_net_m2   = 0.0;  /* Welford sum of squares */
+static double       g_net_sum  = 0.0;  /* raw sum of net_ns (the warmup tax) */
+
+/* Feed one measured batch into the controller and latch when significant.
+ * Incumbent-aware (C4): the initial decision (incumbent == 0) uses a plain
+ * z-test with the MAX_JOBS break-even fallback, same as before. A re-probe
+ * (incumbent != 0) instead asks whether the NEW evidence still supports the
+ * incumbent direction: agreement only needs to *confirm* at the ordinary z
+ * (or is kept on an inconclusive probe-cap timeout); disagreement needs a
+ * higher bar (z+1) to *flip* the incumbent, so noise near break-even cannot
+ * flap the decision back and forth every cadence. */
+static inline void net_observe(double net_ns, int n)
+{
+    if (n <= 0) return;
+    std::lock_guard<std::mutex> lk(g_net_mtx);
+    if (g_net_state.load(std::memory_order_relaxed) != NET_MEASURING) return;
+    g_net_sum  += net_ns;
+    g_net_jobs += (uint64_t)n;
+    g_net_k    += 1;
+    const double d  = net_ns - g_net_mean;            /* Welford, per-BATCH statistic */
+    g_net_mean += d / (double)g_net_k;
+    g_net_m2   += d * (net_ns - g_net_mean);
+    const int incumbent = g_net_incumbent.load(std::memory_order_relaxed);
+    int decision = 0; const char *why = "";
+    if (g_net_k >= NET_MIN_BATCHES) {
+        const double var = g_net_m2 / (double)(g_net_k - 1);
+        const double sd  = var > 0.0 ? sqrt(var) : 0.0;
+        const double z   = sd > 0.0 ? g_net_mean * sqrt((double)g_net_k) / sd : 0.0;
+        const int    fav = (g_net_mean < 0.0) ? NET_LATCH_ON : NET_LATCH_OFF;
+        const double zc  = net_z_crit();
+        if (incumbent == 0) {                       /* initial: plain test, cap -> ON */
+            if      (fabs(z) >= zc)               { decision = fav;           why = "measured"; }
+            else if (g_net_jobs >= NET_MAX_JOBS)  { decision = NET_LATCH_ON;  why = "break-even, keeping default"; }
+        } else if (fav == incumbent) {              /* re-probe, evidence agrees */
+            if      (fabs(z) >= zc)                       { decision = incumbent; why = "re-probe confirmed"; }
+            else if (g_net_jobs >= NET_PROBE_MAX_JOBS)    { decision = incumbent; why = "re-probe inconclusive, kept"; }
+        } else {                                    /* re-probe, evidence opposes: flip bar is z+1 */
+            if      (fabs(z) >= zc + 1.0)                 { decision = fav;       why = "re-probe FLIPPED"; }
+            else if (g_net_jobs >= NET_PROBE_MAX_JOBS)    { decision = incumbent; why = "below flip margin, kept"; }
+        }
+    }
+    if (decision) {
+        g_net_incumbent.store(decision, std::memory_order_relaxed);
+        g_net_since_latch.store(0, std::memory_order_relaxed);
+        g_net_state.store(decision, std::memory_order_relaxed);
+        if (bwa_verbose >= 3)
+            fprintf(stderr, "[dedup-auto] %s: %llu jobs / %llu batches, mean net=%.1f us/batch -> dedup %s\n",
+                    why, (unsigned long long)g_net_jobs, (unsigned long long)g_net_k,
+                    g_net_mean / 1e3, decision == NET_LATCH_ON ? "ON" : "OFF");
+    }
+}
+
+/* Env-configured re-probe cadence, in jobs (same style as net_z_crit): 0 or a
+ * negative/unset value falls back to the default; 0 explicitly disables
+ * re-probing (net_maybe_reprobe short-circuits on period <= 0). */
+static inline int64_t bsw_dedup_reprobe_jobs(void)
+{
+    return bsw_dedup_cfg().reprobe_jobs;
+}
+
+/* Work-based re-probe: called from BOTH latched paths with this batch's job
+ * count. When the cadence elapses, reset the accumulator and re-enter
+ * MEASURING. All stats mutation is under g_net_mtx; the reset happens before
+ * the state store, so no thread can feed a stale accumulator. Byte-identity is
+ * unaffected: a probe only changes when the kernel is skipped. */
+static inline void net_maybe_reprobe(int n)
+{
+    const int64_t period = bsw_dedup_reprobe_jobs();
+    if (period <= 0) return;
+    if (g_net_since_latch.fetch_add(n, std::memory_order_relaxed) + n < period) return;
+    std::lock_guard<std::mutex> lk(g_net_mtx);
+    const int st = g_net_state.load(std::memory_order_relaxed);
+    if (st == NET_MEASURING) return;                                   /* probe already running */
+    if (g_net_since_latch.load(std::memory_order_relaxed) < period) return;  /* lost the race */
+    g_net_k = 0; g_net_jobs = 0; g_net_mean = 0.0; g_net_m2 = 0.0; g_net_sum = 0.0;
+    g_net_since_latch.store(0, std::memory_order_relaxed);
+    if (bwa_verbose >= 3)
+        fprintf(stderr, "[dedup-auto] re-probe (incumbent %s)\n", st == NET_LATCH_ON ? "ON" : "OFF");
+    g_net_state.store(NET_MEASURING, std::memory_order_relaxed);
+}
+
+/* Fold up to LIMIT bytes from each END of `s` into `h`, eight bytes (one 64-bit
+ * word) at a time. Fingerprinting only the ends as words -- rather than hashing
+ * every byte scalar -- is what keeps dedup's cost a few percent of a job's DP
+ * instead of a third of it: a full byte-wise hash over the ~230-byte target
+ * would eat most of what the dedup saves. Fingerprint collisions are harmless
+ * because every candidate is byte-verified (bsw_job_eq / cache memcmp) before a
+ * result is reused, so this only needs to separate distinct jobs *well*, not
+ * perfectly. */
+static inline void bsw_hash_fold(uint64_t &h, const uint8_t *s, int len)
+{
+    const int LIMIT = 32;
+    auto mix = [&](const uint8_t *p, int n) {
+        int k = 0;
+        for (; k + 8 <= n; k += 8) {
+            uint64_t v; memcpy(&v, p + k, 8);
+            h ^= v; h *= 1099511628211ULL;
+        }
+        if (k < n) {                                   /* < 8-byte tail */
+            uint64_t v = 0;
+            for (int i = 0; k + i < n; i++) v |= (uint64_t)p[k + i] << (8 * i);
+            h ^= v; h *= 1099511628211ULL;
+        }
+    };
+    if (len <= 2 * LIMIT) mix(s, len);
+    else { mix(s, LIMIT); mix(s + len - LIMIT, LIMIT); }
+}
+
+static inline uint64_t bsw_job_hash(const uint8_t *s1, int len1,
+                                    const uint8_t *s2, int len2, int h0)
+{
+    uint64_t h = 1469598103934665603ULL;              /* FNV-1a offset basis */
+    h ^= ((uint64_t)(uint32_t)len1 << 32) | (uint32_t)len2;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)(uint32_t)h0;
+    h *= 1099511628211ULL;
+    bsw_hash_fold(h, s1, len1);
+    bsw_hash_fold(h, s2, len2);
+    return h;
+}
+
+/* BWAMEM3_DEDUP_STATS=1: count distinct-within-batch (m) vs total (n) extension
+ * DP jobs and print the batch dup rate once at exit. Measurement only; a single
+ * cached-bool branch per batch, inert unless armed. */
+static std::atomic<uint64_t> g_dedup_total{0};
+static std::atomic<uint64_t> g_dedup_distinct{0};
+static inline bool bsw_dedup_stats_on(void)
+{
+    static const bool on = []() {
+        const char *e = getenv("BWAMEM3_DEDUP_STATS");
+        return e && *e && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+static struct BswDedupStatsDumper {
+    ~BswDedupStatsDumper() {
+        if (!bsw_dedup_stats_on()) return;
+        uint64_t t = g_dedup_total.load(), d = g_dedup_distinct.load();
+        fprintf(stderr,
+            "[dedup-stats] total_jobs=%llu distinct_jobs=%llu perbatch_dup_rate=%.4f\n",
+            (unsigned long long)t, (unsigned long long)d,
+            t ? 1.0 - (double)d / (double)t : 0.0);
+    }
+} g_bsw_dedup_stats_dumper;
+
+/* BWAMEM3_EXT_TIME=1: sum the wall time spent inside bsw_tier_kernel (the
+ * extension dedup + banded-SW path) across all worker threads, print at exit.
+ * Dedup changes only affect this phase, so a small-read smoke run reports the
+ * extension delta directly instead of burying it under the fixed index-load +
+ * I/O wall. Sums thread-time, which is fine for A/B ratios. Inert unless armed. */
+static std::atomic<uint64_t> g_ext_ns{0};
+static inline bool bsw_ext_time_on() {
+    static const bool on = []() {
+        const char *e = getenv("BWAMEM3_EXT_TIME");
+        return e && *e && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+static struct BswExtTimeDumper {
+    ~BswExtTimeDumper() {
+        if (bsw_ext_time_on())
+            fprintf(stderr, "[ext-time] bsw_tier_kernel_thread_ms=%.1f\n",
+                    g_ext_ns.load() / 1e6);
+    }
+} g_bsw_ext_time_dumper;
+struct BswExtTimer {
+    std::chrono::steady_clock::time_point t0;
+    bool on;
+    BswExtTimer() : on(bsw_ext_time_on()) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~BswExtTimer() {
+        if (on) g_ext_ns.fetch_add(
+            (uint64_t)std::chrono::duration<double, std::nano>(
+                std::chrono::steady_clock::now() - t0).count(),
+            std::memory_order_relaxed);
+    }
+};
+
+/* Dedup wrapper over bsw_score_batch: score each distinct (seq1,seq2,h0) job
+ * once within this batch and copy its result to the repeats. Byte-identical to
+ * scoring all n: every candidate sharing a fingerprint is byte-verified
+ * (memcmp on both sequences) before its result is reused, so a fingerprint
+ * collision can only cost an extra memcmp, never a wrong or lost dedup. */
+static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
+        SeqPair *pa, uint8_t *ref, uint8_t *qer, int n, int nthreads, int32_t w,
+        SeqPair *sort_scratch, int32_t *hist)
+{
+    if (n <= 0) return;
+    BswExtTimer _ext_timer;           /* inert unless BWAMEM3_EXT_TIME set */
+    const int mode = bsw_dedup_mode();
+    if (mode == BSW_DEDUP_OFF || n < 2) {
+        bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
+        return;
+    }
+    if (mode == BSW_DEDUP_AUTO) {
+        net_maybe_reprobe(n);
+        if (g_net_state.load(std::memory_order_relaxed) == NET_LATCH_OFF) {
+            bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
+            return;   /* net-cycles controller measured dedup net-negative here */
+        }
+    }
+
+    /* net-cycles controller: while measuring (AUTO), run the dedup path AND
+     * time it, so the ON/OFF decision comes from observed net wall (see
+     * net_observe). net_t0 spans everything the OFF path would NOT do; the
+     * kernel call is timed separately and subtracted out to isolate the
+     * dedup-wrapper overhead from the DP-kernel cost. */
+    const bool net_measure = (mode == BSW_DEDUP_AUTO
+                        && g_net_state.load(std::memory_order_relaxed) == NET_MEASURING);
+    std::chrono::steady_clock::time_point net_t0;
+    int64_t net_total_cells = 0, net_dp_cells = 0;
+    double  net_kernel_ns = 0.0;
+    /* Banded-SW cost model: a job computes ~ len2 * band cells, NOT len1*len2 --
+     * the band (2w+1, capped by the target length) is far narrower than len1, so
+     * len1*len2 wildly over-weights long targets and skews the per-cell rate,
+     * biasing the ON/OFF decision toward OFF. min(len1, 2w+1) is the true DP width. */
+    const int64_t net_band = 2 * (int64_t)w + 1;
+    if (net_measure) net_t0 = std::chrono::steady_clock::now();
+
+    static thread_local std::vector<int>          miss_grp;    /* per pair: miss-group, or -1 if cache-resolved */
+    static thread_local std::vector<SeqPair>      repbuf;      /* one rep per distinct miss (to score) */
+    static thread_local std::vector<int>          next_grp;    /* per miss-group: next group (1-based) in its hash chain, 0 = end (intrusive bucket) */
+    static thread_local std::vector<BswJobResult> miss_res;    /* per miss-group: scored result */
+    static thread_local robin_hood::unordered_flat_map<uint64_t,int> missidx; /* content hash -> head miss-group of the chain (this batch) */
+
+    miss_grp.assign(n, -1);
+    repbuf.clear();
+    next_grp.clear();
+    missidx.clear();
+
+    for (int i = 0; i < n; i++) {
+        const uint8_t *s1 = ref + pa[i].idr; const int len1 = pa[i].len1;
+        const uint8_t *s2 = qer + pa[i].idq; const int len2 = pa[i].len2;
+        const int      h0 = pa[i].h0;
+        if (net_measure) {
+            const int64_t cells = (int64_t)len2 * ((int64_t)len1 < net_band ? (int64_t)len1 : net_band);
+            net_total_cells += cells;
+        }
+        const uint64_t hv = bsw_job_hash(s1, len1, s2, len2, h0);
+
+        /* miss: dedup against distinct misses already seen in THIS batch. Every
+         * candidate sharing this fingerprint is byte-compared (walking the
+         * intrusive chain), so a fingerprint collision costs an extra memcmp --
+         * it never SPLITS a true group and loses the dedup, which a single-slot
+         * map would on collision. */
+        int g = -1;
+        int &head = missidx[hv];        /* value-inits to 0 on a new key; groups are stored 1-based, 0 = empty chain */
+        for (int cand = head; cand > 0; cand = next_grp[cand - 1]) {
+            const SeqPair &rep = repbuf[cand - 1];
+            if (rep.len1 == len1 && rep.len2 == len2 && rep.h0 == h0
+                && memcmp(ref + rep.idr, s1, (size_t)len1) == 0
+                && memcmp(qer + rep.idq, s2, (size_t)len2) == 0) { g = cand - 1; break; }
+        }
+        if (g < 0) {
+            g = (int)repbuf.size();
+            repbuf.push_back(pa[i]);
+            next_grp.push_back(head);   /* prepend: new group's chain-next is the old head (0 = end) */
+            head = g + 1;               /* store 1-based so a fresh map slot (0) reads as "empty" */
+        }
+        miss_grp[i] = g;
+    }
+
+    const int m = (int)repbuf.size();
+    if (bsw_dedup_stats_on()) {   /* count distinct-within-batch vs total */
+        g_dedup_total.fetch_add((uint64_t)n, std::memory_order_relaxed);
+        g_dedup_distinct.fetch_add((uint64_t)m, std::memory_order_relaxed);
+    }
+    if (m > 0) {
+        /* tag each rep's group in the unused `id` field before scoring permutes
+         * repbuf. The kernels write `id` only on the padding lanes
+         * (pairArray[ii].id = ii for ii >= numPairs), never on a real slot, and
+         * sortPairsLen moves whole SeqPairs -- so id survives the reorder and
+         * identifies each scored rep's group with no second map (the old
+         * (seqid,regid) repkey2grp). */
+        for (int g = 0; g < m; g++) {
+            if (net_measure) { const int64_t l1 = repbuf[g].len1;
+                net_dp_cells += (int64_t)repbuf[g].len2 * (l1 < net_band ? l1 : net_band); }
+            repbuf[g].id = g;
+        }
+
+        /* The kernels write and (guardedly) prefetch padding lanes past
+         * numPairs; the caller's seqPair buffers are ALWAYS allocated as
+         * (numPairs-bound + MAX_LINE_LEN), so every kernel is written against
+         * that guaranteed slack. repbuf must honor the same contract -- a tight
+         * roundup(m, SIMD_WIDTH8) is not enough and overruns the heap. Value-
+         * initialization zeroes len1/len2/idr/idq so the slack lanes stay inert. */
+        repbuf.resize((size_t)((m + SIMD_WIDTH8 - 1) / SIMD_WIDTH8) * SIMD_WIDTH8
+                      + MAX_LINE_LEN);
+
+        std::chrono::steady_clock::time_point net_k0;
+        if (net_measure) net_k0 = std::chrono::steady_clock::now();
+        bsw_score_batch(tier, bsw, repbuf.data(), ref, qer, m, nthreads, w, sort_scratch, hist);
+        if (net_measure)
+            net_kernel_ns = std::chrono::duration<double, std::nano>(
+                                std::chrono::steady_clock::now() - net_k0).count();
+
+        /* map each scored rep back to its miss-group by the `id` tag set above.
+         * `id` is kernel-controlled: guard it before indexing so a tier that
+         * violates the "id survives untouched on real slots" contract fails
+         * loudly (xassert fires under -DNDEBUG too) instead of scattering out of
+         * bounds and corrupting the heap. */
+        miss_res.resize(m);
+        for (int k = 0; k < m; k++) {
+            const int32_t rk = repbuf[k].id;
+            xassert(rk >= 0 && rk < m, "dedup scatter: kernel-controlled repbuf.id out of [0, m)");
+            miss_res[rk] =
+                BswJobResult{repbuf[k].score, repbuf[k].tle, repbuf[k].qle,
+                             repbuf[k].gscore, repbuf[k].gtle, repbuf[k].max_off};
+        }
+
+        for (int i = 0; i < n; i++)   /* apply miss results to their pending pairs */
+            if (miss_grp[i] >= 0) bsw_apply_result(pa[i], miss_res[miss_grp[i]]);
+    }
+
+    /* net-cycles decision: overhead = whole dedup wrapper minus the kernel; the
+     * benefit is the kernel time the skipped duplicate cells would have cost, at
+     * this batch's measured per-cell rate. Feed the signed net to the controller. */
+    if (net_measure && net_dp_cells > 0 && net_kernel_ns > 0.0) {
+        const double total_ns = std::chrono::duration<double, std::nano>(
+                                    std::chrono::steady_clock::now() - net_t0).count();
+        const double overhead_ns  = total_ns - net_kernel_ns;
+        const double c_cell       = net_kernel_ns / (double)net_dp_cells;
+        const double cells_saved  = (double)(net_total_cells - net_dp_cells);
+        const double benefit_ns   = cells_saved * c_cell;
+        net_observe(overhead_ns - benefit_ns, n);
     }
 }
 
@@ -4061,6 +5163,187 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
     bsw_tier_kernel(tier, sym, pair_ar + mid, ref, qer, n_sym, nthreads, w, meth_scratch, hist);
 }
 
+/* The rung's finalize blocks call the ugp_record_*_outcome profiling hooks, which are
+ * defined further below (after the rung). Those calls compile only under the profiling
+ * build (-DBWAMEM3_UGP_PROFILE=1, off by default), so forward-declare them here to avoid
+ * a use-before-definition under that flag. No effect on the default (non-profiling) build. */
+#if BWAMEM3_UGP_PROFILE
+static inline void ugp_record_left_outcome(const SeqPair *sp, int a_match, int tid);
+static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
+#endif
+
+/* ------------------------------------------------------------------------
+ * Certified tight_band probe rung (tier-parameterized; see `tier`).
+ *
+ * 8-bit tier: its ladder starts at opt->w, so short-read extensions that carry a proven
+ * tight_band still pay the full-width band. This rung gives it a narrow probe it lacked.
+ * 16-bit tier: its ladder already probes narrow (first rung INIT_W(opt->w) = 20); here the
+ * rung REPLACES that single uniform-20 probe with a per-w_need bucketed one and the caller
+ * then starts the ladder at opt->w. Both are byte-identical by the same certificate, and both
+ * feed the identical downstream ladder. This rung runs the eligible pairs at the probe width
+ * BEFORE the ladder and finalizes only those band_cert_accept certifies there --
+ * byte-identical to the full-width ladder result, by the same certificate the
+ * other tiers ship (band_cert_accept's w < opt->w branch: the S - pen_clip anchor
+ * pins score/qle/tle/gscore/gtle and the clip decision; mem_band_cert_params_safe
+ * -- implied by opt->band_cert, see fastmap.cpp -- pins the control flow, and its
+ * w0 = 20 conditions cover a 20-wide probe verbatim; wider bucket ceilings re-check
+ * that envelope at their own width via mem_band_cert_params_safe_w, see Gate B below).
+ *
+ * Eligibility (gate A): opt->band_cert AND 0 < tight_band AND w_need(tb) <= w_cap,
+ * where w_cap is the widest bucket ceiling whose control-flow envelope still holds
+ * (ADAPTIVE_BAND_START = 20 at minimum, 30 at default params -- Gate B). Ineligible
+ * pairs (no proof, or a band wider than w_cap) skip the rung and reach the untouched
+ * ladder unchanged. Uncertified pairs GAP2-restore a->score and fall through to the
+ * ladder too. The rung returns the count of pairs left for the ladder (ineligible +
+ * uncertified), compacted to the front of pair_ar.
+ *
+ * The bucket call scores a sub-slice of pair_ar, so its padding-lane overshoot
+ * would clobber the following region: guard the sym object for its duration
+ * (OT/OB are already guarded under --meth). pen_clip / is_left select the
+ * extension-direction clip penalty and profiling hook.
+ * ------------------------------------------------------------------------- */
+/* Forward declarations: the certified probe rung below records post-SW outcomes
+ * through these profiling helpers, whose definitions live after the ladder
+ * blocks further down this file. */
+static inline void ugp_record_left_outcome(const SeqPair *sp, int a_match, int tid);
+static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
+
+static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_alnreg_v *av_v,
+        IBandedPairWiseSW *sym, IBandedPairWiseSW *ot, IBandedPairWiseSW *ob,
+        SeqPair *pair_ar, uint8_t *ref, uint8_t *qer, int nump,
+        int nthreads, SeqPair *scratch, int32_t *hist,
+        const bseq1_t *seq_, int pen_clip, int is_left, int tid)
+{
+    if (nump <= 0 || !opt->band_cert) return nump;
+
+    /* Quantized bucket ceilings. A pair runs at the smallest ceiling >= its w_need, so a
+     * proven-narrow pair does its DP at a band near its tb rather than the uniform probe
+     * width -- the whole point, since on the short 8-bit extensions band 20 costs about
+     * what band opt->w does. The certificate is evaluated at the bucket ceiling W_b >= tb,
+     * so acceptance is byte-identical for every ceiling.
+     *
+     * Gate B: ceilings ABOVE ADAPTIVE_BAND_START (20) recover the ~10-17% of eligible pairs
+     * whose w_need exceeds the startup probe width. They may only be used where the certificate's
+     * control-flow envelope still holds AT the wider band, so each such ceiling is admitted only
+     * when mem_band_cert_params_safe_w(opt, W_b) passes. Because that predicate tightens
+     * monotonically in W_b, the admissible ceilings form a prefix up to a single cap w_cap
+     * (= 30 at default params, where the zdrop margin binds: zdrop 100 > 7 + 3*30). Ceilings
+     * <= 20 are already covered by the startup gate (opt->band_cert on <=> _w(opt,20) passed). */
+    static const int32_t BUCKET_CEIL[] = {4, 8, 12, 16, ADAPTIVE_BAND_START, 24, 28, 30};
+    const int NBUCK = (int)(sizeof(BUCKET_CEIL) / sizeof(BUCKET_CEIL[0]));
+    int w_cap = ADAPTIVE_BAND_START;
+    for (int b = 0; b < NBUCK; b++) {
+        const int32_t Wc = BUCKET_CEIL[b];
+        if (Wc <= ADAPTIVE_BAND_START) { w_cap = Wc; continue; }
+        if (!mem_band_cert_params_safe_w(opt, Wc)) break;  /* monotone: wider ceilings also fail */
+        w_cap = Wc;
+    }
+
+    /* The certificate at run width W_b needs W_b >= tb + ceil(pen_clip/e_min): tight_band is
+     * anchored on the raw ungapped score with no clip slack, but the accept below certifies at
+     * S - pen_clip (the direction's clip). So key eligibility and buckets on the width the
+     * certificate actually demands, w_need = tb + clip_slack, NOT tb -- otherwise the modal
+     * ungapped-optimal pair (sc == max_sc_proof) fails the certificate by exactly that margin and
+     * re-runs the ladder. This is a heuristic width choice only; the certificate is still evaluated
+     * at the actual run width, so byte-identity is unchanged. */
+    const int e_min = opt->e_del < opt->e_ins ? opt->e_del : opt->e_ins;
+    const int clip_slack = (e_min > 0) ? (pen_clip + e_min - 1) / e_min : ADAPTIVE_BAND_START;
+    auto w_need_of = [&](int tb) { return tb + clip_slack; };
+
+    /* Partition [ineligible | eligible]; eligible = proven narrow (w_need <= w_cap). */
+    int n_inelig = 0;
+    for (int l = 0; l < nump; l++) {
+        int tb = pair_ar[l].tight_band;
+        if (!(tb > 0 && w_need_of(tb) <= w_cap)) {
+            SeqPair t = pair_ar[n_inelig]; pair_ar[n_inelig] = pair_ar[l]; pair_ar[l] = t;
+            n_inelig++;
+        }
+    }
+    int n_elig = nump - n_inelig;
+    if (n_elig <= 0) return nump;
+    SeqPair *elig = pair_ar + n_inelig;
+
+    /* Counting-sort the eligible pairs into contiguous ceiling-buckets keyed on w_need (scratch
+     * as temp; freed before any bsw_run_tier call reuses it as sort scratch). */
+    int cnt[NBUCK] = {0}, off[NBUCK] = {0};
+    auto bucket_of = [&](int w_need) { int b = 0; while (b < NBUCK - 1 && BUCKET_CEIL[b] < w_need) b++; return b; };
+    for (int l = 0; l < n_elig; l++) cnt[bucket_of(w_need_of(elig[l].tight_band))]++;
+    for (int b = 1; b < NBUCK; b++) off[b] = off[b - 1] + cnt[b - 1];
+    { int cur[NBUCK]; for (int b = 0; b < NBUCK; b++) cur[b] = off[b];
+      for (int l = 0; l < n_elig; l++) { int b = bucket_of(w_need_of(elig[l].tight_band)); scratch[cur[b]++] = elig[l]; }
+      for (int l = 0; l < n_elig; l++) elig[l] = scratch[l]; }
+
+    /* Score each non-empty bucket at its ceiling and certify there; failures from
+     * all buckets compact after the ineligible run (write cursor <= read cursor)
+     * for the untouched ladder. Guard the sym object: each bucket is a sub-slice. */
+    int n_fail = 0;
+    for (int b = 0; b < NBUCK; b++) {
+      if (cnt[b] <= 0) continue;
+      const int32_t Wb = BUCKET_CEIL[b];
+      SeqPair *bkt = elig + off[b];
+      sym->set_guard_overshoot(true);
+      bsw_run_tier(tier, opt, av_v, sym, ot, ob,
+                   bkt, ref, qer, cnt[b], nthreads, Wb, scratch, scratch, hist);
+      sym->set_guard_overshoot(false);
+      for (int l = 0; l < cnt[b]; l++) {
+        SeqPair *sp = &bkt[l];
+        mem_alnreg_t *a = &(av_v[sp->seqid].a[sp->regid]);
+        int prev = a->score;
+        a->score = sp->score;
+        /* Fix 2 (branch-A accept): certify at the direction's pen_clip anchor with NO gscore
+         * precondition, then let the finalize block below pick branch A (clipped: qle/tle) or
+         * branch B (query-end: gscore/gtle) by the same threshold the ladder uses. band_cert_ok
+         * at S - pen_clip proves every out-of-band cell scores strictly below S - pen_clip, so the
+         * wide run's branch decision and both branches' finalized fields are band-invariant
+         * (Fable-verified against the kernel update rules). The direction's pen_clip is REQUIRED:
+         * min(pen_clip5,pen_clip3) is unsound for branch A under asymmetric -L. This is a SEPARATE
+         * accept from the shared band_cert_accept, so the shipped scalar/16-bit probes are untouched. */
+        if (band_cert_ok(a->score - pen_clip, sp->h0, sp->len1, sp->len2, Wb, opt)) {
+            /* Finalize exactly as the direction's ladder does (LEFT: qb/rb backward, truesc=;
+             * RIGHT: qe/re forward, truesc+=, branch B sets qe=l_query). */
+            if (is_left) {
+#if BWAMEM3_UGP_PROFILE
+                ugp_record_left_outcome(sp, opt->a, tid);
+#endif
+                if (sp->gscore <= 0 || sp->gscore <= a->score - pen_clip) {
+                    a->qb -= sp->qle; a->rb -= sp->tle;
+                    a->truesc = a->score;
+                } else {
+                    a->qb = 0; a->rb -= sp->gtle;
+                    a->truesc = sp->gscore;
+                }
+            } else {
+#if BWAMEM3_UGP_PROFILE
+                ugp_record_right_outcome(sp, tid);
+#endif
+                if (sp->gscore <= 0 || sp->gscore <= a->score - pen_clip) {
+                    a->qe += sp->qle; a->re += sp->tle;
+                    a->truesc += a->score - sp->h0;
+                } else {
+                    int l_query = seq_[sp->seqid].l_seq;
+                    a->qe = l_query; a->re += sp->gtle;
+                    a->truesc += sp->gscore - sp->h0;
+                }
+            }
+            a->w = max_(a->w, Wb);
+            if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+                int ii = 0;
+                for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
+                    const mem_seed_t *t = &(a->c->seeds[ii]);
+                    if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
+                        t->rbeg >= a->rb && t->rbeg + t->len <= a->re)
+                        a->seedcov += t->len;
+                }
+            }
+        } else {
+            a->score = prev;              /* GAP2 restore (unconditional) */
+            elig[n_fail++] = *sp;          /* carry to the ladder */
+        }
+      }
+    }
+    return n_inelig + n_fail;
+}
+
 /* Restructured BSW parent function */
 #define FAC 8
 #define PFD 2
@@ -4094,7 +5377,22 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
 // So any band ≥ tight_band is sufficient; narrower bands suffice too
 // when the gapped alternative score is < min_len·a. Starting SW at
 // tight_band is strictly correct and avoids over-banded DP work.
-#define FP_N_MAX 128
+#define FP_N_MAX 512
+/* TIGHT routing (accepting a narrow banded-SW result early via the retry
+ * ladder's tight_band clause) is byte-identity-proven only up to this length.
+ * Beyond it, a width-w accepted result and the width-2w result a FALLBACK pair
+ * would retry can differ in extent fields (qle/tle/gscore/max_off and a->w)
+ * even at an identical optimal score -- the ladder clause is score-sound but
+ * not extent-invariant. So a pair longer than this may only HIT (skip SW,
+ * whose scalar walk mirrors kernel semantics at any length) or FALLBACK to the
+ * exact full-width ladder; it must never emit a tight_band. Keep <= the old
+ * scanner cap so behavior at those lengths is unchanged. */
+#define FP_TIGHT_MAX 128
+/* Words in the per-pair mismatch bitmap. Sized to FP_N_MAX so every scanned
+ * position 0..FP_N_MAX-1 has a bit; a shift by the in-word offset (< 64) can
+ * never alias. (Must track FP_N_MAX: at 128 this is 2 words = the old
+ * mis_lo/mis_hi pair.) */
+#define FP_MIS_NWORDS ((FP_N_MAX + 63) / 64)
 #define FP_STATUS_FALLBACK  0
 #define FP_STATUS_HIT       1
 #define FP_STATUS_TIGHT     2
@@ -4192,52 +5490,6 @@ static inline int ungapped_walk_score(const uint8_t *qs, const uint8_t *rs,
     return max_sc;
 }
 
-/* optimal ungapped score (no floor) from a per-base mismatch bitmap.
- *
- *     score(i) = h0 + (i − mismatches_i)·a − mismatches_i·b
- *              = h0 + i·a − mismatches_i·(a+b)        for i ∈ [0, N]
- *
- * f(i) is monotone non-decreasing within match runs and drops by b at each
- * mismatch. Local maxima therefore live at one of:
- *   (a) i = 0                                    f(0)  = h0
- *   (b) i = p,  bitmap[p] == 1                   f(p)  = h0 + p·a − k·(a+b)
- *                                                where k = mismatches in [0,p)
- *   (c) i = N                                    f(N)  = h0 + N·a − total·(a+b)
- *
- * Iterating set bits of the bitmap via ctz + clear-low is O(total_mis), not
- * O(N) — typically a handful of operations for HIT/TIGHT candidates.
- *
- * Unlike ungapped_walk_score, there is NO floor: score is allowed to dip
- * below 0 and recover. This yields max_sc ≥ walk's max_sc, giving a strictly
- * tighter (still safe) bound on the SW band in the tight_band proof. The
- * walk's floor exists to mirror SW kernel local-SW semantics for SAM
- * byte-identity on qle/gscore — irrelevant for the band proof. */
-static inline int ungapped_max_sc_from_bitmap(uint64_t mis_lo, uint64_t mis_hi,
-                                               int N, int h0, int a, int b)
-{
-    int max_sc = h0;            /* candidate (a): empty extension */
-    int gap    = a + b;         /* score drop per mismatch (relative to match) */
-    int k      = 0;             /* mismatches counted so far */
-    uint64_t lo = mis_lo, hi = mis_hi;
-    while (lo) {
-        int p = __builtin_ctzll(lo);
-        int s = h0 + p * a - k * gap;
-        if (s > max_sc) max_sc = s;
-        lo &= lo - 1;
-        k++;
-    }
-    while (hi) {
-        int p = 64 + __builtin_ctzll(hi);
-        int s = h0 + p * a - k * gap;
-        if (s > max_sc) max_sc = s;
-        hi &= hi - 1;
-        k++;
-    }
-    int s_end = h0 + N * a - k * gap;       /* candidate (c) */
-    if (s_end > max_sc) max_sc = s_end;
-    return max_sc;
-}
-
 static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
                                     int h0, int a, int b,
                                     int o_min, int e_min,
@@ -4249,7 +5501,7 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     if (N <= 0 || N > FP_N_MAX || x_threshold < 0) return FP_STATUS_FALLBACK;
 
     const __m128i v3 = _mm_set1_epi8(3);
-    uint64_t mis_lo = 0, mis_hi = 0;
+    uint64_t mis[FP_MIS_NWORDS] = {0};
     int total_mis = 0;
     int i = 0;
     for (; i + 16 <= N; i += 16) {
@@ -4262,46 +5514,50 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         __m128i eqv = _mm_cmpeq_epi8(qv, rv);
         unsigned mism_mask = (~(unsigned)_mm_movemask_epi8(eqv)) & 0xFFFFu;
         total_mis += __builtin_popcount(mism_mask);
-        if (i < 64) {
-            mis_lo |= ((uint64_t)mism_mask) << i;
-            if (i + 16 > 64) mis_hi |= ((uint64_t)mism_mask) >> (64 - i);
-        } else {
-            mis_hi |= ((uint64_t)mism_mask) << (i - 64);
-        }
+        /* i is 16-aligned, so (i & 63) in {0,16,32,48}: a 16-bit mask shifted
+         * by at most 48 fills bits [i&63, (i&63)+15] within a single word and
+         * never straddles a 64-bit boundary. */
+        mis[i >> 6] |= ((uint64_t)mism_mask) << (i & 63);
     }
     for (; i < N; i++) {
         uint8_t qi = qs[i], ri = rs[i];
         if (qi >= 4 || ri >= 4) return FP_STATUS_FALLBACK;
         if (qi != ri) {
             total_mis++;
-            if (i < 64) mis_lo |= (1ULL << i);
-            else        mis_hi |= (1ULL << (i - 64));
+            mis[i >> 6] |= (1ULL << (i & 63));
         }
     }
 
-    // precise max_sc (no floor) from the mismatch bitmap.
-    //
-    // An earlier formulation used `S = h0 + first_mis_pos·a` — a loose lower bound on the
-    // walk's max_sc — to skip the scalar walk on TIGHT pairs. That preserved
-    // walk-time but left the band proof loose: any matching run after the
-    // first mismatch could not contribute to S, so the proven band stayed
-    // wider than necessary.
-    //
-    // The bitmap-derived max_sc is the optimal ungapped score over all
-    // prefix lengths in [0, N], with no floor (score is allowed to dip and
-    // recover). It is ≥ the walk's max_sc, so substituting it into the band
-    // proof yields a strictly tighter (still safe) bound. Computing it from
-    // the bitmap is O(total_mis), independent of N.
-    //
-    // Band derivation (see comment above):
-    //     B < (min_len·a − S − o_min) / e_min        with S = max_sc − h0
-    // For LEFT extensions where the caller gates on len1 ≥ len2,
-    // min_len = N. Substituting:
-    //     numerator = N·a − (max_sc_proof − h0) − o_min
-    //               = N·a + h0 − max_sc_proof − o_min
-    int max_sc_proof = ungapped_max_sc_from_bitmap(mis_lo, mis_hi, N, h0, a, b);
-
     if (total_mis > x_threshold) {
+        /* TIGHT routing is extent-invariant only up to FP_TIGHT_MAX (see the
+         * define). A longer pair that is not a HIT falls back to the exact
+         * full-width ladder rather than accepting a narrow banded-SW result. */
+        if (N > FP_TIGHT_MAX) return FP_STATUS_FALLBACK;
+        // S in the band proof must be REALIZABLE by an actual offset-0 extension.
+        // The tight_band derivation shows every out-of-band alignment (band
+        // offset B >= tb) scores <= S, so a band >= tb is sufficient ONLY IF the
+        // in-band (offset-0) run actually achieves S. ungapped_walk_score is the
+        // floored ungapped score under ksw_extend local-truncation semantics
+        // (once the running score hits 0 it stays 0) -- exactly the score the
+        // rung-1 banded DP can reach on the diagonal, so it is a valid lower
+        // bound on the in-band optimum.
+        //
+        // A no-floor score (which lets a negative prefix recover via later
+        // matches) can EXCEED the floor-killed value the DP actually reaches;
+        // feeding that larger S shrinks tb below what is sound, letting the retry
+        // ladder skip the wider rung a gapped alignment in (default_w, wider]
+        // genuinely needs -- a CIGAR/coordinate divergence from the full-width
+        // ladder (breaking byte-identity). The walk is O(N) and runs only on the
+        // TIGHT branch after the FP_TIGHT_MAX gate above (N <= 128), so its cost
+        // is negligible.
+        //
+        // Band derivation (see comment above):
+        //     B < (min_len·a − S − o_min) / e_min        with S = max_sc − h0
+        // For LEFT extensions where the caller gates on len1 ≥ len2,
+        // min_len = N. Substituting:
+        //     numerator = N·a − (max_sc_proof − h0) − o_min
+        //               = N·a + h0 − max_sc_proof − o_min
+        int max_sc_proof = ungapped_walk_score(qs, rs, N, h0, a, b);
         int64_t numerator = (int64_t)N * a + h0 - max_sc_proof - o_min;
         int band;
         if (numerator <= 0) {
@@ -4312,7 +5568,14 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
             band = default_w;
         } else {
             band = (int)((numerator + e_min - 1) / e_min);
-            if (band > default_w) band = default_w;
+            // The band proof only excludes diagonal offsets >= band. When the
+            // proven band exceeds default_w, clamping to default_w would falsely
+            // certify that a width-default_w run is complete, letting the retry
+            // ladder short-circuit and skip the wider rungs a gapped alignment
+            // in the unproven window (default_w, band) genuinely needs. Emit the
+            // tight_band = 0 fallback sentinel instead, so such a pair runs the
+            // exact full-width ladder (byte-identical to non-adaptive extension).
+            if (band > default_w) band = 0;
         }
         *out_tight_band = band;
         // Outputs unused on TIGHT; set sane values for any future caller.
@@ -4359,8 +5622,7 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     // from SW on tied-score walks, breaking byte-identical SAM.
     int cur = h0, max_sc = h0, max_i = 0;
     for (int j = 0; j < N; j++) {
-        int is_mis = (j < 64) ? (int)((mis_lo >> j) & 1ULL)
-                              : (int)((mis_hi >> (j - 64)) & 1ULL);
+        int is_mis = (int)((mis[j >> 6] >> (j & 63)) & 1ULL);
         if (cur == 0) continue;
         if (!is_mis) cur += a;
         else {
@@ -4425,11 +5687,34 @@ static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si)
 }
 
 
-void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
+void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                                    const uint8_t *pac, bseq1_t *seq_, int nseq,
                                    mem_chain_v* chain_ar, mem_alnreg_v *av_v,
                                    mem_cache *mmc, uint8_t *ref_string, int tid)
 {
+    /* Enforce the certified-band safety envelope at this public entry point.
+     * band_cert is default-on, but the certificate is sound only inside the
+     * parameter envelope (see mem_band_cert_params_safe). main_mem() applies
+     * this same guard for the CLI, so for the shipping binary this is a no-op
+     * (opt_in->band_cert already agrees with the guard) and the run stays
+     * byte-identical. A library caller that mutates scoring/gap fields after
+     * mem_opt_init(), or sets an aggressive adaptive-band start (band_start > 0)
+     * without also clearing band_cert the way the --adaptive-band CLI path does,
+     * and calls this entry point directly would otherwise select certified
+     * narrowing outside the envelope and change alignment records; sanitize a
+     * local copy here so every band_cert decision and restore below falls back
+     * to the exact full-width ladder when band_start is set or the parameters
+     * are unsafe. The short-circuit keeps the mat scan off the hot path whenever
+     * band_cert is already off. */
+    mem_opt_t opt_sanitized;
+    const mem_opt_t *opt = opt_in;
+    if (opt_in->band_cert &&
+        (opt_in->band_start > 0 || !mem_band_cert_params_safe(opt_in))) {
+        opt_sanitized = *opt_in;
+        opt_sanitized.band_cert = 0;
+        opt = &opt_sanitized;
+    }
+
     SeqPair *seqPairArrayAux      = mmc->seqPairArrayAux[tid];
     SeqPair *seqPairArrayLeft128  = mmc->seqPairArrayLeft128[tid];
     SeqPair *seqPairArrayRight128 = mmc->seqPairArrayRight128[tid];
@@ -5124,7 +6409,16 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 else
                 {
                     a->qe = l_query, a->re = s->rbeg + s->len;
-                    // seedcov business, this "if" block should be redundant, check and remove.
+                    // Do NOT remove this seedcov recompute: it is load-bearing.
+                    // This is the no-right-extension branch (s->qbeg + s->len ==
+                    // l_query). When the seed also needs no left extension
+                    // (s->qbeg == 0, i.e. it spans the whole read, as perfect-match
+                    // reads do) no SW pair is staged on either side, so none of the
+                    // other seedcov recompute sites run -- neither the right-HIT
+                    // path above, nor the post-SW LEFT-accept loops, nor the
+                    // RIGHT-accept loops. In that case this block is the ONLY writer
+                    // of a->seedcov. Dropping it would leave seedcov stale and change
+                    // mem_approx_mapq_se (log(seedcov)), altering the emitted MAPQ.
                     if (a->rb != H0_ && a->qb != H0_)
                     {
                         int i;
@@ -5252,9 +6546,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     int init_w = INIT_W(opt->w);
 
     // scalar
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // uint64_t tim = __rdtsc();
         bsw_run_tier(BSW_TIER_SCALAR, opt, av_v,
                      bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
@@ -5301,6 +6595,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 }
 
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
@@ -5319,9 +6615,25 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     nump = numPairsLeft16;
     init_w = INIT_W(opt->w);
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    /* item 2: certified tight_band probe rung on the 16-bit tier, as a PURE PREPEND. The 16-bit
+     * ladder already probes narrow (its first rung is INIT_W(opt->w) = 20); the rung certifies the
+     * proven-narrow (tb>0, w_need <= w_cap) pairs at a per-w_need bucket <= 20/30 and removes them
+     * early, byte-identically (a certified pair's fields are band-invariant beyond its bucket, so
+     * the bucket and the width-20 probe finalize identically). Everything else -- ineligible pairs
+     * (tb=0, or w_need > w_cap) and the rare uncertified pair -- falls through to the UNCHANGED
+     * [20, opt->w, ...] ladder and keeps its cheap w=20 first probe.
+     *
+     * init_w is deliberately NOT raised to opt->w here (it is on the 8-bit tier, which has no w=20
+     * probe to preserve). The 16-bit tier is ~all tb=0 on short reads; raising init_w would force
+     * those ineligible pairs to probe at opt->w first (5x wider) -- a measured ~0.12% regression on
+     * 2x150 with no offsetting narrow population. As a pure prepend the rung is zero-cost on short
+     * reads (no eligible pairs -> immediate return) and wins on long-read/SBX (~25% 16-bit tier). */
+    nump = bsw_tb_probe_rung(BSW_TIER_16, opt, av_v, bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
+                             pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads,
+                             pair_ar_aux, hist, seq_, opt->pen_clip5, /*is_left=*/1, tid);
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // int64_t tim = __rdtsc();
         bsw_run_tier(BSW_TIER_16, opt, av_v,
                      bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
@@ -5370,6 +6682,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
@@ -5385,9 +6699,15 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     nump = numPairsLeft128;
     init_w = opt->w;
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    /* commit 4: certified tight_band probe rung. Finalizes the proven-narrow
+     * 8-bit pairs at the probe width (byte-identical); returns the count left
+     * (ineligible + uncertified), compacted to the front, for the ladder. */
+    nump = bsw_tb_probe_rung(BSW_TIER_8, opt, av_v, bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
+                             pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads,
+                             pair_ar_aux, hist, seq_, opt->pen_clip5, /*is_left=*/1, tid);
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // int64_t tim = __rdtsc();
 
         /* These pairs were bucketed for the 8-bit path at the initial band
@@ -5443,6 +6763,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
@@ -5607,9 +6929,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     nump = numPairsRight1;
     init_w = INIT_W(opt->w);
 
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // tim = __rdtsc();
         bsw_run_tier(BSW_TIER_SCALAR, opt, av_v,
                      bswRight.get(), bswRightOt.get(), bswRightOb.get(),
@@ -5656,6 +6978,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
@@ -5670,10 +6994,16 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight16;
     init_w = INIT_W(opt->w);
+    /* item 2: certified tight_band probe rung on the 16-bit tier (mirror of the LEFT 16-bit
+     * rung; pen_clip3, is_left=0). See the LEFT block for the byte-identity argument and why
+     * init_w stays at INIT_W(opt->w) (pure prepend; no short-read regression). */
+    nump = bsw_tb_probe_rung(BSW_TIER_16, opt, av_v, bswRight.get(), bswRightOt.get(), bswRightOb.get(),
+                             pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads,
+                             pair_ar_aux, hist, seq_, opt->pen_clip3, /*is_left=*/0, tid);
 
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // uint64_t tim = __rdtsc();
         bsw_run_tier(BSW_TIER_16, opt, av_v,
                      bswRight.get(), bswRightOt.get(), bswRightOb.get(),
@@ -5723,6 +7053,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
@@ -5738,10 +7070,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight128;
     init_w = opt->w;
+    /* commit 4: certified tight_band probe rung (mirror of the LEFT rung; pen_clip3). */
+    nump = bsw_tb_probe_rung(BSW_TIER_8, opt, av_v, bswRight.get(), bswRightOt.get(), bswRightOb.get(),
+                             pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads,
+                             pair_ar_aux, hist, seq_, opt->pen_clip3, /*is_left=*/0, tid);
 
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // uint64_t tim = __rdtsc();
 
         /* See the LEFT int8 loop: bsw_run_tier (BSW_TIER_8) diverts w >= 128
@@ -5793,6 +7129,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
