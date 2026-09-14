@@ -71,17 +71,117 @@ else
     endif
 endif
 
+# ---- Compiler version floor -------------------------------------------------
+# bwa-mem3's shipping and benchmarked builds use clang-19 (bioconda forces
+# clang; the performance benchmark suite builds with clang-19). Older toolchains
+# produce materially slower binaries: clang-19 is ~5% faster than gcc-15 and
+# ~15%+ faster than gcc-11 on ARM (~5-16% on x86), because older compilers emit
+# redundant SIMD ops (e.g. extra blend mask-broadcasts) that a modern clang
+# already elides. To keep an accidentally-slow build from being mistaken for
+# bwa-mem3 being slow, a bare `make` on a below-floor compiler FAILS. Deliberate
+# builds on old toolchains (packagers on older distros, compatibility CI, A/B
+# tests) opt out with ALLOW_UNSUPPORTED_COMPILER=1.
+#
+# Thresholds are overridable (?=) so a distro/packager can set its own policy.
+# Apple clang has its own, lower floor because its version numbers do not track
+# upstream LLVM.
+CLANG_MIN      ?= 19
+GCC_MIN        ?= 15
+APPLECLANG_MIN ?= 15
+
+# The floor gates *builds* — clean-only goals invoke no compiler (they just
+# `rm` artifacts) and so must not require a floor-passing toolchain. Without
+# this, `make clean` on GNU make's default CXX (`g++`, i.e. gcc-13 on Ubuntu
+# 24.04) trips the parse-time $(error) below and aborts — breaking both
+# contributor cleanups and any CI step that runs `make clean` before a build
+# with a pinned CXX (e.g. the kswv ASan steps in proto-neon-kswv.yml, which
+# `make clean` bare, then `make ... CXX="ccache clang++-19"`). Enforce only when
+# a real build is requested: a bare `make` (empty MAKECMDGOALS → the default
+# build goal) or any goal list containing a non-clean target still enforces it;
+# a goal list of clean targets only is exempt.
+FLOOR_EXEMPT_GOALS := clean pgo-clean profile-clean lto-clean
+ifeq ($(strip $(MAKECMDGOALS)),)
+    ENFORCE_COMPILER_FLOOR := 1
+else ifeq ($(strip $(filter-out $(FLOOR_EXEMPT_GOALS),$(MAKECMDGOALS))),)
+    ENFORCE_COMPILER_FLOOR :=
+else
+    ENFORCE_COMPILER_FLOOR := 1
+endif
+
+ifeq ($(ENFORCE_COMPILER_FLOOR),1)
+ifneq ($(ALLOW_UNSUPPORTED_COMPILER),1)
+    # Family from the --version banner; major from -dumpversion (gcc/clang/Apple
+    # clang all report a usable "<major>[.minor.patch]" there). If $(CXX) can't
+    # be probed (missing, or an unrecognized toolchain), CXX_KIND stays empty and
+    # the floor is not enforced — fail open, never block an unknown-but-working CXX.
+    CXX_VER_1ST  := $(shell $(CXX) --version 2>/dev/null | head -1)
+    CXX_VER_FULL := $(shell $(CXX) --version 2>/dev/null)
+    CXX_MAJOR    := $(shell $(CXX) -dumpversion 2>/dev/null | cut -d. -f1)
+    ifneq (,$(findstring Apple clang,$(CXX_VER_1ST)))
+        CXX_KIND  := Apple clang
+        CXX_FLOOR := $(APPLECLANG_MIN)
+    else ifneq (,$(findstring clang,$(CXX_VER_1ST)))
+        CXX_KIND  := clang
+        CXX_FLOOR := $(CLANG_MIN)
+    else ifneq (,$(findstring Free Software Foundation,$(CXX_VER_FULL)))
+        CXX_KIND  := gcc
+        CXX_FLOOR := $(GCC_MIN)
+    else
+        CXX_KIND  :=
+    endif
+    ifneq ($(CXX_KIND),)
+    ifneq (,$(CXX_MAJOR))
+    ifeq ($(shell test $(CXX_MAJOR) -lt $(CXX_FLOOR) 2>/dev/null && echo old),old)
+        $(info )
+        $(info bwa-mem3: unsupported compiler -- $(CXX_KIND) $(CXX_MAJOR) is below the floor ($(CXX_KIND) >= $(CXX_FLOOR)).)
+        $(info )
+        $(info   Modern compilers are REQUIRED for performance. clang-19 -- what bioconda and the)
+        $(info   performance benchmarks ship -- is ~5% faster than gcc-15 and ~15%+ faster than gcc-11)
+        $(info   on ARM (~5-16% on x86); older compilers emit redundant SIMD ops a modern clang elides.)
+        $(info   An old-compiler build is needlessly slow and must not be benchmarked as representative.)
+        $(info )
+        $(info   Fix (recommended): install clang >= $(CLANG_MIN) and build with `make CXX=clang++ CC=clang`.)
+        $(info   Or gcc >= $(GCC_MIN) (acceptable, ~5% slower on ARM).)
+        $(info   Override (packagers / compat CI / deliberate A/B on old toolchains):)
+        $(info       make ALLOW_UNSUPPORTED_COMPILER=1 ...)
+        $(info )
+        $(error unsupported compiler: $(CXX_KIND) $(CXX_MAJOR) < $(CXX_FLOOR); set ALLOW_UNSUPPORTED_COMPILER=1 to override)
+    endif
+    endif
+    endif
+endif
+endif
+# -----------------------------------------------------------------------------
+
 # AddressSanitizer support for catching kswv rowMax / SIMD store overruns
 # in regression tests (e.g. kswv_nrow_zero_test). Opt-in with `make ASAN=1 ...`
 # Forces USE_MIMALLOC off: mimalloc's malloc override interposes before asan
-# and the two can't coexist cleanly. Must be set before the mimalloc block so
-# USE_MIMALLOC=0 actually takes effect there. CXXFLAGS picks up $(ASAN_FLAGS)
+# and the two can't coexist cleanly. Uses `override` so an explicit
+# `USE_MIMALLOC=1` on the command line cannot re-enable the incompatible
+# allocator under the sanitizer. CXXFLAGS picks up $(ASAN_FLAGS)
 # unconditionally later in the file; it stays empty when ASAN is unset.
 ifneq ($(strip $(ASAN)),)
-    USE_MIMALLOC = 0
+    override USE_MIMALLOC = 0
     ASAN_FLAGS   = -fsanitize=address -fno-omit-frame-pointer -O1
     LDFLAGS     += -fsanitize=address
     CFLAGS      += $(ASAN_FLAGS)
+endif
+
+# MemorySanitizer support for catching uninitialized reads, specifically the
+# padded-lane input fields the SW kernels read back (see
+# kernel_padded_lane_uninit_test). Opt-in with `make MSAN=1 ...`. MSan is a
+# clang-only instrumentation; it forces USE_MIMALLOC off via `override` (mimalloc's
+# malloc override interposes before the sanitizer runtime, and `override` keeps a
+# command-line USE_MIMALLOC=1 from re-enabling it) and reuses the ASAN_FLAGS
+# slot so the flags reach CXXFLAGS/CFLAGS/the test link lines unconditionally.
+# ASAN and MSAN are mutually exclusive; ASAN wins if both are set.
+ifneq ($(strip $(MSAN)),)
+ifeq ($(strip $(ASAN)),)
+    override USE_MIMALLOC = 0
+    ASAN_FLAGS   = -fsanitize=memory -fsanitize-memory-track-origins=2 -fno-omit-frame-pointer -O1
+    LDFLAGS     += -fsanitize=memory
+    CFLAGS      += $(ASAN_FLAGS)
+endif
 endif
 
 # TESTING_BUILD=1 defines BWAMEM3_TESTING which enables test-only injection
@@ -153,8 +253,38 @@ ifneq ($(IS_ARM),)
     SSE2NEON_INCLUDES = -Iext/sse2neon
     CPPFLAGS += $(SSE2NEON_FLAGS)
     INCLUDES += $(SSE2NEON_INCLUDES)
-    # Apple Silicon uses 128-byte cache lines
-    CPPFLAGS += -DCACHE_LINE_BYTES=128
+    # CPU tuning. Default is generic/portable scheduling — safe for any ARM core
+    # including Apple Silicon, and what portable release binaries should ship.
+    # Set ARM_CPU=<name> for a core-tuned build, e.g. ARM_CPU=neoverse-v2
+    # (Graviton4) or ARM_CPU=native (match the build host). This goes in CPPFLAGS
+    # (not ARCH_FLAGS) because ARCH_FLAGS is reset with `=` in the arch=arm64
+    # branch below; CPPFLAGS uses `+=` and reaches every compile line.
+    ifneq ($(ARM_CPU),)
+        CPPFLAGS += -mcpu=$(ARM_CPU)
+    endif
+    # Cache-line size used as the minimum SIMD allocation alignment. Apple
+    # Silicon uses 128-byte lines; Neoverse/Graviton use 64. Default 128 —
+    # over-aligning on a 64-byte core is harmless. A tuned build overrides it
+    # with ARM_CACHE_LINE=64.
+    ARM_CACHE_LINE ?= 128
+    # Reject unsupported alignments before they reach CACHE_LINE_BYTES. An
+    # invalid value would make _mm_malloc call posix_memalign with a bad
+    # alignment, which returns EINVAL/NULL and is then dereferenced unchecked in
+    # the kswv constructor. CACHE_LINE_BYTES must be exactly one supported value:
+    # guard the token count first ($(filter) matches per word, so a multi-token
+    # value like "64 128" would slip past a bare membership test; this also
+    # rejects empty), then the value itself. The supported values are the
+    # $(filter) PATTERN and the user value is the text, not the reverse: a user
+    # value used as the pattern could carry a `%` wildcard (e.g. ARM_CACHE_LINE=%)
+    # that matches everything and passes the check. Fail at parse time with a
+    # clear message instead of building a broken binary.
+    ifneq ($(words $(ARM_CACHE_LINE)),1)
+        $(error ARM_CACHE_LINE must be a single value, 64 or 128 (got '$(ARM_CACHE_LINE)'))
+    endif
+    ifeq ($(filter 64 128,$(ARM_CACHE_LINE)),)
+        $(error ARM_CACHE_LINE must be 64 or 128 (got '$(ARM_CACHE_LINE)'))
+    endif
+    CPPFLAGS += -DCACHE_LINE_BYTES=$(ARM_CACHE_LINE)
     # Link Accelerate framework on macOS for potential BLAS/vecLib usage
     ifeq ($(UNAME_S),Darwin)
         LIBS_EXTRA = -framework Accelerate
@@ -316,14 +446,14 @@ LDFLAGS += $(HTSLIB_static_LDFLAGS)
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/kstring.o src/bntseq.o src/bwamem.o src/seed_order.o src/profiling.o \
 			src/compat_target.o \
-			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
+			src/FMI_search.o src/fmi_seed_api.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
 			src/meth_xm.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
-			src/bwa_shm.o src/simd_dispatch.o \
+			src/bwa_shm.o src/bwa_hugepages.o src/simd_dispatch.o \
 			src/fast_reader.o src/fast_reader_bseq.o src/fr_fastq.o src/stage_prof.o \
-			src/smem_dedup.o
+			src/smem_dedup.o src/lockstep_width.o src/read_memo.o
 
 # Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
 # and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
@@ -346,7 +476,15 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    bandedswa_padding_test bandedswa_highzdrop_seed_test \
                    bandedswa_high_h0_zdrop_test shm_section_find_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
-                   kt_for_pool_test bns_zero_calloc_test
+                   kt_for_pool_test bns_zero_calloc_test \
+                   err_fgets_eof_test \
+                   kernel_padded_lane_uninit_test bam_rec_scratch_test \
+                   detect_sa_compx_test nst_nt4_decode_test \
+                   read_arena_overflow_test packed_text_neg_nbases_test \
+                   packed_text_overflow_nbases_test \
+                   mem_gen_alt_zero_calloc_test srtgg_grow_multi_test \
+                   kopen_pipe_status_test cli_arg_safety_test \
+                   pwrite_all_status_test x86_soa_pack_test
 STANDALONE_TEST_OBJS = $(STANDALONE_TESTS:%=test/%.o)
 
 # shm_pack_round_trip_test is excluded from `test:` because it runs via
@@ -717,6 +855,18 @@ src/bandedSWA.native.o: src/bandedSWA.cpp
 bandedswa_padding_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_padding_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_padding_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
 
+# Uninitialized-padded-lane gate for the banded-SW kernels
+# (BandedPairWiseSW::getScores8/16). Meaningful under MemorySanitizer
+# (`make MSAN=1 kernel_padded_lane_uninit_test`) or Valgrind memcheck: it hands
+# the kernels a RAW-malloc'd (never value-initialized) pair array so the padding
+# lanes are genuinely uninitialized, and any tier that reads a padded-lane field
+# it did not first write is reported as a use of an uninitialized value. Links
+# the native-tier bandedSWA object so the host's widest getScores8/16 wrappers
+# are the ones exercised. (The kswv counterpart is a follow-up -- see the test's
+# header comment -- so this recipe links bandedSWA only.)
+kernel_padded_lane_uninit_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/kernel_padded_lane_uninit_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/kernel_padded_lane_uninit_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
+
 # Unsigned h0-prefix seed regression: getScores8 vs scalar at zdrop > 126 with
 # seed prefix bytes > 127 (the range the old signed seed could not represent).
 bandedswa_highzdrop_seed_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_highzdrop_seed_test.o
@@ -745,11 +895,16 @@ test-binaries: $(BWA_LIB) $(HTS_LIB)
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
+	    ARM_CPU='$(ARM_CPU)' \
+	    ARM_CACHE_LINE='$(or $(ARM_CACHE_LINE),128)' \
 	    HTSLIB_static_LIBS='$(HTSLIB_static_LIBS)' \
 	    HTSLIB_static_LDFLAGS='$(HTSLIB_static_LDFLAGS)'
 
 shm_section_find_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_section_find_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_section_find_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
+detect_sa_compx_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/detect_sa_compx_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/detect_sa_compx_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
 shm_pack_round_trip_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_round_trip_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_pack_round_trip_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
@@ -760,11 +915,91 @@ shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destr
 kt_for_pool_test: $(BWA_LIB) $(HTS_LIB) test/kt_for_pool_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/kt_for_pool_test.o $(BWA_LIB) $(LIBS) -o $@
 
+# mem_chain2aln_across_reads_V2 srtgg growth-loop regression. Meaningful under
+# ASan (`make ASAN=1 srtgg_grow_multi_test`): a single chain with a seed count
+# past a single doubling of srtgg's initial capacity over-writes the buffer
+# under the buggy single-doubling growth; the loop-until-it-fits fix runs
+# clean. See the test's header comment.
+srtgg_grow_multi_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/srtgg_grow_multi_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/srtgg_grow_multi_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
+# kopen_pipe_status_test links libbwa.a for kopen/kclose (src/kopen.o) and
+# exercises the `<cmd` pipe path with synthetic producers; no fixture, no arch.
+kopen_pipe_status_test: $(BWA_LIB) $(HTS_LIB) test/kopen_pipe_status_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/kopen_pipe_status_test.o $(BWA_LIB) $(LIBS) -o $@
+
+# cli_arg_safety_test links libbwa.a for bwa_insert_header/bwa_escape and
+# bseq_classify; exercises -R/-H escape and the -p empty-batch path. No arch.
+cli_arg_safety_test: $(BWA_LIB) $(HTS_LIB) test/cli_arg_safety_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/cli_arg_safety_test.o $(BWA_LIB) $(LIBS) -o $@
+
+# pwrite_all_status_test: header-only io_utils.h contract; links libbwa for err_fatal.
+pwrite_all_status_test: $(BWA_LIB) $(HTS_LIB) test/pwrite_all_status_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/pwrite_all_status_test.o $(BWA_LIB) $(LIBS) -o $@
+
 # Standalone on purpose: it defines its own calloc so a zero-size request can
 # return NULL, and that interposition must not reach any other test. See the
 # header comment in the source.
 bns_zero_calloc_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/bns_zero_calloc_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/bns_zero_calloc_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
+# Compile+link smoke test for the fmi_seed_api.h facade: proves the header's
+# extern "C" section and every declared symbol actually resolve against
+# libbwa.a, standing in for the external (e.g. minibwa) consumer build. Not
+# part of $(STANDALONE_TESTS)/`test:` -- it is a link-surface check, not a
+# behavioral regression test.
+.PHONY: smoke
+smoke: fmi_seed_api_smoke
+	./fmi_seed_api_smoke
+
+fmi_seed_api_smoke: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/fmi_seed_api_smoke.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/fmi_seed_api_smoke.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+
+test/fmi_seed_api_smoke.o: test/fmi_seed_api_smoke.cpp $(FLAGS_STAMP)
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+# Regression test for the fmi_seed_api.h facade's max_occ guard: forwarding
+# max_occ <= 0 into FMI_search::get_sa_entries_prefetch divides by max_occ.
+# Requires a real index prefix argument (see test/run_unit_tests.sh), unlike
+# the link-surface-only fmi_seed_api_smoke target above.
+fmi_seed_api_guards_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/fmi_seed_api_guards_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/fmi_seed_api_guards_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+
+test/fmi_seed_api_guards_test.o: test/fmi_seed_api_guards_test.cpp $(FLAGS_STAMP)
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+# Unit test for the nst_nt4_decode helper (nt4 re-encoding, signed-char safety).
+nst_nt4_decode_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/nst_nt4_decode_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/nst_nt4_decode_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+test/nst_nt4_decode_test.o: test/nst_nt4_decode_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+# Alloc-guard regression tests: memory-safety guard paths that do not fire on
+# valid input (see each source header for what old-vs-new behavior it pins).
+read_arena_overflow_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/read_arena_overflow_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/read_arena_overflow_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+test/read_arena_overflow_test.o: test/read_arena_overflow_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+packed_text_neg_nbases_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/packed_text_neg_nbases_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/packed_text_neg_nbases_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+test/packed_text_neg_nbases_test.o: test/packed_text_neg_nbases_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+packed_text_overflow_nbases_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/packed_text_overflow_nbases_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/packed_text_overflow_nbases_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+test/packed_text_overflow_nbases_test.o: test/packed_text_overflow_nbases_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+mem_gen_alt_zero_calloc_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/mem_gen_alt_zero_calloc_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/mem_gen_alt_zero_calloc_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+test/mem_gen_alt_zero_calloc_test.o: test/mem_gen_alt_zero_calloc_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+# err_fgets must name EOF as EOF, not a stale strerror. Links libbwa for
+# err_fgets / _err_fatal_simple; forked child captures the abort diagnostic.
+err_fgets_eof_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/err_fgets_eof_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/err_fgets_eof_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
 # fast_reader is C (not C++); the implicit .c rule omits $(INCLUDES), so give
 # these objects explicit rules carrying the project include paths (incl.
@@ -813,7 +1048,7 @@ ifeq ($(UNAME_S),Darwin)
         FAST_READER_TEST_LIB += -L$(ZLIBNG_PREFIX)/lib
     endif
 endif
-fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c $(FAST_READER_TEST_DEP)
+fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c test/gz_test_util.h $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fast_reader_selftest.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Differential test: fr_fastq vs kseq, byte-identical record parsing. Links only
@@ -825,6 +1060,47 @@ fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $
 # Usage: ./fr_fastq_bench {kseq|frfastq} reads.fq[.gz] [reps]
 fr_fastq_bench: src/fr_fastq.c src/fast_reader.c test/fr_fastq_bench.c $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_bench.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+
+# Regression: bseq_read_fast must not overrun its buffer in paired-end mode when
+# the initial capacity estimate is odd (a paired iteration writes two records
+# but capacity is checked once). Always built with ASan so the overflowing write
+# aborts on regression; links only the reader TUs (no bwa-mem3 build), like
+# fr_fastq_diff_test. Built and run per-row by the CI matrix (ci.yml).
+bseq_read_pe_oob_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_pe_oob_test.c $(FAST_READER_TEST_DEP)
+	$(CC) -O1 -g -fsanitize=address -fno-omit-frame-pointer -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_pe_oob_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+
+# Coverage for bseq_read_fast's copy_comment/-C gate (bseq1_t.comment set only
+# when the caller asked AND the record had a comment), across SE/PE. The parser
+# is covered by fr_fastq_diff_test; this drives the adapter. Reader TUs only.
+bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_comment_copy_test.c $(FAST_READER_TEST_DEP)
+	$(CC) -O2 -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_comment_copy_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+
+# Regression: bseq_read_fast must abort (err_fatal), not swallow a truncated
+# gzip member as clean EOF. Drives the full fast_reader -> fr_fastq ->
+# bseq_read_fast chain over a mid-member-truncated .fq.gz; the forked child must
+# die by SIGABRT rather than reach a clean n==0 EOF. Reader TUs only (no
+# bwa-mem3 build), like bseq_read_comment_copy_test. Built and run in ci.yml.
+bseq_read_truncated_gzip_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_truncated_gzip_test.c test/gz_test_util.h $(FAST_READER_TEST_DEP)
+	$(CC) -O2 -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_truncated_gzip_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+# kvec_alloc_fail_test -- forces the backing realloc to fail and asserts kvec.h's
+# growth macros abort loudly (SIGABRT + an out-of-memory diagnostic) instead of
+# leaking the old buffer and writing through the NULL that realloc returns.
+# Header-only (kvec.h is standalone), so it links no bwa-mem3 objects, needs no
+# index, and runs on every CI row. Forked: the abort is contained so the parent
+# asserts *how* the child died -- a regression (a NULL-deref SIGSEGV, or silent
+# continuation) fails the test rather than taking the process down with it.
+kvec_alloc_fail_test: test/kvec_alloc_fail_test.c src/kvec.h
+	$(CC) -O2 -Wall -Wextra -Isrc test/kvec_alloc_fail_test.c -o $@
+# klib_alloc_fail_test -- the same contract for the other vendored klib headers
+# (kbtree.h, kseq.h, ksort.h): force a calloc, a malloc and a realloc guard
+# across the three headers to fail (fail-once, so a downstream guard can't mask
+# a deleted one) and assert the header's self-contained guard aborts with an
+# out-of-memory diagnostic instead of writing through NULL. Header-only and
+# forked like the kvec test.
+# -Wno-unused-function: the KBTREE_INIT/KSEQ_INIT expansions define static
+# accessors the test never calls.
+klib_alloc_fail_test: test/klib_alloc_fail_test.c src/kbtree.h src/kseq.h src/ksort.h
+	$(CC) -O2 -Wall -Wextra -Wno-unused-function -Isrc test/klib_alloc_fail_test.c -o $@
 
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 
@@ -842,10 +1118,12 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 # Note: depends on `bwa-mem3` so version_banner.sh has a binary to grep —
 # previously `test:` only built the test harness binaries, not the main
 # executable.
-test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) bwa-mem3
+test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib_alloc_fail_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
 	for t in $(STANDALONE_TESTS_IN_TEST_TARGET); do echo "./$$t"; ./$$t || exit 1; done
+	./kvec_alloc_fail_test
+	./klib_alloc_fail_test
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 	./test/regression/ndebug_gate_lint_selftest.sh
@@ -893,6 +1171,15 @@ test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
 test/kswv_freed_cell_test.o: test/kswv_freed_cell_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) -Iext $(DEPFLAGS) $< -o $@
 
+# x86_soa_pack.h byte-identity vs the scalar SoA fill: header-only, so it links
+# nothing from libbwa.a. -march=native so W == 64 is instantiated exactly when
+# the host has AVX-512BW; on a host without AVX2 the header is empty and the
+# binary records the skip. Carries -Iext for doctest like kswv_freed_cell_test.
+x86_soa_pack_test: test/x86_soa_pack_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/x86_soa_pack_test.o -o $@
+test/x86_soa_pack_test.o: test/x86_soa_pack_test.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) -Iext $(DEPFLAGS) $< -o $@
+
 test/bandedswa_padding_test.o: test/bandedswa_padding_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
@@ -902,7 +1189,19 @@ test/bandedswa_highzdrop_seed_test.o: test/bandedswa_highzdrop_seed_test.cpp
 test/bandedswa_high_h0_zdrop_test.o: test/bandedswa_high_h0_zdrop_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
+# Must be built -march=native like its sibling banded-SW tests: it links against
+# src/bandedSWA.native.o (host SIMD widths), and getScores8/16 write padding
+# lanes sized by SIMD_WIDTH8/16. The generic .cpp.o rule would compile this TU at
+# the baseline (SSE4.1, width 16), so on an AVX2/AVX-512 host the native kernel
+# would write padding beyond the test's baseline-sized allocation -- an OOB
+# access. Compiling the test at -march=native keeps its widths in lockstep.
+test/kernel_padded_lane_uninit_test.o: test/kernel_padded_lane_uninit_test.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
 test/shm_section_find_test.o: test/shm_section_find_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/detect_sa_compx_test.o: test/detect_sa_compx_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
@@ -911,7 +1210,30 @@ test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
 test/kt_for_pool_test.o: test/kt_for_pool_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
+test/srtgg_grow_multi_test.o: test/srtgg_grow_multi_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/kopen_pipe_status_test.o: test/kopen_pipe_status_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/cli_arg_safety_test.o: test/cli_arg_safety_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/pwrite_all_status_test.o: test/pwrite_all_status_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
 test/bns_zero_calloc_test.o: test/bns_zero_calloc_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+# Header-only: exercises BamRecScratch::grow() geometric growth. Uses no lib
+# symbols (POD kstring_t + malloc/free), so it links against libc alone.
+bam_rec_scratch_test: test/bam_rec_scratch_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/bam_rec_scratch_test.o -o $@
+
+test/bam_rec_scratch_test.o: test/bam_rec_scratch_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/err_fgets_eof_test.o: test/err_fgets_eof_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # Archive both the baseline (unmangled) kernel objects from $(OBJS) and the
@@ -928,12 +1250,54 @@ $(BWA_LIB):$(OBJS) $(KERNEL_TIER_OBJS)
 # htslib: minimal configure (no lzma/bz2/curl/S3/GCS/plugins), zlib only.
 # Guard on config.mk (only created by ./configure) rather than Makefile, which
 # is checked into the htslib tree and would make the guard a no-op.
-$(HTS_LIB):
+# Guard: htslib's configure installs htscodecs.mk as a symlink to
+# htscodecs_bundled.mk, and htslib's own `htscodecs.mk:` recipe regenerates
+# the file by writing THROUGH that symlink. GNU make remakes included
+# makefiles even under -n, so a `make -B` (or -B -n) that recurses into
+# ext/htslib overwrites htscodecs_bundled.mk with a 3-line stub; the next
+# libhts.a then silently lacks the htscodecs objects and the final link of
+# bwa-mem3 fails on undefined rans_*/tok3_* symbols, far from the cause.
+# Fail here instead, with the fix.
+# One shell statement, used twice in the $(HTS_LIB) recipe and by the
+# check-htscodecs-fragment target below. Only active once configure has
+# turned htscodecs.mk into a symlink; a fresh checkout has a regular file
+# there and nothing to check.
+HTSCODECS_FRAGMENT_CHECK = if [ -L ext/htslib/htscodecs.mk ] && \
+    ! grep -q '^HTSCODECS_OBJS' ext/htslib/htscodecs_bundled.mk 2>/dev/null; then \
+    echo "ERROR: ext/htslib/htscodecs_bundled.mk has been overwritten (it no longer defines HTSCODECS_OBJS)."; \
+    echo "  htslib's htscodecs.mk recipe wrote through the configure-made symlink, usually after a 'make -B'."; \
+    echo "  Restore it with: git -C ext/htslib checkout -- htscodecs_bundled.mk   (or: git submodule update --force ext/htslib), then re-run make"; \
+    exit 1; \
+fi
+
+# The fragment guard is an order-only prerequisite (check-htscodecs-fragment): it
+# fires whenever $(HTS_LIB) is CONSIDERED -- including when libhts.a is up to date
+# but incomplete (a corrupted htscodecs_bundled.mk), where the recipe below is
+# skipped entirely -- without marking the archive out of date or rerunning the
+# sub-make. It runs again at the end of the recipe (a clobber the sub-make just
+# performed, e.g. under this very `make -B`), so a failure is reported here, next
+# to its cause, rather than as missing rans/tok3 symbols at the final link.
+#
+# GNU make runs any recipe line containing $(MAKE) even under -n (the recursion
+# convention) while skipping the @-prefixed fragment check below it. During a
+# dry run that would let the htslib sub-make clobber htscodecs_bundled.mk with
+# neither guard firing. DRY_RUN detects -n at parse time so the recursion is
+# dropped from the recipe: a dry run then performs no sub-make and no clobber.
+DRY_RUN := $(findstring n,$(firstword -$(MAKEFLAGS)))
+$(HTS_LIB): | check-htscodecs-fragment
+ifeq ($(DRY_RUN),)
 	cd ext/htslib && \
 	    ([ -f config.mk ] || (autoreconf -i && \
 	        ./configure --disable-lzma --disable-libcurl --disable-gcs \
 	                    --disable-s3 --disable-plugins --disable-bz2)) && \
 	    $(MAKE) libhts.a htslib_static.mk
+endif
+	@$(HTSCODECS_FRAGMENT_CHECK)
+
+# Standalone entry point for the same check (test/regression/make_htscodecs_guard.sh).
+.PHONY: check-htscodecs-fragment
+check-htscodecs-fragment:
+	@$(HTSCODECS_FRAGMENT_CHECK)
 
 # Companion to the `-include ext/htslib/htslib_static.mk` near LIBS:
 # declare the include file as a target with a non-empty recipe so GNU
@@ -998,7 +1362,7 @@ $(ZLIBNG_LIB):
 	cd $(ZLIBNG_BUILD) && cmake $(ZLIBNG_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) bwa-mem3.arm64
+	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS) $(LIBSAIS_OBJS:.o=.d)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean

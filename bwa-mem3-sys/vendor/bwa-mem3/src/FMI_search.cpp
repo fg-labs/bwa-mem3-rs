@@ -38,12 +38,14 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <pthread.h>
 #include <unistd.h>       /* pread, _exit */
 #include <sys/mman.h>     /* munmap */
+#include <sys/stat.h>     /* fstat */
 #if defined(__linux__)
 #include <fcntl.h>        /* posix_fadvise */
 #endif
 #include "bwa_madvise.h"
 #include "bwa_shm.h"
 #include "utils.h"        /* ATTRIBUTE, err_fread_noeof */
+#include "io_utils.h"     /* io_request_size, IO_MAX_ONCE */
 #include "FMI_search.h"
 #include "profiling.h"
 #include "libsais_build.h"
@@ -81,8 +83,9 @@ int fmi_pread_worker_count(size_t nbytes, int nthreads)
 
 size_t fmi_pread_request_size(size_t remaining)
 {
-    const size_t PREAD_MAX_ONCE = (size_t)1 << 30;   /* 1GiB, well under INT_MAX */
-    return remaining > PREAD_MAX_ONCE ? PREAD_MAX_ONCE : remaining;
+    // Delegate to the one shared clamp so read and write agree on the cap; see
+    // io_utils.h. pread() has the same macOS >INT_MAX EINVAL cap as pwrite().
+    return io_request_size(remaining, IO_MAX_ONCE);
 }
 
 namespace {
@@ -173,18 +176,36 @@ void parallel_pread(int fd, void *dst, size_t nbytes, off_t off, int nthreads)
         if (spawned[i]) pthread_join(tids[i], NULL);
 }
 
+}  // namespace
+
 // Worker count for the index load: the caller's -t, capped (bandwidth bound
 // past ~8), with an explicit BWA3_LOAD_THREADS override for tuning.
+// Exposed (declared in FMI_search.h) so the env-parse validation is
+// unit-testable without loading a real index.
 int index_load_threads(int n_threads)
 {
     int t = n_threads > 0 ? n_threads : 1;
     if (t > 8) t = 8;
     const char *e = getenv("BWA3_LOAD_THREADS");
-    if (e != NULL) { int v = atoi(e); if (v > 0) t = v; }
+    if (e != NULL && *e != '\0') {
+        // Strict parse: atoi silently accepts garbage (abc -> 0, 0x8 -> 0) and
+        // any huge value (100000 -> ~1280 pthread_creates). On malformed input
+        // warn and keep the computed default -- ignore-and-continue like
+        // BWA3_SMEM_LOCKSTEP_N (bwa3_lockstep_width_parse_env), NOT the hard
+        // exit(1) that BWA_INDEX_THREADS's parse_ll takes. Clamp to a 64-thread
+        // ceiling (the load is bandwidth-bound past ~8).
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(e, &end, 10);
+        if (errno != 0 || end == e || *end != '\0' || v <= 0) {
+            fprintf(stderr, "ERROR: BWA3_LOAD_THREADS=\"%s\" is not a positive integer; ignoring it\n", e);
+        } else {
+            if (v > 64) v = 64;   // ceiling; the load is bandwidth-bound past ~8
+            t = (int)v;
+        }
+    }
     return t;
 }
-
-}  // namespace
 
 /* Declared in FMI_search.h; see there for the contract. ftello reports the
  * stream's logical position (buffered bytes included), so it is the right
@@ -202,6 +223,88 @@ void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads)
         fprintf(stderr, "ERROR: fseeko failed during index load: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
+}
+
+/* Declared in FMI_search.h; see there for the contract.
+ *
+ * The on-disk layout is: header(48B: reference_seq_len + count[5], i.e.
+ * 6*sizeof(int64_t)) + cp_occ + SA-sample arrays (sized by sa_compx) +
+ * sentinel_index(8B) [+ sa_compx tag(8B), new format only]. Since the
+ * SA-sample-array size depends on sa_compx, the tag's own file offset can't
+ * be computed without already knowing sa_compx -- so instead we read the
+ * file's last 8 bytes as a `candidate` sa_compx and verify it reproduces the
+ * file's actual size when plugged back into the layout-size formula
+ * (`off_sent_for`). If it doesn't -- including on a legacy, pre-this-feature
+ * index, which carries no tag at all -- we fall back to `default_compx`.
+ *
+ * Why this is safe without a version field: a legacy index (no tag, always
+ * built at the fixed compile-time SA_COMPX rate) has file size
+ *
+ *   legacy_size = off_sent_for(SA_COMPX) + 8            (sentinel only)
+ *
+ * while a false-positive match against some candidate `c` would require
+ *
+ *   legacy_size == off_sent_for(c) + 16                  (sentinel + tag)
+ *
+ * Each unit of SA-sample count changes off_sent_for by exactly 5 bytes
+ * (1-byte int8_t + 4-byte uint32_t per sample), so equating the two reduces
+ * to 5*Delta == 8 for some integer Delta = sa_sample_cnt(SA_COMPX) -
+ * sa_sample_cnt(c). Since 5 does not divide 8, no integer Delta -- and hence
+ * no candidate `c`, including c == SA_COMPX itself (Delta == 0, 0 != 8) --
+ * can satisfy it. A legacy index can therefore never be misdetected as
+ * carrying a valid tail. This is a property of the byte accounting, not of
+ * a chosen constant, so it must not be "shored up" with a magic-number or
+ * version field: doing so would change the on-disk format and break this
+ * branch's byte-identity guarantee against stock indexes for no benefit. */
+int64_t detect_sa_compx(int fd, int64_t file_size, int64_t ref_seq_len, int64_t default_compx)
+{
+    int64_t candidate = -1;
+    if (file_size >= (int64_t)(2 * sizeof(int64_t))) {
+        /* Robustly read the trailing 8-byte candidate tag. A read error or a
+         * short/EOF read here must NOT silently fall back to default_compx: a
+         * genuinely non-default index would then be mis-sized (wrong SA-sample
+         * offsets, no diagnostic) -- the same failure the fstat() guards at
+         * both call sites already prevent. Retry EINTR and treat any other
+         * failure as a fatal load error, mirroring pread_chunk_worker() above.
+         * Only a fully-read candidate that fails the layout test below
+         * legitimately falls back to default_compx. */
+        char   *dst  = (char *)&candidate;
+        off_t   off  = (off_t)(file_size - (int64_t)sizeof(int64_t));
+        size_t  done = 0;
+        while (done < sizeof(int64_t)) {
+            ssize_t r = pread(fd, dst + done, sizeof(int64_t) - done,
+                              off + (off_t)done);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                fprintf(stderr, "ERROR: pread failed reading SA-rate tag "
+                                "during index load: %s\n", strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            if (r == 0) {
+                fprintf(stderr, "ERROR: unexpected EOF reading SA-rate tag "
+                                "during index load\n");
+                exit(EXIT_FAILURE);
+            }
+            done += (size_t)r;
+        }
+    }
+
+    auto off_sent_for = [ref_seq_len](int64_t compx) -> int64_t {
+        // Mirrors HDR_BYTES in fm_index_writer.cpp / BWA_BWT_2BIT_HEADER_BYTES
+        // in bwa_shm.cpp: ref_seq_len + count[5].
+        const int64_t hdr_bytes      = 6 * (int64_t)sizeof(int64_t);
+        const int64_t cp_occ_cnt     = (ref_seq_len >> CP_SHIFT) + 1;
+        const int64_t sa_sample_cnt  = (ref_seq_len >> compx) + 1;
+        return hdr_bytes + cp_occ_cnt * (int64_t)sizeof(CP_OCC)
+                         + sa_sample_cnt * (int64_t)sizeof(int8_t)
+                         + sa_sample_cnt * (int64_t)sizeof(uint32_t);
+    };
+
+    if (candidate >= 0 && candidate <= CP_SHIFT &&
+        off_sent_for(candidate) + 2 * (int64_t)sizeof(int64_t) == file_size) {
+        return candidate;
+    }
+    return default_compx;
 }
 
 /* Build "<prefix><suffix>" into `out` (sized `outsz`); aborts on overflow.
@@ -223,6 +326,8 @@ FMI_search::FMI_search(const char *fname)
     fmi_build_path(file_name, sizeof(file_name), fname, "");
     reference_seq_len = 0;
     sentinel_index = 0;
+    sa_compx = SA_COMPX;
+    sa_compx_mask = SA_COMPX_MASK;
     sa_ls_word = NULL;
     sa_ms_byte = NULL;
     cp_occ = NULL;
@@ -255,7 +360,7 @@ int64_t FMI_search::cp_occ_size_bytes() const {
 }
 
 int64_t FMI_search::sa_sample_count() const {
-    return (reference_seq_len >> SA_COMPX) + 1;
+    return (reference_seq_len >> sa_compx) + 1;
 }
 
 void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
@@ -274,6 +379,15 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
     memcpy(&reference_seq_len, base + off,                                    sizeof(int64_t));
     memcpy(count,              base + off + sizeof(int64_t),                  sizeof(int64_t) * 5);
     memcpy(&sentinel_index,    base + off + sizeof(int64_t) * 6,              sizeof(int64_t));
+    /* sa_compx: the SA sample-rate shift the staged index was built with.
+     * IMPORTANT FIX: this used to stay at the constructor's compile-time
+     * default (SA_COMPX) because nothing here overrode it, so a non-default
+     * `-u`-built index attached via shm was mis-sized (sa_sample_count() and
+     * every sa_ms_byte/sa_ls_word index below used the wrong shift). Reading
+     * it from the packed scalars (see BWA_SHM_FMI_SCALARS_BYTES / the PACK
+     * side in bwa_shm.cpp) makes shm-attach agree with the disk loader's
+     * tail-detected rate. */
+    memcpy(&sa_compx,          base + off + sizeof(int64_t) * 7,              sizeof(int64_t));
 
     /* Validate scalars before we use reference_seq_len in cp_occ_size_bytes()
      * and the SA size accessors. Bounds match the disk path's asserts in
@@ -285,12 +399,25 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
             (long long)reference_seq_len);
         exit(EXIT_FAILURE);
     }
-    /* count[] is +1-adjusted by bwa_shm_compute; range [1, ref_seq_len+1]. */
+    /* count[] is +1-adjusted by bwa_shm_compute; range [1, ref_seq_len+1], and
+     * as the cumulative C[] array it must be non-decreasing. These bounds match
+     * the disk path's post-adjustment asserts in load_index(): a count[i] == 0
+     * drives smem.k out of cp_occ on the first backwardExt, and a non-monotone
+     * pair yields a negative smem.s (interval width) during seed extraction, so
+     * a corrupt segment must fail closed here rather than attach with an invalid
+     * C array. */
     for (int i = 0; i < 5; ++i) {
-        if (count[i] < 0 || count[i] > reference_seq_len + 1) {
+        if (count[i] < 1 || count[i] > reference_seq_len + 1) {
             fprintf(stderr,
                 "ERROR! shm FMI_SCALARS: count[%d]=%lld out of bounds (ref_seq_len=%lld)\n",
                 i, (long long)count[i], (long long)reference_seq_len);
+            exit(EXIT_FAILURE);
+        }
+        if (i > 0 && count[i] < count[i - 1]) {
+            fprintf(stderr,
+                "ERROR! shm FMI_SCALARS: count[%d]=%lld < count[%d]=%lld "
+                "(not monotonically non-decreasing)\n",
+                i, (long long)count[i], i - 1, (long long)count[i - 1]);
             exit(EXIT_FAILURE);
         }
     }
@@ -300,6 +427,17 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
             (long long)sentinel_index, (long long)reference_seq_len);
         exit(EXIT_FAILURE);
     }
+    /* [0,6]: same range the -u CLI validates and write_fm_index_streaming
+     * enforces (the sample period 1<<sa_compx must divide CP_BLOCK_SIZE=64). */
+    if (sa_compx < 0 || sa_compx > 6) {
+        fprintf(stderr,
+            "ERROR! shm FMI_SCALARS: sa_compx=%lld out of bounds\n",
+            (long long)sa_compx);
+        exit(EXIT_FAILURE);
+    }
+    /* Only compute the mask once sa_compx is known to be in [0,6]; shifting by
+     * an out-of-range value (e.g. a corrupt -1 or 64) would be UB. */
+    sa_compx_mask = (1LL << sa_compx) - 1;
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_OCC, &off, &sz) != 0
         || (int64_t)sz != cp_occ_size_bytes()) {
@@ -329,7 +467,7 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
             (long)reference_seq_len, (long)sentinel_index);
 }
 
-int FMI_search::build_index(bool emit_unpacked_ref) {
+int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
 
     char *prefix = file_name;
 
@@ -381,6 +519,7 @@ int FMI_search::build_index(bool emit_unpacked_ref) {
     if (const char* mu = getenv("BWA_INDEX_MAX_MEMORY_USER"))
         opts.max_memory_user_specified = (mu[0] == '1');
     opts.emit_unpacked_ref = emit_unpacked_ref;
+    opts.sa_compx          = sa_compx;
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
@@ -436,10 +575,36 @@ void FMI_search::load_index(bool load_pac, int n_threads)
 #endif
 
     err_fread_noeof(&reference_seq_len, sizeof(int64_t), 1, cpstream);
-    assert(reference_seq_len > 0);
-    assert(reference_seq_len <= 0x7fffffffffL);
+    // Fail closed on a truncated/corrupt index, mirroring load_index_from_shm's
+    // scalar bounds checks (a bad reference_seq_len/count[]/sentinel_index drives
+    // smem.k past cp_occ on the first backwardExt -> wrong seeds, not a crash).
+    // xassert survives a hypothetical -DNDEBUG build where a plain assert would not.
+    xassert(reference_seq_len > 0 && reference_seq_len <= 0x7fffffffffLL,
+            "FMI index: reference_seq_len out of bounds (corrupt .bwt.2bit.64?)");
 
     fprintf(stderr, "* Reference seq len for bi-index = %lld\n", (long long)reference_seq_len);
+
+    // Peek the trailing sa_compx field (if present) before sizing the SA
+    // sample arrays below, via the shared detect_sa_compx() helper (see its
+    // doc comment in FMI_search.h and implementation comment above for why
+    // the tail-detection heuristic is safe). pread doesn't disturb
+    // cpstream's buffered read position, so this doesn't affect the
+    // sequential reads that follow.
+    {
+        struct stat st;
+        /* A failed fstat() must not silently fall back to file_size=0: that
+         * would make detect_sa_compx() treat a genuinely non-default-rate
+         * index as legacy (rate 3), mis-sizing the SA-sample arrays below
+         * and producing wrong seed coordinates with no diagnostic. Fail the
+         * load instead -- consistent with the ftello/fseeko error handling
+         * just above in fmi_pread_from_stream(). */
+        if (fstat(fileno(cpstream), &st) != 0) {
+            fprintf(stderr, "ERROR: fstat failed during index load: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        sa_compx = detect_sa_compx(fileno(cpstream), (int64_t)st.st_size, reference_seq_len, SA_COMPX);
+        sa_compx_mask = (1LL << sa_compx) - 1;
+    }
 
     // create checkpointed occ
     int64_t cp_occ_size = (reference_seq_len >> CP_SHIFT) + 1;
@@ -454,14 +619,50 @@ void FMI_search::load_index(bool load_pac, int n_threads)
 
     fmi_pread_from_stream(cpstream, cp_occ, (size_t)cp_occ_bytes, load_nt);
     int64_t ii = 0;
+    // Validate the RAW on-disk count[] before the +1 adjustment below. Doing the
+    // bounds/monotonicity checks on the raw values (rather than after +1) is what
+    // makes this overflow-safe: a corrupt count[ii] == INT64_MAX would trigger
+    // signed-overflow UB in `count[ii] + 1` before any post-adjustment check
+    // could fail closed. On disk count[] is the cumulative C[] array of the
+    // reference, so a valid raw entry lies in [0, reference_seq_len]; the shm
+    // producer (bwa_shm_compute) applies the same +1 and load_index_from_shm
+    // then validates the adjusted [1, ref_seq_len+1] range.
+    for (ii = 0; ii < 5; ii++) {
+        // A raw count[ii] outside [0, ref_seq_len] (e.g. a disk -1, or a value
+        // exceeding the reference length) drives smem.k out of cp_occ on the
+        // first backwardExt once adjusted.
+        xassert(count[ii] >= 0 && count[ii] <= reference_seq_len,
+                "FMI index: count[] out of bounds (corrupt .bwt.2bit.64?)");
+        // count[] is the cumulative C[] array, so it must be non-decreasing; a
+        // non-monotone pair yields a negative smem.s (interval width) downstream.
+        // The +1 is applied uniformly, so raw monotonicity == adjusted monotonicity.
+        xassert(ii == 0 || count[ii] >= count[ii - 1],
+                "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
+    }
     for(ii = 0; ii < 5; ii++)// update read count structure
     {
         count[ii] = count[ii] + 1;
     }
+    // Validate count[] (post +1-adjustment, range [1, ref_seq_len+1]) as
+    // load_index_from_shm does; a count[a] exceeding the reference length drives
+    // smem.k out of cp_occ on the first backwardExt.
+    for (ii = 0; ii < 5; ii++) {
+        // Lower bound is 1, not 0: the +1 adjustment above is applied before
+        // this check (load_index_from_shm instead validates the raw disk value
+        // in [0, ref_seq_len] and adjusts after), so a disk count[ii] == -1
+        // becomes 0 here and would slip past a >= 0 test -- leaving the disk
+        // loader open to an invalid FM interval that the shm producer rejects.
+        xassert(count[ii] >= 1 && count[ii] <= reference_seq_len + 1,
+                "FMI index: count[] out of bounds (corrupt .bwt.2bit.64?)");
+        // count[] is the cumulative C[] array, so it must be non-decreasing; a
+        // non-monotone pair yields a negative smem.s (interval width) downstream.
+        xassert(ii == 0 || count[ii] >= count[ii - 1],
+                "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
+    }
 
     #if SA_COMPRESSION
 
-    int64_t reference_seq_len_ = (reference_seq_len >> SA_COMPX) + 1;
+    int64_t reference_seq_len_ = (reference_seq_len >> sa_compx) + 1;
     int64_t sa_ms_bytes = reference_seq_len_ * sizeof(int8_t);
     int64_t sa_ls_bytes = reference_seq_len_ * sizeof(uint32_t);
     sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
@@ -495,6 +696,8 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     sentinel_index = -1;
     #if SA_COMPRESSION
     err_fread_noeof(&sentinel_index, sizeof(int64_t), 1, cpstream);
+    xassert(sentinel_index >= 0 && sentinel_index < reference_seq_len,
+            "FMI index: sentinel_index out of bounds (corrupt .bwt.2bit.64?)");
     fprintf(stderr, "* sentinel-index: %lld\n", (long long)sentinel_index);
     #endif
     fclose(cpstream);
@@ -596,7 +799,12 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                 {
                     SMEM smem_ = smem;
 
-                    // Forward extension is backward extension with the BWT of reverse complement
+                    // Forward extension is backward extension with the BWT of reverse complement:
+                    // swap k <-> l, backwardExt, swap back. `l` is LIVE here — after the swap it is
+                    // the k that drives the next forward step, and the full backwardExt's
+                    // l-cumulation is what produces it. So backwardExt_konly (which drops the
+                    // backward-phase-dead l-chain) does NOT apply to the forward pass; the full
+                    // backwardExt is required. konly is backward-only by construction.
                     smem_.k = smem.l;
                     smem_.l = smem.k;
                     SMEM newSmem_ = backwardExt(smem_, 3 - a);
@@ -648,7 +856,25 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                 prev[numPrev - p - 1] = temp;
             }
 
-            // Backward search
+            // Backward search.
+            //
+            // This scalar path deliberately keeps the FULL backwardExt (which
+            // also maintains the reverse-complement start `l`), NOT the
+            // backwardExt_konly used by the lockstep production path
+            // (ls_advance_backward_step). Two reasons, both intentional — do not
+            // "unify" this to konly:
+            //   1. Oracle independence. This function is the reference the
+            //      lockstep path is validated against in
+            //      test/smem_lockstep_parity_test.cpp; that test cross-checks
+            //      konly's k/s against this full implementation's k/s. Making
+            //      both use konly would remove the independent check.
+            //   2. It is compiled out of production at the shipping
+            //      SMEM_LOCKSTEP_N > 1 (getSMEMsAllPosOneThread dispatches to the
+            //      lockstep driver), so the extra l-chain work here is off every
+            //      shipped path — there is nothing to optimize.
+            // (A SMEM_LOCKSTEP_N <= 1 build would run this in production and pay
+            // the full-backwardExt cost, but that config is unsupported and the
+            // parity test #errors on it.)
             int cur_j = readlength;
             for(j = x - 1; j >= 0; j--)
             {
@@ -756,6 +982,7 @@ struct LockstepSmemCache {
     SMEM  *prev     = nullptr;
     SMEM  *match    = nullptr;
     size_t per_slot = 0;
+    int32_t n_slots = 0;   // lockstep width the buffers were sized for
     ~LockstepSmemCache() {
         if (prev  != nullptr) _mm_free(prev);
         if (match != nullptr) _mm_free(match);
@@ -870,6 +1097,14 @@ void FMI_search::ls_init_slot(BatchSlot *s,
     s->rid         = rid_array[input_idx];
     s->start_pos   = query_pos_array[input_idx];
     s->min_intv    = min_intv_array[input_idx];
+    /* backwardExt_konly leaves the new k stale on its s'->0 exit and relies on
+     * the caller discarding that seed via `newSmem.s < min_intv` — which only
+     * holds when min_intv >= 1 (an s'==0 result must compare < min_intv). Every
+     * current source of min_intv satisfies this (mem_collect_smem seeds 1 or
+     * p->s+1 >= 2; max_mem_intv is guarded > 0 and never reaches this path), so
+     * this guard documents and enforces the precondition rather than papering
+     * over a live bug. Once per slot init — off the per-step hot path. */
+    xassert(s->min_intv >= 1, "ls_init_slot: min_intv must be >= 1");
     s->readlength  = seq_[s->rid].l_seq;
     s->offset      = query_cum_len_ar[s->rid];
     s->next_x      = s->start_pos + 1;
@@ -1006,10 +1241,42 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
         uint8_t a = enc_qdb[s->offset + s->j];
         if (a > 3) goto DONE;
 
+        /* numPrev==1 straight-line path: the two-loop machinery and the curr_s
+         * dedup collapse to a single element. Byte-identical. This is a hand-kept
+         * specialization of the two general loops below (the emit predicate, the
+         * prefetch pair, and the numCurr/j-- bookkeeping are duplicated here) — a
+         * future edit to that logic in the general loops MUST be mirrored into
+         * this block, or numPrev==1 reads (unique matches — the common case this
+         * path accelerates) silently diverge. The lockstep parity test guards
+         * this (see Case 13, which drives real interior-start backward walks). */
+        if (s->numPrev == 1) {
+            SMEM smem = s->prev[0];
+            SMEM newSmem = backwardExt_konly(smem, a);
+            newSmem.m = s->j;
+            if (newSmem.s < s->min_intv) {
+                if ((smem.n - smem.m + 1) >= minSeedLen) {
+                    s->cur_j = s->j;
+                    s->match_buf[s->match_count++] = smem;
+                }
+                /* numCurr stays 0 */
+            } else {
+                s->prev[0] = newSmem;
+#ifdef ENABLE_PREFETCH
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+                numCurr = 1;
+            }
+            s->numPrev = numCurr;
+            s->j--;
+            if (numCurr == 0) goto DONE;
+            return;
+        }
+
         int p;
         for (p = 0; p < s->numPrev; p++) {
             SMEM smem = s->prev[p];
-            SMEM newSmem = backwardExt(smem, a);
+            SMEM newSmem = backwardExt_konly(smem, a);
             newSmem.m = s->j;
             if ((newSmem.s < s->min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
                 s->cur_j = s->j;
@@ -1029,7 +1296,7 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
         p++;
         for (; p < s->numPrev; p++) {
             SMEM smem = s->prev[p];
-            SMEM newSmem = backwardExt(smem, a);
+            SMEM newSmem = backwardExt_konly(smem, a);
             newSmem.m = s->j;
             if ((newSmem.s >= s->min_intv) && (newSmem.s != curr_s)) {
                 curr_s = newSmem.s;
@@ -1352,7 +1619,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
 
     if (numReads == 0) return;
 
-    const int32_t N = SMEM_LOCKSTEP_N;
+    const int32_t N = g_smem_lockstep_n;
     // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
     // state (~80 B per slot, full array fits in 1-2 cache lines for N=8).
     // Bulk per-slot buffers (prev/match_buf) live separately and are reused
@@ -1375,18 +1642,26 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     // service pipeline appears: gate the realloc on a configured upper
     // bound (e.g. MAX_SMEM_PER_SLOT) or shrink when cache.per_slot greatly
     // exceeds the current batch.
-    BatchSlot slots[SMEM_LOCKSTEP_N] = {};
+    /* Fixed-size on the stack (compile-time MAX); only the first N are used,
+     * where N = g_smem_lockstep_n is the startup-probed runtime width. */
+    BatchSlot slots[SMEM_LOCKSTEP_N_MAX] = {};
     static thread_local LockstepSmemCache cache;
     const size_t per_slot_smems = (size_t)max_readlength;
-    if (per_slot_smems > cache.per_slot) {
+    if (per_slot_smems > cache.per_slot || N > cache.n_slots) {
         if (cache.prev  != nullptr) _mm_free(cache.prev);
         if (cache.match != nullptr) _mm_free(cache.match);
-        const size_t total_slot_bytes = (size_t)N * per_slot_smems * sizeof(SMEM);
+        // Grow on EITHER dimension: g_smem_lockstep_n (N) can rise after first
+        // use (BWA3_SMEM_LOCKSTEP_N / the MLP probe), and sizing only on per_slot
+        // would leave slots[N-1] pointing past the allocation.
+        const size_t alloc_slots = (size_t)(N > cache.n_slots ? N : cache.n_slots);
+        const size_t alloc_per   = per_slot_smems > cache.per_slot ? per_slot_smems : cache.per_slot;
+        const size_t total_slot_bytes = alloc_slots * alloc_per * sizeof(SMEM);
         cache.prev  = (SMEM *)_mm_malloc(total_slot_bytes, 64);
         assert_not_null(cache.prev, total_slot_bytes, total_slot_bytes);
         cache.match = (SMEM *)_mm_malloc(total_slot_bytes, 64);
         assert_not_null(cache.match, total_slot_bytes, (size_t)2 * total_slot_bytes);
-        cache.per_slot = per_slot_smems;
+        cache.per_slot = alloc_per;
+        cache.n_slots  = (int32_t)alloc_slots;
     }
     for (int32_t s = 0; s < N; s++) {
         slots[s].prev      = cache.prev  + (size_t)s * cache.per_slot;
@@ -1439,7 +1714,11 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
             // the next single-step access; this T1 prefetch on slot[s+N/2] keeps
             // a copy in L2 for that slot's access ~N/2 stepping-passes from now,
             // hiding DRAM-class latency when cp_occ entries spill out of L3.
-            const int32_t s_la = (s + (N / 2)) % N;
+            // N is runtime (g_smem_lockstep_n), so `% N` is a real idiv every
+            // step. s < N and N/2 < N => s + N/2 < 2N, so one compare + subtract
+            // replaces the division. Byte-identical.
+            int32_t s_la = s + (N >> 1);
+            if (s_la >= N) s_la -= N;
             if (slots[s_la].phase == PH_FWD || slots[s_la].phase == PH_BWD) {
                 ls_prefetch_cp_occ_t1(&slots[s_la]);
             }
@@ -1774,6 +2053,16 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
  * the SysV-ABI struct-by-value pass and return-slot store that dominate
  * self-time on gcc 12+. */
 
+/* Uncompressed SA accessors: these index sa_ms_byte[pos] / sa_ls_word[pos] by the
+ * raw BWT row. Under SA_COMPRESSION (the shipped build) those arrays are sized to
+ * reference_seq_len >> SA_COMPX, so a raw-row index reads ~SA_COMPX-fold out of
+ * bounds. They are only correct for a full (uncompressed) SA, and every in-tree
+ * caller is already guarded by `#if !SA_COMPRESSION` (see FMI_search.cpp's
+ * sentinel scan and bwamem.cpp's per-read SA resolve), so fence the definitions to
+ * match: under SA_COMPRESSION they must not be compiled or callable. The compressed
+ * paths (get_sa_entry_compressed / get_sa_entries(..., tid) / get_sa_entries_prefetch)
+ * below are the shipped equivalents. */
+#if !SA_COMPRESSION
 int64_t FMI_search::get_sa_entry(int64_t pos)
 {
     int64_t sa_entry = sa_ms_byte[pos];
@@ -1834,14 +2123,15 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
         totalCoordCount += c;
     }
 }
+#endif // !SA_COMPRESSION
 
 // sa_compression
 int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
 {
-    if ((pos & SA_COMPX_MASK) == 0) {
+    if ((pos & sa_compx_mask) == 0) {
         
         #if  SA_COMPRESSION
-        int64_t sa_entry = sa_ms_byte[pos >> SA_COMPX];
+        int64_t sa_entry = sa_ms_byte[pos >> sa_compx];
         #else
         int64_t sa_entry = sa_ms_byte[pos];     // simulation
         #endif
@@ -1849,7 +2139,7 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
         sa_entry = sa_entry << 32;
         
         #if  SA_COMPRESSION
-        sa_entry = sa_entry + sa_ls_word[pos >> SA_COMPX];
+        sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];
         #else
         sa_entry = sa_entry + sa_ls_word[pos];   // simulation
         #endif
@@ -1888,11 +2178,11 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
             
             offset ++;
             // tprof[ALIGN1][tid] ++;
-            if ((sp & SA_COMPX_MASK) == 0) break;
+            if ((sp & sa_compx_mask) == 0) break;
         }
-        // assert((reference_seq_len >> SA_COMPX) - 1 >= (sp >> SA_COMPX));
+        // assert((reference_seq_len >> sa_compx) - 1 >= (sp >> sa_compx));
         #if  SA_COMPRESSION
-        int64_t sa_entry = sa_ms_byte[sp >> SA_COMPX];
+        int64_t sa_entry = sa_ms_byte[sp >> sa_compx];
         #else
         int64_t sa_entry = sa_ms_byte[sp];      // simultion
         #endif
@@ -1900,7 +2190,7 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
         sa_entry = sa_entry << 32;
 
         #if  SA_COMPRESSION
-        sa_entry = sa_entry + sa_ls_word[sp >> SA_COMPX];
+        sa_entry = sa_entry + sa_ls_word[sp >> sa_compx];
         #else
         sa_entry = sa_entry + sa_ls_word[sp];      // simulation
         #endif
@@ -1935,12 +2225,13 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
 }
 
 // SA_COPMRESSION w/ PREFETCH
-int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset)
+int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset,
+                                  int drop_sentinel_offset)
 {
-    if ((pos & SA_COMPX_MASK) == 0) {        
-        sa_entry = sa_ms_byte[pos >> SA_COMPX];        
+    if ((pos & sa_compx_mask) == 0) {        
+        sa_entry = sa_ms_byte[pos >> sa_compx];        
         sa_entry = sa_entry << 32;        
-        sa_entry = sa_entry + sa_ls_word[pos >> SA_COMPX];        
+        sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];        
         // return sa_entry;
         return 1;
     }
@@ -1953,6 +2244,34 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         uint64_t *one_hot_bwt_str = cp_occ[occ_id_pp_].one_hot_bwt_str;
         uint8_t b;
 
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+        /* The BWT symbol at sp is one-hot across the four bit-planes, and the
+         * bases are close to uniformly distributed, so testing the planes one
+         * branch at a time mispredicts on most steps. Test all four at once
+         * and select the symbol without a branch; the empty case (no plane
+         * set) is the sentinel row, kept as the one real branch since it is
+         * nearly never taken. The occurrence count then reuses the k-only
+         * backward step's NEON popcount, whose d-register loads keep the
+         * masked word out of the general-purpose file. Symbol priority
+         * (lowest plane wins) matches the plane-at-a-time test exactly. */
+        const unsigned t0 = (unsigned)((one_hot_bwt_str[0] >> y_pp_) & 1);
+        const unsigned t1 = (unsigned)((one_hot_bwt_str[1] >> y_pp_) & 1);
+        const unsigned t2 = (unsigned)((one_hot_bwt_str[2] >> y_pp_) & 1);
+        const unsigned t3 = (unsigned)((one_hot_bwt_str[3] >> y_pp_) & 1);
+        if ((t0 | t1 | t2 | t3) == 0) {
+            // Sentinel ($) row (no bit-plane set, the scalar path's b == 4): its
+            // suffix-array value is 0 and we walked `offset` LF steps to reach it,
+            // so the SA entry is 0 + offset. drop_sentinel_offset (=> 0) reproduces
+            // bwa-mem2's dropped walk for --compat=bwa-mem2; the default keeps the
+            // accumulated offset, matching the scalar branch and the compressed
+            // sibling get_sa_entry_compressed.
+            sa_entry = drop_sentinel_offset ? 0 : offset;
+            return 1;
+        }
+        b = (uint8_t)(t0 ? 0 : t1 ? 1 : t2 ? 2 : 3);
+        const int64_t occ_sp = cp_occ[occ_id_pp_].cp_count[b] +
+            occ_popcount64(&one_hot_bwt_str[b], &one_hot_mask_array[sp & CP_MASK]);
+#else
         if((one_hot_bwt_str[0] >> y_pp_) & 1)
             b = 0;
         else if((one_hot_bwt_str[1] >> y_pp_) & 1)
@@ -1964,20 +2283,29 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         else
             b = 4;
         if (b == 4) {
-            sa_entry = 0;
+            // Sentinel ($) row: its suffix-array value is 0, and we have walked
+            // `offset` LF steps to reach it, so the SA entry is 0 + offset. The
+            // compressed sibling get_sa_entry_compressed returns `offset` here for
+            // the same reason. bwa-mem2 set sa_entry = 0 here, dropping the walk
+            // and reporting positions within the first `offset` bases of the
+            // concatenated reference up to `offset` bases too far left; that is
+            // kept only for --compat=bwa-mem2 (drop_sentinel_offset), whose
+            // contract is to reproduce bwa-mem2's records.
+            sa_entry = drop_sentinel_offset ? 0 : offset;
             return 1;
         }
         
         GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
+#endif
         
         sp = count[b] + occ_sp;
         
         offset ++;
-        if ((sp & SA_COMPX_MASK) == 0) {
+        if ((sp & sa_compx_mask) == 0) {
     
-            sa_entry = sa_ms_byte[sp >> SA_COMPX];        
+            sa_entry = sa_ms_byte[sp >> sa_compx];        
             sa_entry = sa_entry << 32;
-            sa_entry = sa_entry + sa_ls_word[sp >> SA_COMPX];
+            sa_entry = sa_entry + sa_ls_word[sp >> sa_compx];
             
             sa_entry += offset;
             // return sa_entry;
@@ -1989,6 +2317,28 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         }
     } // else
 }
+
+/* Lane count of the pipelined compressed-SA resolver (get_sa_entries_prefetch);
+ * see the BWA3_SA_LANES note there. 40 on x86_64, 20 elsewhere: a 20-vs-40 A/B
+ * on a 5M-pair WGS slice (3 interleaved reps, user CPU) measured -0.30% on
+ * AMD Zen3 (every rep faster) and no change on Intel Sapphire Rapids, while
+ * a 16..40 sweep on Graviton4 was flat. The count only sets how many
+ * checkpoint-block fetches are in flight; results are stored by position and
+ * are byte-identical at every width. */
+#if defined(__x86_64__) || defined(_M_X64)
+#define SA_RESOLVE_LANES_DEFAULT 40
+#else
+#define SA_RESOLVE_LANES_DEFAULT 20
+#endif
+#define SA_RESOLVE_LANES_MAX 64
+/* The resolver's lane arrays (working_set/map_pos/offset) are sized to
+ * SA_RESOLVE_LANES_MAX and indexed by sa_batch_size, which is clamped into
+ * [1, SA_RESOLVE_LANES_MAX] for env overrides but defaults to
+ * SA_RESOLVE_LANES_DEFAULT unclamped -- guard the default against silently
+ * overrunning those stack arrays if it is ever raised past the array size. */
+static_assert(SA_RESOLVE_LANES_DEFAULT >= 1 &&
+              SA_RESOLVE_LANES_DEFAULT <= SA_RESOLVE_LANES_MAX,
+              "SA_RESOLVE_LANES_DEFAULT must be within [1, SA_RESOLVE_LANES_MAX]");
 
 /* Thread-local scratch for the pos_ar/map_ar staging buffers below. These were
  * two _mm_malloc/_mm_free per call, and this function runs once per read — so on
@@ -2009,6 +2359,9 @@ struct SaPrefetchScratch {
         if (n <= cap) return;
         _mm_free(pos);
         pos = (int64_t *) _mm_malloc((size_t)n * sizeof(int64_t), 64);
+        // Fail loudly on OOM: without this, pos==NULL but cap=n reports capacity,
+        // so the next call returns early and the staging loop writes through NULL.
+        xassert(pos != NULL, "out of memory: SA prefetch staging buffer");
         cap = n;
     }
     ~SaPrefetchScratch() { _mm_free(pos); }
@@ -2017,7 +2370,8 @@ struct SaPrefetchScratch {
 
 void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                                          int64_t *coordCountArray, int64_t count,
-                                         const int32_t max_occ, int tid, int64_t &id_)
+                                         const int32_t max_occ, int tid, int64_t &id_,
+                                         int drop_sentinel_offset)
 {
 
     // uint32_t i;
@@ -2070,9 +2424,36 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     
     id_ += id;
     
-    const int32_t sa_batch_size = 20;
-    int64_t working_set[sa_batch_size], map_pos[sa_batch_size];;
-    int64_t offset[sa_batch_size] = {-1};
+    /* Number of SA rows walked concurrently. Each lane's next checkpoint block
+     * is prefetched when the lane is (re)staged, so the lane count sets how
+     * many block fetches are in flight; it does not affect results, which are
+     * stored by position. BWA3_SA_LANES overrides the default for tuning; out
+     * of range values (below 1 or above SA_RESOLVE_LANES_MAX) are ignored. */
+    static const int32_t sa_batch_size = []() {
+        int32_t lanes = SA_RESOLVE_LANES_DEFAULT;
+        const char *e = getenv("BWA3_SA_LANES");
+        if (e != NULL) {
+            // Strict parse: atoi accepts a numeric prefix ("1x" -> 1) and has
+            // undefined behavior when the value overflows int. Match the
+            // BWA3_LOAD_THREADS parse in index_load_threads -- reject empty,
+            // trailing-garbage, and overflowed input, then keep values in
+            // [1, SA_RESOLVE_LANES_MAX]. On anything else warn and keep the
+            // default (ignore-and-continue, no hard exit).
+            char *end = NULL;
+            errno = 0;
+            const long v = strtol(e, &end, 10);
+            if (errno != 0 || end == e || *end != '\0' ||
+                v < 1 || v > SA_RESOLVE_LANES_MAX) {
+                fprintf(stderr, "[W::get_sa_entries_prefetch] ignoring BWA3_SA_LANES=%s (expected 1..%d)\n",
+                        e, (int) SA_RESOLVE_LANES_MAX);
+            } else {
+                lanes = (int32_t) v;
+            }
+        }
+        return lanes;
+    }();
+    int64_t working_set[SA_RESOLVE_LANES_MAX], map_pos[SA_RESOLVE_LANES_MAX];
+    int64_t offset[SA_RESOLVE_LANES_MAX] = {-1};
     
     int i = 0, j = 0;    
     while(i<id && j<sa_batch_size)
@@ -2082,9 +2463,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         map_pos[j] = i;   // map_ar[i] == i (see staging loop invariant)
         offset[j] = 0;
         
-        if ((pos & SA_COMPX_MASK) == 0) {
-            _mm_prefetch(&sa_ms_byte[pos >> SA_COMPX], _MM_HINT_T0);
-            _mm_prefetch(&sa_ls_word[pos >> SA_COMPX], _MM_HINT_T0);
+        if ((pos & sa_compx_mask) == 0) {
+            _mm_prefetch(&sa_ms_byte[pos >> sa_compx], _MM_HINT_T0);
+            _mm_prefetch(&sa_ls_word[pos >> sa_compx], _MM_HINT_T0);
         }
         else {
             int64_t occ_id_pp_ = pos >> CP_SHIFT;
@@ -2105,7 +2486,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             int64_t sp = 0, pos = 0;
             bool quit;
             if (offset[k] >= 0) {
-                quit = call_one_step(working_set[k], sp, offset[k]);
+                quit = call_one_step(working_set[k], sp, offset[k], drop_sentinel_offset);
             }
             else
                 continue;
@@ -2121,9 +2502,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                     map_pos[k] = i++;   // map_ar[i] == i (staging invariant)
                     offset[k] = 0;
                     
-                    if ((pos & SA_COMPX_MASK) == 0) {
-                        _mm_prefetch(&sa_ms_byte[pos >> SA_COMPX], _MM_HINT_T0);
-                        _mm_prefetch(&sa_ls_word[pos >> SA_COMPX], _MM_HINT_T0);
+                    if ((pos & sa_compx_mask) == 0) {
+                        _mm_prefetch(&sa_ms_byte[pos >> sa_compx], _MM_HINT_T0);
+                        _mm_prefetch(&sa_ls_word[pos >> sa_compx], _MM_HINT_T0);
                     }
                     else {
                         int64_t occ_id_pp_ = pos >> CP_SHIFT;
@@ -2135,9 +2516,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             }
             else {
                 working_set[k] = sp;
-                if ((sp & SA_COMPX_MASK) == 0) {
-                    _mm_prefetch(&sa_ms_byte[sp >> SA_COMPX], _MM_HINT_T0);
-                    _mm_prefetch(&sa_ls_word[sp >> SA_COMPX], _MM_HINT_T0);
+                if ((sp & sa_compx_mask) == 0) {
+                    _mm_prefetch(&sa_ms_byte[sp >> sa_compx], _MM_HINT_T0);
+                    _mm_prefetch(&sa_ls_word[sp >> sa_compx], _MM_HINT_T0);
                 }
                 else {
                     int64_t occ_id_pp_ = sp >> CP_SHIFT;

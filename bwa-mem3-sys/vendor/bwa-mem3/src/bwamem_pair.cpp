@@ -297,6 +297,18 @@ static void matesw_sort_partitions_by_len(SeqPair *sp, int64_t pcnt8, int64_t pc
     std::sort(sp, sp + pcnt8, by_len1);
     if (pcnt > pcnt8) std::sort(sp + pcnt8, sp + pcnt, by_len1);
 }
+
+/* T5/L3: RAII holder for mem_pair's per-thread scratch vectors. Retaining a
+ * vector's grown capacity across calls (reset n=0, keep .a/.m) removes two
+ * malloc/free pairs per read-pair, but a bare `static thread_local pair64_v`
+ * is a POD with no destructor: its backing .a allocation would never be freed
+ * and LeakSanitizer (the ASan CI row runs LSan) flags it as a per-thread leak
+ * at exit. Wrapping the vector in a type whose destructor frees .a releases the
+ * buffer when the worker thread ends, so the reuse is genuinely leak-free. */
+struct pair64_scratch {
+    pair64_v v = {0, 0, 0};
+    ~pair64_scratch() { free(v.a); }
+};
 } // namespace
 
 /* File-scope forward declaration of the dedup/patch entry point defined in
@@ -519,6 +531,66 @@ void mem_pestat(const mem_opt_t *opt, int64_t l_pac, int n,
         }
 }
 
+/* ------------------------------------------------------------------------- *
+ * u8 mate-rescue admission (tier selection)
+ *
+ * Mate rescue routes each pair to the 8-bit (u8) or 16-bit SW kernel. The u8
+ * kernel biases scores by `shift` and stores them in a uint8_t, so it is only
+ * byte-identical to the 16-bit kernel while the max attainable biased score
+ * cannot saturate/early-break the u8 DP. The binding limit is the u8-only
+ * early break `gmax + q->shift >= 255` in ksw.cpp (ksw_u8), i.e. the biased
+ * max score must be <= 254; the batched kswv u8 kernel saturates one unit
+ * later, so 254 is the tighter, shared bound.
+ *
+ * `shift` is the kernel's score bias: ksw derives it as `256 - min(matrix)`
+ * taken as a uint8_t, which equals `-(min matrix entry)` for every matrix
+ * bwa-mem3 builds (>= 1 in practice; the floor guards a degenerate matrix).
+ *
+ * There is a second, geometric provability condition. The u8 and 16-bit paths
+ * pad the query to different widths (16*ceil(l/16) vs 8*ceil(l/8)); a pair may
+ * flip tier only when those pad widths are equal, otherwise the two kernels run
+ * different padded column counts and their tie-break/XS scan can diverge. That
+ * equality holds exactly when l % 16 == 0 || l % 16 >= 9. Pairs already routed
+ * to u8 under the historical `l_ms*a < 250` bound keep their routing regardless
+ * (they were u8 before and stay u8), so the geometry clause only gates the new
+ * admissions the tightened bound opens up.
+ * ------------------------------------------------------------------------- */
+
+/* Kernel score bias for a 5x5 scoring matrix, matching ksw_qinit's
+ * `256 - (uint8_t)min` reduction. >= 1 for any real matrix (min <= 0). */
+static inline int matesw_u8_shift(const int8_t *mat) {
+    int mn = 0;
+    for (int i = 0; i < 25; ++i) if (mat[i] < mn) mn = mat[i];
+    int s = -mn;
+    return s < 1 ? 1 : s;
+}
+
+/* Worst-case (max) bias across every matrix the SW at a site could use. Taking
+ * the max only ever routes MORE pairs to the safe 16-bit tier, so it can never
+ * over-admit. Under --meth the actual matrix is one of mat_ot/mat_ob (chosen by
+ * the rescued mate's read#); folding both in keeps the batched pre/post split
+ * consistent no matter which hypothesis a pair ends up scored under. */
+static inline int matesw_u8_shift_for(const mem_opt_t *opt, const int8_t *base_mat) {
+    int s = matesw_u8_shift(base_mat);
+    if (opt->meth_mode) {
+        int so = matesw_u8_shift(opt->mat_ot);
+        int sb = matesw_u8_shift(opt->mat_ob);
+        if (so > s) s = so;
+        if (sb > s) s = sb;
+    }
+    return s;
+}
+
+/* True iff a mate of query length l_ms may be scored on the u8 tier
+ * byte-identically. `a` is the match reward (opt->a); `shift` the kernel bias
+ * from matesw_u8_shift_for(). */
+static inline int matesw_use_u8(int l_ms, int a, int shift) {
+    int prod = l_ms * a;                              /* max attainable SW score */
+    return (prod + shift <= 254)                      /* no u8 saturation / early break */
+        && (prod < 250                                /* historical admissions keep routing */
+            || l_ms % 16 == 0 || (l_ms % 16) >= 9);   /* new admissions: pad geometry equal */
+}
+
 int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
                const uint8_t *pac, const mem_pestat_t pes[4],
                const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
@@ -578,7 +650,7 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
         xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+            ms2[k] = nst_nt4_decode(c, 4);
         }
         ms = ms2; // alias the projected-mate pointer to the original bases
     }
@@ -607,6 +679,17 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
         if (re > l_pac<<1) re = l_pac<<1;
         static thread_local u8vec_scratch_t t_ref;
         if (rb < re) {
+            /* Prefetch the rescue window's first pac[] cache line ahead of the fetch (cf. AP6).
+             * Best-effort: the rescue window (a->rb ± pes[r]) is unbounded, so when it straddles a
+             * contig boundary bns_fetch_seq_into clamps the read start up to far_beg and this hint
+             * — computed from the pre-clamp rb — can target a line the fetch never reads. Harmless
+             * (it just misses), never wrong output. bns_depos maps the strand-dependent window
+             * start; the outer is_rev is load-bearing, so discard bns_depos's strand into a
+             * scratch and do NOT reuse that name. Pure hint -> byte-identical. */
+            {
+                int is_rev_pf;  // discarded; do NOT reuse the outer is_rev
+                __builtin_prefetch(&pac[bns_depos(bns, rb, &is_rev_pf) >> 2], 0, 3);
+            }
             size_t want = (size_t)((re - rb) + 64);
             if (t_ref.v.m < want) kv_resize(uint8_t, t_ref.v, want);
             int64_t rlen;
@@ -616,7 +699,8 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
             kswr_t aln;
             mem_alnreg_t b;
-            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
+            int u8_shift = matesw_u8_shift_for(opt, sw_mat);
+            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             /* D3 (--meth): score the rescued mate under ITS OWN read-number
              * chemistry (mate_meth_ot: R1=1/OT, R2=0/OB), flipped by the rescue
@@ -718,10 +802,28 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
 
 int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_pestat_t pes[4], bseq1_t s[2], mem_alnreg_v a[2], int id, int *sub, int *n_sub, int z[2], int n_pri[2])
 {
-    pair64_v v, u;
+    /* T5/L3: v and u are pure per-call working buffers -- rebuilt from n=0 every
+     * call, only [0,n) is ever read, and no state survives the return. Making
+     * them thread-local persistent buffers (reset n=0, keep the grown capacity)
+     * removes two malloc/free pairs per read-pair without changing any bytes:
+     * a reset-to-empty vector with retained capacity behaves identically to a
+     * fresh kv_init'd one. The pair64_scratch wrapper frees .a at thread exit
+     * (LSan-clean; see its definition above). */
+    static thread_local pair64_scratch v_buf, u_buf;
+    pair64_v &v = v_buf.v, &u = u_buf.v;
     int r, i, k, y[4], ret; // y[] keeps the last hit
     int64_t l_pac = bns->l_pac;
-    kv_init(v); kv_init(u);
+    /* Bound the retained capacity so one pathological high-cardinality pair does
+     * not pin a large allocation for the worker thread's lifetime. Below the cap
+     * the grown buffer is reused as-is; above it we release and let the next call
+     * re-grow from empty. Capacity-only -- [0,n) content and output are
+     * byte-identical either way. The cap (64Ki entries = 1 MiB per buffer) sits
+     * orders of magnitude above any realistic per-pair candidate count, so the
+     * common path never trims. */
+    const size_t PAIR_SCRATCH_MAX_M = (size_t)1 << 16;
+    if (v.m > PAIR_SCRATCH_MAX_M) { free(v.a); v.a = 0; v.m = 0; }
+    if (u.m > PAIR_SCRATCH_MAX_M) { free(u.a); u.a = 0; u.m = 0; }
+    v.n = 0; u.n = 0;
     for (r = 0; r < 2; ++r) { // loop through read number
         for (i = 0; i < n_pri[r]; ++i) {
             pair64_t key;
@@ -733,7 +835,18 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
         }
     }
 
-    ks_introsort_128(v.n, v.a);
+    /* Both sorts in this function run on keys that are pairwise distinct by
+     * construction: v's `y` ends in `i << 2 | strand << 1 | r`, and (i, r) is
+     * distinct per element (score and strand ride along); u's `y` is the
+     * (k, i) pair, pushed at most once per (k, i). So the sorted order is
+     * unique and pdqsort gives the same array as the klib introsort it
+     * replaces (faster on the sort microbench's 9-32 element bucket; measured
+     * whole-aligner in the PR). Tested against ks_introsort_128 in
+     * test/unit/test_pair64_sort.cpp. The strict-order check after each sort
+     * turns a future key change that breaks distinctness into a hard failure
+     * instead of a silently different pairing on ties. */
+    if (v.n > 1) pdqsort_128(v.n, v.a);  // v.a is null when no candidates were pushed; PDQSORT_INIT forms a + n, UB on a null pointer
+    xassert(pair64_strictly_sorted(v.n, v.a), "mem_pair: candidate keys must be pairwise distinct");
     y[0] = y[1] = y[2] = y[3] = -1;
     for (i = 0; i < v.n; ++i) {
         for (r = 0; r < 2; ++r) { // loop through direction
@@ -751,7 +864,12 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
                 //printf("%d: %lld\n", k, dist);
                 if (dist > pes[dir].high) break;
                 if (dist < pes[dir].low)  continue;
-                ns = (dist - pes[dir].avg) / pes[dir].std;
+                // Guard std==0 (from -I mean,0 or a fixed-insert cohort where
+                // mem_pestat yields std=0): every surviving candidate already has
+                // dist==avg, so ns=0 is the right limit. Without this the divide
+                // is 0/0=NaN, the (int) cast of NaN is UB, and pairing silently
+                // collapses (q=0 for every pair).
+                ns = pes[dir].std > 0. ? (dist - pes[dir].avg) / pes[dir].std : 0.;
                 q = (int)((v.a[i].y>>32) + (v.a[k].y>>32) + .721 * log(2. * erfc(fabs(ns) * M_SQRT1_2)) * opt->a + .499); // .721 = 1/log(4)
                 if (q < 0) q = 0;
                 p = kv_pushp(pair64_t, u);
@@ -765,7 +883,8 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
         int tmp = opt->a + opt->b;
         tmp = tmp > opt->o_del + opt->e_del? tmp : opt->o_del + opt->e_del;
         tmp = tmp > opt->o_ins + opt->e_ins? tmp : opt->o_ins + opt->e_ins;
-        ks_introsort_128(u.n, u.a);
+        pdqsort_128(u.n, u.a);   /* unique keys, see above */
+        xassert(pair64_strictly_sorted(u.n, u.a), "mem_pair: pair keys must be pairwise distinct");
         i = u.a[u.n-1].y >> 32; k = u.a[u.n-1].y << 32 >> 32;
         z[v.a[i].y&1] = v.a[i].y<<32>>34; // index of the best pair
         z[v.a[k].y&1] = v.a[k].y<<32>>34;
@@ -775,7 +894,8 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
             if (*sub - (int)(u.a[i].x>>32) <= tmp) ++*n_sub;
 
     } else ret = 0, *sub = 0, *n_sub = 0;
-    free(u.a); free(v.a);
+    /* T5/L3: no per-call free -- v/u keep their capacity for reuse across calls;
+     * the pair64_scratch destructor releases .a when the worker thread exits. */
     return ret;
 }
 
@@ -815,6 +935,30 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq
 // Returns the number of mate-rescue hits produced (same meaning as the
 // historical `n` return from mem_sam_pe — i.e. a caller-visible accounting
 // of mate-SW work done).
+/* --extend-csub (PE): estimate the pair score of a competitor pruned before
+ * extension, so the pairing MAPQ raw_mapq(o - subo) reflects it. Each mate contributes
+ * its pruned-competitor SE score, estimated from the dropped chain weight scaled by that
+ * mate's OBSERVED per-base score rate (score/span). Note this is deliberately gentler
+ * than the all-match upper bound (weight * a) that mem_seed_capped_sub uses on the SE
+ * side: a pair score is the sum of two such estimates, so the generous bound would
+ * overstate subo roughly twice over. The sum is clamped strictly below o, so q_pe drops
+ * proportionally to a near-tie rather than being forced to 0.
+ * Returns a floor for subo, or 0 to leave subo unchanged. */
+int mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o)
+{
+    long est = 0;
+    for (int i = 0; i < 2; i++) {
+        if (a[i].capped_w <= 0 || z[i] < 0 || (size_t)z[i] >= a[i].n) continue;
+        const mem_alnreg_t *p = &a[i].a[z[i]];
+        int span = p->qe - p->qb;
+        if (span > 0 && p->score > 0)
+            est += (long)a[i].capped_w * p->score / span;
+    }
+    if (est <= 0) return 0;
+    if (est > (long)o - 1) est = (long)o - 1;   /* clamp: never force q_pe to 0 */
+    return (int)est;
+}
+
 int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
                      const uint8_t *pac, const mem_pestat_t pes[4],
                      uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
@@ -822,6 +966,7 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
                      int *extra_flag_out, int *paired_out)
 {
     extern int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
+    extern void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);
     extern int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a);
 
     #if MATE_SORT
@@ -900,6 +1045,11 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
     }
     #endif
 
+    /* --extend-csub: seed each end's primary competitor score from the chains the
+     * cap/gate dropped, before pairing/MAPQ below reads csub. No-op when off. */
+    mem_seed_capped_sub(&a[0], opt->a);
+    mem_seed_capped_sub(&a[1], opt->a);
+
     if (opt->flag & MEM_F_NOPAIRING) {
         *extra_flag_out = extra_flag;
         return n;
@@ -926,6 +1076,7 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
     // compute mapQ for the best SE hit
     score_un = a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
     subo = subo > score_un ? subo : score_un;
+    if (opt->extend_csub) { int fl = mem_capped_pair_subo(a, z, o); if (fl > subo) subo = fl; }
     q_pe = raw_mapq(o - subo, opt->a);
     if (n_sub > 0) q_pe -= (int)(4.343 * log(n_sub + 1) + .499);
     if (q_pe < 0) q_pe = 0;
@@ -1414,6 +1565,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           int32_t &gcnt, int tid)
 {
     extern int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
+    extern void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);
     extern int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a);
     extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                             bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
@@ -1513,6 +1665,11 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         mem_reorder_primary5(opt->T, &a[1]);
     }
     #endif
+
+    /* --extend-csub: seed each end's primary competitor score from the chains the
+     * cap/gate dropped, before pairing/MAPQ below reads csub. No-op when off. */
+    mem_seed_capped_sub(&a[0], opt->a);
+    mem_seed_capped_sub(&a[1], opt->a);
     
     if (opt->flag&MEM_F_NOPAIRING) goto no_pairing;
 
@@ -1532,6 +1689,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         score_un = a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
         //q_pe = o && subo < o? (int)(MEM_MAPQ_COEF * (1. - (double)subo / o) * log(a[0].a[z[0]].seedcov + a[1].a[z[1]].seedcov) + .499) : 0;
         subo = subo > score_un? subo : score_un;
+        if (opt->extend_csub) { int fl = mem_capped_pair_subo(a, z, o); if (fl > subo) subo = fl; }
         {
             /* Meth PE MAPQ hardening (dragmap-style, cf. minibwa r404): fold each
              * end's SECOND-best single-end hit into the pair MAPQ so a repeat on
@@ -1745,7 +1903,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
         xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+            ms2[k] = nst_nt4_decode(c, 4);
         }
         ms = ms2;
     }
@@ -1850,7 +2008,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             }
             //kswr_t aln;
             //mem_alnreg_t b;
-            int xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
+            int u8_shift = matesw_u8_shift_for(opt, opt->mat);
+            int xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             /* D3 (--meth): enqueue ONE SW, scored under the rescued mate's own
              * read-number chemistry (mate_meth_ot: R1=1/OT, R2=0/OB) flipped by
@@ -1885,7 +2044,14 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 sp.len2 = l_ms;
                 sp.id = sp.score = sp.seqid = sp.gtle = sp.tle = sp.qle = sp.max_off = sp.gscore = -1; // not needed, remove while code cleaning
             
-                assert(sp.len1 >= 0 && sp.len2 >= 0);
+                /* Both lengths are cast to size_t as memcpy counts into the
+                 * staged seqBufRef/seqBufQer below, so a negative value here
+                 * is a heap overrun rather than a wrong answer. re > rb holds
+                 * only through the enclosing `re - rb >= opt->min_seed_len`
+                 * guard, and -k is an unvalidated atoi, so keep the check live
+                 * in every build (cf. the post-grow capacity xasserts below). */
+                xassert(sp.len1 >= 0 && sp.len2 >= 0,
+                        "mate rescue: negative reference-window or mate length");
                 if (refOffset + sp.len1 >= *wsize_buf_ref)
                 {
                     if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufRefs in %s\n",
@@ -1894,7 +2060,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     *wsize_buf_ref = seqbuf_grow_capacity(tmp);
                     if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
                         seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
-                    assert(*wsize_buf_ref > refOffset + sp.len1);
+                    xassert(*wsize_buf_ref >= refOffset + sp.len1,
+                            "mate rescue: reference window exceeds seqBufRef capacity after grow");
 
                     uint8_t *seqBufRef_ = (uint8_t*)
                         _mm_realloc(seqBufRef, tmp, *wsize_buf_ref, sizeof(uint8_t)); 
@@ -1914,7 +2081,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     *wsize_buf_qer = seqbuf_grow_capacity(tmp);
                     if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
                         seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
-                    assert(*wsize_buf_qer > qerOffset + sp.len2);
+                    xassert(*wsize_buf_qer >= qerOffset + sp.len2,
+                            "mate rescue: mate query exceeds seqBufQer capacity after grow");
 
                     uint8_t *seqBufQer_ = (uint8_t*)
                         _mm_realloc(seqBufQer, tmp, *wsize_buf_qer, sizeof(uint8_t)); 
@@ -1930,17 +2098,22 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 {
                     if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairs in %s\n", tid, __func__);
                     *wsize_pair += 1024;
-                    mmc->seqPairArrayAux[tid] = (SeqPair *) realloc(mmc->seqPairArrayAux[tid],
-                                                        (*wsize_pair + MAX_LINE_LEN)
-                                                        * sizeof(SeqPair));
-                    mmc->seqPairArrayLeft128[tid] = (SeqPair *) realloc(mmc->seqPairArrayLeft128[tid],
-                                                        (*wsize_pair + MAX_LINE_LEN)
-                                                        * sizeof(SeqPair));
-                    mmc->seqPairArrayRight128[tid] = (SeqPair *) realloc(mmc->seqPairArrayRight128[tid],
-                                                        (*wsize_pair + MAX_LINE_LEN)
-                                                        * sizeof(SeqPair));
+                    // realloc into a temp + xassert: a failed grow must not leak
+                    // the old block and leave a NULL slot that later writes deref.
+                    SeqPair *tmp_aux = (SeqPair *) realloc(mmc->seqPairArrayAux[tid],
+                                                        (*wsize_pair + MAX_LINE_LEN) * sizeof(SeqPair));
+                    xassert(tmp_aux != NULL, "out of memory: seqPairArrayAux");
+                    mmc->seqPairArrayAux[tid] = tmp_aux;
+                    SeqPair *tmp_left = (SeqPair *) realloc(mmc->seqPairArrayLeft128[tid],
+                                                        (*wsize_pair + MAX_LINE_LEN) * sizeof(SeqPair));
+                    xassert(tmp_left != NULL, "out of memory: seqPairArrayLeft128");
+                    mmc->seqPairArrayLeft128[tid] = tmp_left;
+                    SeqPair *tmp_right = (SeqPair *) realloc(mmc->seqPairArrayRight128[tid],
+                                                        (*wsize_pair + MAX_LINE_LEN) * sizeof(SeqPair));
+                    xassert(tmp_right != NULL, "out of memory: seqPairArrayRight128");
+                    mmc->seqPairArrayRight128[tid] = tmp_right;
                     seqPairArray = mmc->seqPairArrayLeft128[tid];
-                    gar = (int32_t*) (mmc->seqPairArrayAux[tid]);               
+                    gar = (int32_t*) (mmc->seqPairArrayAux[tid]);
                 }
 
                 if (maxRefLen < sp.len1) maxRefLen = sp.len1;
@@ -2070,7 +2243,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+            ms2[k] = nst_nt4_decode(c, 4);
         }
         ms = ms2;
     }
@@ -2110,7 +2283,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             // overwritten below with the mate read#-derived hypothesis
             // ((mate_meth_ot ^ is_rev) & 1), mirroring the scalar mem_matesw.
             int meth_won_hyp = -1;
-            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
+            int u8_shift = matesw_u8_shift_for(opt, opt->mat);
+            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             //aln = **myaln;
             //(*myaln)++;

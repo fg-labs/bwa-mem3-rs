@@ -46,54 +46,13 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 
 #include "read_index_ele.h"
 #include "bwa.h"
+#include "lockstep_width.h"  /* SMEM_LOCKSTEP_N (+ _MAX), runtime width + probe */
+#include "fmi_seed_api.h"
 
 #define DUMMY_CHAR 6
 
 #define assert_not_null(x, size, cur_alloc) \
         if (x == NULL) { fprintf(stderr, "Allocation of %0.2lf GB for " #x " failed.\nCurrent Allocation = %0.2lf GB\n", size * 1.0 /(1024*1024*1024), cur_alloc * 1.0 /(1024*1024*1024)); exit(EXIT_FAILURE); }
-
-#define CP_BLOCK_SIZE 64
-#define CP_FILENAME_SUFFIX ".bwt.2bit.64"
-#define CP_MASK 63
-#define CP_SHIFT 6
-
-typedef struct checkpoint_occ_scalar
-{
-    int64_t cp_count[4];
-    uint64_t one_hot_bwt_str[4];
-}CP_OCC;
-
-#if defined(__clang__) || defined(__GNUC__)
-static inline int _mm_countbits_64(unsigned long x) {
-    return __builtin_popcountl(x);
-}
-#endif
-
-/* One-hot position masks: entry [i] has the top `i` bits set (entry [0] == 0),
- * i.e. one_hot_mask_array[i] == (one_hot_mask_array[i-1] >> 1) | 0x8000...
- * for i in 1..63. The FMI-index lifetime constant is identical on every path,
- * so it lives inline here as a file-scope table rather than a heap allocation
- * reached through a per-object pointer: this removes a dependent load in the
- * (~10^9-call) backwardExt/GET_OCC hot path. Values are byte-identical to the
- * former runtime-computed array. */
-static const uint64_t one_hot_mask_array[64] = {
-    0x0000000000000000ULL, 0x8000000000000000ULL, 0xc000000000000000ULL, 0xe000000000000000ULL,
-    0xf000000000000000ULL, 0xf800000000000000ULL, 0xfc00000000000000ULL, 0xfe00000000000000ULL,
-    0xff00000000000000ULL, 0xff80000000000000ULL, 0xffc0000000000000ULL, 0xffe0000000000000ULL,
-    0xfff0000000000000ULL, 0xfff8000000000000ULL, 0xfffc000000000000ULL, 0xfffe000000000000ULL,
-    0xffff000000000000ULL, 0xffff800000000000ULL, 0xffffc00000000000ULL, 0xffffe00000000000ULL,
-    0xfffff00000000000ULL, 0xfffff80000000000ULL, 0xfffffc0000000000ULL, 0xfffffe0000000000ULL,
-    0xffffff0000000000ULL, 0xffffff8000000000ULL, 0xffffffc000000000ULL, 0xffffffe000000000ULL,
-    0xfffffff000000000ULL, 0xfffffff800000000ULL, 0xfffffffc00000000ULL, 0xfffffffe00000000ULL,
-    0xffffffff00000000ULL, 0xffffffff80000000ULL, 0xffffffffc0000000ULL, 0xffffffffe0000000ULL,
-    0xfffffffff0000000ULL, 0xfffffffff8000000ULL, 0xfffffffffc000000ULL, 0xfffffffffe000000ULL,
-    0xffffffffff000000ULL, 0xffffffffff800000ULL, 0xffffffffffc00000ULL, 0xffffffffffe00000ULL,
-    0xfffffffffff00000ULL, 0xfffffffffff80000ULL, 0xfffffffffffc0000ULL, 0xfffffffffffe0000ULL,
-    0xffffffffffff0000ULL, 0xffffffffffff8000ULL, 0xffffffffffffc000ULL, 0xffffffffffffe000ULL,
-    0xfffffffffffff000ULL, 0xfffffffffffff800ULL, 0xfffffffffffffc00ULL, 0xfffffffffffffe00ULL,
-    0xffffffffffffff00ULL, 0xffffffffffffff80ULL, 0xffffffffffffffc0ULL, 0xffffffffffffffe0ULL,
-    0xfffffffffffffff0ULL, 0xfffffffffffffff8ULL, 0xfffffffffffffffcULL, 0xfffffffffffffffeULL,
-};
 
 #define \
 GET_OCC(pp, c, occ_id_pp, y_pp, occ_pp, one_hot_bwt_str_c_pp, match_mask_pp) \
@@ -103,16 +62,6 @@ GET_OCC(pp, c, occ_id_pp, y_pp, occ_pp, one_hot_bwt_str_c_pp, match_mask_pp) \
                 uint64_t one_hot_bwt_str_c_pp = cp_occ[occ_id_pp].one_hot_bwt_str[c]; \
                 uint64_t match_mask_pp = one_hot_bwt_str_c_pp & one_hot_mask_array[y_pp]; \
                 occ_pp += _mm_countbits_64(match_mask_pp);
-
-typedef struct smem_struct
-{
-#ifdef DEBUG
-    uint64_t info; // for debug
-#endif
-    uint32_t rid;
-    uint32_t m, n;
-    int64_t k, l, s;
-}SMEM;
 
 /* Reusable scratch for FMI_search::sortSMEMs' rid counting sort. Hoisted out of
  * the per-batch malloc/free + memcpy (audit SEED-15): the caller owns one of
@@ -132,16 +81,21 @@ typedef struct smem_sort_scratch
 
 #define SAL_PFD 16
 
-#ifndef SMEM_LOCKSTEP_N
-#define SMEM_LOCKSTEP_N 16
-#endif
+/* SMEM_LOCKSTEP_N (phase-2 SMEM lockstep width, the compile-time floor/default
+ * and the enable guard) and SMEM_LOCKSTEP_N_MAX now live in lockstep_width.h,
+ * included above, alongside the runtime width g_smem_lockstep_n and the startup
+ * MLP probe that resolves it. */
 
 /* Lockstep depth for the third-pass (bwtSeedStrategy) re-seeding, tuned
- * separately from the phase-2 SMEM depth above. The third-pass lockstep is
- * gated to arm64 at its call site (bwamem.cpp) because it only wins on non-SMT
- * cores; N=8 is the measured whole-aligner optimum on Graviton4 (-1.7% vs the
- * scalar third pass, -16.7% on the seeding stage). Set to 1 to fall back to the
- * scalar third-pass path even on arm. */
+ * separately from the phase-2 SMEM depth above. Whether the lockstep driver
+ * runs is a per-run decision (g_bwtseed_lockstep, resolved once at startup:
+ * arm64 always on; x86 on iff every worker thread gets its own physical core;
+ * BWA3_BWTSEED_LOCKSTEP pins it), because it only wins where nothing else hides
+ * the cp_occ latency it overlaps -- see the policy in lockstep_width.h. N=8 is
+ * the measured whole-aligner optimum on Graviton4 (-1.7% vs the scalar third
+ * pass, -16.7% on the seeding stage). Set to 1 to compile the lockstep driver
+ * out entirely (the `#if BWTSEED_LOCKSTEP_N > 1` guard) and always take the
+ * scalar third-pass path. */
 #ifndef BWTSEED_LOCKSTEP_N
 #define BWTSEED_LOCKSTEP_N 8
 #endif
@@ -184,6 +138,44 @@ size_t fmi_pread_request_size(size_t remaining);
  * unit-testable against a synthetic file. */
 void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads);
 
+/* Detect the trailing sa_compx tag on a loaded FM-index (.bwt.2bit.64) file,
+ * falling back to `default_compx` when no valid tag is present (a legacy
+ * index built before this field existed).
+ *
+ * `fd` is the open file descriptor to pread() from; `file_size` is its size
+ * on disk (e.g. from fstat); `ref_seq_len` is the reference_seq_len already
+ * read from the file's header, which the implied layout size depends on.
+ *
+ * Aborts the process (EXIT_FAILURE) on a tail-read error or short/EOF read:
+ * silently degrading to `default_compx` there would mis-size the SA-sample
+ * arrays of a genuinely non-default index with no diagnostic. `default_compx`
+ * is returned only for a fully-read tag that fails the layout test (a legacy,
+ * pre-tag index) or a file too small to carry a tail.
+ *
+ * Shared by FMI_search::load_index (the disk loader, FMI_search.cpp) and
+ * bwa_shm_layout_load (the shm sizing path, bwa_shm.cpp) -- both must agree
+ * on the detected rate, since bwa_shm_compute sizes the shm segment the
+ * loader then attaches to.
+ *
+ * This tail-detection heuristic is provably unambiguous and MUST NOT be
+ * replaced by a dedicated magic-number/version field in the on-disk format:
+ * see the implementation comment in FMI_search.cpp for the proof (the size
+ * delta a false positive would require, 5*Delta == 8, has no integer
+ * solution since 5 does not divide 8). Adding a version field would change
+ * the on-disk format and break this branch's byte-identity guarantee with
+ * stock indexes for no benefit. */
+int64_t detect_sa_compx(int fd, int64_t file_size, int64_t ref_seq_len, int64_t default_compx);
+
+/* Worker count for the index load: the caller's `n_threads` clamped to [1, 8],
+ * overridable via the BWA3_LOAD_THREADS environment variable. A malformed
+ * override (non-numeric, trailing garbage, non-positive, or unrepresentable as
+ * a long) is warned about and ignored, keeping the computed default; a valid
+ * override is honored and clamped to a 64-thread ceiling. Always returns >= 1.
+ *
+ * Exposed (rather than kept file-local with the pread machinery) so the
+ * fail-closed env-parse validation is unit-testable without loading an index. */
+int index_load_threads(int n_threads);
+
 class FMI_search: public indexEle
 {
     public:
@@ -211,8 +203,10 @@ class FMI_search: public indexEle
 
     /* emit_unpacked_ref defaults false: skip writing the unpacked `<prefix>.0123`.
      * `mem` pac-fetches the original reference from `.pac`, so `.0123` is never
-     * read; pass true only to emit it for an external consumer (e.g. bwa-mem2). */
-    int build_index(bool emit_unpacked_ref = false);
+     * read; pass true only to emit it for an external consumer (e.g. bwa-mem2).
+     * sa_compx defaults to 3 (the historical rate); `bwa-mem3 index -u INT`
+     * threads its validated [0,6] value down to here via bwa_idx_build. */
+    int build_index(bool emit_unpacked_ref = false, int sa_compx = 3);
     /* load_pac=false skips loading the 2-bit packed reference (BNS only). D3
      * --meth uses this for the SEED index: seeding needs the FM-index + bns
      * (for the seed->original remap) but never the seed pac — extension/scoring
@@ -321,6 +315,11 @@ class FMI_search: public indexEle
                    int32_t readlength,
                    int nthreads,
                    SmemSortScratch &scratch);
+    // Uncompressed SA accessors -- index sa_ms_byte/sa_ls_word by raw BWT row, so
+    // they read out of bounds against the SA_COMPRESSION-sized arrays. Fenced to
+    // match their definitions in FMI_search.cpp; the compressed equivalents below
+    // are the shipped paths. Every in-tree caller is likewise `#if !SA_COMPRESSION`.
+#if !SA_COMPRESSION
     int64_t get_sa_entry(int64_t pos);
     void get_sa_entries(int64_t *posArray,
                         int64_t *coordArray,
@@ -331,6 +330,7 @@ class FMI_search: public indexEle
                         int32_t *coordCountArray,
                         uint32_t count,
                         int32_t max_occ);
+#endif // !SA_COMPRESSION
     int64_t get_sa_entry_compressed(int64_t pos, int tid=0);
     void get_sa_entries(SMEM *smemArray,
                         int64_t *coordArray,
@@ -338,13 +338,21 @@ class FMI_search: public indexEle
                         uint32_t count,
                         int32_t max_occ,
                         int tid);
-    int64_t call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset);
+    /* drop_sentinel_offset selects the coordinate reported when the LF walk
+     * reaches the sentinel row: 0 = the accumulated walk offset (correct, bwa's
+     * behaviour), 1 = 0 (bwa-mem2 v2.2.1's behaviour, selected by
+     * --compat=bwa-mem2; see compat_target_t::sa_sentinel_drop_offset). */
+    int64_t call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset,
+                          int drop_sentinel_offset = 0);
     void get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                                  int64_t *coordCountArray, int64_t count,
-                                 const int32_t max_occ, int tid, int64_t &id_);
+                                 const int32_t max_occ, int tid, int64_t &id_,
+                                 int drop_sentinel_offset = 0);
     
     int64_t reference_seq_len;
     int64_t sentinel_index;
+    int64_t sa_compx;        // SA sample shift; sample rate 1/(1<<sa_compx). Loaded per-index.
+    int64_t sa_compx_mask;   // (1<<sa_compx)-1
 private:
         char file_name[PATH_MAX];
         int64_t count[5];
@@ -369,7 +377,7 @@ private:
          * function's CPU samples on c7a (Zen 4) with gcc-14, with the
          * matching argument load close behind. always_inline removes the
          * call boundary and recovers the full gcc-11 baseline (and beats
-         * it by ~4% wall-clock on c7a wgs-5M shm-warmed). */
+         * it by ~4% wall-clock on c7a with a 5M-read WGS slice, shm-warmed). */
         __attribute__((always_inline)) inline
         SMEM backwardExt(SMEM smem, uint8_t a) const
         {
@@ -430,6 +438,77 @@ private:
             smem.k = count[a] + occ_sp[a];
             smem.l = l[a];
             smem.s = s[a];
+            return smem;
+        }
+
+        /* Population count of (*word & *mask) for one 64-bit BWT word.
+         * arm64 has no scalar popcount: __builtin_popcountll lowers to
+         * fmov d,x; cnt.8b; addv.8b; fmov x,d -- two GPR<->SIMD moves on the
+         * k' dependency chain. Loading the word and the mask straight into d
+         * registers (both are memory operands here) leaves one move, the
+         * result. Bit-identical. Other targets keep the scalar builtin. */
+        static inline int64_t occ_popcount64(const uint64_t *word, const uint64_t *mask)
+        {
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+            const uint8x8_t bits = vreinterpret_u8_u64(vand_u64(vld1_u64(word), vld1_u64(mask)));
+            return (int64_t) vaddv_u8(vcnt_u8(bits));
+#else
+            return (int64_t) __builtin_popcountll(*word & *mask);
+#endif
+        }
+
+        /* K-only backward extension for the pure-backward SMEM phase
+         * (ls_advance_backward_step). Computes ONLY smem.k and smem.s, leaving
+         * smem.l untouched: in the backward phase the reverse-complement interval
+         * start `l` is dead — it is consumed only to compute the next step's `l`,
+         * and every downstream reader of an emitted seed's `l` is redundant by the
+         * (rid,m,n) => (k,l,s) invariant. Those readers were the smem_dedup
+         * comparator (smem_dedup_inplace) and the scalar/lockstep field comparator
+         * in the parity harness (test/smem_lockstep_parity_test.cpp); both have
+         * been updated to drop `l`, so an emitted seed's identity is (rid,m,n,k,s).
+         * NOTE this means the l this phase emits is intentionally stale (frozen at
+         * its forward-phase value); it must never be resurrected as an observable
+         * field without also restoring the l-chain here. Dropping the l-chain
+         * removes the sentinel test, the l cumulation, and (on x86) six of eight
+         * popcounts — same two cache lines read, far fewer instructions.
+         * Byte-identical in observable (SAM) output.
+         *
+         * s==1 fast path: when the interval is a single suffix (common once the
+         * match is unique), occ(a, sp+1) - occ(a, sp) is exactly the one BWT bit
+         * at sp, so s' is a single bit test on the sp block — no ep block, no
+         * second popcount. one_hot_mask_array is MSB-first (mask[i] = top i bits),
+         * so BWT position `pos` lives at bit (CP_MASK - pos). On the s'->0 exit the
+         * new k is left stale (unset): this is safe ONLY because every caller
+         * discards a seed with s < min_intv while emitting the OLD smem, and every
+         * caller uses min_intv >= 1 (enforced by an xassert in ls_init_slot), so an
+         * s'==0 result is always discarded and its k is never read. Under that
+         * precondition the remaining popcount is skipped too. */
+        __attribute__((always_inline)) inline
+        SMEM backwardExt_konly(SMEM smem, uint8_t a) const
+        {
+            const int64_t sp = (int64_t)smem.k;
+            if (smem.s == 1) {
+                const CP_OCC &blk = cp_occ[sp >> CP_SHIFT];
+                const int pos = (int)(sp & CP_MASK);
+                const uint64_t oh = blk.one_hot_bwt_str[a];
+                if ((oh >> (CP_MASK - pos)) & 1ULL) {  /* BWT[sp] == a  => s' = 1 */
+                    smem.k = count[a] + blk.cp_count[a] +
+                             occ_popcount64(&blk.one_hot_bwt_str[a], &one_hot_mask_array[pos]);
+                    smem.s = 1;
+                } else {                               /* s' = 0; new k is dead */
+                    smem.s = 0;
+                }
+                return smem;
+            }
+            const int64_t ep = sp + (int64_t)smem.s;
+            const CP_OCC &blk_sp = cp_occ[sp >> CP_SHIFT];
+            const CP_OCC &blk_ep = cp_occ[ep >> CP_SHIFT];
+            const int64_t occ_s = blk_sp.cp_count[a] +
+                occ_popcount64(&blk_sp.one_hot_bwt_str[a], &one_hot_mask_array[(sp & CP_MASK)]);
+            const int64_t occ_e = blk_ep.cp_count[a] +
+                occ_popcount64(&blk_ep.one_hot_bwt_str[a], &one_hot_mask_array[(ep & CP_MASK)]);
+            smem.k = count[a] + occ_s;
+            smem.s = occ_e - occ_s;
             return smem;
         }
 

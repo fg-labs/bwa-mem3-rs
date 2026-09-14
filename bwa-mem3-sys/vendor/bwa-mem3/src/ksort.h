@@ -62,9 +62,22 @@
 #ifndef AC_KSORT_H
 #define AC_KSORT_H
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+
+/* Allocation-failure guard for the merge buffer and the introsort stack
+ * below. Both are written through as soon as they are allocated, so a NULL
+ * return is a NULL-deref, and the guard has to hold in every build rather
+ * than only where assert() is live. Vendored header with no project
+ * includes, so the abort is self-contained (cf. kv_realloc_or_die() in
+ * kvec.h) instead of going through the project's fatal-error macro. */
+static inline void ksort_oom_abort(size_t n)
+{
+	fprintf(stderr, "[ksort] out of memory: failed to (re)allocate %zu bytes\n", n);
+	abort();
+}
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -92,7 +105,7 @@ typedef struct {
 																		\
 		a2[0] = array;													\
 		a2[1] = temp? temp : (type_t*)malloc(sizeof(type_t) * n);	\
-        assert(a2[1] != NULL);                                          \
+        if (a2[1] == NULL && n != 0) ksort_oom_abort(sizeof(type_t) * n); /* malloc(0) may be NULL */ \
 		for (curr = 0, shift = 0; (1ul<<shift) < n; ++shift) {			\
 			a = a2[curr]; b = a2[1-curr];								\
 			if (shift == 0) {											\
@@ -159,13 +172,28 @@ typedef struct {
 			tmp = *l; *l = l[i]; l[i] = tmp; ks_heapadjust_##name(0, i, l); \
 		}																\
 	}																	\
+	/* bwa-mem3 local change (vs upstream klib): __ks_insertsort_##name below is \
+	 * rewritten from upstream's three-copy swap form into the hold-and-shift    \
+	 * form described here. The change is byte-identical (see the permutation    \
+	 * note below) and pinned by test/unit/test_ksort_permutation.cpp.           \
+	 * Insertion sort, hold-and-shift form: the moving element is held in `v`   \
+	 * and each displaced neighbour is copied once, instead of a three-copy     \
+	 * swap per step. The sequence of comparisons is exactly the classic       \
+	 * swap form's (the moving element against its left neighbour, stopping   \
+	 * at the same place), so the permutation -- which defines output on tied  \
+	 * keys under a partial-order comparator -- is unchanged. Pinned by        \
+	 * test/unit/test_ksort_permutation.cpp. */                                \
 	static inline void __ks_insertsort_##name(type_t *s, type_t *t)		\
 	{																	\
-		type_t *i, *j, swap_tmp;										\
-		for (i = s + 1; i < t; ++i)										\
-			for (j = i; j > s && __sort_lt(*j, *(j-1)); --j) {			\
-				swap_tmp = *j; *j = *(j-1); *(j-1) = swap_tmp;			\
+		type_t *i, *j, v;												\
+		for (i = s + 1; i < t; ++i) {									\
+			j = i;														\
+			if (__sort_lt(*j, *(j-1))) {								\
+				v = *j;													\
+				do { *j = *(j-1); --j; } while (j > s && __sort_lt(v, *(j-1))); \
+				*j = v;													\
 			}															\
+		}																\
 	}																	\
 	void ks_combsort_##name(size_t n, type_t a[])						\
 	{																	\
@@ -219,7 +247,7 @@ typedef struct {
 			stack = stack_buf;											\
 		} else {														\
 			stack = (ks_isort_stack_t*)malloc(sizeof(ks_isort_stack_t) * ((sizeof(size_t)*d)+2)); \
-			assert(stack != NULL);                                      \
+			if (stack == NULL) ksort_oom_abort(sizeof(ks_isort_stack_t) * ((sizeof(size_t)*d)+2)); \
 			stack_heap_alloc = 1;										\
 		}																\
 		top = stack; s = a; t = a + (n-1); d <<= 1;						\

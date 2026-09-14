@@ -42,8 +42,10 @@
 #include "utils.h"
 
 #include "ksort.h"
-#define pair64_lt(a, b) ((a).x < (b).x || ((a).x == (b).x && (a).y < (b).y))
+#include "pdqsort_wrap.h"
+/* pair64_lt comes from utils.h */
 KSORT_INIT(128, pair64_t, pair64_lt)
+PDQSORT_INIT(128, pair64_t, pair64_lt)
 KSORT_INIT(64,  uint64_t, ks_lt_generic)
 
 #include "kseq.h"
@@ -213,7 +215,11 @@ char* err_fgets(char *str, int size, FILE *stream)
 	char* ret = fgets(str, size, stream );
 	if (ret == NULL)
 	{
-		_err_fatal_simple("fgets", strerror(errno));
+		/* fgets returns NULL on EOF as well as on error, and errno is not set
+		 * on EOF -- so reporting strerror(errno) unconditionally names a stale,
+		 * misleading cause on a truncated input. Distinguish the two the way
+		 * err_fread_noeof does. */
+		_err_fatal_simple("fgets", ferror(stream) ? strerror(errno) : "Unexpected end of file");
 	}
 
 	return ret;
