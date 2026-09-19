@@ -1213,9 +1213,6 @@ extern "C" {
 extern "C" {
     pub fn bwa_shim_regs_heap_bytes(r: *const BwaRegs) -> usize;
 }
-extern "C" {
-    pub fn bwa_shim_seeds_from_regs(r: *mut BwaRegs) -> *mut BwaSeeds;
-}
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct BwaIdBases {

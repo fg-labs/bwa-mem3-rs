@@ -110,7 +110,6 @@ extern "C" {
     size_t       shim_regs_n_pairs(const ShimRegs *r);
     size_t       shim_regs_n_singles(const ShimRegs *r);
     size_t       shim_regs_heap_bytes(const ShimRegs *r);
-    ShimSeeds   *shim_seeds_from_regs(ShimRegs *r);
 
     /* Phase 3: cohort pestat + sink-based pair/emit (Task 4). */
     struct ShimIdBases { uint64_t first_single_id; uint64_t first_pair_id; };
@@ -564,21 +563,6 @@ extern "C" void   bwa_shim_regs_free(BwaRegs *r) { if (!r) return; shim_regs_fre
 extern "C" size_t bwa_shim_regs_n_pairs(const BwaRegs *r)    { return r ? shim_regs_n_pairs(r->inner) : 0; }
 extern "C" size_t bwa_shim_regs_n_singles(const BwaRegs *r)  { return r ? shim_regs_n_singles(r->inner) : 0; }
 extern "C" size_t bwa_shim_regs_heap_bytes(const BwaRegs *r) { return r ? shim_regs_heap_bytes(r->inner) : 0; }
-extern "C" BwaSeeds *bwa_shim_seeds_from_regs(BwaRegs *r) {
-    shim_clear_err();
-    if (!r) { shim_set_err("null regs"); return NULL; }
-    ShimSeeds *inner = shim_seeds_from_regs(r->inner);
-    free(r);
-    BwaSeeds *s = (BwaSeeds *) calloc(1, sizeof(BwaSeeds));
-    if (!s) {
-        shim_seeds_free(inner);
-        shim_set_err("calloc failed");
-        return NULL;
-    }
-    s->inner = inner;
-    return s;
-}
-
 extern "C" int bwa_shim_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
                                       const BwaRegs *const *regs, size_t n_regs, mem_pestat_t *out) {
     shim_clear_err();

@@ -167,10 +167,6 @@ size_t   bwa_shim_regs_n_singles(const BwaRegs *r);
 /* Bytes held on the C heap by `r`: copied names/seqs/quals + alnreg arrays. */
 size_t   bwa_shim_regs_heap_bytes(const BwaRegs *r);
 
-/* Compatibility: wrap phase-1 output in a BwaSeeds so the legacy
- * bwa_shim_extend_batch can consume it. Takes ownership of `r`. */
-BwaSeeds *bwa_shim_seeds_from_regs(BwaRegs *r);
-
 /* Origin kinds for the record sink: whether a record came from the batch's
  * pairs (interleaved R1/R2) or its singles. */
 #define BWA_ORIGIN_PAIR   0u
@@ -191,7 +187,10 @@ typedef void (*BwaRecordSinkFn)(void *ctx, uint32_t origin_kind, size_t origin_i
 
 /* Cohort insert-size model over the PE reads of several phase-1 batches
  * (mem_pestat once, over the concatenated per-read alnreg headers, in the
- * order given). Singles are ignored. `out` = mem_pestat_t[4]. Returns 0. */
+ * order given). Singles are ignored. `out` = mem_pestat_t[4]. Returns 0 on
+ * success, -1 on a null argument (idx/opts/out, or a null regs array or a null
+ * regs[k] when n_regs > 0) or an internal allocation failure; callers rely on
+ * that -1. */
 int bwa_shim_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
                            const BwaRegs *const *regs, size_t n_regs, mem_pestat_t *out);
 
