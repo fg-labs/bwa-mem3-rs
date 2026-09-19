@@ -271,6 +271,35 @@ pub fn estimate_pestat(
     Ok(pestat_out)
 }
 
+impl MemPeStat {
+    /// Insert-size model for one `-K` cohort: `mem_pestat` once over the
+    /// paired reads of every batch in `regs` (singles are ignored), exactly as
+    /// `bwa-mem3 mem` computes it per chunk (`bwamem.cpp:3030-3050`). Feed the
+    /// result to every [`pair_emit`] of the same cohort.
+    pub fn infer_cohort(idx: &BwaIndex, opts: &MemOpts, regs: &[AlnRegs]) -> Result<Self> {
+        let mut out = Self::zero()?;
+        let raw: Vec<*const bwa_mem3_sys::BwaRegs> = regs.iter().map(|r| r.raw()).collect();
+        // SAFETY: `idx.raw()`/`opts.as_ptr()` are valid for the call; `raw`
+        // holds `raw.len()` live `BwaRegs` pointers (each owned elsewhere by
+        // its `AlnRegs`, still alive for the duration of this call since we
+        // only borrowed them); `out.as_mut_ptr()` is a live `mem_pestat_t[4]`
+        // owned by `out`.
+        let rc = unsafe {
+            bwa_mem3_sys::bwa_shim_pestat_cohort(
+                idx.raw(),
+                opts.as_ptr(),
+                raw.as_ptr(),
+                raw.len(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(shim_err("pestat_cohort"));
+        }
+        Ok(out)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Three-phase API: seed_extend -> MemPeStat::infer_cohort -> pair_emit
 // ---------------------------------------------------------------------------

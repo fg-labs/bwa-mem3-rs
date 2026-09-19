@@ -189,8 +189,7 @@ fn run_three_phase(
             v.into_iter().map(|(_, r)| r).collect()
         });
         // Cohort pestat over every batch, in order.
-        let refs: Vec<&AlnRegs> = regs.iter().collect();
-        let pestat = MemPeStat::infer_cohort(idx, opts, &refs).unwrap();
+        let pestat = MemPeStat::infer_cohort(idx, opts, &regs).unwrap();
         // Phase 3, again spread over threads; ids per batch from the cohort layout.
         let n_se = singles.len() as u64;
         let mut se_off = 0u64;

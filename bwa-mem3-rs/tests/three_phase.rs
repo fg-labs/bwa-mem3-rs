@@ -112,8 +112,7 @@ fn three_phase_matches_align_batch_single_cohort() {
             .unwrap()
         })
         .collect();
-    let refs: Vec<&AlnRegs> = regs.iter().collect();
-    let pestat = MemPeStat::infer_cohort(&idx, &opts, &refs).unwrap();
+    let pestat = MemPeStat::infer_cohort(&idx, &opts, &regs).unwrap();
     let mut got = Vec::new();
     for (k, r) in regs.into_iter().enumerate() {
         let mut sink = RecordVec::default();
@@ -171,7 +170,7 @@ fn regs_and_scratch_cross_threads() {
     });
     assert_eq!(regs.n_pairs(), 32);
     assert!(regs.heap_bytes() > 32 * 2 * 300);
-    let pestat = MemPeStat::infer_cohort(&idx, &opts, &[&regs]).unwrap();
+    let pestat = MemPeStat::infer_cohort(&idx, &opts, std::slice::from_ref(&regs)).unwrap();
     let n = std::thread::scope(|s| {
         s.spawn(move || {
             let mut sc = AlignScratch::new().unwrap();
@@ -293,8 +292,7 @@ fn pair_emit_propagates_a_panicking_sink_as_an_ordinary_panic() {
         },
     )
     .unwrap();
-    let refs: Vec<&AlnRegs> = vec![&regs];
-    let pestat = MemPeStat::infer_cohort(&idx, &opts, &refs).unwrap();
+    let pestat = MemPeStat::infer_cohort(&idx, &opts, std::slice::from_ref(&regs)).unwrap();
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut sink = PanicOnFirstEmit { calls: 0 };
