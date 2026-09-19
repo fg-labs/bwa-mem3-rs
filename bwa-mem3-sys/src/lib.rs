@@ -5,3 +5,9 @@
 #![allow(clippy::all)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+pub mod build_info;
+
+#[cfg(test)]
+#[path = "../build_support/compiler_floor.rs"]
+mod compiler_floor;

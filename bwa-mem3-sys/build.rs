@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+include!("build_support/compiler_floor.rs");
+
 /// Kernel TUs: bwa-mem3 v0.2.0 compiles these once per SIMD tier on x86_64
 /// (`sse41`, `sse42`, `avx`, `avx2`, `avx512bw`) with `-DKERNEL_VARIANT=_<tier>`
 /// so each per-tier compile emits mangled symbols (`make_kswv_kernel_avx2`,
@@ -223,6 +225,35 @@ fn main() {
     build.define("MATE_SORT", Some("0"));
     apply_common_warning_silencing(&mut build);
 
+    // Version string for `@PG VN:` and PACKAGE_VERSION. Upstream's Makefile
+    // generates version.h from scripts/version.sh (Makefile:635); the pruned
+    // vendor tree has no git metadata, so version.txt is the source of truth.
+    let version = fs::read_to_string(vendor_root.join("version.txt"))
+        .expect("vendor/bwa-mem3/version.txt")
+        .trim()
+        .to_string();
+    build.define("PACKAGE_VERSION", Some(format!("\"{version}\"").as_str()));
+    println!("cargo:rustc-env=BWA_MEM3_SYS_VERSION={version}");
+    println!("cargo:rerun-if-changed=vendor/bwa-mem3/version.txt");
+
+    // Compiler floor. cc enforces nothing, so at least say so loudly.
+    let compiler_line = compiler_version_line(&build);
+    let (toolchain, major) = parse_version_line(&compiler_line);
+    if let Some(w) = floor_warning(toolchain, major) {
+        println!("cargo:warning={w}");
+    }
+    println!("cargo:rustc-env=BWA_MEM3_SYS_COMPILER={compiler_line}");
+    let tiers = if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+        KERNEL_TIERS_X86
+            .iter()
+            .map(|(t, _)| *t)
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        String::new()
+    };
+    println!("cargo:rustc-env=BWA_MEM3_SYS_X86_TIERS={tiers}");
+
     build.compile("bwa-mem3");
 
     println!("cargo:rustc-link-lib=z");
@@ -236,6 +267,22 @@ fn main() {
 
     // 5. Generate Rust bindings for the shim header.
     generate_bindings(&manifest, &vendor_src, &out);
+}
+
+/// First line of `<cxx> --version`, or a placeholder when the compiler cannot
+/// be run (the build itself will fail later with the real error).
+fn compiler_version_line(build: &cc::Build) -> String {
+    let compiler = build.get_compiler();
+    let out = Command::new(compiler.path()).arg("--version").output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        _ => format!("unknown ({})", compiler.path().display()),
+    }
 }
 
 fn apply_common_warning_silencing(build: &mut cc::Build) {
