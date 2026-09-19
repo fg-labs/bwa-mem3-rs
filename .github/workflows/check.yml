@@ -141,6 +141,13 @@ jobs:
       # bwa-mem3-sys itself (three_phase_ffi, three_phase_cli_parity) so the
       # sys crate's own FFI/parity tests are validated against the real CLI
       # in this default BATCHED config, not only in the scalar A/B run below.
+      # bwa-mem3-rs is included too: its wrapper-level three-phase tests
+      # (byte identity, cross-thread Send, panic-across-FFI-unwind) build a
+      # small PhiX index at test time and so run here where bwa-mem3 is on
+      # PATH -- the ci-test build job never installs it, so this is the only
+      # place they execute. Its remaining integration tests stay gated on
+      # BWA_MEM3_RS_TEST_REF (a full index), which this job does not set, so
+      # they skip; only the PhiX-backed ones run.
       # --no-fail-fast: without it, a failure in one target (e.g.
       # cli_parity_pair_select) stops the run before later targets execute,
       # hiding whether a regression's scope is one target or several. Suite
@@ -148,7 +155,7 @@ jobs:
       - name: Run CLI test suite (e2e + byte-parity)
         env:
           BWA_MEM3_RS_REQUIRE_TOOLS: "1"
-        run: cargo test -p bwa-mem3-sys -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
+        run: cargo test -p bwa-mem3-sys -p bwa-mem3-rs -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
       # A/B: the run above exercises the shim's BATCHED mate-rescue path (the
       # AVX2 baseline on ubuntu-latest x86_64 sets BWAMEM_BATCHED_MATESW=1); this
       # second run forces the shim's SCALAR path so both are checked against the
@@ -163,4 +170,4 @@ jobs:
           CXXFLAGS: "-DDISABLE_BATCHED_MATESW=1"
         run: |
           cargo clean -p bwa-mem3-sys
-          cargo test -p bwa-mem3-sys -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
+          cargo test -p bwa-mem3-sys -p bwa-mem3-rs -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture

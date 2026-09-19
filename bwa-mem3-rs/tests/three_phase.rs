@@ -1,15 +1,23 @@
-//! Wrapper-level three-phase tests. Skipped unless `BWA_MEM3_RS_TEST_REF`
-//! points at a bwa-mem3 index prefix (the sys crate covers the C behavior on
-//! PhiX; this checks ownership, Send, and parity with `align_batch`).
+//! Wrapper-level three-phase tests. These build a small PhiX index at test
+//! time (via `bwa-mem3 index`), so the safety-critical checks here -- byte
+//! identity with `align_batch`, cross-thread `Send`, and panic-across-FFI
+//! unwind -- run in CI wherever the `bwa-mem3` binary is available, rather than
+//! being gated on a full hg38 index that CI never provides.
 //!
-//! `BWA_MEM3_RS_TEST_REF` is typically a full hg38 index (~10 GB resident once
-//! loaded). The harness runs `#[test]`s in one binary concurrently by default,
-//! so tests that only need to *read* the index share one `Arc<BwaIndex>` via
-//! [`shared_idx`] rather than each loading their own -- five independent
-//! full-hg38 loads running at once is enough to trip the OOM killer on a
-//! modest CI box. [`load_with_threads_matches_load`] is the deliberate
-//! exception: it exists to test loading itself, so it loads its own pair.
+//! A missing `bwa-mem3` makes each test skip (returning early with a message),
+//! unless `BWA_MEM3_RS_REQUIRE_TOOLS` is set, in which case it is a hard
+//! failure -- the same skip-vs-panic convention the sys and cli crates use, so
+//! a CI job that promises the tools cannot silently degrade into a no-op.
+//!
+//! PhiX (~5.5 kb) loads in milliseconds, so unlike the old hg38 path there is
+//! no OOM risk from concurrent loads; the tests that only *read* the index
+//! still share one `Arc<BwaIndex>` via [`shared_idx`] to avoid re-indexing per
+//! test. [`load_with_threads_matches_load`] is the deliberate exception: it
+//! exists to test loading itself, so it loads its own pair from the prefix.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 use bwa_mem3_rs::{
@@ -17,23 +25,83 @@ use bwa_mem3_rs::{
     IdBases, MemOpts, MemPeStat, ReadBatch, ReadPair, RecordOrigin, RecordSink, RecordVec,
 };
 
-fn ref_prefix() -> Option<String> {
-    let p = std::env::var("BWA_MEM3_RS_TEST_REF").ok()?;
-    std::path::Path::new(&format!("{p}.bwt.2bit.64"))
-        .exists()
-        .then_some(p)
+#[path = "../../bwa-mem3-rs-cli/tests/phix_seq.rs"]
+mod phix_seq;
+
+/// A PhiX index built once per test-binary run, kept alive for the process.
+struct PhixRef {
+    _dir: tempfile::TempDir, // holds the on-disk index files alive
+    prefix: PathBuf,
+    idx: Arc<BwaIndex>,
+}
+
+/// Locate `bwa-mem3` via `BWA_MEM3_BIN` or `PATH`. Returns `None` (with a skip
+/// message) when it is absent, unless `BWA_MEM3_RS_REQUIRE_TOOLS` is set, which
+/// turns the absence into a hard failure.
+fn find_bwa_mem3() -> Option<String> {
+    if let Ok(p) = std::env::var("BWA_MEM3_BIN") {
+        if Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    let out = Command::new("which").arg("bwa-mem3").output().ok();
+    let found = out.and_then(|o| {
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|p| !p.is_empty())
+    });
+    if found.is_none() {
+        assert!(
+            std::env::var_os("BWA_MEM3_RS_REQUIRE_TOOLS").is_none(),
+            "BWA_MEM3_RS_REQUIRE_TOOLS is set but bwa-mem3 was not found; \
+             set BWA_MEM3_BIN or install it on PATH"
+        );
+        eprintln!("skip: bwa-mem3 not on PATH (set BWA_MEM3_BIN)");
+    }
+    found
+}
+
+/// Build+load a PhiX index once, shared across the whole test binary. `None`
+/// (skip) when `bwa-mem3` is unavailable and not required.
+fn phix() -> Option<&'static PhixRef> {
+    static REF: OnceLock<Option<PhixRef>> = OnceLock::new();
+    REF.get_or_init(|| {
+        let bwa = find_bwa_mem3()?;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fa = dir.path().join("phix.fa");
+        let mut f = std::fs::File::create(&fa).unwrap();
+        writeln!(f, ">phix").unwrap();
+        for chunk in phix_seq::PHIX_SEQ.as_bytes().chunks(72) {
+            f.write_all(chunk).unwrap();
+            writeln!(f).unwrap();
+        }
+        drop(f);
+        let status = Command::new(&bwa)
+            .arg("index")
+            .arg(&fa)
+            .status()
+            .expect("run bwa-mem3 index");
+        assert!(status.success(), "bwa-mem3 index failed");
+        let idx = Arc::new(BwaIndex::load(&fa).expect("load PhiX index"));
+        Some(PhixRef {
+            _dir: dir,
+            prefix: fa,
+            idx,
+        })
+    })
+    .as_ref()
+}
+
+/// The PhiX index prefix (its FASTA path), or `None` (skip) without the tools.
+fn ref_prefix() -> Option<&'static Path> {
+    phix().map(|p| p.prefix.as_path())
 }
 
 /// One `BwaIndex` shared by every test that only reads it, loaded at most
 /// once per test binary run. See the module doc for why this matters.
 fn shared_idx() -> Option<Arc<BwaIndex>> {
-    static IDX: OnceLock<Option<Arc<BwaIndex>>> = OnceLock::new();
-    IDX.get_or_init(|| {
-        ref_prefix()
-            .and_then(|p| BwaIndex::load(&p).ok())
-            .map(Arc::new)
-    })
-    .clone()
+    phix().map(|p| p.idx.clone())
 }
 
 fn pairs(n: usize) -> (Vec<String>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
@@ -73,7 +141,7 @@ fn version_and_build_info_are_populated() {
 #[test]
 fn three_phase_matches_align_batch_single_cohort() {
     let Some(idx) = shared_idx() else {
-        eprintln!("skip: set BWA_MEM3_RS_TEST_REF");
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
         return;
     };
     let opts = MemOpts::new().unwrap();
@@ -134,7 +202,7 @@ fn three_phase_matches_align_batch_single_cohort() {
 #[test]
 fn regs_and_scratch_cross_threads() {
     let Some(idx) = shared_idx() else {
-        eprintln!("skip: set BWA_MEM3_RS_TEST_REF");
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
         return;
     };
     let opts = Arc::new(MemOpts::new().unwrap());
@@ -240,8 +308,8 @@ fn load_with_threads_matches_load() {
     let Some(prefix) = ref_prefix() else {
         return;
     };
-    let a = BwaIndex::load(&prefix).unwrap();
-    let b = BwaIndex::load_with_threads(&prefix, 4).unwrap();
+    let a = BwaIndex::load(prefix).unwrap();
+    let b = BwaIndex::load_with_threads(prefix, 4).unwrap();
     assert_eq!(
         a.contigs().collect::<Vec<_>>(),
         b.contigs().collect::<Vec<_>>()
