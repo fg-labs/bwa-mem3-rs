@@ -71,13 +71,19 @@ use bwa_mem3_rs::*;
 let idx = BwaIndex::load_with_threads("hg38.fa", 8)?;
 let opts = MemOpts::new()?;
 let mut scratch = AlignScratch::new()?;               // one per worker thread
+// cohort_sub_batches, cohort_first_pair_id, and my_sink are caller-supplied
 let regs: Vec<AlnRegs> = cohort_sub_batches.iter()   // any size, any thread
     .map(|b| seed_extend(&idx, &opts, &mut scratch, &ReadBatch { pairs: b, singles: &[] }))
     .collect::<Result<_>>()?;
-let pestat = MemPeStat::infer_cohort(&idx, &opts, &regs.iter().collect::<Vec<_>>())?;
+let pestat = MemPeStat::infer_cohort(&idx, &opts, &regs)?;
+// Sub-batches may differ in length, so advance the pair id by each one's
+// actual pair count -- a fixed stride would give later calls the wrong global
+// ordinal and break the cohort-exact tie-break.
+let mut next_pair_id = cohort_first_pair_id;
 for (k, r) in regs.into_iter().enumerate() {
-    let ids = IdBases { first_single_id: 0, first_pair_id: cohort_first_pair_id + (k * sub) as u64 };
+    let ids = IdBases { first_single_id: 0, first_pair_id: next_pair_id };
     pair_emit(&idx, &opts, &mut scratch, r, Some(&pestat), ids, &mut my_sink)?;
+    next_pair_id += cohort_sub_batches[k].len() as u64;
 }
 ```
 

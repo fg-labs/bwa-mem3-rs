@@ -1305,6 +1305,7 @@ int shim_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
     size_t total = 0;
     for (size_t k = 0; k < n_regs; ++k) total += 2 * regs[k]->n_pairs;
     mem_alnreg_v *cat = total ? (mem_alnreg_v *) malloc(total * sizeof(mem_alnreg_v)) : nullptr;
+    if (total && !cat) return -1;
     size_t at = 0;
     for (size_t k = 0; k < n_regs; ++k) {
         size_t n = 2 * regs[k]->n_pairs;
@@ -1424,6 +1425,9 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
                                const int n_pri[2], const int z[2], const int q_se[2],
                                int extra_flag, int paired)
 {
+    /* n_pri is unused here: it's kept only so this signature stays symmetric
+     * with pair_resolve_scalar (both take the same resolve/emit param set),
+     * making it easy to swap in a batched resolve/emit pair later. */
     (void)n_pri;
     /* Build a synthetic unmapped mem_aln_t in `dst[0]` (a single-record list).
      * upstream's own unmapped record (mem_reg2aln, bwamem.cpp:2632-2645)

@@ -137,7 +137,10 @@ jobs:
       # so running only e2e left them unexercised everywhere in CI. They all
       # build their own PhiX-scale index and need no large reference.
       # BWA_MEM3_RS_REQUIRE_TOOLS makes a missing tool fail rather than skip,
-      # so this job cannot silently degrade into a no-op.
+      # so this job cannot silently degrade into a no-op. Also runs
+      # bwa-mem3-sys itself (three_phase_ffi, three_phase_cli_parity) so the
+      # sys crate's own FFI/parity tests are validated against the real CLI
+      # in this default BATCHED config, not only in the scalar A/B run below.
       # --no-fail-fast: without it, a failure in one target (e.g.
       # cli_parity_pair_select) stops the run before later targets execute,
       # hiding whether a regression's scope is one target or several. Suite
@@ -145,15 +148,15 @@ jobs:
       - name: Run CLI test suite (e2e + byte-parity)
         env:
           BWA_MEM3_RS_REQUIRE_TOOLS: "1"
-        run: cargo test -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
+        run: cargo test -p bwa-mem3-sys -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
       # A/B: the run above exercises the shim's BATCHED mate-rescue path (the
       # AVX2 baseline on ubuntu-latest x86_64 sets BWAMEM_BATCHED_MATESW=1); this
       # second run forces the shim's SCALAR path so both are checked against the
       # reference CLI every time. Both must be byte-identical to the CLI (gotcha
       # #18). cargo clean -p bwa-mem3-sys forces build.rs to recompile the shim
-      # (and the vendored TUs) with the new CXXFLAGS. Also re-runs bwa-mem3-sys
-      # itself (three_phase_ffi, three_phase_cli_parity) so the sys crate's own
-      # FFI/parity tests are validated in scalar mode too, not just the CLI's.
+      # (and the vendored TUs) with the new CXXFLAGS. Re-runs bwa-mem3-sys's own
+      # FFI/parity tests (three_phase_ffi, three_phase_cli_parity) too, this time
+      # in scalar mode, mirroring the batched run above.
       - name: Run CLI test suite with the shim's scalar mate rescue (A/B)
         env:
           BWA_MEM3_RS_REQUIRE_TOOLS: "1"

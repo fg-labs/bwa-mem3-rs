@@ -526,6 +526,11 @@ extern "C" BwaScratch *bwa_shim_scratch_new(void) {
     ShimScratch *inner = shim_scratch_new();
     if (!inner) { shim_set_err("scratch alloc failed"); return NULL; }
     BwaScratch *s = (BwaScratch *) calloc(1, sizeof(BwaScratch));
+    if (!s) {
+        shim_scratch_free(inner);
+        shim_set_err("calloc failed");
+        return NULL;
+    }
     s->inner = inner;
     return s;
 }
@@ -547,6 +552,11 @@ extern "C" BwaRegs *bwa_shim_seed_extend(const BwaIndex *idx, const mem_opt_t *o
         return NULL;
     }
     BwaRegs *r = (BwaRegs *) calloc(1, sizeof(BwaRegs));
+    if (!r) {
+        shim_regs_free(inner);
+        shim_set_err("calloc failed");
+        return NULL;
+    }
     r->inner = inner;
     return r;
 }
@@ -557,9 +567,15 @@ extern "C" size_t bwa_shim_regs_heap_bytes(const BwaRegs *r) { return r ? shim_r
 extern "C" BwaSeeds *bwa_shim_seeds_from_regs(BwaRegs *r) {
     shim_clear_err();
     if (!r) { shim_set_err("null regs"); return NULL; }
-    BwaSeeds *s = (BwaSeeds *) calloc(1, sizeof(BwaSeeds));
-    s->inner = shim_seeds_from_regs(r->inner);
+    ShimSeeds *inner = shim_seeds_from_regs(r->inner);
     free(r);
+    BwaSeeds *s = (BwaSeeds *) calloc(1, sizeof(BwaSeeds));
+    if (!s) {
+        shim_seeds_free(inner);
+        shim_set_err("calloc failed");
+        return NULL;
+    }
+    s->inner = inner;
     return s;
 }
 
@@ -569,6 +585,7 @@ extern "C" int bwa_shim_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts
     if (!idx || !opts || !out || (n_regs > 0 && !regs)) { shim_set_err("null arg"); return -1; }
     /* Unwrap the handles into a bridge array. */
     const ShimRegs **inner = (const ShimRegs **) malloc((n_regs ? n_regs : 1) * sizeof(*inner));
+    if (!inner) { shim_set_err("malloc failed"); return -1; }
     for (size_t k = 0; k < n_regs; ++k) {
         if (!regs[k]) { free(inner); shim_set_err("null regs[%zu]", k); return -1; }
         inner[k] = regs[k]->inner;

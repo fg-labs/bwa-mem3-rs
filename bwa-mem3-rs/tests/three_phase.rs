@@ -135,6 +135,7 @@ fn three_phase_matches_align_batch_single_cohort() {
 #[test]
 fn regs_and_scratch_cross_threads() {
     let Some(idx) = shared_idx() else {
+        eprintln!("skip: set BWA_MEM3_RS_TEST_REF");
         return;
     };
     let opts = Arc::new(MemOpts::new().unwrap());
