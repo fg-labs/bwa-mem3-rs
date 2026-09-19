@@ -131,6 +131,19 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let is_x86 = target_arch == "x86_64";
 
+    // Version string for `@PG VN:` and PACKAGE_VERSION. Upstream's Makefile
+    // generates version.h from scripts/version.sh (Makefile:635); the pruned
+    // vendor tree has no git metadata, so version.txt is the source of truth.
+    // Computed here (before the kernel loop below) so every compiled TU --
+    // the five per-tier kernel builds in 4a and the main build in 4b -- gets
+    // the same `-DPACKAGE_VERSION` define.
+    let version = fs::read_to_string(vendor_root.join("version.txt"))
+        .expect("vendor/bwa-mem3/version.txt")
+        .trim()
+        .to_string();
+    println!("cargo:rustc-env=BWA_MEM3_SYS_VERSION={version}");
+    println!("cargo:rerun-if-changed=vendor/bwa-mem3/version.txt");
+
     // 4a. Per-tier kernel TUs (x86_64 only). bwa-mem3 v0.2.0 picks the
     // matching tier at runtime in `simd_dispatch.cpp`; we must supply all
     // five mangled tier copies of bandedSWA/kswv/ksw/sam_encode so the
@@ -155,6 +168,7 @@ fn main() {
             k_build.define("ENABLE_PREFETCH", None);
             k_build.define("V17", Some("1"));
             k_build.define("MATE_SORT", Some("0"));
+            k_build.define("PACKAGE_VERSION", Some(format!("\"{version}\"").as_str()));
             // kernel_dispatch.h mangles every exported kernel symbol to
             // `<name><KERNEL_VARIANT>` (e.g. `_avx2`). The dispatcher in
             // simd_dispatch.cpp expects this exact suffix per tier.
@@ -223,18 +237,8 @@ fn main() {
     build.define("ENABLE_PREFETCH", None);
     build.define("V17", Some("1"));
     build.define("MATE_SORT", Some("0"));
-    apply_common_warning_silencing(&mut build);
-
-    // Version string for `@PG VN:` and PACKAGE_VERSION. Upstream's Makefile
-    // generates version.h from scripts/version.sh (Makefile:635); the pruned
-    // vendor tree has no git metadata, so version.txt is the source of truth.
-    let version = fs::read_to_string(vendor_root.join("version.txt"))
-        .expect("vendor/bwa-mem3/version.txt")
-        .trim()
-        .to_string();
     build.define("PACKAGE_VERSION", Some(format!("\"{version}\"").as_str()));
-    println!("cargo:rustc-env=BWA_MEM3_SYS_VERSION={version}");
-    println!("cargo:rerun-if-changed=vendor/bwa-mem3/version.txt");
+    apply_common_warning_silencing(&mut build);
 
     // Compiler floor. cc enforces nothing, so at least say so loudly.
     let compiler_line = compiler_version_line(&build);
