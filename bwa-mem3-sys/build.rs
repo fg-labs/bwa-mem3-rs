@@ -377,8 +377,10 @@ const DEFINES_DELIBERATELY_OMITTED: &[(&str, &str)] = &[
     ),
     (
         "DISABLE_BATCHED_MATESW",
-        "upstream sets this only for the proto-neon-kswv CI's on/off A/B test of the \
-         batched mate-rescue SW port, never for a normal build",
+        "an A/B escape hatch (macro.h:80-88), never set for a normal build. Upstream \
+         uses it for the proto-neon-kswv CI's on/off test of the batched mate-rescue SW \
+         port; this crate's own CI passes it via CXXFLAGS (not the Makefile) to run the \
+         CLI parity suites against the shim's scalar mate-rescue path too (gotcha #18)",
     ),
     (
         "KERNEL_VARIANT",

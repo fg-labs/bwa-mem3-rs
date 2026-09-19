@@ -356,6 +356,18 @@ any edit to `shim/bwa_shim.h` run
 `BWA_MEM3_SYS_WRITE_BINDINGS=1 cargo build -p bwa-mem3-sys --features regenerate-bindings`
 and commit the result; CI's `bindings` job fails on drift.
 
+### 18. Mate rescue runs the batched kernel where the CLI does
+
+`shim_pair_emit` uses `mem_sam_pe_batch_pre` → `sort_classify` →
+`mem_sam_pe_batch` → `mem_pair_resolve_batch_post` under
+`BWAMEM_BATCHED_MATESW` (AVX2/AVX-512/NEON, `macro.h:80-88`) and the scalar
+`mem_pair_resolve` otherwise — the same switch the CLI's `worker_sam` takes.
+`mem_pair_resolve_batch_post` is carried as
+`patches/0001-mem-pair-resolve-batch-post.patch` until it lands upstream; on
+a vendor refresh, diff it against `mem_sam_pe_batch_post` (the emission-free
+twin must track any change to the resolve half). CI runs the CLI suites twice,
+once per shim path (`CXXFLAGS=-DDISABLE_BATCHED_MATESW=1`).
+
 ## Commit / PR conventions
 
 - Conventional Commits; sign with `-S`; see `CONTRIBUTING.md`.

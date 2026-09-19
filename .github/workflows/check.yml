@@ -146,3 +146,16 @@ jobs:
         env:
           BWA_MEM3_RS_REQUIRE_TOOLS: "1"
         run: cargo test -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
+      # A/B: the run above exercises the shim's BATCHED mate-rescue path (the
+      # AVX2 baseline on ubuntu-latest x86_64 sets BWAMEM_BATCHED_MATESW=1); this
+      # second run forces the shim's SCALAR path so both are checked against the
+      # reference CLI every time. Both must be byte-identical to the CLI (gotcha
+      # #18). cargo clean -p bwa-mem3-sys forces build.rs to recompile the shim
+      # (and the vendored TUs) with the new CXXFLAGS.
+      - name: Run CLI test suite with the shim's scalar mate rescue (A/B)
+        env:
+          BWA_MEM3_RS_REQUIRE_TOOLS: "1"
+          CXXFLAGS: "-DDISABLE_BATCHED_MATESW=1"
+        run: |
+          cargo clean -p bwa-mem3-sys
+          cargo test -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture

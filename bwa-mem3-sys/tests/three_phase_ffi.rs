@@ -687,3 +687,53 @@ fn pair_emit_requires_pestat_for_pairs() {
         sys::bwa_shim_idx_free(idx);
     }
 }
+
+/// On AVX2/NEON builds the CLI resolves pairs through the batched kswv mate
+/// rescue; the shim used the scalar path. The two must agree byte-for-byte on
+/// a fixture where rescue actually fires (one mate mutated hard enough that
+/// seeding finds nothing and only mate rescue places it).
+#[test]
+fn rescue_heavy_fixture_matches_between_batched_and_legacy_paths() {
+    let Some((_dir, prefix)) = common::phix_index() else {
+        return;
+    };
+    let idx = common::load_idx(&prefix);
+    let opts = common::new_opts();
+    let mut fx = common::simulate(400, 100, 300, 61);
+    // Mutate every 3rd R2 at every 7th base: ~14 substitutions in 100 bp
+    // leaves no 19-mer seed, so R2 is placeable only by rescue from R1.
+    for i in (0..fx.r2.len()).step_by(3) {
+        for j in (0..fx.r2[i].len()).step_by(7) {
+            fx.r2[i][j] = match fx.r2[i][j] {
+                b'A' => b'C',
+                b'C' => b'G',
+                b'G' => b'T',
+                _ => b'A',
+            };
+        }
+    }
+    let pairs = fx.pairs();
+    let legacy = common::align_batch_records(idx, opts, &pairs);
+    let phased = three_phase(idx, opts, &pairs, 64, 0);
+    assert_eq!(phased, legacy);
+    // Rescue must have fired: some R2 records are mapped (no 0x4) despite the
+    // mutation load. Counted on the legacy output so a silent "everything
+    // unmapped" regression cannot pass vacuously.
+    let mapped_r2 = legacy
+        .iter()
+        .filter(|(i, r)| {
+            i % 3 == 0 && {
+                let f = u16::from_le_bytes([r[4 + 14], r[4 + 15]]);
+                f & 0x80 != 0 && f & 0x4 == 0
+            }
+        })
+        .count();
+    assert!(
+        mapped_r2 > 50,
+        "rescue did not fire ({mapped_r2} mutated R2 mapped)"
+    );
+    unsafe {
+        sys::bwa_shim_opts_free(opts);
+        sys::bwa_shim_idx_free(idx);
+    }
+}

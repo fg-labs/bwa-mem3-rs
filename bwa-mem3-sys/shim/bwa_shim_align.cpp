@@ -25,6 +25,12 @@
 #include "utils.h"          /* xassert — survives NDEBUG, unlike assert */
 #include "FMI_search.h"
 #include "meth_xm.h"   /* meth_build_xm — D3 (--meth) XM:Z tag */
+#include "kswv.h"      /* kswr_t / SIMD_WIDTH8 — batched mate-rescue path below */
+
+/* sort_classify has external linkage in bwamem.cpp but no header declaration
+ * (the CLI's worker_sam calls it from the same TU). The batched mate-rescue
+ * path in shim_pair_emit needs it, so forward-declare it here. */
+extern int64_t sort_classify(mem_cache *mmc, int64_t pcnt, int tid);
 
 /* worker_alloc / worker_free — per-worker scratch (chaining arrays, BSW
  * buffers, lazy SMEM buffers) sized for one BATCH_SIZE chunk. Upstream defines
@@ -1268,6 +1274,14 @@ static void single_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
                             const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                             bseq1_t *s, mem_alnreg_v *a);
 
+/* Defined below (with pair_resolve_scalar); forward-declared so the batched
+ * mate-rescue path in shim_pair_emit can emit each resolved pair. */
+static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
+                               const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                               bseq1_t *s, mem_alnreg_v *a, const mem_pestat_t pes[4],
+                               const int n_pri[2], const int z[2], const int q_se[2],
+                               int extra_flag, int paired);
+
 /* mem_pestat over the PE reads of several batches, exactly as the CLI runs it
  * once per -K cohort (mem_process_seqs, bwamem.cpp:3030-3050). Only the
  * 24-byte mem_alnreg_v headers are gathered; the alnreg payloads stay put.
@@ -1320,10 +1334,39 @@ int shim_pair_emit(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc, Shi
 
     mem_opt_t opt_pe = *opts; opt_pe.n_threads = 1; opt_pe.flag |= MEM_F_PE;
     ShimEmit e = { sc, sink, ctx, 0u /* BWA_ORIGIN_PAIR */ };
-    for (size_t i = 0; i < r->n_pairs; ++i) {
+#if BWAMEM_BATCHED_MATESW
+    /* The CLI's worker_sam path on AVX2/AVX-512/NEON (bwamem.cpp:2826-2879):
+     * gather every pair's rescue jobs, run them through the SIMD kswv kernel
+     * once, then resolve + emit per pair. tid = 0: one ShimScratch per thread. */
+    if (r->n_pairs > 0) {
+        worker_t &w = sc->w;
+        int32_t maxRefLen = 0, maxQerLen = 0, gcnt = 0;
+        int64_t pcnt = 0;
+        for (size_t i = 0; i < r->n_pairs; ++i)
+            mem_sam_pe_batch_pre(&opt_pe, bns, pac, pestat, ids.first_pair_id + (uint64_t)i,
+                                 r->seqs + 2*i, r->regs + 2*i, &w.mmc, pcnt, gcnt,
+                                 maxRefLen, maxQerLen, 0);
+        int64_t pcnt8 = sort_classify(&w.mmc, pcnt, 0);
+        kswr_t *aln = (kswr_t *) _mm_malloc((pcnt + SIMD_WIDTH8) * sizeof(kswr_t), 64);
+        xassert(aln != NULL, "out of memory: aln");
+        mem_sam_pe_batch(&opt_pe, &w.mmc, pcnt, pcnt8, aln, maxRefLen, maxQerLen, 0);
+        gcnt = 0;
+        kswr_t *myaln = aln;
+        for (size_t i = 0; i < r->n_pairs; ++i) {
+            int n_pri[2], z[2], q_se[2], extra_flag, paired;
+            mem_pair_resolve_batch_post(&opt_pe, bns, pac, pestat, ids.first_pair_id + (uint64_t)i,
+                                        r->seqs + 2*i, r->regs + 2*i, &myaln, &w.mmc, gcnt, 0,
+                                        n_pri, z, q_se, &extra_flag, &paired);
+            emit_resolved_pair(&e, i, &opt_pe, bns, pac, r->seqs + 2*i, r->regs + 2*i, pestat,
+                               n_pri, z, q_se, extra_flag, paired);
+        }
+        _mm_free(aln);
+    }
+#else
+    for (size_t i = 0; i < r->n_pairs; ++i)
         pair_and_emit(&e, i, ids.first_pair_id + (uint64_t)i,
                       &opt_pe, bns, pac, r->seqs + 2*i, r->regs + 2*i, pestat);
-    }
+#endif
     /* Singles after pairs: SE group emitted with MEM_F_PE cleared, ids from
      * first_single_id, one origin_idx per single (index into batch->singles).
      * BWA_ORIGIN_SINGLE (1) distinguishes them from pairs at the sink. */
