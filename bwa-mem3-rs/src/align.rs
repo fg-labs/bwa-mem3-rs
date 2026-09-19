@@ -346,6 +346,9 @@ pub struct AlignScratch {
 
 impl AlignScratch {
     pub fn new() -> Result<Self> {
+        // SAFETY: `bwa_shim_scratch_new` is an opaque C allocator with no
+        // preconditions; it returns null on failure, which we check below
+        // before ever treating the result as a valid handle.
         let handle = unsafe { bwa_mem3_sys::bwa_shim_scratch_new() };
         if handle.is_null() {
             return Err(shim_err("scratch_new"));
@@ -357,6 +360,9 @@ impl AlignScratch {
 impl Drop for AlignScratch {
     fn drop(&mut self) {
         if !self.handle.is_null() {
+            // SAFETY: `self.handle` is a valid non-null handle produced by
+            // `bwa_shim_scratch_new`, owned exclusively by `self`, and this
+            // is the only place it is freed -- `Drop` runs at most once.
             unsafe { bwa_mem3_sys::bwa_shim_scratch_free(self.handle) };
         }
     }
@@ -392,6 +398,9 @@ impl AlnRegs {
     /// Bytes this handle holds on the C heap (read copies + alnreg arrays).
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
+        // SAFETY: `self.handle` is a valid non-null handle produced by
+        // `bwa_shim_seed_extend`, owned by `self` for at least the duration
+        // of this read-only call.
         unsafe { bwa_mem3_sys::bwa_shim_regs_heap_bytes(self.handle) }
     }
 
@@ -403,6 +412,9 @@ impl AlnRegs {
 impl Drop for AlnRegs {
     fn drop(&mut self) {
         if !self.handle.is_null() {
+            // SAFETY: `self.handle` is a valid non-null handle produced by
+            // `bwa_shim_seed_extend`, owned exclusively by `self`, and this
+            // is the only place it is freed -- `Drop` runs at most once.
             unsafe { bwa_mem3_sys::bwa_shim_regs_free(self.handle) };
         }
     }
