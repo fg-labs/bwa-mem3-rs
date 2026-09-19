@@ -1,16 +1,17 @@
-//! Regression test for a fix-round finding on top of the const-correctness
-//! change: `shim_seed_batch` copies the caller's `mem_opt_t` into
-//! `s->opts_copy` and forces `n_threads = 1` / `flag |= MEM_F_PE` there (so
-//! `bwa_shim_align_batch` never writes through the caller's pointer), and
-//! `shim_extend_batch`/`shim_estimate_pestat` read that forced copy back via
-//! `s->opts`. But `s->w.opt` — what the SEEDING kernel (`mem_kernel1_core`)
-//! actually reads options through — was still set to the caller's raw,
-//! un-forced `opts`. `mem_kernel1_core` reads `opt->flag & MEM_F_PE` to
-//! decide whether the `--extend-mate-concordant` chain cap runs
-//! (`bwamem.cpp:2501-2521`), so with the bug present the forced PE flag never
-//! reached the seeding stage: a caller whose own `opts.flag` had `MEM_F_PE`
-//! off got the non-mate-aware cap at seeding regardless of the shim's
-//! always-paired semantics for `bwa_shim_align_batch`.
+//! Regression test that `bwa_shim_align_batch`'s always-paired semantics reach
+//! the SEEDING stage, not just pairing/pestat. The shim never writes through
+//! the caller's `mem_opt_t`: `shim_seed_extend` makes a per-group copy of the
+//! options and forces `n_threads = 1` / `flag |= MEM_F_PE` on the PAIR copy
+//! (`opt_pe`), then hands that copy to `seed_extend_range`, which sets
+//! `w.opt = opt_pe` before invoking `mem_kernel1_core`. So the forced PE flag
+//! flows into seeding through the group's option copy — there is no persistent
+//! `ShimSeeds` options field any more (`ShimSeeds` is now just a `ShimRegs`
+//! owner; the pre-refactor `s->opts_copy` / `s->opts` / `s->w.opt` fields are
+//! gone). `mem_kernel1_core` reads `opt->flag & MEM_F_PE` to decide whether the
+//! `--extend-mate-concordant` chain cap runs (`bwamem.cpp:2501-2521`); if the
+//! seeding kernel ever read the caller's raw, un-forced `opts` instead of the
+//! forced copy, a caller whose own `opts.flag` had `MEM_F_PE` off would get the
+//! non-mate-aware cap at seeding despite asking for paired alignment.
 //!
 //! This builds a small reference with one 150bp block duplicated at two
 //! well-separated loci, so a 100bp read drawn from either copy matches both
