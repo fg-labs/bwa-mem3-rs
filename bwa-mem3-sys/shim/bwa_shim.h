@@ -26,6 +26,8 @@ extern "C" {
 typedef struct BwaIndex BwaIndex;
 typedef struct BwaSeeds BwaSeeds;
 typedef struct BwaBatch BwaBatch;
+typedef struct BwaScratch BwaScratch;
+typedef struct BwaRegs    BwaRegs;
 
 typedef struct {
     const char    *r1_name;  size_t r1_name_len;
@@ -35,6 +37,20 @@ typedef struct {
     const uint8_t *r2_seq;   size_t r2_seq_len;
     const uint8_t *r2_qual;
 } BwaReadPair;
+
+/* A single-end read. Layout mirrors the bridge's ShimSingleRead. */
+typedef struct {
+    const char    *name;  size_t name_len;
+    const uint8_t *seq;   size_t seq_len;
+    const uint8_t *qual;
+} BwaSingleRead;
+
+/* One work item: pairs (r1/r2 interleaved into seqs[0..2*n_pairs)) followed by
+ * singles (seqs[2*n_pairs..)). Either slice may be empty. */
+typedef struct {
+    const BwaReadPair   *pairs;   size_t n_pairs;
+    const BwaSingleRead *singles; size_t n_singles;
+} BwaReadBatch;
 
 /* Options lifecycle. `opts_new` returns a heap-allocated mem_opt_t populated
  * with bwa-mem3 defaults (mem_opt_init). `opts_free` releases it. Field-level
@@ -127,6 +143,29 @@ int bwa_shim_estimate_pestat(
     const BwaIndex *idx, const mem_opt_t *opts,
     const BwaReadPair *pairs, size_t n_pairs,
     mem_pestat_t *pestat_out);
+
+/* ---- Three-phase API (caller-owned parallelism, cohort-exact output) ---- */
+
+/* Per-thread reusable scratch: banded-SW buffers, SMEM buffers, chain/seed
+ * windows, record-building buffers. ~24 MB after first use. Send, not Sync. */
+BwaScratch *bwa_shim_scratch_new(void);
+void        bwa_shim_scratch_free(BwaScratch *sc);
+
+/* Phase 1: seed + single-end-extend every read of `batch` (the fused
+ * `worker_bwt_aln` work). Per-read independent: safe to split a cohort into
+ * any number of batches on any number of threads. Returns NULL + last_error
+ * on failure. `opts` is never written. */
+BwaRegs *bwa_shim_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
+                              BwaScratch *sc, const BwaReadBatch *batch);
+void     bwa_shim_regs_free(BwaRegs *r);
+size_t   bwa_shim_regs_n_pairs(const BwaRegs *r);
+size_t   bwa_shim_regs_n_singles(const BwaRegs *r);
+/* Bytes held on the C heap by `r`: copied names/seqs/quals + alnreg arrays. */
+size_t   bwa_shim_regs_heap_bytes(const BwaRegs *r);
+
+/* Compatibility: wrap phase-1 output in a BwaSeeds so the legacy
+ * bwa_shim_extend_batch can consume it. Takes ownership of `r`. */
+BwaSeeds *bwa_shim_seeds_from_regs(BwaRegs *r);
 
 size_t         bwa_shim_batch_n_records (const BwaBatch *b);
 size_t         bwa_shim_batch_pair_idx  (const BwaBatch *b, size_t rec);

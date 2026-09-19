@@ -27,19 +27,19 @@
 #include "meth_xm.h"   /* meth_build_xm — D3 (--meth) XM:Z tag */
 
 /* worker_alloc / worker_free — per-worker scratch (chaining arrays, BSW
- * buffers, lazy SMEM buffers) sized for the batch. Upstream defines these in
- * `fastmap.cpp`, but as of bwa-mem3 0.6.0 that TU is transitively coupled to
- * the new `fast_reader` FASTQ path (libdeflate + zlib-ng) and to numa/htslib,
- * none of which this crate compiles (the Rust CLI does its own I/O). We
- * therefore do not build `fastmap.cpp` (see `bwa-mem3-sys/build.rs`) and carry
- * file-local copies of just these two allocators here.
+ * buffers, lazy SMEM buffers) sized for one BATCH_SIZE chunk. Upstream defines
+ * these in `fastmap.cpp`, but as of bwa-mem3 0.6.0 that TU is transitively
+ * coupled to the new `fast_reader` FASTQ path (libdeflate + zlib-ng) and to
+ * numa/htslib, none of which this crate compiles (the Rust CLI does its own
+ * I/O). We therefore do not build `fastmap.cpp` (see `bwa-mem3-sys/build.rs`)
+ * and carry file-local copies of just these two allocators here.
  *
  * The allocation set below is verbatim from upstream's `worker_alloc` /
  * `worker_free`, with ONE deliberate divergence: upstream's per-call
  * "Memory pre-allocation" stderr diagnostics are dropped. Upstream calls
  * worker_alloc once per thread at process start; this crate calls it once per
- * `shim_seed_batch` (per read chunk), so those prints would spam stderr on
- * every batch.
+ * `ShimScratch` (shim_scratch_new), which the caller reuses across batches, so
+ * those prints would spam stderr on every scratch.
  *
  * KEEP IN SYNC with `vendor/bwa-mem3/src/fastmap.cpp` on every vendor refresh:
  * the buffer set must match exactly what `mem_kernel1_core` /
@@ -50,85 +50,36 @@
  * phase_split), so run it with `BWA_MEM3_RS_TEST_REF` set after any refresh.
  * A cleaner long-term fix is to split these into a dependency-light TU in the
  * fg-labs/bwa-mem3 fork and compile that instead of copying. */
-static void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nthreads)
+/* Allocate the per-thread scratch a fused seed+extend needs. `nthreads` is
+ * always 1 here (one ShimScratch per caller thread), kept as a parameter so
+ * the loops stay textually close to upstream's worker_alloc. Chain/seed
+ * windows are BATCH_SIZE-sized because seeding and extension now run
+ * chunk-by-chunk inside one call (upstream's v0.9.0 fusion, bwamem.cpp:2782):
+ * chains never outlive the chunk that produced them. `regs` are NOT here --
+ * they belong to the ShimRegs that outlives the call. */
+static void worker_alloc(worker_t &w, int32_t nthreads)
 {
-    assert(opt != NULL);
-    assert(nreads >= 0);
     assert(nthreads > 0);
-
-    /* Mirrors upstream's clamp (fastmap.cpp:280): the assert above compiles out
-     * under NDEBUG, and kt_for makes the same input safe by clamping rather
-     * than refusing. Ours does not size anything from nthreads except the mmc
-     * loops below, but agreeing with upstream costs nothing. */
     if (nthreads < 1) nthreads = 1;
-
-    // Record the thread count on the worker so worker_free can validate the
-    // paired call and the per-thread loops can never walk past the slots
-    // populated here.
     w.nthreads = nthreads;
-
-    int32_t memSize = nreads;
-
-    /* Mem allocation section for core kernels */
-    w.regs = NULL; w.chain_scratch = NULL; w.seed_scratch = NULL;
-    /* Vestigial in v0.9.0 (see the note below); zero them so worker_free and
-     * any future upstream code cannot act on an indeterminate pointer. */
+    w.regs = NULL;
+    /* Vestigial worker_t members that nothing allocates (every real
+     * `auxSeedBuf` upstream is a local in test_and_merge, bwamem.cpp:894); zero
+     * them so worker_free and any future upstream code cannot act on an
+     * indeterminate pointer. */
     w.auxSeedBuf = NULL; w.auxSeedBufSize = 0;
-
-    /* Every allocation in this block is sized from memSize (see the divergence
-     * note below), so a zero-read batch makes all three zero-size requests --
-     * and calloc(0, n) / malloc(0) are both permitted to return NULL. The
-     * xasserts deliberately do NOT compile out under NDEBUG, so without this
-     * guard an empty batch would abort a *release* build on any allocator that
-     * takes that option.
-     *
-     * Upstream guards only `regs` (fastmap.cpp:303-307); its other two are
-     * nthreads-sized and so never zero. Ours keeps the nreads sizing, so the
-     * guard has to cover all three.
-     *
-     * Leaving them NULL is a valid state, as it is upstream: the seeding and
-     * extension loops are bounded by n_seqs and never run, and worker_free is
-     * NULL-safe (free(NULL) is a no-op). */
-    if (memSize > 0) {
-        w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
-
-    /* DELIBERATE DIVERGENCE from upstream's v0.9.0 worker_alloc, which sizes
-     * these as `nthreads * BATCH_SIZE` and indexes them by `tid`.
-     *
-     * Upstream could shrink them because it fused its two kt_for passes into
-     * `worker_bwt_aln`: with seeding and extension on the same reads in one
-     * work item, chains are dead the moment the item ends, so a per-thread
-     * window suffices. It renamed `chain_ar`/`seedBuf` to `chain_scratch`/
-     * `seed_scratch` precisely so out-of-tree callers still doing
-     * `w.chain_ar + seq_id` would fail to compile instead of running off the
-     * end (fastmap.cpp:309-334, bwamem.h:481-485).
-     *
-     * This crate IS such a caller, by design: its public API is the phase
-     * split (`seed_batch` -> `extend_batch`), which is exactly the barrier
-     * upstream removed, so chains and their seeds MUST survive between the two
-     * calls for every read in the batch. We therefore keep the pre-0.9.0
-     * nreads sizing and seq_id indexing. The kernels take both arrays as
-     * parameters and index them [0, nseq), and `tid` is used only for `mmc`,
-     * so a caller-owned per-read array remains valid.
-     *
-     * Do NOT "fix" the field names to `auxSeedBuf`/`auxSeedBufSize` as the
-     * compiler's did-you-mean suggests: those are vestigial worker_t members
-     * that nothing allocates (every real `auxSeedBuf` upstream is a local in
-     * test_and_merge, bwamem.cpp:894). Taking that suggestion compiles and
-     * then dereferences an unallocated pointer. */
-        w.chain_scratch = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
-        w.seed_scratch  = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
-
-        /* xassert, not assert: these are ALLOCATION failures, and plain assert
-         * compiles out under NDEBUG -- turning an OOM into a null deref in
-         * exactly the build most likely to be memory-pressured. Upstream made
-         * the same switch in v0.9.0's worker_alloc (fastmap.cpp:306, :341-342).
-         * The argument preconditions above stay `assert`: those are programmer
-         * errors, not runtime conditions. */
-        xassert(w.seed_scratch  != NULL, "out of memory: w.seed_scratch");
-        xassert(w.regs          != NULL, "out of memory: w.regs");
-        xassert(w.chain_scratch != NULL, "out of memory: w.chain_scratch");
-    }
+    /* BATCH_SIZE-sized, chunk-local windows. Seeding and extension are fused
+     * per BATCH_SIZE chunk in seed_extend_range, so a chain is dead the moment
+     * its chunk's mem_kernel2_core returns -- exactly upstream's v0.9.0 worker
+     * layout, which no longer needs the pre-0.9.0 nreads-sized, seq_id-indexed
+     * arrays this crate used to carry across the seed/extend phase barrier. */
+    w.chain_scratch = (mem_chain_v*) malloc ((size_t)BATCH_SIZE * sizeof(mem_chain_v));
+    w.seed_scratch  = (mem_seed_t *) calloc(sizeof(mem_seed_t), (size_t)BATCH_SIZE * AVG_SEEDS_PER_READ);
+    /* xassert, not assert: these are ALLOCATION failures, and plain assert
+     * compiles out under NDEBUG -- turning an OOM into a null deref in exactly
+     * the build most likely to be memory-pressured (fastmap.cpp:306, :341). */
+    xassert(w.seed_scratch  != NULL, "out of memory: w.seed_scratch");
+    xassert(w.chain_scratch != NULL, "out of memory: w.chain_scratch");
 
     w.seed_scratch_size = BATCH_SIZE * AVG_SEEDS_PER_READ;
 
@@ -197,7 +148,9 @@ static void worker_free(worker_t &w, int32_t nthreads)
     assert(w.nthreads == nthreads);
 
     free(w.chain_scratch);
-    free(w.regs);
+    /* w.regs is NOT freed here: during seed_extend_range it aliases the
+     * caller-owned ShimRegs::regs, which shim_regs_free owns. worker_alloc
+     * leaves it NULL and nothing in the scratch ever allocates it. */
     free(w.seed_scratch);
 
     for(int l=0; l<nthreads; l++) {
@@ -251,24 +204,35 @@ struct ShimAlignOutput {
     mem_pestat_t pes[4];
 };
 
-/* Phase-1 state carried into extend_batch. Owns worker and seqs; borrows
- * ref_string from the index handle. extend_batch (or estimate_pestat) frees
- * the owned pieces. */
-struct ShimSeeds {
-    worker_t w;
-    bseq1_t *seqs;
-    int      n_seqs;
-    mem_opt_t *opts;
-    mem_opt_t opts_copy;
-    FMI_search *fmi;
-    uint8_t *ref_string;  /* borrowed from BwaShimIndex; not freed here */
-    /* D3 (--meth): original-coordinate handles borrowed from BwaShimIndex
-     * (NULL outside --meth). meth_orig_ref_string is the original 2*l_pac
-     * unpacked reference used for extension in place of ref_string. */
-    const bntseq_t *meth_orig_bns;
-    const uint8_t  *meth_orig_pac;
-    uint8_t        *meth_orig_ref_string;
+/* Per-thread reusable scratch (public: BwaScratch). */
+struct ShimScratch {
+    worker_t w;              /* mmc + BATCH_SIZE chain/seed windows; nthreads = 1 */
+    uint8_t *rec_buf; size_t rec_cap;   /* one packed record under construction */
+    uint8_t *aux_buf; size_t aux_cap;   /* one aux block under construction */
 };
+
+/* Phase-1 output (public: BwaRegs). Owns the read copies and the per-read
+ * alnreg arrays; borrows nothing from the scratch. */
+struct ShimRegs {
+    bseq1_t      *seqs;      int n_seqs;      /* [0,2*n_pairs) pairs, then singles */
+    size_t        n_pairs;   size_t n_singles;
+    mem_alnreg_v *regs;                       /* n_seqs entries */
+    int           meth_mode;
+    size_t        heap_bytes;                 /* names+seqs+quals (+meth_orig) */
+};
+
+struct ShimSingleRead {
+    const char    *name;  size_t name_len;
+    const uint8_t *seq;   size_t seq_len;
+    const uint8_t *qual;
+};
+struct ShimReadBatch {
+    const ShimReadPair   *pairs;   size_t n_pairs;
+    const ShimSingleRead *singles; size_t n_singles;
+};
+
+/* Legacy phase-1 handle: now just an owned ShimRegs. */
+struct ShimSeeds { ShimRegs *regs; };
 
 /* Index handle: owns the loaded FMI_search plus the one-time-unpacked
  * 2*l_pac reference string used by mem_chain2aln_across_reads_V2. The
@@ -464,7 +428,8 @@ void shim_opts_apply_meth_defaults(mem_opt_t *opt) {
 /* ------------------ Helpers ------------------ */
 
 static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
-                                   int meth_mode) {
+                                   int meth_mode, size_t *heap_bytes) {
+    *heap_bytes = 0;
     int nseqs = (int)(2 * n_pairs);
     /* NULL is an ALLOCATION FAILURE only when nseqs > 0. calloc(0, n) may
      * legally return NULL, so on an empty batch a NULL return here means "no
@@ -496,6 +461,7 @@ static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
             } else {
                 s->qual = nullptr;
             }
+            *heap_bytes += (nl[k] + 1) + (sl[k] + 1) + (ql[k] ? sl[k] + 1 : 0);
             s->sam = nullptr;
             /* D3 (--meth): retain the ORIGINAL (unconverted) read bases before
              * projecting seq to match the converted seed index, then apply the
@@ -506,6 +472,7 @@ static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
              * CIGAR/NM/MD and the XM call string. Same orientation as seq. */
             if (meth_mode) {
                 s->meth_orig_seq = strdup(s->seq);
+                *heap_bytes += (size_t)s->l_seq + 1;
                 /* v0.9.0: read-number chemistry, consumed by the seed filter in
                  * meth_seed_to_orig (bwamem.cpp:1878-1881), which drops any seed
                  * whose genomic strand does not match the read's. R1 = OT = 1,
@@ -1076,106 +1043,120 @@ static void append_bam_record(ShimAlignOutput *out, size_t pair_idx,
     out->buf_len = rec_off + rec_size;
 }
 
-/* ------------------ Phase 1: seed_batch ------------------ */
+/* ------------------ Phase 1: scratch + fused seed+extend ------------------ */
 
-ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
+ShimScratch *shim_scratch_new(void) {
+    ShimScratch *sc = (ShimScratch *) calloc(1, sizeof(ShimScratch));
+    if (!sc) return nullptr;
+    worker_alloc(sc->w, 1);
+    sc->rec_cap = 4096; sc->rec_buf = (uint8_t *) malloc(sc->rec_cap);
+    sc->aux_cap = 1024; sc->aux_buf = (uint8_t *) malloc(sc->aux_cap);
+    return sc;
+}
+
+void shim_scratch_free(ShimScratch *sc) {
+    if (!sc) return;
+    worker_free(sc->w, 1);
+    free(sc->rec_buf); free(sc->aux_buf);
+    free(sc);
+}
+
+size_t shim_regs_n_pairs(const ShimRegs *r)   { return r ? r->n_pairs : 0; }
+size_t shim_regs_n_singles(const ShimRegs *r) { return r ? r->n_singles : 0; }
+size_t shim_regs_heap_bytes(const ShimRegs *r) {
+    if (!r) return 0;
+    size_t b = r->heap_bytes + (size_t)r->n_seqs * (sizeof(bseq1_t) + sizeof(mem_alnreg_v));
+    for (int i = 0; i < r->n_seqs; ++i) b += (size_t)r->regs[i].m * sizeof(mem_alnreg_t);
+    return b;
+}
+
+void shim_regs_free(ShimRegs *r) {
+    if (!r) return;
+    for (int i = 0; i < r->n_seqs; ++i) free(r->regs[i].a);
+    free(r->regs);
+    free_seqs(r->seqs, r->n_seqs);
+    free(r);
+}
+
+/* Fused seed + SE-extend over seqs[first, first+n) in BATCH_SIZE chunks, the
+ * shape of upstream's worker_bwt_aln (bwamem.cpp:2782-2786). `opt` is the
+ * per-group copy (MEM_F_PE set for pairs). Chain/seed windows are chunk-local
+ * so the BATCH_SIZE scratch suffices; the pre-0.9.0 tail `seedBufSz` shrink is
+ * dropped as upstream did ("output-dead either way", worker_bwt). */
+static void seed_extend_range(ShimScratch *sc, ShimRegs *r, BwaShimIndex *idx,
+                              const mem_opt_t *opt, int first, int n)
+{
+    worker_t &w = sc->w;
+    FMI_search *fmi = idx->fmi;
+    w.opt = opt; w.fmi = fmi; w.seqs = r->seqs; w.regs = r->regs;
+    w.n_processed = 0; w.pes = nullptr; w.nreads = r->n_seqs;
+    w.meth_orig_bns = idx->meth_orig_bns;
+    w.meth_orig_pac = idx->meth_orig_pac;
+    w.meth_orig_ref_string = idx->meth_orig_ref_string;
+    w.ref_string = idx->meth_orig_ref_string ? idx->meth_orig_ref_string : idx->ref_string;
+    for (int seq_id = first; seq_id < first + n; seq_id += BATCH_SIZE) {
+        int bs = first + n - seq_id;
+        if (bs > BATCH_SIZE) bs = BATCH_SIZE;
+        mem_kernel1_core(fmi, opt, r->seqs + seq_id, bs,
+                         w.chain_scratch, w.seed_scratch, w.seed_scratch_size,
+                         &w.mmc, 0 /* tid */, idx->meth_orig_bns, idx->meth_orig_pac);
+        mem_kernel2_core(fmi, opt, r->seqs + seq_id, r->regs + seq_id, bs,
+                         w.chain_scratch, &w.mmc, w.ref_string, 0 /* tid */,
+                         idx->meth_orig_bns, idx->meth_orig_pac);
+    }
+}
+
+ShimRegs *shim_seed_extend(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
+                           const ShimReadBatch *batch)
+{
+    if (!idx_opaque || !opts || !sc || !batch) return nullptr;
+    if (batch->n_singles > 0) return nullptr;   /* Task 5 adds singles; error set by the caller */
+    BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
+
+    ShimRegs *r = (ShimRegs *) calloc(1, sizeof(ShimRegs));
+    if (!r) return nullptr;
+    r->n_pairs = batch->n_pairs;
+    r->n_singles = 0;
+    r->n_seqs = (int)(2 * batch->n_pairs);
+    r->meth_mode = opts->meth_mode;
+    r->seqs = copy_pairs_to_seqs(batch->pairs, batch->n_pairs, opts->meth_mode, &r->heap_bytes);
+    if (!r->seqs && r->n_seqs > 0) { free(r); return nullptr; }
+    r->regs = r->n_seqs > 0 ? (mem_alnreg_v *) calloc((size_t)r->n_seqs, sizeof(mem_alnreg_v)) : nullptr;
+    if (!r->regs && r->n_seqs > 0) { free_seqs(r->seqs, r->n_seqs); free(r); return nullptr; }
+
+    mem_opt_t opt_pe = *opts;
+    opt_pe.n_threads = 1;
+    opt_pe.flag |= MEM_F_PE;
+    if (r->n_seqs > 0) seed_extend_range(sc, r, idx, &opt_pe, 0, r->n_seqs);
+    return r;
+}
+
+/* ---- legacy phase-1 on top of the fused primitive ---- */
+
+ShimSeeds *shim_seed_batch(void *idx_opaque, const mem_opt_t *opts,
                            const ShimReadPair *pairs, size_t n_pairs)
 {
-    if (!idx_opaque || !opts) return nullptr;
-    BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
-    FMI_search *fmi = idx->fmi;
-
+    ShimReadBatch b = { pairs, n_pairs, nullptr, 0 };
+    ShimScratch *sc = shim_scratch_new();
+    if (!sc) return nullptr;
+    ShimRegs *r = shim_seed_extend(idx_opaque, opts, sc, &b);
+    shim_scratch_free(sc);
+    if (!r) return nullptr;
     ShimSeeds *s = (ShimSeeds *) calloc(1, sizeof(ShimSeeds));
-    s->opts = opts;
-    s->fmi  = fmi;
-    s->n_seqs = (int)(2 * n_pairs);
-    s->seqs = copy_pairs_to_seqs(pairs, n_pairs, opts->meth_mode);
-    /* `n_pairs > 0` qualifies the check: for an empty batch a NULL return is
-     * the allocator's prerogative on a zero-size request, not a failure, and
-     * reporting it as one would turn "align nothing" into a spurious error. */
-    if (!s->seqs && n_pairs > 0) { free(s); return nullptr; }
+    s->regs = r;
+    return s;
+}
 
-    /* D3 (--meth): borrow the original-coordinate handles from the index. NULL
-     * outside --meth (or if a non-meth index was loaded), in which case the
-     * NULL meth_orig args select the kernels' legacy (non-meth) path. */
-    s->meth_orig_bns        = idx->meth_orig_bns;
-    s->meth_orig_pac        = idx->meth_orig_pac;
-    s->meth_orig_ref_string = idx->meth_orig_ref_string;
-
-    /* Never write through the caller's options: with one MemOpts shared by
-     * every worker thread that is a data race, and upstream itself works on a
-     * copy for exactly this reason (fastmap.cpp:912 `mem_opt_t tmp_opt = *opt`).
-     * The copy forces single-thread kernels and the PE flag for the pair path. */
-    s->opts_copy = *opts;
-    s->opts_copy.n_threads = 1;
-    s->opts_copy.flag |= MEM_F_PE;
-    s->opts = &s->opts_copy;
-
-    /* Allocate per-worker scratch using upstream's public helper so our
-     * layout stays in sync with the main bwa-mem3 pipeline. Sets w.nthreads
-     * internally and asserts on bad input / OOM; we fill in the non-scratch
-     * fields afterward. */
-    worker_alloc(opts, s->w, s->n_seqs, 1);
-    /* Seeding/extension kernels read n_threads/MEM_F_PE through w.opt (e.g.
-     * the mate-concordant chain cap at bwamem.cpp:2501 reads opt->flag), so
-     * they must see the same forced copy as the pairing/pestat phases, not
-     * the caller's raw, un-forced opts. */
-    s->w.opt = s->opts;
-    s->w.nreads = s->n_seqs;
-    s->w.fmi = fmi;
-    s->w.seqs = s->seqs;
-    s->w.n_processed = 0;
-    s->w.pes = nullptr;
-    s->w.meth_orig_bns = s->meth_orig_bns;
-    s->w.meth_orig_pac = s->meth_orig_pac;
-    s->w.meth_orig_ref_string = s->meth_orig_ref_string;
-
-    /* Borrow the unpacked reference string from the index handle
-     * (built once at load time; see BwaShimIndex / shim_align_idx_load). */
-    s->ref_string = idx->ref_string;
-
-    /* Seed in BATCH_SIZE chunks by calling mem_kernel1_core directly. */
-    int memSize = s->n_seqs;
-    for (int seq_id = 0; seq_id < s->n_seqs; seq_id += BATCH_SIZE) {
-        int batch_size = s->n_seqs - seq_id;
-        if (batch_size > BATCH_SIZE) batch_size = BATCH_SIZE;
-        /* Upstream v0.9.0 dropped this tail adjustment (bwamem.cpp's worker_bwt)
-         * because its per-thread window has no remainder to grant. Ours does --
-         * the buffer really is nreads-sized (see worker_alloc) -- so the grant
-         * is still well-defined, and keeping it preserves this crate's
-         * pre-0.9.0 behavior exactly. Upstream documents the difference as
-         * output-dead either way: on overflow chain_add_one_seed falls back to
-         * calloc and flags the chain, which only the capacity-growth ladder
-         * reads, so a chain's contents are unchanged. */
-        int seedBufSz = s->w.seed_scratch_size;
-        if (batch_size < BATCH_SIZE) {
-            seedBufSz = (memSize - seq_id) * AVG_SEEDS_PER_READ;
-        }
-        mem_kernel1_core(s->w.fmi, s->w.opt,
-                         s->w.seqs + seq_id,
-                         batch_size,
-                         /* seq_id-indexed, NOT `+ tid * BATCH_SIZE`: this
-                          * crate keeps the per-read arrays the phase split
-                          * needs (see worker_alloc). */
-                         s->w.chain_scratch + seq_id,
-                         s->w.seed_scratch + (size_t)seq_id * AVG_SEEDS_PER_READ,
-                         seedBufSz,
-                         &s->w.mmc,
-                         0 /* tid */,
-                         s->meth_orig_bns, s->meth_orig_pac);
-    }
+ShimSeeds *shim_seeds_from_regs(ShimRegs *r) {
+    if (!r) return nullptr;
+    ShimSeeds *s = (ShimSeeds *) calloc(1, sizeof(ShimSeeds));
+    s->regs = r;
     return s;
 }
 
 void shim_seeds_free(ShimSeeds *s) {
     if (!s) return;
-    if (s->w.chain_scratch) {
-        /* chains allocated by mem_kernel1_core; their inner seed arrays live in
-         * w.seed_scratch which worker_alloc owns. No extra freeing needed here. */
-    }
-    free_seqs(s->seqs, s->n_seqs);
-    /* s->ref_string is borrowed from BwaShimIndex; do not free. */
-    worker_free(s->w, 1);
+    shim_regs_free(s->regs);
     free(s);
 }
 
@@ -1190,30 +1171,6 @@ static ShimAlignOutput *alloc_align_output(size_t n_pairs) {
     out->buf_cap = 4096;
     out->buf = (uint8_t *) malloc(out->buf_cap);
     return out;
-}
-
-/* Run SE extension into w.regs by calling mem_kernel2_core in BATCH_SIZE chunks. */
-static void run_se_extension(ShimSeeds *s) {
-    /* D3 (--meth): extension/dedup run against the ORIGINAL .0123 ref_string
-     * (seeds were already remapped into original coords in mem_kernel1_core),
-     * matching upstream worker_aln. Outside --meth this is the seed ref. */
-    s->w.ref_string = s->meth_orig_ref_string ? s->meth_orig_ref_string : s->ref_string;
-    const bntseq_t *bns = s->fmi->idx->bns;
-    const uint8_t *pac  = s->fmi->idx->pac;
-    (void)bns; (void)pac;  /* passed via w.fmi->idx */
-    for (int seq_id = 0; seq_id < s->n_seqs; seq_id += BATCH_SIZE) {
-        int batch_size = s->n_seqs - seq_id;
-        if (batch_size > BATCH_SIZE) batch_size = BATCH_SIZE;
-        mem_kernel2_core(s->w.fmi, s->w.opt,
-                         s->w.seqs + seq_id,
-                         s->w.regs + seq_id,
-                         batch_size,
-                         s->w.chain_scratch + seq_id,
-                         &s->w.mmc,
-                         s->w.ref_string,
-                         0 /* tid */,
-                         s->meth_orig_bns, s->meth_orig_pac);
-    }
 }
 
 /* Core pairing + BAM emission for one interleaved pair (r1=seqs[2i], r2=seqs[2i+1]). */
@@ -1489,72 +1446,64 @@ static void pair_and_emit(ShimAlignOutput *out, size_t pair_idx,
     }
 }
 
-ShimAlignOutput *shim_extend_batch(void *idx_opaque, ShimSeeds *s,
+ShimAlignOutput *shim_extend_batch(void *idx_opaque, const mem_opt_t *opts, ShimSeeds *s,
                                    const mem_pestat_t *pestat_in)
 {
     if (!s) return nullptr;
+    ShimRegs *r = s->regs; s->regs = nullptr; free(s);
     BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
-    FMI_search *fmi = idx ? idx->fmi : s->fmi;
-
-    mem_opt_t *opt = s->opts;
     /* D3 (--meth): after the seed→original remap in the kernels, every
      * downstream consumer (insert-size, pairing, mem_reg2aln, output coords)
      * runs in ORIGINAL-reference coordinates — use the original bns/pac, not
      * the converted seed index's. Outside --meth these are the seed index. */
-    const bntseq_t *bns = s->meth_orig_bns ? s->meth_orig_bns : fmi->idx->bns;
-    const uint8_t  *pac = s->meth_orig_pac ? s->meth_orig_pac : fmi->idx->pac;
+    const bntseq_t *bns = idx->meth_orig_bns ? idx->meth_orig_bns : idx->fmi->idx->bns;
+    const uint8_t  *pac = idx->meth_orig_pac ? idx->meth_orig_pac : idx->fmi->idx->pac;
 
-    /* SE extension. */
-    run_se_extension(s);
+    mem_opt_t opt_pe = *opts;
+    opt_pe.n_threads = 1;
+    opt_pe.flag |= MEM_F_PE;
 
-    /* Insert-size. */
     mem_pestat_t pes[4];
     if (pestat_in) memcpy(pes, pestat_in, sizeof(pes));
-    else           mem_pestat(opt, bns->l_pac, s->n_seqs, s->w.regs, pes);
+    else           mem_pestat(&opt_pe, bns->l_pac, r->n_seqs, r->regs, pes);
 
-    /* Per-pair emission. */
-    ShimAlignOutput *out = alloc_align_output((size_t)(s->n_seqs / 2));
-    size_t n_pairs = (size_t)(s->n_seqs / 2);
-    for (size_t i = 0; i < n_pairs; ++i) {
-        mem_alnreg_v ra[2] = { s->w.regs[2*i], s->w.regs[2*i + 1] };
-        bseq1_t ss[2]      = { s->seqs[2*i],   s->seqs[2*i + 1]   };
-        pair_and_emit(out, i, opt, bns, pac, ss, ra, pes);
-        /* Copy back any modified regs (mate-rescue may append). */
-        s->w.regs[2*i]     = ra[0];
-        s->w.regs[2*i + 1] = ra[1];
+    ShimScratch *sc = shim_scratch_new();
+    ShimAlignOutput *out = alloc_align_output(r->n_pairs);
+    for (size_t i = 0; i < r->n_pairs; ++i) {
+        mem_alnreg_v ra[2] = { r->regs[2*i], r->regs[2*i + 1] };
+        bseq1_t ss[2]      = { r->seqs[2*i], r->seqs[2*i + 1] };
+        pair_and_emit(out, i, &opt_pe, bns, pac, ss, ra, pes);
+        r->regs[2*i] = ra[0]; r->regs[2*i + 1] = ra[1];
     }
-
     memcpy(out->pes, pes, sizeof(pes));
-
-    /* Free per-read regs. */
-    for (int i = 0; i < s->n_seqs; ++i) free(s->w.regs[i].a);
-    shim_seeds_free(s);
+    shim_scratch_free(sc);
+    shim_regs_free(r);
     return out;
 }
 
 /* ------------------ Convenience: align_batch ------------------ */
 
-ShimAlignOutput *shim_align_batch(void *idx_opaque, mem_opt_t *opts,
+ShimAlignOutput *shim_align_batch(void *idx_opaque, const mem_opt_t *opts,
                                   const ShimReadPair *pairs, size_t n_pairs,
                                   const mem_pestat_t *pestat_in)
 {
     ShimSeeds *s = shim_seed_batch(idx_opaque, opts, pairs, n_pairs);
     if (!s) return nullptr;
-    return shim_extend_batch(idx_opaque, s, pestat_in);
+    return shim_extend_batch(idx_opaque, opts, s, pestat_in);
 }
 
 /* ------------------ estimate_pestat ------------------ */
 
-int shim_estimate_pestat(void *idx_opaque, mem_opt_t *opts,
+int shim_estimate_pestat(void *idx_opaque, const mem_opt_t *opts,
                          const ShimReadPair *pairs, size_t n_pairs,
                          mem_pestat_t *pestat_out)
 {
     ShimSeeds *s = shim_seed_batch(idx_opaque, opts, pairs, n_pairs);
     if (!s) return -1;
-    FMI_search *fmi = s->fmi;
-    run_se_extension(s);
-    mem_pestat(s->opts, fmi->idx->bns->l_pac, s->n_seqs, s->w.regs, pestat_out);
-    for (int i = 0; i < s->n_seqs; ++i) free(s->w.regs[i].a);
+    BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
+    const bntseq_t *bns = idx->meth_orig_bns ? idx->meth_orig_bns : idx->fmi->idx->bns;
+    mem_opt_t opt_pe = *opts; opt_pe.n_threads = 1; opt_pe.flag |= MEM_F_PE;
+    mem_pestat(&opt_pe, bns->l_pac, s->regs->n_seqs, s->regs->regs, pestat_out);
     shim_seeds_free(s);
     return 0;
 }

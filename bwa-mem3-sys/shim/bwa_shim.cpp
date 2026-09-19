@@ -78,25 +78,38 @@ extern "C" {
     void shim_opts_apply_meth_defaults(mem_opt_t *opts);
 
     struct ShimSeeds;
+    struct ShimScratch; struct ShimRegs;
+    struct ShimSingleRead { const char *name; size_t name_len; const uint8_t *seq; size_t seq_len; const uint8_t *qual; };
+    struct ShimReadBatch { const ShimReadPair *pairs; size_t n_pairs; const ShimSingleRead *singles; size_t n_singles; };
 
     ShimSeeds       *shim_seed_batch(
-        void *fmi, mem_opt_t *opts,
+        void *fmi, const mem_opt_t *opts,
         const ShimReadPair *pairs, size_t n_pairs);
     void             shim_seeds_free(ShimSeeds *seeds);
 
     ShimAlignOutput *shim_extend_batch(
-        void *fmi, ShimSeeds *seeds,
+        void *fmi, const mem_opt_t *opts, ShimSeeds *seeds,
         const mem_pestat_t *pestat_in);
 
     ShimAlignOutput *shim_align_batch(
-        void *fmi, mem_opt_t *opts,
+        void *fmi, const mem_opt_t *opts,
         const ShimReadPair *pairs, size_t n_pairs,
         const mem_pestat_t *pestat_in);
 
     int shim_estimate_pestat(
-        void *fmi, mem_opt_t *opts,
+        void *fmi, const mem_opt_t *opts,
         const ShimReadPair *pairs, size_t n_pairs,
         mem_pestat_t *pestat_out);
+
+    /* Three-phase primitives (Task 3). */
+    ShimScratch *shim_scratch_new(void);
+    void         shim_scratch_free(ShimScratch *sc);
+    ShimRegs    *shim_seed_extend(void *fmi, const mem_opt_t *opts, ShimScratch *sc, const ShimReadBatch *batch);
+    void         shim_regs_free(ShimRegs *r);
+    size_t       shim_regs_n_pairs(const ShimRegs *r);
+    size_t       shim_regs_n_singles(const ShimRegs *r);
+    size_t       shim_regs_heap_bytes(const ShimRegs *r);
+    ShimSeeds   *shim_seeds_from_regs(ShimRegs *r);
 
     size_t         shim_align_out_n_recs(ShimAlignOutput *out);
     size_t         shim_align_out_pair_idx(ShimAlignOutput *out, size_t i);
@@ -361,8 +374,7 @@ extern "C" int64_t bwa_shim_idx_contig_len(const BwaIndex *h, size_t i) {
 /* -------- seeds / batches ----------------------------------------- */
 
 /* BwaBatch wraps the ShimAlignOutput produced by shim_align_batch.
- * The `bytes` stored inside are SAM lines (temporary; see STATUS doc);
- * full packed-BAM emission is a follow-up. */
+ * The records stored inside are packed BAM records. */
 struct BwaBatch {
     struct ShimAlignOutput *inner;
 };
@@ -382,7 +394,7 @@ extern "C" BwaSeeds *bwa_shim_seed_batch(
         return NULL;
     }
     ShimSeeds *inner = shim_seed_batch(
-        idx->fmi, const_cast<mem_opt_t *>(opts),
+        idx->fmi, opts,
         reinterpret_cast<const ShimReadPair *>(pairs), n_pairs);
     if (!inner) {
         if (!bwa_shim_last_error()) shim_set_err("seed_batch failed");
@@ -407,8 +419,8 @@ extern "C" BwaBatch *bwa_shim_extend_batch(
     mem_pestat_t *pestat_out)
 {
     shim_clear_err();
-    (void)opts; (void)pairs; (void)n_pairs;
-    if (!idx || !seeds || !pestat_out) {
+    (void)pairs; (void)n_pairs;
+    if (!idx || !opts || !seeds || !pestat_out) {
         if (seeds) bwa_shim_seeds_free(seeds);
         shim_set_err("null arg");
         return NULL;
@@ -418,7 +430,7 @@ extern "C" BwaBatch *bwa_shim_extend_batch(
     seeds->inner = nullptr;
     free(seeds);
 
-    ShimAlignOutput *inner = shim_extend_batch(idx->fmi, inner_seeds, pestat_in);
+    ShimAlignOutput *inner = shim_extend_batch(idx->fmi, opts, inner_seeds, pestat_in);
     if (!inner) {
         if (!bwa_shim_last_error()) shim_set_err("extend_batch failed");
         return NULL;
@@ -443,7 +455,7 @@ extern "C" BwaBatch *bwa_shim_align_batch(
     /* Cast our BwaReadPair (from bwa_shim.h) to the bridge's ShimReadPair.
      * Both have identical layout (same fields in same order). */
     ShimAlignOutput *inner = shim_align_batch(
-        idx->fmi, const_cast<mem_opt_t *>(opts),
+        idx->fmi, opts,
         reinterpret_cast<const ShimReadPair *>(pairs), n_pairs,
         pestat_in);
     if (!inner) {
@@ -467,8 +479,55 @@ extern "C" int bwa_shim_estimate_pestat(
         return -1;
     }
     return shim_estimate_pestat(
-        idx->fmi, const_cast<mem_opt_t *>(opts),
+        idx->fmi, opts,
         reinterpret_cast<const ShimReadPair *>(pairs), n_pairs, pestat_out);
+}
+
+/* -------- three-phase API (Task 3) -------------------------------- */
+
+struct BwaScratch { struct ShimScratch *inner; };
+struct BwaRegs    { struct ShimRegs *inner; };
+
+extern "C" BwaScratch *bwa_shim_scratch_new(void) {
+    shim_clear_err();
+    ShimScratch *inner = shim_scratch_new();
+    if (!inner) { shim_set_err("scratch alloc failed"); return NULL; }
+    BwaScratch *s = (BwaScratch *) calloc(1, sizeof(BwaScratch));
+    s->inner = inner;
+    return s;
+}
+extern "C" void bwa_shim_scratch_free(BwaScratch *sc) {
+    if (!sc) return;
+    shim_scratch_free(sc->inner);
+    free(sc);
+}
+extern "C" BwaRegs *bwa_shim_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
+                                         BwaScratch *sc, const BwaReadBatch *batch) {
+    shim_clear_err();
+    if (!idx || !opts || !sc || !batch) { shim_set_err("null arg"); return NULL; }
+    if (batch->n_pairs > 0 && !batch->pairs) { shim_set_err("null pairs"); return NULL; }
+    if (batch->n_singles > 0 && !batch->singles) { shim_set_err("null singles"); return NULL; }
+    ShimRegs *inner = shim_seed_extend(idx->fmi, opts, sc->inner,
+                                       reinterpret_cast<const ShimReadBatch *>(batch));
+    if (!inner) {
+        if (!bwa_shim_last_error()) shim_set_err("seed_extend failed");
+        return NULL;
+    }
+    BwaRegs *r = (BwaRegs *) calloc(1, sizeof(BwaRegs));
+    r->inner = inner;
+    return r;
+}
+extern "C" void   bwa_shim_regs_free(BwaRegs *r) { if (!r) return; shim_regs_free(r->inner); free(r); }
+extern "C" size_t bwa_shim_regs_n_pairs(const BwaRegs *r)    { return r ? shim_regs_n_pairs(r->inner) : 0; }
+extern "C" size_t bwa_shim_regs_n_singles(const BwaRegs *r)  { return r ? shim_regs_n_singles(r->inner) : 0; }
+extern "C" size_t bwa_shim_regs_heap_bytes(const BwaRegs *r) { return r ? shim_regs_heap_bytes(r->inner) : 0; }
+extern "C" BwaSeeds *bwa_shim_seeds_from_regs(BwaRegs *r) {
+    shim_clear_err();
+    if (!r) { shim_set_err("null regs"); return NULL; }
+    BwaSeeds *s = (BwaSeeds *) calloc(1, sizeof(BwaSeeds));
+    s->inner = shim_seeds_from_regs(r->inner);
+    free(r);
+    return s;
 }
 
 extern "C" size_t bwa_shim_batch_n_records(const BwaBatch *b) {
