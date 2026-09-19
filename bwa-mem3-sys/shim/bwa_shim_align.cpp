@@ -1341,27 +1341,53 @@ int shim_pair_emit(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc, Shi
      * once, then resolve + emit per pair. tid = 0: one ShimScratch per thread. */
     if (r->n_pairs > 0) {
         worker_t &w = sc->w;
-        int32_t maxRefLen = 0, maxQerLen = 0, gcnt = 0;
-        int64_t pcnt = 0;
-        for (size_t i = 0; i < r->n_pairs; ++i)
-            mem_sam_pe_batch_pre(&opt_pe, bns, pac, pestat, ids.first_pair_id + (uint64_t)i,
-                                 r->seqs + 2*i, r->regs + 2*i, &w.mmc, pcnt, gcnt,
-                                 maxRefLen, maxQerLen, 0);
-        int64_t pcnt8 = sort_classify(&w.mmc, pcnt, 0);
-        kswr_t *aln = (kswr_t *) _mm_malloc((pcnt + SIMD_WIDTH8) * sizeof(kswr_t), 64);
-        xassert(aln != NULL, "out of memory: aln");
-        mem_sam_pe_batch(&opt_pe, &w.mmc, pcnt, pcnt8, aln, maxRefLen, maxQerLen, 0);
-        gcnt = 0;
-        kswr_t *myaln = aln;
-        for (size_t i = 0; i < r->n_pairs; ++i) {
-            int n_pri[2], z[2], q_se[2], extra_flag, paired;
-            mem_pair_resolve_batch_post(&opt_pe, bns, pac, pestat, ids.first_pair_id + (uint64_t)i,
-                                        r->seqs + 2*i, r->regs + 2*i, &myaln, &w.mmc, gcnt, 0,
-                                        n_pri, z, q_se, &extra_flag, &paired);
-            emit_resolved_pair(&e, i, &opt_pe, bns, pac, r->seqs + 2*i, r->regs + 2*i, pestat,
-                               n_pri, z, q_se, extra_flag, paired);
+        /* Chunk the batched mate-rescue exactly as the CLI's kt_for dispatches
+         * worker_sam: BATCH_SIZE reads (= BATCH_SIZE/2 pairs) per work item
+         * (kthread.cpp:109-118, bwamem.cpp worker_sam ~L2788). The pre-loop's
+         * running pcnt/gcnt/maxRefLen/maxQerLen and, with them, the kswv seqBuf
+         * ref-window offset (SeqPair.idr, an int32 derived from the monotonic
+         * pcnt) reset at every chunk boundary, so the offset can never exceed
+         * int32 no matter how large the -K cohort or how long the reads
+         * (seqbuf_grow_capacity's SEQBUF_CAPACITY_OVERFLOW → seqbuf_capacity_fatal
+         * exit(), which would abort across the FFI boundary). Without the chunk
+         * loop a single running pcnt spanned all r->n_pairs, exactly the
+         * unbounded-offset the CLI avoids by resetting per BATCH_SIZE.
+         *
+         * Chunking is purely internal kswv/seqBuf batch bookkeeping. The
+         * per-pair rescue result is independent of how pairs are grouped, and
+         * the GLOBAL read-ordinal id (ids.first_pair_id + global pair index) and
+         * the emit order (global index i, ascending) are unchanged — only
+         * pcnt/gcnt/maxRefLen/maxQerLen/aln/myaln reset per chunk. So output
+         * stays byte-identical to the former single-batch path and to
+         * `bwa-mem3 mem -t 1 -p`. For n_pairs <= BATCH_SIZE/2 this is a single
+         * iteration, identical to before. */
+        const size_t pairs_per_chunk = (size_t)BATCH_SIZE / 2;
+        for (size_t chunk_start = 0; chunk_start < r->n_pairs; chunk_start += pairs_per_chunk) {
+            size_t chunk_end = chunk_start + pairs_per_chunk;
+            if (chunk_end > r->n_pairs) chunk_end = r->n_pairs;
+
+            int32_t maxRefLen = 0, maxQerLen = 0, gcnt = 0;
+            int64_t pcnt = 0;
+            for (size_t i = chunk_start; i < chunk_end; ++i)
+                mem_sam_pe_batch_pre(&opt_pe, bns, pac, pestat, ids.first_pair_id + (uint64_t)i,
+                                     r->seqs + 2*i, r->regs + 2*i, &w.mmc, pcnt, gcnt,
+                                     maxRefLen, maxQerLen, 0);
+            int64_t pcnt8 = sort_classify(&w.mmc, pcnt, 0);
+            kswr_t *aln = (kswr_t *) _mm_malloc((pcnt + SIMD_WIDTH8) * sizeof(kswr_t), 64);
+            xassert(aln != NULL, "out of memory: aln");
+            mem_sam_pe_batch(&opt_pe, &w.mmc, pcnt, pcnt8, aln, maxRefLen, maxQerLen, 0);
+            gcnt = 0;
+            kswr_t *myaln = aln;
+            for (size_t i = chunk_start; i < chunk_end; ++i) {
+                int n_pri[2], z[2], q_se[2], extra_flag, paired;
+                mem_pair_resolve_batch_post(&opt_pe, bns, pac, pestat, ids.first_pair_id + (uint64_t)i,
+                                            r->seqs + 2*i, r->regs + 2*i, &myaln, &w.mmc, gcnt, 0,
+                                            n_pri, z, q_se, &extra_flag, &paired);
+                emit_resolved_pair(&e, i, &opt_pe, bns, pac, r->seqs + 2*i, r->regs + 2*i, pestat,
+                                   n_pri, z, q_se, extra_flag, paired);
+            }
+            _mm_free(aln);
         }
-        _mm_free(aln);
     }
 #else
     for (size_t i = 0; i < r->n_pairs; ++i)

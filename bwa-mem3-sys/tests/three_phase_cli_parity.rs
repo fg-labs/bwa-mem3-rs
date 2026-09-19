@@ -432,3 +432,134 @@ fn run_shim_keys(
         .map(|(_, _, body)| bam_key(body, contigs))
         .collect()
 }
+
+/// Regression guard for the batched mate-rescue chunking (finding [1]):
+/// `shim_pair_emit`'s `BWAMEM_BATCHED_MATESW` path now processes the batch's
+/// pairs in `BATCH_SIZE`-sized chunks, resetting the kswv `pcnt`/`gcnt`/ref-window
+/// offset per chunk exactly like the CLI's `kt_for`-dispatched `worker_sam` — so
+/// the int32 `SeqPair.idr` seqBuf offset can never run past 2^31 and trip
+/// `seqbuf_capacity_fatal()`'s `exit()` across the FFI boundary.
+///
+/// This drives a SINGLE `pair_emit` call over 1300 pairs (2600 reads). With
+/// `BATCH_SIZE` = 512 (x86) that is 6 chunks; with 1024 (arm64) it is 3 chunks —
+/// so the internal chunk loop crosses at least two `BATCH_SIZE` boundaries on
+/// every target. Mate rescue is FORCED to fire (every 3rd R2 mutated past
+/// seedability), which is what enqueues the rescue jobs whose running offset the
+/// old code let grow unbounded; a chunk that failed to reset would diverge from
+/// the CLI's per-work-item reset. The CLI is the independent oracle here: it
+/// chunks in its own `kt_for` code, untouched by this shim change, so a
+/// chunk-boundary bug in the shim shows up as a mismatch against it (an
+/// `align_batch`-vs-`three_phase` self-comparison would share the buggy code and
+/// pass vacuously). `-K` is large enough to keep the CLI in one `-K` cohort, so
+/// its pestat matches the shim's single-cohort estimate.
+#[test]
+fn batched_rescue_spanning_multiple_chunks_matches_bwa_mem3_cli() {
+    let Some(bwa) = bwa_bin() else {
+        eprintln!("skip: bwa-mem3 not found");
+        return;
+    };
+    let Some((_dir, prefix)) = common::phix_index() else {
+        return;
+    };
+    let idx = common::load_idx(&prefix);
+    let opts = common::new_opts();
+    let contigs = contig_names(idx);
+
+    // 1300 pairs => 2600 reads: >= 3 chunks at BATCH_SIZE=1024, 6 at 512, so the
+    // internal chunk loop crosses >= 2 BATCH_SIZE boundaries on every target.
+    let mut fx = common::simulate(1300, 100, 300, 71);
+    // Same rescue-forcing recipe as the FFI rescue-heavy test: mutate every 3rd
+    // R2 at every 7th base (~14 substitutions in 100 bp) so no 19-mer seed
+    // survives and R2 is placeable only by mate rescue from R1. This is what
+    // enqueues the batched rescue jobs across the chunk boundaries.
+    for i in (0..fx.r2.len()).step_by(3) {
+        for j in (0..fx.r2[i].len()).step_by(7) {
+            fx.r2[i][j] = match fx.r2[i][j] {
+                b'A' => b'C',
+                b'C' => b'G',
+                b'G' => b'T',
+                _ => b'A',
+            };
+        }
+    }
+
+    // CLI reference: interleaved (consecutive-same-name) pairs through `-p`, one
+    // -K cohort so the insert-size model matches the shim's single cohort.
+    let mut inter: Vec<(String, Vec<u8>)> = Vec::with_capacity(2 * fx.names.len());
+    for (i, name_c) in fx.names.iter().enumerate() {
+        let name = name_c.to_str().unwrap().to_string();
+        inter.push((name.clone(), fx.r1[i].clone()));
+        inter.push((name, fx.r2[i].clone()));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fq = dir.path().join("inter.fq");
+    write_fastq(&fq, &inter);
+    let prefix_os = prefix.to_str().unwrap();
+    let mut cli = cli_sam_keys(&[
+        bwa.as_ref(),
+        "mem".as_ref(),
+        "-t".as_ref(),
+        "1".as_ref(),
+        "-K".as_ref(),
+        "100000000".as_ref(),
+        "-p".as_ref(),
+        prefix_os.as_ref(),
+        fq.as_os_str(),
+    ]);
+
+    // Shim: the same pairs in ONE seed_extend + ONE pair_emit call, so the
+    // batched rescue path chunks internally across the BATCH_SIZE boundaries.
+    let pairs = fx.pairs();
+    let mut shim = run_shim_keys(idx, opts, &pairs, &[], 0, 0, &contigs);
+
+    assert!(!cli.is_empty(), "reference produced no records");
+    assert_eq!(
+        shim.len(),
+        2 * pairs.len(),
+        "shim did not emit one record per read"
+    );
+    assert_eq!(shim.len(), cli.len(), "record count differs");
+    cli.sort();
+    shim.sort();
+    assert_eq!(
+        shim, cli,
+        "multi-chunk batched rescue diverged from bwa-mem3 CLI"
+    );
+
+    // Rescue must actually have fired across the chunks, or the guard is
+    // vacuous: count mutated R2 (0x80 set) that are still mapped (0x4 clear) in
+    // the CLI SAM. cli is sorted, so recompute keys unsorted here would be
+    // fiddly; instead re-run the reduction over the raw SAM.
+    let out = Command::new(&bwa)
+        .args([
+            "mem".as_ref(),
+            "-t".as_ref(),
+            "1".as_ref(),
+            "-K".as_ref(),
+            "100000000".as_ref(),
+            "-p".as_ref(),
+            prefix_os.as_ref(),
+            fq.as_os_str(),
+        ] as [&std::ffi::OsStr; 8])
+        .output()
+        .expect("run bwa-mem3 mem");
+    let mapped_r2 = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .filter(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let flag: u16 = f[1].parse().unwrap_or(0);
+            // read2 (0x80) and mapped (0x4 clear)
+            flag & 0x80 != 0 && flag & 0x4 == 0
+        })
+        .count();
+    assert!(
+        mapped_r2 > 100,
+        "mate rescue did not fire across chunks ({mapped_r2} mapped R2)"
+    );
+
+    unsafe {
+        sys::bwa_shim_opts_free(opts);
+        sys::bwa_shim_idx_free(idx);
+    }
+}
