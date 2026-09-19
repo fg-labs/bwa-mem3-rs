@@ -147,6 +147,7 @@ dependencies = [
  "flate2",
  "noodles-bgzf",
  "noodles-fastq",
+ "rayon",
  "rstest",
  "tempfile",
  "thiserror",

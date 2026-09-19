@@ -324,12 +324,6 @@ fn setup_phix_index_inner(
     ref_fa
 }
 
-/// Interleaved FASTQ: one record per element, in the given order. A pair is two
-/// consecutive elements with the same name (what `bwa-mem3 mem -p` classifies).
-pub fn write_interleaved_fastq(path: &Path, reads: &[(String, Vec<u8>)]) {
-    write_fastq(path, reads)
-}
-
 /// Minimal BGZF BAM around packed record bodies (no block_size prefix), so
 /// `samtools view` can render them for comparison with the CLI's output.
 pub fn write_bam(

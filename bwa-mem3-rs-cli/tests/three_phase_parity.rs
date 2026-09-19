@@ -25,6 +25,7 @@ use bwa_mem3_rs::{
     pair_emit, seed_extend, AlignScratch, AlnRegs, BwaIndex, IdBases, MemOpts, MemPeStat,
     ReadBatch, ReadPair, RecordOrigin, RecordSink, SingleRead,
 };
+use rayon::prelude::*;
 use rstest::{fixture, rstest};
 
 /// One FASTQ record in input order.
@@ -111,6 +112,15 @@ fn run_three_phase(
     sub: usize,
     threads: usize,
 ) -> Vec<Vec<u8>> {
+    // A dedicated rayon pool so `threads` bounds the fan-out exactly as the old
+    // hand-rolled scoped-thread split did (threads=1 => fully sequential); both
+    // parallel phases run inside it. `map_init` gives each worker its own
+    // reused `AlignScratch`, and `collect` on the indexed parallel iterators
+    // preserves batch order, so no manual index/sort bookkeeping is needed.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .build()
+        .unwrap();
     let mut all: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut cohort_base = 0u64;
     for range in cut_cohorts(reads, k) {
@@ -132,69 +142,55 @@ fn run_three_phase(
             }
         }
         let batches: Vec<&[Template]> = templates.chunks(sub.max(1)).collect();
-        // Phase 1 in parallel (round-robin over `threads` scoped threads, one scratch each).
-        let regs: Vec<AlnRegs> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..threads.max(1))
-                .map(|t| {
-                    let batches = &batches;
-                    s.spawn(move || {
-                        let mut sc = AlignScratch::new().unwrap();
-                        let mut mine = Vec::new();
-                        for (bi, b) in batches.iter().enumerate() {
-                            if bi % threads.max(1) != t {
-                                continue;
-                            }
-                            let pv: Vec<ReadPair<'_>> = b
-                                .iter()
-                                .filter_map(|(p, _)| *p)
-                                .map(|(a, c)| ReadPair {
-                                    name_r1: reads[a].name.as_bytes(),
-                                    seq_r1: &reads[a].seq,
-                                    qual_r1: Some(&reads[a].qual),
-                                    name_r2: reads[c].name.as_bytes(),
-                                    seq_r2: &reads[c].seq,
-                                    qual_r2: Some(&reads[c].qual),
-                                })
-                                .collect();
-                            let sv: Vec<SingleRead<'_>> = b
-                                .iter()
-                                .filter_map(|(_, s)| *s)
-                                .map(|a| SingleRead {
-                                    name: reads[a].name.as_bytes(),
-                                    seq: &reads[a].seq,
-                                    qual: Some(&reads[a].qual),
-                                })
-                                .collect();
-                            let r = seed_extend(
-                                idx,
-                                opts,
-                                &mut sc,
-                                &ReadBatch {
-                                    pairs: &pv,
-                                    singles: &sv,
-                                },
-                            )
-                            .unwrap();
-                            mine.push((bi, r));
-                        }
-                        mine
-                    })
-                })
-                .collect();
-            let mut v: Vec<(usize, AlnRegs)> = handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap())
-                .collect();
-            v.sort_by_key(|(bi, _)| *bi);
-            v.into_iter().map(|(_, r)| r).collect()
+        // Phase 1: seed+extend every batch in parallel; ordered `collect`.
+        let regs: Vec<AlnRegs> = pool.install(|| {
+            batches
+                .par_iter()
+                .map_init(
+                    || AlignScratch::new().unwrap(),
+                    |sc, b| {
+                        let pv: Vec<ReadPair<'_>> = b
+                            .iter()
+                            .filter_map(|(p, _)| *p)
+                            .map(|(a, c)| ReadPair {
+                                name_r1: reads[a].name.as_bytes(),
+                                seq_r1: &reads[a].seq,
+                                qual_r1: Some(&reads[a].qual),
+                                name_r2: reads[c].name.as_bytes(),
+                                seq_r2: &reads[c].seq,
+                                qual_r2: Some(&reads[c].qual),
+                            })
+                            .collect();
+                        let sv: Vec<SingleRead<'_>> = b
+                            .iter()
+                            .filter_map(|(_, s)| *s)
+                            .map(|a| SingleRead {
+                                name: reads[a].name.as_bytes(),
+                                seq: &reads[a].seq,
+                                qual: Some(&reads[a].qual),
+                            })
+                            .collect();
+                        seed_extend(
+                            idx,
+                            opts,
+                            sc,
+                            &ReadBatch {
+                                pairs: &pv,
+                                singles: &sv,
+                            },
+                        )
+                        .unwrap()
+                    },
+                )
+                .collect()
         });
         // Cohort pestat over every batch, in order.
         let pestat = MemPeStat::infer_cohort(idx, opts, &regs).unwrap();
-        // Phase 3, again spread over threads; ids per batch from the cohort layout.
+        // Per-batch id bases + kind indices, in batch order.
         let n_se = singles.len() as u64;
         let mut se_off = 0u64;
         let mut pe_off = 0u64;
-        let mut jobs = Vec::new();
+        let mut jobs: Vec<(AlnRegs, IdBases, Vec<usize>, Vec<(usize, usize)>)> = Vec::new();
         for (b, r) in batches.iter().zip(regs) {
             let ids = ids_for(cohort_base, n_se, se_off, pe_off);
             let bs: Vec<usize> = b.iter().filter_map(|(_, s)| *s).collect();
@@ -203,60 +199,28 @@ fn run_three_phase(
             pe_off += bp.len() as u64;
             jobs.push((r, ids, bs, bp));
         }
-        // `jobs`/`results` MUST live in this stack frame, not inside the
-        // `thread::scope` closure below: `Scope::spawn` requires anything it
-        // borrows to outlive the whole scoped-thread call (the `'env` bound on
-        // `Scope<'scope, 'env>`), and a value created inside the closure passed
-        // to `thread::scope` does not satisfy that -- it is dropped when that
-        // closure returns, one frame too late for the checker to accept a
-        // borrow of it passed into `s.spawn`. `batches` above (borrowed by
-        // Phase 1's `thread::scope` the same way) already lives out here for
-        // the same reason.
-        let jobs = std::sync::Mutex::new(jobs.into_iter().enumerate().collect::<Vec<_>>());
-        let results = std::sync::Mutex::new(Vec::new());
-        std::thread::scope(|s| {
-            let pestat = &pestat;
-            let jobs = &jobs;
-            let results = &results;
-            let hs: Vec<_> = (0..threads.max(1))
-                .map(|_| {
-                    s.spawn(move || {
-                        let mut sc = AlignScratch::new().unwrap();
-                        loop {
-                            let Some((bi, (r, ids, bs, bp))) = jobs.lock().unwrap().pop() else {
-                                break;
-                            };
-                            let mut out = Vec::new();
-                            let has_pairs = r.n_pairs() > 0;
-                            let mut sink = Collector {
-                                out: &mut out,
-                                single_idx: &bs,
-                                pair_idx: &bp,
-                            };
-                            pair_emit(
-                                idx,
-                                opts,
-                                &mut sc,
-                                r,
-                                has_pairs.then_some(pestat),
-                                ids,
-                                &mut sink,
-                            )
+        // Phase 3: emit every batch in parallel; ids per batch from the cohort
+        // layout. Ordered `collect` keeps batches in input order.
+        let pestat_ref = &pestat;
+        let emitted: Vec<Vec<(usize, Vec<u8>)>> = pool.install(|| {
+            jobs.into_par_iter()
+                .map_init(
+                    || AlignScratch::new().unwrap(),
+                    |sc, (r, ids, bs, bp)| {
+                        let mut out = Vec::new();
+                        let has_pairs = r.n_pairs() > 0;
+                        let mut sink = Collector {
+                            out: &mut out,
+                            single_idx: &bs,
+                            pair_idx: &bp,
+                        };
+                        pair_emit(idx, opts, sc, r, has_pairs.then_some(pestat_ref), ids, &mut sink)
                             .unwrap();
-                            results.lock().unwrap().push((bi, out));
-                        }
-                    })
-                })
-                .collect();
-            for h in hs {
-                h.join().unwrap();
-            }
+                        out
+                    },
+                )
+                .collect()
         });
-        let emitted: Vec<Vec<(usize, Vec<u8>)>> = {
-            let mut v = results.into_inner().unwrap();
-            v.sort_by_key(|(bi, _)| *bi);
-            v.into_iter().map(|(_, o)| o).collect()
-        };
         all.extend(emitted.into_iter().flatten());
         cohort_base += (range.end - range.start) as u64;
     }
@@ -407,7 +371,10 @@ fn check_parity(
     let dir = tmp.path();
     let ref_fa = common::setup_phix_index(dir, &bwa, phix_seq::PHIX_SEQ);
     let fq = dir.join("in.fq");
-    common::write_interleaved_fastq(
+    // `reads` is already in interleaved order (each fixture emits a pair's R1
+    // then R2 consecutively), so a plain in-order FASTQ write is exactly what
+    // `bwa-mem3 mem -p` consumes -- no separate interleaving step is needed.
+    common::write_fastq(
         &fq,
         &reads
             .iter()
