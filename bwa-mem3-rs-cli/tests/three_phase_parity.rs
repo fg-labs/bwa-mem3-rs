@@ -101,6 +101,10 @@ impl RecordSink for Collector<'_> {
 /// (as its read index) into the input read list. Exactly one side is `Some`.
 type Template = (Option<(usize, usize)>, Option<usize>);
 
+/// A Phase 3 emit job: one batch's seeded regs, its id bases, and the
+/// batch-local single/pair indices used to key emitted records to input reads.
+type Job = (AlnRegs, IdBases, Vec<usize>, Vec<(usize, usize)>);
+
 /// Run every cohort through the three phases with `sub` templates per batch on
 /// `threads` threads. Records come back keyed by input position so they can
 /// be sorted into input order regardless of dispatch.
@@ -111,6 +115,12 @@ fn run_three_phase(
     k: u64,
     sub: usize,
     threads: usize,
+    // When true, force every cohort's id base to 0 instead of the running global
+    // read count -- the classic "per-cohort id reset" bug. Correct output uses
+    // false; the tandem-repeat test flips this on to prove the cohort-exact
+    // `IdBases` is load-bearing (a wrong base changes the id-seeded tie-break in
+    // every cohort after the first, so byte parity against the CLI breaks).
+    zero_cohort_base: bool,
 ) -> Vec<Vec<u8>> {
     // A dedicated rayon pool so `threads` bounds the fan-out exactly as the old
     // hand-rolled scoped-thread split did (threads=1 => fully sequential); both
@@ -190,9 +200,10 @@ fn run_three_phase(
         let n_se = singles.len() as u64;
         let mut se_off = 0u64;
         let mut pe_off = 0u64;
-        let mut jobs: Vec<(AlnRegs, IdBases, Vec<usize>, Vec<(usize, usize)>)> = Vec::new();
+        let mut jobs: Vec<Job> = Vec::new();
+        let base = if zero_cohort_base { 0 } else { cohort_base };
         for (b, r) in batches.iter().zip(regs) {
-            let ids = ids_for(cohort_base, n_se, se_off, pe_off);
+            let ids = ids_for(base, n_se, se_off, pe_off);
             let bs: Vec<usize> = b.iter().filter_map(|(_, s)| *s).collect();
             let bp: Vec<(usize, usize)> = b.iter().filter_map(|(p, _)| *p).collect();
             se_off += bs.len() as u64;
@@ -214,8 +225,16 @@ fn run_three_phase(
                             single_idx: &bs,
                             pair_idx: &bp,
                         };
-                        pair_emit(idx, opts, sc, r, has_pairs.then_some(pestat_ref), ids, &mut sink)
-                            .unwrap();
+                        pair_emit(
+                            idx,
+                            opts,
+                            sc,
+                            r,
+                            has_pairs.then_some(pestat_ref),
+                            ids,
+                            &mut sink,
+                        )
+                        .unwrap();
                         out
                     },
                 )
@@ -356,20 +375,24 @@ fn fixture_se_edge_cases(seed: u64) -> Vec<Read> {
 /// not just `common::record_key_fields`), and returns the SAM lines of both
 /// so a caller can additionally inspect specific records by name. Returns
 /// `None` (asserting nothing) when the required tools are missing.
-fn check_parity(
-    label: &str,
-    reads: &[Read],
-    k: u64,
-    sub: usize,
-    threads: usize,
-) -> Option<(Vec<String>, Vec<String>)> {
+/// The reference index, options, and CLI SAM lines for a parity run: build an
+/// index from `ref_seq` (contig `contig`), write the interleaved cohort FASTQ,
+/// and align it with `bwa-mem3 mem -p`. The `TempDir` is returned so callers
+/// keep the on-disk index + a scratch dir alive. `None` when the tools are
+/// missing (or a hard failure under `BWA_MEM3_RS_REQUIRE_TOOLS`).
+///
+/// Index, options, and CLI SAM lines for a parity run, plus the `TempDir` that
+/// keeps the on-disk index and scratch dir alive.
+type ParitySetup = (tempfile::TempDir, BwaIndex, MemOpts, Vec<String>);
+
+fn parity_setup(contig: &str, ref_seq: &[u8], reads: &[Read], k: u64) -> Option<ParitySetup> {
     let bwa = common::require_bwa_mem3()?;
     if !common::require_samtools() {
         return None;
     }
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    let ref_fa = common::setup_phix_index(dir, &bwa, phix_seq::PHIX_SEQ);
+    let ref_fa = common::setup_ref_index(dir, &bwa, contig, ref_seq);
     let fq = dir.join("in.fq");
     // `reads` is already in interleaved order (each fixture emits a pair's R1
     // then R2 consecutively), so a plain in-order FASTQ write is exactly what
@@ -382,13 +405,27 @@ fn check_parity(
             .collect::<Vec<_>>(),
     );
     let cli = cli_records(&bwa, &ref_fa, &fq, k, dir);
-
     let idx = BwaIndex::load(&ref_fa).unwrap();
     let opts = MemOpts::new().unwrap();
-    let bodies = run_three_phase(&idx, &opts, reads, k, sub, threads);
-    let bam = dir.join("rs.bam");
-    common::write_bam(&bam, &idx, &opts, &bodies);
-    let rs = common::samtools_view(&bam);
+    Some((tmp, idx, opts, cli))
+}
+
+/// Render three-phase record bodies as `samtools view` SAM lines via a temp BAM.
+fn bodies_to_sam(bam: &Path, idx: &BwaIndex, opts: &MemOpts, bodies: &[Vec<u8>]) -> Vec<String> {
+    common::write_bam(bam, idx, opts, bodies);
+    common::samtools_view(bam)
+}
+
+fn check_parity(
+    label: &str,
+    reads: &[Read],
+    k: u64,
+    sub: usize,
+    threads: usize,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let (tmp, idx, opts, cli) = parity_setup("phix", phix_seq::PHIX_SEQ.as_bytes(), reads, k)?;
+    let bodies = run_three_phase(&idx, &opts, reads, k, sub, threads, false);
+    let rs = bodies_to_sam(&tmp.path().join("rs.bam"), &idx, &opts, &bodies);
 
     let n_cohorts = cut_cohorts(reads, k).len();
     assert_eq!(
@@ -416,6 +453,11 @@ fn named<'a>(lines: &'a [String], qname: &str) -> Vec<&'a String> {
 /// A SAM line's FLAG column.
 fn flag(line: &str) -> u32 {
     line.split('\t').nth(1).unwrap().parse().unwrap()
+}
+
+/// A SAM line's MAPQ column.
+fn mapq(line: &str) -> u32 {
+    line.split('\t').nth(4).unwrap().parse().unwrap()
 }
 
 #[fixture]
@@ -550,6 +592,166 @@ fn single_end_supplementary_and_unmapped_branches(
         "three-phase path must reproduce the SE unmapped branch \
          (K={k}, sub={sub}, threads={threads})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tandem-repeat parity: the id-seeded tie-break, exercised where it MATTERS.
+//
+// Every other fixture in this crate draws reads from repeat-free PhiX, where
+// each read maps to exactly one locus. There the global pair/single id feeds
+// the tie-break hash but changes no output, so a wrong `IdBases` -- even one
+// that ignored the cohort base entirely -- would still pass byte parity. These
+// tests draw reads from within a single unit of a TANDEM-REPEAT reference, so
+// every read maps to `TANDEM_COPIES` equal-score loci and the id-seeded hash
+// (`hash_64(id<<1|i)`, `mem_mark_primary_se`/`mem_pair`) alone decides which
+// locus is primary and the XA order of the rest. Reads span >= 2 cohorts so a
+// NON-ZERO cohort base is actually applied, and both the paired and the
+// SE/mixed emit paths are covered.
+// ---------------------------------------------------------------------------
+
+/// The 300 bp PhiX window used as the tandem repeat unit (same window the sys
+/// crate's `first_pair_id_reaches_the_tie_break_hash` uses).
+const TANDEM_UNIT: std::ops::Range<usize> = 500..800;
+/// Number of times the unit is repeated in the reference.
+const TANDEM_COPIES: usize = 5;
+
+fn tandem_unit() -> &'static [u8] {
+    &phix_seq::PHIX_SEQ.as_bytes()[TANDEM_UNIT]
+}
+
+fn tandem_reference() -> Vec<u8> {
+    tandem_unit().repeat(TANDEM_COPIES)
+}
+
+/// FR pairs drawn from WITHIN one repeat unit, so each pair maps to all
+/// `TANDEM_COPIES` copies at equal score.
+fn fixture_tandem_paired(n: usize, seed: u64) -> Vec<Read> {
+    let unit = tandem_unit();
+    let (read_len, insert) = (60usize, 120usize);
+    let mut rng = common::Rng(seed);
+    let mut v = Vec::with_capacity(2 * n);
+    for i in 0..n {
+        let start = (rng.next() as usize) % (unit.len() - insert + 1);
+        let r1 = unit[start..start + read_len].to_vec();
+        let r2 = common::revcomp(&unit[start + insert - read_len..start + insert]);
+        v.push(Read {
+            name: format!("t{i}"),
+            seq: r1,
+            qual: vec![b'I'; read_len],
+        });
+        v.push(Read {
+            name: format!("t{i}"),
+            seq: r2,
+            qual: vec![b'I'; read_len],
+        });
+    }
+    v
+}
+
+/// Tandem pairs with a single (also drawn from within one unit, so it too
+/// multi-maps) inserted after every third pair, so the SE emit path runs
+/// alongside the paired one in the same multi-cohort layout.
+fn fixture_tandem_mixed(n_pairs: usize, seed: u64) -> Vec<Read> {
+    let pairs = fixture_tandem_paired(n_pairs, seed);
+    let unit = tandem_unit();
+    let mut rng = common::Rng(seed + 1);
+    let mut out = Vec::new();
+    for (i, chunk) in pairs.chunks(2).enumerate() {
+        out.extend_from_slice(chunk);
+        if i % 3 == 2 {
+            let start = (rng.next() as usize) % (unit.len() - 60 + 1);
+            let mut seq = unit[start..start + 60].to_vec();
+            if rng.next() % 2 == 0 {
+                seq = common::revcomp(&seq);
+            }
+            out.push(Read {
+                name: format!("ts{i}"),
+                seq,
+                qual: vec![b'I'; 60],
+            });
+        }
+    }
+    out
+}
+
+/// Parity on the tandem-repeat reference, asserting the id is genuinely
+/// load-bearing so the parity check is not vacuous:
+///   1. the fixture spans >= 2 cohorts (so a non-zero cohort base is applied)
+///      and the CLI genuinely multi-maps it (MAPQ-0 mapped primaries exist);
+///   2. the correct cohort-exact `IdBases` reproduce the CLI byte-for-byte; and
+///   3. forcing every cohort id base to 0 (the classic per-cohort-reset bug)
+///      DIVERGES from the CLI -- direct proof that the id decides the output on
+///      this fixture, i.e. (2) would fail if `IdBases` carried the wrong base.
+fn check_tie_break_parity(label: &str, reads: &[Read], k: u64, sub: usize, threads: usize) {
+    let refseq = tandem_reference();
+    let Some((tmp, idx, opts, cli)) = parity_setup("tandem", &refseq, reads, k) else {
+        return;
+    };
+    let dir = tmp.path();
+
+    // (1) fixture validity, asserted rather than assumed.
+    let cohorts = cut_cohorts(reads, k).len();
+    assert!(
+        cohorts >= 2,
+        "{label}: need >= 2 cohorts so a non-zero cohort base is exercised \
+         (K={k}); got {cohorts}"
+    );
+    let mapped_multi = cli
+        .iter()
+        .filter(|l| flag(l) & 0x4 == 0 && mapq(l) == 0)
+        .count();
+    assert!(
+        mapped_multi > 0,
+        "{label}: fixture must genuinely multi-map (the CLI produced no mapped \
+         MAPQ-0 record, so the tie-break id would be inert)"
+    );
+
+    // (2) correct cohort-exact ids must reproduce the CLI byte-for-byte.
+    let good = run_three_phase(&idx, &opts, reads, k, sub, threads, false);
+    let good_sam = bodies_to_sam(&dir.join("good.bam"), &idx, &opts, &good);
+    assert_eq!(
+        good_sam.len(),
+        cli.len(),
+        "{label}: record count (K={k}, sub={sub}, threads={threads}, cohorts={cohorts})"
+    );
+    for (i, (a, b)) in good_sam.iter().zip(&cli).enumerate() {
+        assert_eq!(
+            a, b,
+            "{label}: record {i} differs (K={k}, sub={sub}, threads={threads}, cohorts={cohorts})\n rs: {a}\ncli: {b}"
+        );
+    }
+
+    // (3) the broken per-cohort-reset ids must DIVERGE, proving (2) is not vacuous.
+    let broken = run_three_phase(&idx, &opts, reads, k, sub, threads, true);
+    let broken_sam = bodies_to_sam(&dir.join("broken.bam"), &idx, &opts, &broken);
+    assert_ne!(
+        broken_sam, cli,
+        "{label}: forcing every cohort id base to 0 still matched the CLI, so \
+         the cohort-exact IdBases is not observed by the tie-break and the \
+         parity check above is vacuous (K={k}, sub={sub}, threads={threads}, cohorts={cohorts})"
+    );
+}
+
+/// Paired path: the id-seeded tie-break decides each pair's primary locus.
+#[rstest]
+fn paired_tandem_repeat_tie_break_matches_cli(
+    #[values(1usize, 64)] sub: usize,
+    #[values(1usize, 4)] threads: usize,
+) {
+    // 300 pairs of 60 bp = 36 kb; K = 12 kb cuts ~3 cohorts (asserted >= 2).
+    let reads = fixture_tandem_paired(300, 0xB165_EED5);
+    check_tie_break_parity("tandem-paired", &reads, 12_000, sub, threads);
+}
+
+/// SE/mixed path: singles share the multi-cohort layout with the pairs, so the
+/// single id's tie-break (`mem_mark_primary_se`) is exercised too.
+#[rstest]
+fn mixed_tandem_repeat_tie_break_matches_cli(
+    #[values(1usize, 64)] sub: usize,
+    #[values(1usize, 4)] threads: usize,
+) {
+    let reads = fixture_tandem_mixed(300, 0x7A4D_E110);
+    check_tie_break_parity("tandem-mixed", &reads, 12_000, sub, threads);
 }
 
 #[test]
