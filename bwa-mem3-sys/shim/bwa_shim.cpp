@@ -145,6 +145,17 @@ extern "C" const char *bwa_shim_last_error(void) {
 
 extern "C" void bwa_shim_set_verbosity(int level) { bwa_verbose = level; }
 
+#ifndef PACKAGE_VERSION
+#  error "build.rs must define PACKAGE_VERSION"
+#endif
+#ifndef BWA_SHIM_COMPILER_LINE
+#  define BWA_SHIM_COMPILER_LINE "unknown"
+#endif
+extern "C" const char *bwa_shim_version(void) { return PACKAGE_VERSION; }
+extern "C" const char *bwa_shim_build_info(void) {
+    return "bwa-mem3 " PACKAGE_VERSION "; compiler: " BWA_SHIM_COMPILER_LINE;
+}
+
 extern "C" void bwa_shim_set_rg_id(const char *id) {
     if (!id) { bwa_rg_id[0] = '\0'; return; }
     size_t n = strnlen(id, sizeof(bwa_rg_id) - 1);

@@ -137,6 +137,11 @@ void           bwa_shim_batch_free      (BwaBatch *b);
 const char *bwa_shim_last_error(void);
 void        bwa_shim_set_verbosity(int level);
 
+/* Vendored bwa-mem3 version (PACKAGE_VERSION, e.g. "0.9.0") — for `@PG VN:`. */
+const char *bwa_shim_version(void);
+/* Human-readable build description: "bwa-mem3 <version>; compiler: <line>". */
+const char *bwa_shim_build_info(void);
+
 /* Shared-memory index lifecycle. Thin wrappers over bwa-mem3's bwa_shm.h
  * (POSIX shm_open + a control segment named "/bwactl"). The shim's
  * `bwa_shim_idx_load` already attaches transparently when a segment named

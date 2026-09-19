@@ -247,6 +247,10 @@ fn main() {
         println!("cargo:warning={w}");
     }
     println!("cargo:rustc-env=BWA_MEM3_SYS_COMPILER={compiler_line}");
+    build.define(
+        "BWA_SHIM_COMPILER_LINE",
+        Some(format!("\"{}\"", compiler_line.replace('"', "'")).as_str()),
+    );
     let tiers = if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
         KERNEL_TIERS_X86
             .iter()

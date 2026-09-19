@@ -259,6 +259,7 @@ struct ShimSeeds {
     bseq1_t *seqs;
     int      n_seqs;
     mem_opt_t *opts;
+    mem_opt_t opts_copy;
     FMI_search *fmi;
     uint8_t *ref_string;  /* borrowed from BwaShimIndex; not freed here */
     /* D3 (--meth): original-coordinate handles borrowed from BwaShimIndex
@@ -1101,9 +1102,14 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
     s->meth_orig_pac        = idx->meth_orig_pac;
     s->meth_orig_ref_string = idx->meth_orig_ref_string;
 
-    /* Force single-thread; ensure PE flag. */
-    opts->n_threads = 1;
-    opts->flag |= MEM_F_PE;
+    /* Never write through the caller's options: with one MemOpts shared by
+     * every worker thread that is a data race, and upstream itself works on a
+     * copy for exactly this reason (fastmap.cpp:912 `mem_opt_t tmp_opt = *opt`).
+     * The copy forces single-thread kernels and the PE flag for the pair path. */
+    s->opts_copy = *opts;
+    s->opts_copy.n_threads = 1;
+    s->opts_copy.flag |= MEM_F_PE;
+    s->opts = &s->opts_copy;
 
     /* Allocate per-worker scratch using upstream's public helper so our
      * layout stays in sync with the main bwa-mem3 pipeline. Sets w.nthreads
@@ -1543,7 +1549,7 @@ int shim_estimate_pestat(void *idx_opaque, mem_opt_t *opts,
     if (!s) return -1;
     FMI_search *fmi = s->fmi;
     run_se_extension(s);
-    mem_pestat(opts, fmi->idx->bns->l_pac, s->n_seqs, s->w.regs, pestat_out);
+    mem_pestat(s->opts, fmi->idx->bns->l_pac, s->n_seqs, s->w.regs, pestat_out);
     for (int i = 0; i < s->n_seqs; ++i) free(s->w.regs[i].a);
     shim_seeds_free(s);
     return 0;
