@@ -1,5 +1,5 @@
 //! Non-meth CLI-parity over a reference that forces the PAIRED-branch
-//! primary-selection path (`z[k] != 0`) in `pair_and_emit`.
+//! primary-selection path (`z[k] != 0`) in `emit_resolved_pair`.
 //!
 //! The reference embeds a 160 bp motif twice: copy A verbatim and copy B with a
 //! couple of point mutations. R1 is drawn from copy A, so its single-end best

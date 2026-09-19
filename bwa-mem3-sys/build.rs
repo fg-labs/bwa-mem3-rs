@@ -91,10 +91,10 @@ fn main() {
         &build_dir.join("bwa-mem3"),
     );
 
-    // 3. Apply any patches in patches/ lexicographic order. Currently ships
-    // one: 0001-mem-pair-resolve-batch-post.patch (carries
-    // mem_pair_resolve_batch_post until it lands upstream; see CLAUDE.md
-    // gotcha #18).
+    // 3. Apply any patches in patches/ lexicographic order. None ship today:
+    // mem_pair_resolve_batch_post landed upstream in fg-labs/bwa-mem3#515, so
+    // the vendored tree provides it directly (see CLAUDE.md gotcha #18). The
+    // loop stays so a future refresh can carry a patch without a build.rs edit.
     let patches_dir = manifest.join("patches");
     if patches_dir.is_dir() {
         let mut patches: Vec<_> = fs::read_dir(&patches_dir)
@@ -355,6 +355,11 @@ fn apply_simd_flags(build: &mut cc::Build) {
 fn extract_makefile_defines(makefile: &str) -> Vec<String> {
     let mut out: Vec<String> = makefile
         .lines()
+        // A `#` begins a Makefile comment to end-of-line, so strip it before
+        // tokenizing: a `-D...` that appears only in explanatory comment text
+        // (e.g. the `-DTAG=x` build-stamp example in the vendored Makefile) is
+        // documentation, not a compiler define this crate must mirror.
+        .map(|line| line.split('#').next().unwrap_or(""))
         .flat_map(str::split_whitespace)
         .filter_map(|tok| tok.strip_prefix("-D"))
         .map(|def| def.trim_matches('"').to_owned())
@@ -377,13 +382,6 @@ const DEFINES_DELIBERATELY_OMITTED: &[(&str, &str)] = &[
         "CACHE_LINE_BYTES",
         "no mirror in build.rs -- see the tracking issue; changing it is a perf change \
          needing its own benchmark",
-    ),
-    (
-        "DISABLE_BATCHED_MATESW",
-        "an A/B escape hatch (macro.h:80-88), never set for a normal build. Upstream \
-         uses it for the proto-neon-kswv CI's on/off test of the batched mate-rescue SW \
-         port; this crate's own CI passes it via CXXFLAGS (not the Makefile) to run the \
-         CLI parity suites against the shim's scalar mate-rescue path too (gotcha #18)",
     ),
     (
         "KERNEL_VARIANT",
@@ -649,8 +647,8 @@ endif
             ("KERNEL_VARIANT", "_avx2")
         );
         assert_eq!(
-            canonical_define("DISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)"),
-            ("DISABLE_BATCHED_MATESW", "$(DISABLE_BATCHED_MATESW)")
+            canonical_define("SOME_DEF=$(SOME_VAR)"),
+            ("SOME_DEF", "$(SOME_VAR)")
         );
     }
 }

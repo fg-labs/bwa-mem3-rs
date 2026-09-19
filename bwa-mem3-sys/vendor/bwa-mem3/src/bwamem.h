@@ -109,9 +109,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #  define MEM_RESCUE_SKIP_FRAC 0.33
 #endif
 
-struct __smem_i;
-typedef struct __smem_i smem_i;
-
 #define MEM_F_PE        0x2
 #define MEM_F_NOPAIRING 0x4
 #define MEM_F_ALL       0x8
@@ -147,10 +144,14 @@ typedef struct __smem_i smem_i;
  *              scores the cell to its matrix value, so mate rescue is batched on
  *              the freed-capable tiers (NEON/AVX2/AVX512BW) exactly like
  *              GENOMIC/COLLAPSED, and falls back to scalar ksw_align2 on the
- *              freed-less x86 tiers (sse41/sse42/avx) as all three modes do.
- *              See reports/2026-07-20-taps-alignment-experiment-results.md. */
+ *              freed-less x86 tiers (sse41/sse42/avx) as all three modes do. */
 enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
                         MEM_METH_SCORING_NEUTRAL = 2 };
+
+/* --meth-seed-prune modes (mem_opt_t.meth_seed_prune). Shared here so the CLI
+ * (fastmap.cpp) and the prune (bwamem.cpp) agree on the numeric values. */
+enum mem_meth_seed_prune { MEM_METH_PRUNE_OFF = 0, MEM_METH_PRUNE_SPEC30 = 1,
+                           MEM_METH_PRUNE_BASELINE = 2 };
 
 /* Bismark tag selection under --meth (--meth-tags). XR:Z and XG:Z are two-byte
  * strand labels; XM:Z is a read-length methylation-call string and dominates the
@@ -197,6 +198,9 @@ typedef struct mem_opt_t {
     int max_extend_chains;  // cap on chains extended per read: keep only the top-N by weight before banded-SW (0 = off). Opt-in speed lever; NOT byte-identical.
     int mate_concordant_window;  // --extend-mate-concordant: when max_extend_chains caps a PE read, also retain chains concordant with a mate chain within this many bp. 0 = off; -1 = auto (use the estimated proper-pair insert high bound); >0 = fixed window. Recovers the true pair's low-weight chain (mainly --meth). NOT byte-identical.
     int est_insert_high;         // runtime state (NOT a user option): upper proper-pair insert bound (pes[FR].high) estimated from data during the run, or from -I; 0 = not yet estimated. Read by the mate-concordant cap when mate_concordant_window == -1 (auto).
+    float extend_tie_frac;       // --extend-tie-frac: extend a chain (ranked at/after extend_tie_floor) only if its weight >= this fraction of the best chain's weight. Complements max_extend_chains (the count cap) and also gates on its own when that cap is off. 0 = off (byte-identical); clamped to [0,1]. Trims non-competitive tail chains from banded-SW. NOT byte-identical when > 0.
+    int extend_csub;             // --extend-csub: when the cap/gate drops chains, seed the primary region's competitor score (calibrated dropped-chain estimate, clamped < primary score) so MAPQ is not inflated by the pruning. 0 = off (byte-identical). Opt-in.
+    int extend_tie_floor;        // --extend-tie-floor: always extend at least this many top-ranked chains regardless of extend_tie_frac. 0 = no unconditional floor (the fraction gate governs from rank 0 up; the best chain always survives). Only meaningful when extend_tie_frac > 0.
     seed_order_t seed_emit_order;  // --seed-order; SEED_ORDER_OFF = byte-identical
     int min_chain_weight;
     int max_chain_extend;
@@ -244,9 +248,19 @@ typedef struct mem_opt_t {
                             // to meth_mode: --meth picks alignment semantics, --bam
                             // picks the container, on every mode alike.
     int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
+    int    bam_threads;     // BGZF deflate threads for --bam output (--bam-threads).
+                            // -1 = unset -> auto (n_threads/8 when bam_level>0);
+                            // 0 = serial on the writer thread; N = that many.
     int    meth_mode;       // 1 = bisulfite mode (--meth)
     int    meth_scoring;    // bisulfite matrix mode (--meth-scoring):
                             // MEM_METH_SCORING_{COLLAPSED,GENOMIC,NEUTRAL}
+    int    meth_seed_prune; // --meth-seed-prune: prune 3-letter over-seeding before
+                            // SA resolution. 0 = off, 1 = spec30 (per-read two-regime),
+                            // 2 = baseline (len<25 & hits>1). mem_opt_init sets 0, but
+                            // the CLI defaults it to spec30 under --meth (bwa-mem3-native
+                            // feature, no upstream reference to preserve); --meth-seed-prune
+                            // =off|baseline (or env BWAMEM3_METH_SEED_PRUNE) overrides.
+                            // ~30% faster --meth at ~0 truth accuracy cost; NOT byte-identical.
     int    meth_chem;       // methylation chemistry (--meth=emseq|taps): meth_chem_t.
                             // Selects XM:Z call polarity ONLY -- seeding, the
                             // converted index and the scoring matrices are shared,
@@ -272,17 +286,17 @@ typedef struct mem_opt_t {
      * Inert without a `.alt` sidecar: a[which] != a[0] requires n_pri < a.n (the
      * read has ALT hits), and is_alt is never set without one.
      *
-     * Deliberately NOT a compat_target_t field. Making the default match both
-     * upstreams means no target needs a say in it, which keeps that table's
-     * "output shaping only, never an alignment change" invariant intact -- FLAG
-     * is an alignment-record field. --compat and this option are instead
-     * mutually exclusive (see main_mem). */
+     * Deliberately NOT a compat_target_t field: that table records where the
+     * two upstreams DIFFER, and both derive FLAG 0x2 from a[0], so the default
+     * matches both and no target needs a say in it. --compat and this option
+     * are instead mutually exclusive (see main_mem). */
     int    proper_pair_from_emitted;
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
     int    smem_dedup;        // 1 = dedup fully-identical SMEMs before SA expansion (--smem-dedup); 0 = off (default, byte-identical to baseline)
     int    alnreg_sort_fast;  // 1 = strict-total-order comparator + pdqsort at the mem_sort_dedup_patch sort sites (set by --fast); 0 = bwa-mem2's re-only comparator + ks_introsort (default, bwa-mem2-compatible)
-    int    skip_contained_ext; // 1 = skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed (--skip-contained-ext); 0 = off. Byte-identical to baseline: the skip set is a subset of the post-extension containment purge (PE18).
+    int    skip_contained_ext; // 1 (default) = skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; 0 = the reference extension path (--keep-contained-ext; --compat forces 0). Byte-identical to the reference path on all read lengths and under --meth: a contained seed is deferred past the main extension batch and skipped only when the real post-extension containment purge (PE18) confirms it against its container's extended alnreg; otherwise it is extended in a second batch. Pure speed lever, so it is on by default; --skip-contained-ext is the deprecated (accepted, no-op) spelling of the default.
     int    band_start;       // >0 = adaptive chain-geometry banding active (start band; set to ADAPTIVE_BAND_START by --adaptive-band); 0 = off (byte-identical). Long-read speed lever; no-op on the 8-bit short-read tier.
+    int    band_cert;        // 1 = sound (byte-identical) adaptive band via per-pair tie-break certificate (default); 0 = off, set by --fast/--adaptive-band (which use the aggressive band_start heuristic instead). Skips the wide DP on provably-narrow pairs with bit-for-bit-identical output.
     /* --compat: the selected output-compatibility target. Non-NULL on any
      * mem_opt_t from mem_opt_init(), which sets it to &COMPAT_TARGET_OFF
      * (bwa-mem3's native output), so consumers can dereference it
@@ -290,7 +304,9 @@ typedef struct mem_opt_t {
      * memset to zero and is NOT such a struct; only its scalars are ever read.)
      * Points into the static table in compat_target.cpp -- not owned, never
      * freed, so the shallow struct copy in the MEM_F_SMARTPE path is correct.
-     * Shapes OUTPUT ONLY: no alignment, score, flag, or tag VALUE depends on it. */
+     * Reproduces the target's output: tag and header shaping, plus the target's
+     * own alignment on the two records where bwa and bwa-mem2 disagree (see
+     * compat_target.h). */
     const compat_target_t *compat;
 } mem_opt_t;
 
@@ -309,6 +325,23 @@ typedef struct abc {
     int aln;
     int32_t n_hits;  // SMEM SA occurrence count this seed came from; 1 = unique
 } mem_seed_t; // unaligned memory
+
+/* Width of mem_chain_t::w, and the largest value that field can hold.
+ *
+ * These exist so the bitfield and mem_chain_weight()'s saturating clamp cannot
+ * drift apart. They used to disagree: the clamp saturated at (1<<30)-1 while
+ * the field was 27 bits, so a weight in [2^27, 2^30) wrapped modulo 2^27 on
+ * store and a very heavy chain could come back with a tiny w -- dropped by the
+ * `c->w < opt->min_chain_weight` gate, or losing a `drop_ratio` shadowing
+ * comparison it should have won (fg-labs/bwa-mem3#309).
+ *
+ * Unreachable on real data, and the fix is byte-identical because of it: chain
+ * weight accumulates non-overlapping seed spans and takes min(query, ref)
+ * coverage, so it is bounded by the query length and saturating needs a single
+ * ~134 Mbp read. The point is that the two constants now have one definition,
+ * not that the old arithmetic ever fired. */
+#define MEM_CHAIN_W_BITS 27
+#define MEM_CHAIN_W_MAX  ((1u << MEM_CHAIN_W_BITS) - 1u)
 
 typedef struct {
     int32_t seqid, cseed;
@@ -334,20 +367,31 @@ typedef struct {
      * directional / dual-hypothesis-per-read support is ever added, test_and_merge
      * MUST gain a hypothesis guard (it is currently safe only because each read is
      * single-hypothesis). */
-    uint32_t w:27, kept:2, is_alt:1;   /* unsigned: w/kept/is_alt are 0..N flags (kept reaches 3) */
+    uint32_t w:MEM_CHAIN_W_BITS, kept:2, is_alt:1;   /* unsigned: w/kept/is_alt are 0..N flags (kept reaches 3) */
     int32_t  meth_hypothesis:2;        /* signed: needs -1; packs into the same 4-byte word (static_assert below) */
     float frac_rep;
     int64_t pos;
     mem_seed_t *seeds;
 } mem_chain_t;
 
-typedef struct { size_t n, m, cc; mem_chain_t *a;  } mem_chain_v;
+typedef struct { size_t n, m, cc; mem_chain_t *a; int capped_w; } mem_chain_v;
 
 typedef struct mem_alnreg_t {
     // mem_alnreg_t() {c=NULL;}
     int64_t rb, re; // [rb,re): reference sequence in the alignment
     int qb, qe;     // [qb,qe): query sequence in the alignment
     int rid;        // reference seq ID
+    /* Scratch for mem_sort_dedup_patch, perf-only: 0 = unranked, r > 0 = this
+     * record sat at position r-1 of the previous dedup call's post-window
+     * (reference-end ordered) array. The next dedup-only call starts its `re`
+     * sort from that order; the value is never trusted for correctness (a
+     * stale or duplicate rank only costs time). Lives in what was the padding
+     * between `rid` and `c`, so the record stays 112 bytes (static_assert
+     * below). Fresh records are zero-initialised on every alignment-creation
+     * path (calloc at extension, memset in mate rescue), so a new record reads
+     * as unranked; the --dedup-reads memo copy instead carries the
+     * representative's rank, which the sort validates rather than trusts. */
+    int32_t dedup_re_rank;
     mem_chain_t *c;
     int score;      // best local SW score
     int truesc;     // actual score corresponding to the aligned region; possibly smaller than $score
@@ -380,8 +424,17 @@ typedef struct mem_alnreg_t {
      * (Output XG/XM still use the raw meth_hypothesis — the genome strand.) */
     int8_t meth_strand_hyp;
 } mem_alnreg_t;
+#ifdef __cplusplus
+static_assert(sizeof(mem_alnreg_t) == 112,
+              "mem_alnreg_t must stay 112 bytes: dedup_re_rank fills the padding after rid; "
+              "growing the record raises the gather traffic the dedup sorts are bound by");
+#endif
 
-typedef struct { size_t n, m; mem_alnreg_t *a; } mem_alnreg_v;
+typedef struct { size_t n, m; mem_alnreg_t *a; int capped_w; } mem_alnreg_v;
+/* capped_w: max WEIGHT among chains the cap/gate dropped before extension, carried
+ * to worker_sam so --extend-csub can seed the primary region's competitor score
+ * (a calibrated estimate, clamped below the primary's own score) and keep MAPQ from
+ * inflating when a real competitor was pruned. 0 = nothing dropped / feature off. */
 
 typedef struct {
     int low, high;   // lower and upper bounds within which a read pair is considered to be properly paired
@@ -506,6 +559,9 @@ typedef struct worker_t {
     const bntseq_t   *meth_orig_bns;
     const uint8_t    *meth_orig_pac;
     uint8_t          *meth_orig_ref_string;
+    /* [dedup-reads] per-chunk memoization state (Phase 2 consumer). NULL = no
+     * memoization; Phase 1 always leaves it NULL (measure-only). */
+    const struct read_memo_state *memo;
 } worker_t;
 
 /* D3 (--meth, PR-3) helpers. In --meth, this returns the ORIGINAL bns/pac/
@@ -553,14 +609,15 @@ static inline int mem_opt_records_are_bam(const mem_opt_t *opt) {
 
 typedef kvec_t(int) int_v;
 
-smem_i *smem_itr_init(const bwt_t *bwt);
-void smem_itr_destroy(smem_i *itr);
-void smem_set_query(smem_i *itr, int len, const uint8_t *query);
-void smem_config(smem_i *itr, int min_intv, int max_len, uint64_t max_intv);
-const bwtintv_v *smem_next(smem_i *itr);
-
 mem_opt_t *mem_opt_init(void);
 void mem_fill_scmat(int a, int b, int8_t mat[25]);
+/* True iff the certified adaptive band (opt->band_cert) is safe to apply under the
+ * current scoring/gap/zdrop parameters. The certificate bounds the optimal score but
+ * not the extension kernel's early-termination heuristics; outside a conservative
+ * parameter envelope (small zdrop, large clip penalties, a matrix scoring above a)
+ * the caller must fall back to the exact full-width ladder. No-op at default
+ * parameters. Defined in bwamem.cpp. */
+int mem_band_cert_params_safe(const mem_opt_t *opt);
 /* (Re)derive the --meth per-hypothesis matrices (mat_ot/mat_ob) from opt->mat +
  * opt->a. Call after any rebuild of opt->mat (e.g. CLI -A/-B/-x parsing) so meth
  * scoring tracks the user's options instead of the init-time defaults. */
@@ -582,10 +639,25 @@ void mem_opt_fill_meth_mat(mem_opt_t *opt);
  * Must be called AFTER -A/-B/-T/-L/-U parsing and after update_a(). */
 void mem_opt_apply_meth_defaults(mem_opt_t *opt, const mem_opt_t *opt0);
 
+/* Configure extension-DP job dedup. mode_arg is the --dedup CLI value (NULL =>
+ * fall back to env BWAMEM3_DEDUP, then default 'auto'). The controller knobs z
+ * and reprobe are expert-only, resolved from env (BWAMEM3_DEDUP_Z default 2.0,
+ * BWAMEM3_DEDUP_REPROBE default 12000000) -- no CLI flag, matching the house
+ * style for BWAMEM3_* tuning knobs. Must be called before the first alignment
+ * batch; invalid values are fatal. CLI(mode) > env > default. */
+void mem_dedup_configure(const char *mode_arg);
+
 // Skip-short-seed extension filter: drop seeds shorter than min_ext_len from a
 // chain in place (stable; surviving seeds keep their order). Returns the new
 // seed count. min_ext_len <= 0 is a no-op. See mem_opt_t::min_ext_len.
 int mem_chain_drop_short_seeds(mem_chain_t *c, int min_ext_len);
+
+// Chain weight: the smaller of the chain's query-axis and reference-axis
+// coverage, counting each base once however many seeds span it. Saturates at
+// MEM_CHAIN_W_MAX, the largest value mem_chain_t::w can hold (#309). Declared
+// here (it was file-local to bwamem.cpp) so the clamp is unit-testable; the
+// only callers in the aligner remain the two stores in mem_chain_flt.
+int mem_chain_weight(const mem_chain_t *c);
 
 void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                  bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
@@ -593,6 +665,11 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a) ;
 
 int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
+void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);  /* --extend-csub: seed primary sub from dropped chains */
+/* Exposed for unit tests (test/unit/test_chain_cap.cpp). */
+int  mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
+                          int *capped_w_out);   /* --max-extend-chains count cap + --extend-tie-frac gate */
+int  mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o);  /* --extend-csub PE competitor floor */
 
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
 
@@ -685,12 +762,12 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
 /* Given two alignment begin positions (rb) on the 2-bit-packed concat-with-
  * reverse-complement index, infer the pair orientation (0=FF, 1=FR, 2=RF,
  * 3=RR) and the distance between 5' ends. Exposed so that external consumers
- * can share the same proper-pair classification used by mem_sam_pe's
- * no_pairing fallback. */
+ * can share the same proper-pair classification the batched pairing path
+ * (mem_sam_pe_batch_post) uses on its no-pairing fallback. */
 int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
 
-/* Proper-pair bit (FLAG 0x2) for a pair emitted on mem_sam_pe's no-pairing
- * path. Returns 2 when properly paired and 0 otherwise, so the result ORs
+/* Proper-pair bit (FLAG 0x2) for a pair emitted on the batched pairing path's
+ * no-pairing fallback. Returns 2 when properly paired and 0 otherwise, so the result ORs
  * straight into extra_flag. `which[i]` is the index of the region mate i
  * actually emits; both entries must be >= 0 and the two EMITTED regions
  * (a[i].a[which[i]]) must already be known to share a reference sequence. That
@@ -698,8 +775,8 @@ int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
  * the two coordinates may sit on different reference sequences and yield a
  * cross-sequence distance. bwa and bwa-mem2 compute it the same way.
  *
- * The single definition of a decision the two no-pairing blocks make
- * identically: derive 0x2 from the top-scoring region a[0] (bwa and bwa-mem2,
+ * The single definition of the decision the batched no-pairing path makes:
+ * derive 0x2 from the top-scoring region a[0] (bwa and bwa-mem2,
  * the default) or from the emitted a[which] (#17, opt-in via
  * --proper-pair-from-emitted). Inert without a `.alt` sidecar, since the two
  * indices coincide unless the read has ALT hits. */
@@ -717,6 +794,32 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           kswr_t **myaln, mem_cache *mmc,
                           int32_t &gcnt, int tid);
 
+/* The resolve half of mem_sam_pe_batch_post (rescue via mem_matesw_batch_post
+ * over the kswv results, mem_mark_primary_se, PRIMARY5, mem_seed_capped_sub,
+ * mem_pair, is_multi, q_pe/q_se, secondary_all switch) with emission left to the
+ * caller. mem_sam_pe_batch_post itself calls this for its resolve half, so this
+ * is the shipped path -- not a separate copy. Byte-identical to the former
+ * scalar mem_pair_resolve in non-meth mode; under --meth the PE MAPQ follows the
+ * current hardened path (folds each end's second-best SE hit into the pair
+ * MAPQ), so it differs from the removed scalar resolver there. Call after
+ * mem_sam_pe_batch_pre for every pair of the batch, sort_classify, and
+ * mem_sam_pe_batch.
+ *
+ * Out-param contract: n_pri[] is ALWAYS set. q_se[] is written ONLY when
+ * *paired_out == 1. z[] is valid ONLY when *paired_out == 1; mem_pair may
+ * modify it before the no-pairing / is_multi early returns (which leave
+ * *paired_out == 0), so callers must gate both arrays on *paired_out. On
+ * *paired_out == 1 *extra_flag_out is fully assembled and carries 0x2 iff the
+ * paired alignment was preferred; on *paired_out == 0 it is partial (0x1 only)
+ * and the caller owns the proper-pair 0x2 FLAG bit itself (emission-side), as
+ * mem_sam_pe does. Returns the mate-rescue hit count. */
+int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
+                                const uint8_t *pac, const mem_pestat_t pes[4],
+                                uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
+                                kswr_t **myaln, mem_cache *mmc, int32_t &gcnt, int tid,
+                                int n_pri[2], int z[2], int q_se[2],
+                                int *extra_flag_out, int *paired_out);
+
 int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const uint8_t *pac, const mem_pestat_t pes[4],
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
@@ -724,35 +827,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           int32_t *gar, mem_cache *mmc, const char *ms_orig = NULL,
                           const int8_t *mat = NULL, int mate_meth_ot = -1);
 
-int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-               const mem_pestat_t pes[4], uint64_t id, bseq1_t s[2],
-               mem_alnreg_v a[2]);
-
-// Core pairing decision for a single read pair. Runs mate-rescue SW,
-// mem_mark_primary_se, optional MEM_F_PRIMARY5 reorder, mem_pair, is-multi
-// sanity check, q_pe/q_se computation, and the secondary<->primary
-// secondary_all patch. Does NOT emit SAM/BAM — callers do that.
-//
-// Output contract:
-//   * paired_out: set to 1 iff the paired branch was taken; 0 otherwise.
-//     Callers must always inspect *paired_out before reading z[] / q_se[].
-//   * z[], q_se[]: valid only when *paired_out == 1. On the no-pairing path
-//     they must be treated as undefined — mem_pair() can populate z[]
-//     before the is_multi early return, so their contents do not signal
-//     anything when *paired_out == 0.
-//   * extra_flag_out: on the paired path it is fully assembled (and
-//     includes 0x2 iff the paired alignment was preferred); on the
-//     no-pairing path it is only partial — the caller (or mem_sam_pe's
-//     no_pairing emission block) is responsible for OR-ing in 0x2 itself.
-//   * n_pri[]: always populated.
-//
-// Returns the number of mate-rescue hits produced (same meaning as the
-// historical `n` return of mem_sam_pe).
-int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
-                     const uint8_t *pac, const mem_pestat_t pes[4],
-                     uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
-                     int n_pri[2], int z[2], int q_se[2],
-                     int *extra_flag_out, int *paired_out);
+/* The scalar mem_sam_pe / mem_pair_resolve pairing path was removed; the batched
+ * mem_sam_pe_batch* path above is the only mate-rescue/pairing path. */
 /**
  * Align a batch of sequences and generate the alignments in the SAM format
  *
@@ -778,6 +854,10 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
 void mem_process_seqs(mem_opt_t *opt, int64_t n_processed,
                       int n, bseq1_t *seqs, const mem_pestat_t *pes0,
                       worker_t &w);
+
+/* Release the read-memo module scratch at shutdown (after the worker pipeline
+ * finishes). Idempotent. */
+void mem_readmemo_teardown(void);
 
 /**
  * Align one slice of a pestat cohort: seeding + banded SW only, no pairing.

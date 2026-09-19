@@ -29,6 +29,19 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "kernel_dispatch.h"
 #include "bandedSWA.h"
+#include "utils.h"   /* xassert */
+#if defined(__ARM_NEON) || defined(__aarch64__)
+/* neon_soa_pack.h remaps the nt4 ambiguity code to the kernels' query-N code.
+ * These names live in kswv.cpp; this translation unit needs them too, so define
+ * them here before the include. AMBQ matches the query-N=8 the 8-bit prepass uses. */
+#ifndef AMBIG_
+#define AMBIG_ 4
+#endif
+#ifndef AMBQ
+#define AMBQ 8
+#endif
+#include "neon_soa_pack.h"   /* tiled SoA packing for the 128-bit 8-bit wrapper */
+#endif
 #ifdef VTUNE_ANALYSIS
 #include <ittnotify.h> 
 #endif
@@ -89,6 +102,11 @@ extern uint64_t prof[10][112];
 #define AMBIG 4
 #define DUMMY1 99
 #define DUMMY2 100
+
+#if defined(__AVX2__)
+/* Tiled SoA packing for the AVX2 / AVX-512BW 8-bit batch wrappers. */
+#include "x86_soa_pack.h"
+#endif
 
 // Asymmetric ambiguous-base (N) encoding for the AVX-512 16-bit permutexvar LUT
 // prepass (SBT_PREPASS16_LUT). Ref-N and query-N map to distinct codes so that
@@ -191,6 +209,10 @@ BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o
     this->w_open     = o_del;  // redundant, used in vector code.
     this->w_extend   = e_del;  // redundant, used in vector code.
     this->w_ambig    = DEFAULT_AMBIG;
+    // Precompute the scoring-matrix-derived state once, now that mat/w_match/
+    // w_mismatch/w_ambig are final; the kernels read it instead of rebuilding
+    // it per SIMD-batch. See bsw_build_mat_cache().
+    bsw_build_mat_cache();
     this->swTicks = 0;
     this->SW_cells = 0;
     setupTicks = 0;
@@ -239,6 +261,26 @@ BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o
     sbt16_ = (int16_t *)(base + 4 * sz8 + 3 * sz16);
 }
 
+// Compute the scoring-matrix-derived state once. Pure functions of the
+// constructor-fixed this->mat / w_match / w_mismatch / w_ambig, so the result is
+// identical to what every kernel recomputed per SIMD-batch -- this just hoists
+// it off the hot path. Uses the same this-> values (negated w_mismatch,
+// DEFAULT_AMBIG) the kernels pass, so the cached bytes/predicates are bit-exact.
+// Invariant: this caches the *contents* of the pointed-to matrix (*mat, 25
+// bytes), not just the mat pointer -- valid because the scoring matrix is
+// run-constant for the instance's lifetime and nothing mutates *mat after
+// construction (the pre-hoist kernels re-read it every call). If a future path
+// mutates a scoring matrix in place between batches, this cache must be rebuilt.
+void BandedPairWiseSW::bsw_build_mat_cache() {
+    const bool forced = bsw_force_generic_matrix();  // ctor-local; not a member (no kernel reads it)
+    bsw_gen_mat_ = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+                   || forced;
+    bsw_fc_      = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    build_pmat16(bsw_pmat_bytes_, this->w_match, this->w_mismatch, this->w_ambig);
+    build_amat16(bsw_amat_bytes_, this->mat);
+    build_pmat16_lut(bsw_pmat16_lut_, this->w_match, this->w_mismatch, this->w_ambig);
+}
+
 // destructor
 BandedPairWiseSW::~BandedPairWiseSW() {
     _mm_free(dp_slab_);
@@ -278,9 +320,9 @@ int BandedPairWiseSW::scalarBandedSWA(int qlen, const uint8_t *query,
     
     // allocate memory
     qp = (int8_t *) malloc(qlen * m);
-    assert(qp != NULL);
+    xassert(qp != NULL, "out of memory: qp");
     eh = (eh_t *) calloc(qlen + 1, 8);
-    assert(eh != NULL);
+    xassert(eh != NULL, "out of memory: eh");
 
     // generate the query profile
     for (k = i = 0; k < m; ++k) {
@@ -441,10 +483,22 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
         __m256i insdel = _mm256_blendv_epi16(e_ins256, e_del256, cmp);  \
         __m256i sub_a256 = _mm256_sub_epi16(tmpi, tmpj);                    \
         __m256i sub_b256 = _mm256_sub_epi16(tmpj, tmpi);                    \
-        tmp = _mm256_blendv_epi16(sub_b256, sub_a256, cmp);             \
-        tmp = _mm256_sub_epi16(score256, tmp);                          \
+        __m256i drift256 = _mm256_blendv_epi16(sub_b256, sub_a256, cmp); \
+        /* Weight the z-drop drift by the gap-extend penalty, matching the      \
+         * scalar and the 8-bit kernels: (max-m) - |drift| * e_{del|ins},       \
+         * formed in wide int32 (unpack -> _mm256_mullo_epi32) and narrowed    \
+         * with a SATURATING _mm256_packs_epi32 so |drift|*e cannot wrap int16. \
+         * unpack/pack share the per-128-lane interleave, so lane order is      \
+         * preserved. Identical to the old |drift| term at the default -E 1. */ \
+        __m256i dsgn = _mm256_srai_epi16(drift256, 15);                 \
+        __m256i esgn = _mm256_srai_epi16(insdel, 15);                   \
+        __m256i dif_lo = _mm256_mullo_epi32(_mm256_unpacklo_epi16(drift256, dsgn), \
+                                            _mm256_unpacklo_epi16(insdel, esgn)); \
+        __m256i dif_hi = _mm256_mullo_epi32(_mm256_unpackhi_epi16(drift256, dsgn), \
+                                            _mm256_unpackhi_epi16(insdel, esgn)); \
+        tmp = _mm256_sub_epi16(score256, _mm256_packs_epi32(dif_lo, dif_hi)); \
         cmp = _mm256_cmpgt_epi16(tmp, zdrop256);                            \
-        exit0 = _mm256_andnot_si256(cmp, exit0);               \
+        if (zdrop > 0) exit0 = _mm256_andnot_si256(cmp, exit0);               \
     }
 
 
@@ -559,11 +613,17 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
         __m256i m11 = _mm256_add_epi16(h00, sbt11);                     \
         __m256i cmp11 = _mm256_cmpeq_epi16(h00, zero256);               \
         m11 = _mm256_andnot_si256(cmp11, m11);                 \
+        /* m11 = h00 + sbt11 can be NEGATIVE (a positive h00 plus a mismatch/N \
+         * penalty). Floor it at 0 up front: it does not change h11 (max with \
+         * the non-negative e11/f11) and it lets the subs_epu16 gap-opens below \
+         * stay valid. Without it, subs_epu16 reads a negative m11 as a huge \
+         * unsigned and the result stays negative, leaking a sub-zero E/F into \
+         * the band's zero-scan (a stray -1 shifts head/tail and corrupts gtle). \
+         * max(m11,0) then subs_epu16 == the scalar oracle's signed sub + floor, \
+         * for one op instead of a full signed-sub + max per gap-open. */ \
+        m11 = _mm256_max_epi16(m11, zero256);                          \
         h11 = _mm256_max_epi16(m11, e11);                               \
         h11 = _mm256_max_epi16(h11, f11);                               \
-        /* max(x - open, 0) == subs_epu16(x, open): scores are non-negative and \
-         * < 32768, so unsigned-saturating sub matches the signed sub + zero  \
-         * floor (brings the u16 core to parity with the u8 core's subs_epu8). */ \
         __m256i val256 = _mm256_subs_epu16(m11, oe_ins256);            \
         e11 = _mm256_sub_epi16(e11, e_ins256);                          \
         e11 = _mm256_max_epi16(val256, e11);                            \
@@ -659,6 +719,17 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        // The i+j+PFD look-ahead prefetch below is bounded by roundNumPairs and so
+        // reads a padded lane's idr/idq to form its (hint-only) prefetch address;
+        // zero them here -- as every other tier that prefetches does -- so that
+        // read is well-defined and the hint lands at seqBuf offset 0 (in-bounds).
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
@@ -687,7 +758,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         uint8_t *seq2;
         uint8_t h0[SIMD_WIDTH8]   __attribute__((aligned(64)));
         uint8_t band[SIMD_WIDTH8];      
-        uint8_t qlen[SIMD_WIDTH8] __attribute__((aligned(64)));
+        int32_t qlen_scaled[SIMD_WIDTH8] __attribute__((aligned(64)));  /* len2*max_sc for the band-clamp reach, in a wide int32 slot (a narrow uint8 slot overflows it for long reads / -A>1). The 8-bit DP kernel takes no qlen[], so unlike the 16-bit tiers there is no narrow companion array here. */
         int32_t bsize = 0;
         
         int8_t *H1 = H8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
@@ -722,6 +793,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             int maxLen1 = 0;
             int maxLen2 = 0;
             bsize = w;
+            const uint8_t *seq1p[SIMD_WIDTH8], *seq2p[SIMD_WIDTH8];
+            int len1a[SIMD_WIDTH8], len2a[SIMD_WIDTH8];
 
             uint64_t tim;
             for(j = 0; j < SIMD_WIDTH8; j++)
@@ -751,23 +824,20 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
+                if (sp.len1 < 0 || sp.len1 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d is out of range [0, MAX_SEQ_LEN8=%d)", sp.len1, sp.id, MAX_SEQ_LEN8);
+                if (sp.len2 < 0 || sp.len2 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d is out of range [0, MAX_SEQ_LEN8=%d)", sp.len2, sp.id, MAX_SEQ_LEN8);
 
-                for(k = 0; k < sp.len1; k++)
-                {
-                    mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
-                }
-                qlen[j] = sp.len2 * max;
+                seq1p[j] = seq1;
+                len1a[j] = sp.len1;
+                qlen_scaled[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
             }
-
-            for(j = 0; j < SIMD_WIDTH8; j++)
-            {
-                SeqPair sp = pairArray[i + j];
-                for(k = sp.len1; k <= maxLen1; k++) //removed "="
-                {
-                    mySeq1SoA[k * SIMD_WIDTH8 + j] = DUMMY1;
-                }
-            }
+            /* Tiled transpose in place of the strided byte scatter (see
+             * x86_soa_pack.h): bases (N stays 4), then DUMMY1 from len1 through
+             * row maxLen1 inclusive -- byte-for-byte what the scalar loops wrote. */
+            x86_soa_pack<SIMD_WIDTH8>(mySeq1SoA, seq1p, len1a, len1a, maxLen1 + 1, DUMMY1, DUMMY1, false, AMBIG, 8);
             /* B5: only the boundary row H2[maxLen1] survives the h0-prefix
              * deletion seed below (which overwrites rows [0, maxLen1)); write
              * just that row here, before the seed, instead of the dead per-row
@@ -801,24 +871,14 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 SeqPair sp = pairArray[i + j];
                 seq2 = seqBufQer + (int64_t)sp.idq;
                 
-                if (sp.len2 > MAX_SEQ_LEN8) fprintf(stderr, "Error !! : %d %d\n", sp.id, sp.len2);
-                assert(sp.len2 < MAX_SEQ_LEN8);
                 
-                for(k = 0; k < sp.len2; k++)
-                {
-                    mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
-                }
+                seq2p[j] = seq2;
+                len2a[j] = sp.len2;
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
-
-            for(j = 0; j < SIMD_WIDTH8; j++)
-            {
-                SeqPair sp = pairArray[i + j];
-                for(k = sp.len2; k <= maxLen2; k++)
-                {
-                    mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY2;
-                }
-            }
+            /* Query side: bases with N (4) -> 8, then DUMMY2 from len2 through
+             * column maxLen2 inclusive. */
+            x86_soa_pack<SIMD_WIDTH8>(mySeq2SoA, seq2p, len2a, len2a, maxLen2 + 1, DUMMY2, DUMMY2, true, AMBIG, 8);
             /* B5: only the boundary row H1[maxLen2] (value 0) survives the
              * h0-prefix insertion seed below; write just that row, before the
              * seed so its unconditional H1[0]/H1[1] stores still win. */
@@ -848,7 +908,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                  * the clamp and running a far wider band than the scalar reference.
                  * Per-batch (SIMD_WIDTH8 lanes), not per-cell, so wide math is free. */
                 for (int l = 0; l < SIMD_WIDTH8; l++) {
-                    const int ql    = (int) qlen[l];
+                    const int ql    = qlen_scaled[l];
                     const int reach = ql + eb;
                     int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
                     if (max_ins < 1) max_ins = 1;
@@ -914,21 +974,18 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 
     // PR 16: pmat LUT, broadcast into both 128-bit halves (shuffle_epi8 is
     // lane-wise on AVX2 — each half shuffles against its own half of pmat256).
-    int8_t pmat_bytes[16] __attribute__((aligned(16)));
-    build_pmat16(pmat_bytes, this->w_match, this->w_mismatch, this->w_ambig);
-    __m128i pmat128 = _mm_load_si128((__m128i *)pmat_bytes);
-    __m256i pmat256 = _mm256_broadcastsi128_si256(pmat128);
     // D3 generic-matrix seam: symmetric default uses the XOR pmat (fast); an
     // asymmetric matrix (bisulfite OT/OB) uses the target-major amat LUT.
-    const bool forced  = bsw_force_generic_matrix();
-    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
-                         || forced;
-    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    // gen_mat / fc / the pmat & amat LUTs are cached in the constructor
+    // (bsw_build_mat_cache): pure functions of the construction-fixed matrix, so
+    // reading the cache is bit-identical to the former per-batch recompute.
+    __m128i pmat128 = _mm_load_si128((__m128i *)bsw_pmat_bytes_);
+    __m256i pmat256 = _mm256_broadcastsi128_si256(pmat128);
+    const bool gen_mat = bsw_gen_mat_;
+    const BswFreedCell fc = bsw_fc_;
     __m256i frref256  = _mm256_set1_epi8(fc.ref);
     __m256i frread256 = _mm256_set1_epi8(fc.read);
-    int8_t amat_bytes[16] __attribute__((aligned(16)));
-    build_amat16(amat_bytes, this->mat);
-    __m256i amat256 = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i *)amat_bytes));
+    __m256i amat256 = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i *)bsw_amat_bytes_));
     __m256i three256_8 = _mm256_set1_epi8(3);
 
     __m256i e_del256    = _mm256_set1_epi8(this->e_del);
@@ -1207,66 +1264,106 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             }
         }
 
-        j256 = _mm256_set1_epi8(beg - i);   // diagonal offset of first band column
-#pragma unroll(4)
-        for(j = beg; j < end; j++)
-        {
-            __m256i f11, f21, sbt11;
-            h00 = _mm256_load_si256((__m256i *)(H_h + j * SIMD_WIDTH8));
-            f11 = _mm256_load_si256((__m256i *)(F + j * SIMD_WIDTH8));
-            sbt11 = _mm256_load_si256((__m256i *)(sbt_buf + j * SIMD_WIDTH8));
-
-            __m256i pj256 = j256;
-            j256 = _mm256_add_epi8(j256, one256);
-
-            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero256,
-                            e_ins256, oe_ins256,
-                            e_del256, oe_del256);
-
-            // Masked writing
-            __m256i cmp1 = _mm256_cmpgt_epi8(head256, pj256);
-            __m256i cmp2 = _mm256_cmpgt_epi8(pj256, tail256);
-            cmp1 = _mm256_or_si256(cmp1, cmp2);
-            h10 = _mm256_andnot_si256(cmp1, h10);
-            f21 = _mm256_andnot_si256(cmp1, f21);
-
-            __m256i bmaxRS = maxRS1;
-            maxRS1 =_mm256_max_epu8(maxRS1, h11);
-            // "new row-max" argmax mask. maxRS1 = max(bmaxRS,h11), so
-            // (maxRS1 != bmaxRS) is a strict subset of (maxRS1 == h11) (both
-            // mean h11 >= bmaxRS); the OR was redundant. cmpeq(maxRS1,h11) is
-            // the exact combined mask — bit-identical, drops a cmpeq+xor+or.
-            __m256i cmpA = _mm256_cmpeq_epi8(maxRS1, h11);
-            cmp1 = _mm256_cmpgt_epi8(j256, tail256);
-            cmp1 = _mm256_or_si256(cmp1, cmp2);
-            cmpA = _mm256_blendv_epi8(y1_256, j256, cmpA);
-            y1_256 = _mm256_blendv_epi8(cmpA, y1_256, cmp1);
-            maxRS1 = _mm256_blendv_epi8(maxRS1, bmaxRS, cmp1);
-
-            _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), f21);
-            _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH8), h10);
-
-            h10 = h11;
-
-            // gscore query-end capture (see smithWaterman128_8 for the full
-            // rationale: the re-baseline saturating-subtract zeroes off-diagonal
-            // query-end cells, so gscore cannot be reconstructed from the trimmed
-            // tail; capture (byte+B) per row and finalize wide). Fire exactly like
-            // the byte-identical 16-bit tier: col == qlen-1 (j256 == qlen_off) AND
-            // the band-grown tail reached the query end (tail256 == qlen_off ==
-            // scalar's end == qlen) AND in-band (qlen_valid) AND lane alive (exit0).
-            // gtle CONTRACT (see smithWaterman128_8): exact vs scalar for
-            // gscore > 0; may differ only in the unused gscore == 0 tail.
-            if (j >= minq)
-            {
-                __m256i cmp = _mm256_cmpeq_epi8(j256, qlen_off256);
-                cmp = _mm256_and_si256(cmp, _mm256_cmpeq_epi8(tail256, qlen_off256));
-                cmp = _mm256_and_si256(cmp, qlen_valid256);
-                cmp = _mm256_and_si256(cmp, exit0);
-                hqe256   = _mm256_blendv_epi8(hqe256, h11, cmp);
-                qfire256 = _mm256_blendv_epi8(qfire256, ff256, cmp);
+        // EXT-13: unmasked fast-regime bounds (see smithWaterman128_8). When every
+        // one of the 32 lanes is active the band mask is all-zero for pj in
+        // [max(head), min(tail)), so the middle sub-loop drops it. Not-all-active
+        // (finished/padding lane) leaves fast_lo == fast_hi == beg, so the whole
+        // band runs the masked body -- byte-identical to the un-split loop. Applied
+        // to the 8-bit tiers only; the parallel 16-bit kernels (smithWaterman*_16)
+        // share this band-mask shape but stay masked as the cold high-score fallback.
+        int fast_lo = beg, fast_hi = beg;
+        if (_mm256_movemask_epi8(exit0) == -1) {   // all 32 lanes' sign bits set
+            int8_t hh_[SIMD_WIDTH8] __attribute((aligned(SIMD_WIDTH8)));
+            int8_t tt_[SIMD_WIDTH8] __attribute((aligned(SIMD_WIDTH8)));
+            _mm256_store_si256((__m256i *) hh_, head256);
+            _mm256_store_si256((__m256i *) tt_, tail256);
+            int maxhead = -128, mintail = 127;
+            for (int l = 0; l < SIMD_WIDTH8; l++) {
+                if (hh_[l] > maxhead) maxhead = hh_[l];
+                if (tt_[l] < mintail) mintail = tt_[l];
             }
+            fast_lo = i + maxhead; if (fast_lo < beg) fast_lo = beg; if (fast_lo > end) fast_lo = end;
+            fast_hi = i + mintail; if (fast_hi < fast_lo) fast_hi = fast_lo; if (fast_hi > end) fast_hi = end;
         }
+
+        j256 = _mm256_set1_epi8(beg - i);   // diagonal offset of first band column
+
+#define EXT13_CELL8_256_COMMON \
+            __m256i f11, f21, sbt11; \
+            h00 = _mm256_load_si256((__m256i *)(H_h + j * SIMD_WIDTH8)); \
+            f11 = _mm256_load_si256((__m256i *)(F + j * SIMD_WIDTH8)); \
+            sbt11 = _mm256_load_si256((__m256i *)(sbt_buf + j * SIMD_WIDTH8)); \
+            __m256i pj256 = j256; (void) pj256; /* pre-increment col: masked body only */ \
+            j256 = _mm256_add_epi8(j256, one256); \
+            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero256, \
+                            e_ins256, oe_ins256, e_del256, oe_del256);
+#define EXT13_CELL8_256_GSCORE \
+            if (j >= minq) { \
+                __m256i cmp = _mm256_cmpeq_epi8(j256, qlen_off256); \
+                cmp = _mm256_and_si256(cmp, _mm256_cmpeq_epi8(tail256, qlen_off256)); \
+                cmp = _mm256_and_si256(cmp, qlen_valid256); \
+                cmp = _mm256_and_si256(cmp, exit0); \
+                hqe256   = _mm256_blendv_epi8(hqe256, h11, cmp); \
+                qfire256 = _mm256_blendv_epi8(qfire256, ff256, cmp); \
+            }
+        // Masked body: verbatim the pre-EXT-13 inline loop.
+#define EXT13_CELL8_256_MASKED { \
+            EXT13_CELL8_256_COMMON \
+            __m256i cmp1 = _mm256_cmpgt_epi8(head256, pj256); \
+            __m256i cmp2 = _mm256_cmpgt_epi8(pj256, tail256); \
+            cmp1 = _mm256_or_si256(cmp1, cmp2); \
+            h10 = _mm256_andnot_si256(cmp1, h10); \
+            f21 = _mm256_andnot_si256(cmp1, f21); \
+            __m256i bmaxRS = maxRS1; \
+            maxRS1 =_mm256_max_epu8(maxRS1, h11); \
+            __m256i cmpA = _mm256_cmpeq_epi8(maxRS1, h11); \
+            cmp1 = _mm256_cmpgt_epi8(j256, tail256); \
+            cmp1 = _mm256_or_si256(cmp1, cmp2); \
+            cmpA = _mm256_blendv_epi8(y1_256, j256, cmpA); \
+            y1_256 = _mm256_blendv_epi8(cmpA, y1_256, cmp1); \
+            maxRS1 = _mm256_blendv_epi8(maxRS1, bmaxRS, cmp1); \
+            _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), f21); \
+            _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH8), h10); \
+            h10 = h11; \
+            EXT13_CELL8_256_GSCORE \
+        }
+        // Debug-only (off by default) envelope guard; see BSW8_ASSERT_FAST8_128.
+#ifdef BSW8_ASSERT_ENVELOPE
+#define BSW8_ASSERT_FAST8_256(pjv, jpostv) \
+        do { \
+            __m256i _msk = _mm256_or_si256(_mm256_cmpgt_epi8(head256, (pjv)), \
+                                           _mm256_cmpgt_epi8((jpostv), tail256)); \
+            assert(_mm256_movemask_epi8(_msk) == 0 && \
+                   "EXT-13: EXT13_CELL8_256_FAST ran a column with a non-empty " \
+                   "band mask -- fast_lo/fast_hi no longer bound the in-band range"); \
+        } while (0)
+#else
+#define BSW8_ASSERT_FAST8_256(pjv, jpostv) ((void) 0)
+#endif
+        // Fast body: band mask all-ones here, so h/f stores go unmasked and the
+        // argmax updates without the cmp1 (out-of-band) exclusion.
+#define EXT13_CELL8_256_FAST { \
+            EXT13_CELL8_256_COMMON \
+            BSW8_ASSERT_FAST8_256(pj256, j256); \
+            maxRS1 =_mm256_max_epu8(maxRS1, h11); \
+            __m256i cmpA = _mm256_cmpeq_epi8(maxRS1, h11); \
+            y1_256 = _mm256_blendv_epi8(y1_256, j256, cmpA); \
+            _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), f21); \
+            _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH8), h10); \
+            h10 = h11; \
+            EXT13_CELL8_256_GSCORE \
+        }
+#pragma unroll(4)
+        for (j = beg; j < fast_lo; j++)   EXT13_CELL8_256_MASKED
+#pragma unroll(4)
+        for (j = fast_lo; j < fast_hi; j++) EXT13_CELL8_256_FAST
+#pragma unroll(4)
+        for (j = fast_hi; j < end; j++)   EXT13_CELL8_256_MASKED
+#undef EXT13_CELL8_256_COMMON
+#undef EXT13_CELL8_256_GSCORE
+#undef EXT13_CELL8_256_MASKED
+#undef EXT13_CELL8_256_FAST
+#undef BSW8_ASSERT_FAST8_256
         __m256i cmp1 = _mm256_cmpgt_epi8(head256, j256);
         __m256i cmp2 = _mm256_cmpgt_epi8(j256, tail256);
         cmp1 = _mm256_or_si256(cmp1, cmp2);
@@ -1334,7 +1431,28 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         // row (ierow), absolute-frame score tracking, and the z-drop test — all
         // done in wide scalars so row distances that exceed int8 for long reads
         // are handled exactly.
-        {
+        //
+        // Run the block only on rows where some lane can actually change:
+        //   * xrow / best_abs change only where cmp is set (the global max
+        //     advanced this row; best_abs is always >= the byte max otherwise,
+        //     so max(best_abs, ms) is the identity);
+        //   * gbest_abs / ierow change only where qfire is set;
+        //   * a lane can z-drop only if drop - dif > zdrop with dif >= 0, so
+        //     drop > zdrop is necessary, and drop = maxScore - maxRS1 is exact
+        //     in bytes on alive lanes (both are [0,255] under the routing
+        //     envelope). subs_epu8 twice: nonzero iff drop > zdrop. Dead lanes
+        //     may read as "needed"; the block masks them with exit as before,
+        //     so that only costs a skipped skip. When zdrop is 0 the kill is
+        //     never applied, so the term is dropped from the gate. A zdrop
+        //     above 255 truncates in the byte broadcast to a smaller value, so
+        //     the gate opens on a superset of rows: still byte-identical.
+        // Byte-identical: when the gate is clear every store below is a no-op.
+        const __m256i need_z = (zdrop > 0)
+            ? _mm256_subs_epu8(_mm256_subs_epu8(maxScore256, maxRS1), zdrop256)
+            : zero256;
+        const __m256i need_any = _mm256_or_si256(_mm256_or_si256(cmp, qfire256), need_z);
+        const bool need_wide = !_mm256_testz_si256(need_any, need_any);
+        if (need_wide) {
             int8_t  cmp_a[SIMD_WIDTH8]      __attribute((aligned(32)));
             int8_t  y1_a[SIMD_WIDTH8]       __attribute((aligned(32)));
             int8_t  y_a[SIMD_WIDTH8]        __attribute((aligned(32)));
@@ -1421,7 +1539,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
                                               _mm256_extracti128_si256(die, 1));
                 __m128i d8  = _mm_packs_epi16(d16, d16);
                 __m128i ex  = _mm_loadl_epi64((const __m128i *)(exit_a + base));
-                _mm_storel_epi64((__m128i *)(exit_a + base), _mm_andnot_si128(d8, ex));
+                if (zdrop > 0) _mm_storel_epi64((__m128i *)(exit_a + base), _mm_andnot_si128(d8, ex));
             }
             exit0 = _mm256_load_si256((__m256i *) exit_a);
         }
@@ -1624,6 +1742,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].len2 = 0;
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT 
@@ -1647,6 +1770,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         uint16_t h0[SIMD_WIDTH16]   __attribute__((aligned(64)));
         uint16_t band[SIMD_WIDTH16];        
         uint16_t qlen[SIMD_WIDTH16] __attribute__((aligned(64)));
+        int32_t qlen_scaled[SIMD_WIDTH16] __attribute__((aligned(64)));  /* len2*max_sc for the band-clamp reach, in a wide int32 slot (the narrow uint16 qlen[] overflows it for long reads / -A>1). qlen[] itself is refilled with len2 by smithWaterman*_16 for the DP. */
         int32_t bsize = 0;
         
         int16_t *H1 = H16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
@@ -1657,8 +1781,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         __m256i oe_ins256 = _mm256_set1_epi16(o_ins + e_ins);
         __m256i o_del256  = _mm256_set1_epi16(o_del);
         __m256i e_del256  = _mm256_set1_epi16(e_del);
-        __m256i eb_ins256 = _mm256_set1_epi16(eb - o_ins);
-        __m256i eb_del256 = _mm256_set1_epi16(eb - o_del);
         
         int16_t max = 0;
         if (max < w_match) max = w_match;
@@ -1676,34 +1798,38 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             bsize = w;
 
             uint64_t tim;
+            /* Gather the group's lane geometry once (with the reference and
+             * query prefetches), then build both int16 SoA buffers with the
+             * tiled transpose (x86_soa_pack_u16): reference bases (N -> 0xFFFF)
+             * then DUMMY1 through row maxLen1, query bases (N -> 0xFFFF)
+             * then DUMMY2 through column maxLen2. */
+            const uint8_t *seq1p[SIMD_WIDTH16], *seq2p[SIMD_WIDTH16];
+            int len1a[SIMD_WIDTH16], len2a[SIMD_WIDTH16];
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
                 if ((i + j + PFD) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
                     SeqPair spf = pairArray[i + j + PFD];
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr, _MM_HINT_NTA);
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr + 64, _MM_HINT_NTA);
+                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
+                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
                 }
-
-                SeqPair sp = pairArray[i + j];
+                const SeqPair &sp = pairArray[i + j];
                 h0[j] = sp.h0;
-                seq1 = seqBufRef + (int64_t)sp.idr;
-                
-                for(k = 0; k < sp.len1; k++)
-                {
-                    mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG?0xFFFF:seq1[k]);
-                }
-                qlen[j] = sp.len2 * max;
+                if (sp.len1 < 0 || sp.len1 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d is out of range [0, MAX_SEQ_LEN16=%d)", sp.len1, sp.id, MAX_SEQ_LEN16);
+                if (sp.len2 < 0 || sp.len2 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d is out of range [0, MAX_SEQ_LEN16=%d)", sp.len2, sp.id, MAX_SEQ_LEN16);
+                seq1p[j] = seqBufRef + (int64_t)sp.idr;
+                seq2p[j] = seqBufQer + (int64_t)sp.idq;
+                len1a[j] = sp.len1;
+                len2a[j] = sp.len2;
+                qlen_scaled[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
+                if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
-
-            for(j = 0; j < SIMD_WIDTH16; j++)
-            {
-                SeqPair sp = pairArray[i + j];
-                for(k = sp.len1; k <= maxLen1; k++) //removed "="
-                {
-                    mySeq1SoA[k * SIMD_WIDTH16 + j] = DUMMY1;
-                }
-            }
+            x86_soa_pack_u16<SIMD_WIDTH16>(mySeq1SoA, seq1p, len1a, len1a, maxLen1 + 1, DUMMY1, DUMMY1, AMBIG, 0xFFFF);
+            x86_soa_pack_u16<SIMD_WIDTH16>(mySeq2SoA, seq2p, len2a, len2a, maxLen2 + 1, DUMMY2, DUMMY2, AMBIG, 0xFFFF);
             /* B5: only the boundary row H2[maxLen1] survives the h0-prefix
              * deletion seed below; write just that row, before the seed. */
             _mm256_store_si256((__m256i *)(H2 + maxLen1 * SIMD_WIDTH16), _mm256_set1_epi16((short)DUMMY1));
@@ -1718,32 +1844,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 _mm256_store_si256((__m256i *)(H2 + k* SIMD_WIDTH16), tmp256_);
             }
 //-------------------
-            for(j = 0; j < SIMD_WIDTH16; j++)
-            {
-                if ((i + j + PFD) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
-                    SeqPair spf = pairArray[i + j + PFD];
-                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
-                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
-                }
-                
-                SeqPair sp = pairArray[i + j];
-                //seq2 = seqBufQer + (int64_t)sp.id * MAX_SEQ_LEN_QER;
-                seq2 = seqBufQer + (int64_t)sp.idq;             
-                for(k = 0; k < sp.len2; k++)
-                {
-                    mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k]==AMBIG?0xFFFF:seq2[k]);
-                }
-                if(maxLen2 < sp.len2) maxLen2 = sp.len2;
-            }
-            
-            for(j = 0; j < SIMD_WIDTH16; j++)
-            {
-                SeqPair sp = pairArray[i + j];
-                for(k = sp.len2; k <= maxLen2; k++)
-                {
-                    mySeq2SoA[k * SIMD_WIDTH16 + j] = DUMMY2;
-                }
-            }
             /* B5: only boundary row H1[maxLen2]=0 survives the seed below. */
             _mm256_store_si256((__m256i *)(H1 + maxLen2 * SIMD_WIDTH16), _mm256_setzero_si256());
 //------------------------
@@ -1762,25 +1862,29 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             }
 //------------------------
             uint16_t myband[SIMD_WIDTH16] __attribute__((aligned(64)));
-            uint16_t temp[SIMD_WIDTH16] __attribute__((aligned(64)));
             {
-                __m256i qlen256 = _mm256_load_si256((__m256i *) qlen);
-                __m256i sum256 = _mm256_add_epi16(qlen256, eb_ins256);
-                _mm256_store_si256((__m256i *) temp, sum256);               
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_ins + 1.0;
-                    int max_ins = val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(bsize, max_ins);
-                }
-                sum256 = _mm256_add_epi16(qlen256, eb_del256);
-                _mm256_store_si256((__m256i *) temp, sum256);               
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_del + 1.0;
-                    int max_ins = val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(myband[l], max_ins);
-                    bsize = bsize < myband[l] ? myband[l] : bsize;                  
+                /* Per-lane band clamp in WIDE arithmetic, mirroring
+                 * scalarBandedSWA's "adjust $w if it is too large" block and the
+                 * 8-bit wrappers' fix. The previous 16-bit form added
+                 * qlen*max_sc + (end_bonus - o) with a 16-bit modular add and read
+                 * the sum back through uint16_t, so a negative or >65535 reach
+                 * wrapped -- silently disabling the clamp and running a far wider
+                 * band than the scalar reference on non-default gap penalties.
+                 * qlen_scaled[l] holds len2*max_sc in a wide int32 slot (the narrow
+                 * uint16_t qlen[] fill overflowed it for long reads), so reach is
+                 * qlen_scaled[l] + end_bonus. Per-batch (SIMD_WIDTH16 lanes), not
+                 * per-cell, so wide math is free. */
+                for (int l = 0; l < SIMD_WIDTH16; l++) {
+                    const int ql    = qlen_scaled[l];
+                    const int reach = ql + eb;
+                    int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
+                    if (max_ins < 1) max_ins = 1;
+                    int max_del = (int)((double)(reach - o_del) / e_del + 1.0);
+                    if (max_del < 1) max_del = 1;
+                    int band = bsize;
+                    if (max_ins < band) band = max_ins;
+                    if (max_del < band) band = max_del;
+                    myband[l] = (uint16_t) band;
                 }
             }
 
@@ -1839,15 +1943,13 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
     // D3 generic-matrix seam: symmetric default uses SBT_PREPASS16_SYM; a single
     // freed-to-match cell (bisulfite) uses the rank-1 path; any other asymmetric
     // matrix uses the amat LUT. gen_mat is false on the hot path.
-    const bool forced  = bsw_force_generic_matrix();
-    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
-                         || forced;
-    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    // gen_mat / fc / amat LUT cached in the constructor (bsw_build_mat_cache);
+    // reading the cache is bit-identical to the former per-batch recompute.
+    const bool gen_mat = bsw_gen_mat_;
+    const BswFreedCell fc = bsw_fc_;
     __m256i frref256  = _mm256_set1_epi16(fc.ref);
     __m256i frread256 = _mm256_set1_epi16(fc.read);
-    int8_t amat_bytes[16] __attribute__((aligned(16)));
-    build_amat16(amat_bytes, this->mat);
-    __m256i amat256   = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i *)amat_bytes));
+    __m256i amat256   = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i *)bsw_amat_bytes_));
     __m256i three256  = _mm256_set1_epi16(3);
 
     __m256i e_del256    = _mm256_set1_epi16(this->e_del);
@@ -2305,10 +2407,22 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         __m512i insdel = _mm512_mask_blend_epi16(cmp, e_ins512, e_del512); \
         __m512i sub_a512 = _mm512_sub_epi16(tmpi, tmpj);                    \
         __m512i sub_b512 = _mm512_sub_epi16(tmpj, tmpi);                    \
-        __m512i tmp1 = _mm512_mask_blend_epi16(cmp, sub_b512, sub_a512);            \
-        tmp1 = _mm512_sub_epi16(score512, tmp1);                            \
+        __m512i drift512 = _mm512_mask_blend_epi16(cmp, sub_b512, sub_a512); \
+        /* Weight the z-drop drift by the gap-extend penalty, matching the      \
+         * scalar and the 8-bit kernels: (max-m) - |drift| * e_{del|ins},       \
+         * formed in wide int32 (unpack -> _mm512_mullo_epi32) and narrowed    \
+         * with a SATURATING _mm512_packs_epi32 so |drift|*e cannot wrap int16. \
+         * unpack/pack share the per-128-lane interleave, so lane order is      \
+         * preserved. Identical to the old |drift| term at the default -E 1. */ \
+        __m512i dsgn = _mm512_srai_epi16(drift512, 15);                 \
+        __m512i esgn = _mm512_srai_epi16(insdel, 15);                   \
+        __m512i dif_lo = _mm512_mullo_epi32(_mm512_unpacklo_epi16(drift512, dsgn), \
+                                            _mm512_unpacklo_epi16(insdel, esgn)); \
+        __m512i dif_hi = _mm512_mullo_epi32(_mm512_unpackhi_epi16(drift512, dsgn), \
+                                            _mm512_unpackhi_epi16(insdel, esgn)); \
+        __m512i tmp1 = _mm512_sub_epi16(score512, _mm512_packs_epi32(dif_lo, dif_hi)); \
         cmp = _mm512_cmpgt_epi16_mask(tmp1, zdrop512);                  \
-        exit0 = _mm512_mask_blend_epi16(cmp, exit0, zero512);           \
+        if (zdrop > 0) exit0 = _mm512_mask_blend_epi16(cmp, exit0, zero512);           \
     }
 
 
@@ -2431,11 +2545,17 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         __m512i m11 = _mm512_add_epi16(h00, sbt11);                     \
         __mmask32 cmp11 = _mm512_cmpeq_epi16_mask(h00, zero512);        \
         m11 = _mm512_mask_blend_epi16(cmp11, m11, zero512);             \
+        /* m11 = h00 + sbt11 can be NEGATIVE (a positive h00 plus a mismatch/N \
+         * penalty). Floor it at 0 up front: it does not change h11 (max with \
+         * the non-negative e11/f11) and it lets the subs_epu16 gap-opens below \
+         * stay valid. Without it, subs_epu16 reads a negative m11 as a huge \
+         * unsigned and the result stays negative, leaking a sub-zero E/F into \
+         * the band's zero-scan (a stray -1 shifts head/tail and corrupts gtle). \
+         * max(m11,0) then subs_epu16 == the scalar oracle's signed sub + floor, \
+         * for one op instead of a full signed-sub + max per gap-open. */ \
+        m11 = _mm512_max_epi16(m11, zero512);                          \
         h11 = _mm512_max_epi16(m11, e11);                               \
         h11 = _mm512_max_epi16(h11, f11);                               \
-        /* max(x - open, 0) == subs_epu16(x, open): scores are non-negative and \
-         * < 32768, so unsigned-saturating sub matches the signed sub + zero  \
-         * floor (brings the u16 core to parity with the u8 core's subs_epu8). */ \
         __m512i val512 = _mm512_subs_epu16(m11, oe_ins512);            \
         e11 = _mm512_sub_epi16(e11, e_ins512);                          \
         e11 = _mm512_max_epi16(val512, e11);                            \
@@ -2519,9 +2639,22 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
     {
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
-        pairArray[ii].len2 = pairArray[numPairs - 1].len2;
+        // Zero len2 to honor the getScores8 padding-lane contract (bandedSWA.h),
+        // matching every other tier. This lone wrapper previously copied
+        // pairArray[numPairs - 1].len2 instead. It is byte-identical: the copied
+        // value is the last real pair's query length, and numPairs - 1 is itself
+        // a real lane in this same final partial group, so the cross-lane maxLen2
+        // the group's DP column count derives from is unchanged either way. The
+        // copy left the padded lane packing len2 real (dummy-destined) query bytes
+        // for no benefit; zero makes the padded query empty, as the contract says.
+        pairArray[ii].len2 = 0;
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
@@ -2544,7 +2677,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         uint8_t *seq2;
         uint8_t h0[SIMD_WIDTH8]   __attribute__((aligned(64)));
         uint8_t band[SIMD_WIDTH8];      
-        uint8_t qlen[SIMD_WIDTH8] __attribute__((aligned(64)));
+        int32_t qlen_scaled[SIMD_WIDTH8] __attribute__((aligned(64)));  /* len2*max_sc for the band-clamp reach, in a wide int32 slot (a narrow uint8 slot overflows it for long reads / -A>1). The 8-bit DP kernel takes no qlen[], so unlike the 16-bit tiers there is no narrow companion array here. */
         int32_t bsize = 0;
         
         int8_t *H1 = H8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
@@ -2580,6 +2713,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             int maxLen1 = 0;
             int maxLen2 = 0;
             bsize = w;
+            const uint8_t *seq1p[SIMD_WIDTH8], *seq2p[SIMD_WIDTH8];
+            int len1a[SIMD_WIDTH8], len2a[SIMD_WIDTH8];
 
             uint64_t tim;
             for(j = 0; j < SIMD_WIDTH8; j++)
@@ -2608,23 +2743,20 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
+                if (sp.len1 < 0 || sp.len1 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d is out of range [0, MAX_SEQ_LEN8=%d)", sp.len1, sp.id, MAX_SEQ_LEN8);
+                if (sp.len2 < 0 || sp.len2 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d is out of range [0, MAX_SEQ_LEN8=%d)", sp.len2, sp.id, MAX_SEQ_LEN8);
 
-                for(k = 0; k < sp.len1; k++)
-                {
-                    mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
-                }
-                qlen[j] = sp.len2 * max;
+                seq1p[j] = seq1;
+                len1a[j] = sp.len1;
+                qlen_scaled[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
             }
-
-            for(j = 0; j < SIMD_WIDTH8; j++)
-            {
-                SeqPair sp = pairArray[i + j];
-                for(k = sp.len1; k <= maxLen1; k++)
-                {
-                    mySeq1SoA[k * SIMD_WIDTH8 + j] = DUMMY1;
-                }
-            }
+            /* Tiled transpose in place of the strided byte scatter (see
+             * x86_soa_pack.h): bases (N stays 4), then DUMMY1 from len1 through
+             * row maxLen1 inclusive -- byte-for-byte what the scalar loops wrote. */
+            x86_soa_pack<SIMD_WIDTH8>(mySeq1SoA, seq1p, len1a, len1a, maxLen1 + 1, DUMMY1, DUMMY1, false, AMBIG, 8);
             /* B5: only boundary row H2[maxLen1] survives the seed below; write just that row. */
             _mm512_store_si512((__m512i *)(H2 + maxLen1 * SIMD_WIDTH8), _mm512_set1_epi8((char)DUMMY1));
 //--------------------
@@ -2649,21 +2781,13 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 
                 SeqPair sp = pairArray[i + j];
                 seq2 = seqBufQer + (int64_t)sp.idq;
-                for(k = 0; k < sp.len2; k++)
-                {
-                    mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
-                }
+                seq2p[j] = seq2;
+                len2a[j] = sp.len2;
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
-            
-            for(j = 0; j < SIMD_WIDTH8; j++)
-            {
-                SeqPair sp = pairArray[i + j];
-                for(k = sp.len2; k <= maxLen2; k++)
-                {
-                    mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY2;
-                }
-            }
+            /* Query side: bases with N (4) -> 8, then DUMMY2 from len2 through
+             * column maxLen2 inclusive. */
+            x86_soa_pack<SIMD_WIDTH8>(mySeq2SoA, seq2p, len2a, len2a, maxLen2 + 1, DUMMY2, DUMMY2, true, AMBIG, 8);
             /* B5: only boundary row H1[maxLen2]=0 survives the seed below. */
             _mm512_store_si512((__m512i *)(H1 + maxLen2 * SIMD_WIDTH8), _mm512_setzero_si512());
 //------------------------
@@ -2690,7 +2814,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                  * the clamp and running a far wider band than the scalar reference.
                  * Per-batch (SIMD_WIDTH8 lanes), not per-cell, so wide math is free. */
                 for (int l = 0; l < SIMD_WIDTH8; l++) {
-                    const int ql    = (int) qlen[l];
+                    const int ql    = qlen_scaled[l];
                     const int reach = ql + eb;
                     int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
                     if (max_ins < 1) max_ins = 1;
@@ -2758,21 +2882,17 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     __m512i five512      = _mm512_set1_epi8(5);
 
     // PR 16: pmat LUT broadcast into all 4 128-bit lanes of 512-bit register.
-    int8_t pmat_bytes[16] __attribute__((aligned(16)));
-    build_pmat16(pmat_bytes, this->w_match, this->w_mismatch, this->w_ambig);
-    __m128i pmat128 = _mm_load_si128((__m128i *)pmat_bytes);
-    __m512i pmat512 = _mm512_broadcast_i32x4(pmat128);
     // D3 generic-matrix seam: symmetric default uses the XOR pmat; an asymmetric
-    // matrix (bisulfite OT/OB) uses the target-major amat LUT.
-    const bool forced  = bsw_force_generic_matrix();
-    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
-                         || forced;
-    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    // matrix (bisulfite OT/OB) uses the target-major amat LUT. gen_mat / fc / the
+    // pmat & amat LUTs are cached in the constructor (bsw_build_mat_cache) --
+    // reading the cache is bit-identical to the former per-batch recompute.
+    __m128i pmat128 = _mm_load_si128((__m128i *)bsw_pmat_bytes_);
+    __m512i pmat512 = _mm512_broadcast_i32x4(pmat128);
+    const bool gen_mat = bsw_gen_mat_;
+    const BswFreedCell fc = bsw_fc_;
     __m512i frref512  = _mm512_set1_epi8(fc.ref);
     __m512i frread512 = _mm512_set1_epi8(fc.read);
-    int8_t amat_bytes[16] __attribute__((aligned(16)));
-    build_amat16(amat_bytes, this->mat);
-    __m512i amat512 = _mm512_broadcast_i32x4(_mm_load_si128((__m128i *)amat_bytes));
+    __m512i amat512 = _mm512_broadcast_i32x4(_mm_load_si128((__m128i *)bsw_amat_bytes_));
     __m512i three512_8 = _mm512_set1_epi8(3);
 
     __m512i e_del512    = _mm512_set1_epi8(this->e_del);
@@ -3048,63 +3168,103 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             }
         }
 
-        j512 = _mm512_set1_epi8(beg - i);   // diagonal offset of first band column
-        for(j = beg; j < end; j++)
-        {
-            __m512i f11, f21, f31, f41, f51, jj512, sbt11;
-            h00 = _mm512_load_si512((__m512i *)(H_h + j * SIMD_WIDTH8));
-            f11 = _mm512_load_si512((__m512i *)(F + j * SIMD_WIDTH8));
-            sbt11 = _mm512_load_si512((__m512i *)(sbt_buf + j * SIMD_WIDTH8));
-
-            __m512i pj512 = j512;
-            j512 = _mm512_add_epi8(j512, one512);
-            
-            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero512,
-                            e_ins512, oe_ins512,
-                            e_del512, oe_del512);
-
-            // Masked writing
-            __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(head512, pj512);
-            __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(pj512, tail512);
-            cmp1 = cmp1 | cmp2;
-            h10 = _mm512_mask_blend_epi8(cmp1, h10, zero512);
-            f21 = _mm512_mask_blend_epi8(cmp1, f21, zero512);
-            
-            /* Part of main code MAIN_CODE */
-            __m512i bmaxRS = maxRS1, blend512;
-            maxRS1 =_mm512_max_epu8(maxRS1, h11);
-            // UNSIGNED >: signed cmpgt_epi8 mis-read scores >127 (long reads).
-            __mmask64 cmpA = _mm512_cmpgt_epu8_mask(maxRS1, bmaxRS);
-            __mmask64 cmpB =_mm512_cmpeq_epi8_mask(maxRS1, h11);                    
-            cmpA = cmpA | cmpB;
-            cmp1 = _mm512_cmpgt_epi8_mask(j512, tail512);
-            cmp1 = cmp1 | cmp2;
-            blend512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512);
-            y1_512 = _mm512_mask_blend_epi8(cmp1, blend512, y1_512);
-            maxRS1 = _mm512_mask_blend_epi8(cmp1, maxRS1, bmaxRS);                      
-
-            _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), f21);
-            _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10);
-
-            h10 = h11;
-                        
-            // gscore query-end capture (see smithWaterman128_8). Fire exactly like
-            // the byte-identical 16-bit tier: col == qlen-1 (j512 == qlen_off) AND
-            // band-grown tail reached the query end (tail512 == qlen_off == scalar's
-            // end == qlen) AND in-band (qlen_valid) AND lane alive (exit0 high bit).
-            // mask_blend(k, a, b) selects b where k, a where ~k.
-            // gtle CONTRACT (see smithWaterman128_8): exact vs scalar for
-            // gscore > 0; may differ only in the unused gscore == 0 tail.
-            if (j >= minq)
-            {
-                __mmask64 cmp = _mm512_cmpeq_epi8_mask(j512, qlen_off512);
-                cmp = cmp & _mm512_cmpeq_epi8_mask(tail512, qlen_off512);
-                cmp = cmp & qlen_valid_k;
-                cmp = cmp & _mm512_movepi8_mask(exit0);
-                hqe512   = _mm512_mask_blend_epi8(cmp, hqe512, h11);
-                qfire512 = _mm512_mask_blend_epi8(cmp, qfire512, ff512);
+        // EXT-13: unmasked fast-regime bounds (see smithWaterman128_8). When all 64
+        // lanes are active the band mask is empty for pj in [max(head), min(tail)),
+        // so the middle sub-loop drops it. Not-all-active leaves fast_lo == fast_hi
+        // == beg, so the band runs fully masked -- byte-identical to the un-split loop.
+        // Applied to the 8-bit tiers only; the parallel 16-bit kernels
+        // (smithWaterman*_16) share this band-mask shape but stay masked as the cold
+        // high-score fallback.
+        int fast_lo = beg, fast_hi = beg;
+        if (_mm512_movepi8_mask(exit0) == dmask) {   // all 64 lanes active
+            int8_t hh_[SIMD_WIDTH8] __attribute((aligned(SIMD_WIDTH8)));
+            int8_t tt_[SIMD_WIDTH8] __attribute((aligned(SIMD_WIDTH8)));
+            _mm512_store_si512((__m512i *) hh_, head512);
+            _mm512_store_si512((__m512i *) tt_, tail512);
+            int maxhead = -128, mintail = 127;
+            for (int l = 0; l < SIMD_WIDTH8; l++) {
+                if (hh_[l] > maxhead) maxhead = hh_[l];
+                if (tt_[l] < mintail) mintail = tt_[l];
             }
+            fast_lo = i + maxhead; if (fast_lo < beg) fast_lo = beg; if (fast_lo > end) fast_lo = end;
+            fast_hi = i + mintail; if (fast_hi < fast_lo) fast_hi = fast_lo; if (fast_hi > end) fast_hi = end;
         }
+
+        j512 = _mm512_set1_epi8(beg - i);   // diagonal offset of first band column
+
+#define EXT13_CELL8_512_COMMON \
+            __m512i f11, f21, sbt11; \
+            h00 = _mm512_load_si512((__m512i *)(H_h + j * SIMD_WIDTH8)); \
+            f11 = _mm512_load_si512((__m512i *)(F + j * SIMD_WIDTH8)); \
+            sbt11 = _mm512_load_si512((__m512i *)(sbt_buf + j * SIMD_WIDTH8)); \
+            __m512i pj512 = j512; (void) pj512; /* pre-increment col: masked body only */ \
+            j512 = _mm512_add_epi8(j512, one512); \
+            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero512, \
+                            e_ins512, oe_ins512, e_del512, oe_del512);
+#define EXT13_CELL8_512_GSCORE \
+            if (j >= minq) { \
+                __mmask64 cmp = _mm512_cmpeq_epi8_mask(j512, qlen_off512); \
+                cmp = cmp & _mm512_cmpeq_epi8_mask(tail512, qlen_off512); \
+                cmp = cmp & qlen_valid_k; \
+                cmp = cmp & _mm512_movepi8_mask(exit0); \
+                hqe512   = _mm512_mask_blend_epi8(cmp, hqe512, h11); \
+                qfire512 = _mm512_mask_blend_epi8(cmp, qfire512, ff512); \
+            }
+        // Masked body: verbatim the pre-EXT-13 inline loop.
+#define EXT13_CELL8_512_MASKED { \
+            EXT13_CELL8_512_COMMON \
+            __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(head512, pj512); \
+            __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(pj512, tail512); \
+            cmp1 = cmp1 | cmp2; \
+            h10 = _mm512_mask_blend_epi8(cmp1, h10, zero512); \
+            f21 = _mm512_mask_blend_epi8(cmp1, f21, zero512); \
+            __m512i bmaxRS = maxRS1, blend512; \
+            maxRS1 =_mm512_max_epu8(maxRS1, h11); \
+            __mmask64 cmpA = _mm512_cmpeq_epi8_mask(maxRS1, h11); \
+            cmp1 = _mm512_cmpgt_epi8_mask(j512, tail512); \
+            cmp1 = cmp1 | cmp2; \
+            blend512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512); \
+            y1_512 = _mm512_mask_blend_epi8(cmp1, blend512, y1_512); \
+            maxRS1 = _mm512_mask_blend_epi8(cmp1, maxRS1, bmaxRS); \
+            _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), f21); \
+            _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10); \
+            h10 = h11; \
+            EXT13_CELL8_512_GSCORE \
+        }
+        // Debug-only (off by default) envelope guard; see BSW8_ASSERT_FAST8_128.
+#ifdef BSW8_ASSERT_ENVELOPE
+#define BSW8_ASSERT_FAST8_512(pjv, jpostv) \
+        do { \
+            __mmask64 _msk = _mm512_cmpgt_epi8_mask(head512, (pjv)) | \
+                             _mm512_cmpgt_epi8_mask((jpostv), tail512); \
+            assert(_msk == 0 && \
+                   "EXT-13: EXT13_CELL8_512_FAST ran a column with a non-empty " \
+                   "band mask -- fast_lo/fast_hi no longer bound the in-band range"); \
+        } while (0)
+#else
+#define BSW8_ASSERT_FAST8_512(pjv, jpostv) ((void) 0)
+#endif
+        // Fast body: band mask empty here, so h/f stores go unmasked and the argmax
+        // updates without the cmp1 (out-of-band) exclusion.
+#define EXT13_CELL8_512_FAST { \
+            EXT13_CELL8_512_COMMON \
+            BSW8_ASSERT_FAST8_512(pj512, j512); \
+            maxRS1 =_mm512_max_epu8(maxRS1, h11); \
+            __mmask64 cmpA = _mm512_cmpeq_epi8_mask(maxRS1, h11); \
+            y1_512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512); \
+            _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), f21); \
+            _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10); \
+            h10 = h11; \
+            EXT13_CELL8_512_GSCORE \
+        }
+        for (j = beg; j < fast_lo; j++)   EXT13_CELL8_512_MASKED
+        for (j = fast_lo; j < fast_hi; j++) EXT13_CELL8_512_FAST
+        for (j = fast_hi; j < end; j++)   EXT13_CELL8_512_MASKED
+#undef EXT13_CELL8_512_COMMON
+#undef EXT13_CELL8_512_GSCORE
+#undef EXT13_CELL8_512_MASKED
+#undef EXT13_CELL8_512_FAST
+#undef BSW8_ASSERT_FAST8_512
         __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(head512, j512);
         __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(j512, tail512);
         cmp1 = cmp1 | cmp2;
@@ -3167,7 +3327,29 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         // row (ierow), absolute-frame score tracking, and the z-drop test — all
         // done in wide scalars so row distances that exceed int8 for long reads
         // are handled exactly.
-        {
+        //
+        // Run the block only on rows where some lane can actually change:
+        //   * xrow / best_abs change only where cmp is set (the global max
+        //     advanced this row; best_abs is always >= the byte max otherwise,
+        //     so max(best_abs, ms) is the identity);
+        //   * gbest_abs / ierow change only where qfire is set;
+        //   * a lane can z-drop only if drop - dif > zdrop with dif >= 0, so
+        //     drop > zdrop is necessary, and drop = maxScore - maxRS1 is exact
+        //     in bytes on alive lanes (both are [0,255] under the routing
+        //     envelope). subs_epu8 twice: nonzero iff drop > zdrop. Dead lanes
+        //     may read as "needed"; the block masks them with exit as before,
+        //     so that only costs a skipped skip. When zdrop is 0 the kill is
+        //     never applied, so the term is dropped from the gate. A zdrop
+        //     above 255 truncates in the byte broadcast to a smaller value, so
+        //     the gate opens on a superset of rows: still byte-identical.
+        // Byte-identical: when the gate is clear every store below is a no-op.
+        const __mmask64 qf64 = _mm512_movepi8_mask(qfire512);
+        const __mmask64 need_z = (zdrop > 0)
+            ? _mm512_test_epi8_mask(_mm512_subs_epu8(_mm512_subs_epu8(maxScore512, maxRS1), zdrop512),
+                                    ff512)
+            : 0;
+        const bool need_wide = (cmp | qf64 | need_z) != 0;
+        if (need_wide) {
             // Only the int32 DATA channels need materializing as byte arrays; the
             // cmp/qfire/exit per-lane predicates are read straight from the cmp
             // __mmask64 and movepi8_mask(qfire512)/movepi8_mask(exit0) below.
@@ -3192,7 +3374,6 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             const __m512i vzd  = _mm512_set1_epi32(zdrop);
             const __m512i vedel = _mm512_set1_epi32(this->e_del);
             const __m512i veins = _mm512_set1_epi32(this->e_ins);
-            const __mmask64 qf64 = _mm512_movepi8_mask(qfire512);
             const __mmask64 ex64 = _mm512_movepi8_mask(exit0);
             __mmask64 die64 = 0;
             for (int g = 0; g < SIMD_WIDTH8 / 16; g++) {
@@ -3251,7 +3432,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
                 __mmask16 diem = exm & _mm512_cmpgt_epi32_mask(_mm512_sub_epi32(drop, dif), vzd);
                 die64 |= ((__mmask64)diem) << (16 * g);
             }
-            exit0 = _mm512_mask_mov_epi8(exit0, die64, _mm512_setzero_si512());
+            if (zdrop > 0) exit0 = _mm512_mask_mov_epi8(exit0, die64, _mm512_setzero_si512());
         }
 
 #if RDT
@@ -3447,6 +3628,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].len2 = 0;
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
@@ -3470,14 +3656,14 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         uint16_t h0[SIMD_WIDTH16]   __attribute__((aligned(64)));
         uint16_t band[SIMD_WIDTH16];        
         uint16_t qlen[SIMD_WIDTH16] __attribute__((aligned(64)));
+        int32_t qlen_scaled[SIMD_WIDTH16] __attribute__((aligned(64)));  /* len2*max_sc for the band-clamp reach, in a wide int32 slot (the narrow uint16 qlen[] overflows it for long reads / -A>1). qlen[] itself is refilled with len2 by smithWaterman*_16 for the DP. */
         int32_t bsize = 0;
 
         // PR: SoA N-encoding for the AVX-512 16-bit prepass. On the symmetric
         // (!gen_mat) hot path the LUT prepass requires the asymmetric AMBR16/
         // AMBQ16 codes; the generic-matrix (RANK1/AMAT bisulfite) paths keep the
         // legacy symmetric N=0xFFFF. gen_mat here MUST match smithWaterman512_16.
-        const bool gen_mat16 = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
-                               || bsw_force_generic_matrix();
+        const bool gen_mat16 = bsw_gen_mat_;   // cached in ctor (== per-call value)
         const uint16_t ambRef = gen_mat16 ? (uint16_t)0xFFFF : (uint16_t)AMBR16;
         const uint16_t ambQer = gen_mat16 ? (uint16_t)0xFFFF : (uint16_t)AMBQ16;
 
@@ -3490,8 +3676,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         __m512i oe_ins512 = _mm512_set1_epi16(o_ins + e_ins);
         __m512i o_del512  = _mm512_set1_epi16(o_del);
         __m512i e_del512  = _mm512_set1_epi16(e_del);
-        __m512i eb_ins512 = _mm512_set1_epi16(eb - o_ins);
-        __m512i eb_del512 = _mm512_set1_epi16(eb - o_del);
         
         int16_t max = 0;
         if (max < w_match) max = w_match;
@@ -3508,35 +3692,38 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             uint16_t maxLen2 = 0;
             bsize = w;
 
+            /* Gather the group's lane geometry once (with the reference and
+             * query prefetches), then build both int16 SoA buffers with the
+             * tiled transpose (x86_soa_pack_u16): reference bases (N -> ambRef)
+             * then DUMMY1 through row maxLen1, query bases (N -> ambQer)
+             * then DUMMY2 through column maxLen2. */
+            const uint8_t *seq1p[SIMD_WIDTH16], *seq2p[SIMD_WIDTH16];
+            int len1a[SIMD_WIDTH16], len2a[SIMD_WIDTH16];
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
                 if ((i + j + PFD16) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
                     SeqPair spf = pairArray[i + j + PFD16];
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr, _MM_HINT_NTA);
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr + 64, _MM_HINT_NTA);
+                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
+                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
                 }
-                SeqPair sp = pairArray[i + j];
+                const SeqPair &sp = pairArray[i + j];
                 h0[j] = sp.h0;
-
-                seq1 = seqBufRef + (int64_t)sp.idr;
-
-                for(k = 0; k < sp.len1; k++)
-                {
-                    mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG ? ambRef : seq1[k]);
-                }
-                
-                qlen[j] = sp.len2 * max;
+                if (sp.len1 < 0 || sp.len1 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d is out of range [0, MAX_SEQ_LEN16=%d)", sp.len1, sp.id, MAX_SEQ_LEN16);
+                if (sp.len2 < 0 || sp.len2 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d is out of range [0, MAX_SEQ_LEN16=%d)", sp.len2, sp.id, MAX_SEQ_LEN16);
+                seq1p[j] = seqBufRef + (int64_t)sp.idr;
+                seq2p[j] = seqBufQer + (int64_t)sp.idq;
+                len1a[j] = sp.len1;
+                len2a[j] = sp.len2;
+                qlen_scaled[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
+                if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
-
-            for(j = 0; j < SIMD_WIDTH16; j++)
-            {
-                SeqPair sp = pairArray[i + j];
-                for(k = sp.len1; k <= maxLen1; k++)
-                {
-                    mySeq1SoA[k * SIMD_WIDTH16 + j] = DUMMY1;
-                }
-            }
+            x86_soa_pack_u16<SIMD_WIDTH16>(mySeq1SoA, seq1p, len1a, len1a, maxLen1 + 1, DUMMY1, DUMMY1, AMBIG, ambRef);
+            x86_soa_pack_u16<SIMD_WIDTH16>(mySeq2SoA, seq2p, len2a, len2a, maxLen2 + 1, DUMMY2, DUMMY2, AMBIG, ambQer);
             /* B5: only boundary row H2[maxLen1] survives the seed below. */
             _mm512_store_si512((__m512i *)(H2 + maxLen1 * SIMD_WIDTH16), _mm512_set1_epi16((short)DUMMY1));
 //--------------------
@@ -3551,31 +3738,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 _mm512_store_si512((__m512i *)(H2 + k* SIMD_WIDTH16), tmp512_);
             }
 //-------------------
-            for(j = 0; j < SIMD_WIDTH16; j++)
-            {
-                if ((i + j + PFD16) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
-                    SeqPair spf = pairArray[i + j + PFD16];
-                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
-                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
-                }
-                
-                SeqPair sp = pairArray[i + j];
-                seq2 = seqBufQer + (int64_t)sp.idq;
-                for(k = 0; k < sp.len2; k++)
-                {
-                    mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k]==AMBIG? ambQer : seq2[k]);
-                }
-                if(maxLen2 < sp.len2) maxLen2 = sp.len2;
-            }
-            
-            for(j = 0; j < SIMD_WIDTH16; j++)
-            {
-                SeqPair sp = pairArray[i + j];
-                for(k = sp.len2; k <= maxLen2; k++)
-                {
-                    mySeq2SoA[k * SIMD_WIDTH16 + j] = DUMMY2;
-                }
-            }
             /* B5: only boundary row H1[maxLen2]=0 survives the seed below. */
             _mm512_store_si512((__m512i *)(H1 + maxLen2 * SIMD_WIDTH16), _mm512_setzero_si512());
 //------------------------
@@ -3596,26 +3758,30 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
 
             /* Banding calculation in pre-processing */
             uint16_t myband[SIMD_WIDTH16] __attribute__((aligned(64)));
-            uint16_t temp[SIMD_WIDTH16] __attribute__((aligned(64)));
             {
-                __m512i qlen512 = _mm512_load_si512((__m512i *) qlen);
-                __m512i sum512 = _mm512_add_epi16(qlen512, eb_ins512);
-                _mm512_store_si512((__m512i *) temp, sum512);               
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_ins + 1.0;
-                    int max_ins = val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(bsize, max_ins);
+                /* Per-lane band clamp in WIDE arithmetic, mirroring
+                 * scalarBandedSWA's "adjust $w if it is too large" block and the
+                 * 8-bit wrappers' fix. The previous 16-bit form added
+                 * qlen*max_sc + (end_bonus - o) with a 16-bit modular add and read
+                 * the sum back through uint16_t, so a negative or >65535 reach
+                 * wrapped -- silently disabling the clamp and running a far wider
+                 * band than the scalar reference on non-default gap penalties.
+                 * qlen_scaled[l] holds len2*max_sc in a wide int32 slot (the narrow
+                 * uint16_t qlen[] fill overflowed it for long reads), so reach is
+                 * qlen_scaled[l] + end_bonus. Per-batch (SIMD_WIDTH16 lanes), not
+                 * per-cell, so wide math is free. */
+                for (int l = 0; l < SIMD_WIDTH16; l++) {
+                    const int ql    = qlen_scaled[l];
+                    const int reach = ql + eb;
+                    int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
+                    if (max_ins < 1) max_ins = 1;
+                    int max_del = (int)((double)(reach - o_del) / e_del + 1.0);
+                    if (max_del < 1) max_del = 1;
+                    int band = bsize;
+                    if (max_ins < band) band = max_ins;
+                    if (max_del < band) band = max_del;
+                    myband[l] = (uint16_t) band;
                 }
-                sum512 = _mm512_add_epi16(qlen512, eb_del512);
-                _mm512_store_si512((__m512i *) temp, sum512);               
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_del + 1.0;
-                    int max_ins = val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(myband[l], max_ins);
-                    bsize = bsize < myband[l] ? myband[l] : bsize;
-                }               
             }
 
             smithWaterman512_16(mySeq1SoA,
@@ -3676,24 +3842,23 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
 
     // D3 generic-matrix seam: symmetric default uses SYM; a single freed-to-match
     // cell (bisulfite) uses rank-1; any other asymmetric matrix uses the amat LUT.
-    const bool forced  = bsw_force_generic_matrix();
-    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
-                         || forced;
-    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    // gen_mat / fc / amat & pmat16 LUTs cached in the constructor
+    // (bsw_build_mat_cache); reading the cache is bit-identical to the former
+    // per-batch recompute.
+    const bool gen_mat = bsw_gen_mat_;
+    const BswFreedCell fc = bsw_fc_;
     __m512i frref512  = _mm512_set1_epi16(fc.ref);
     __m512i frread512 = _mm512_set1_epi16(fc.read);
-    int8_t amat_bytes[16] __attribute__((aligned(16)));
-    build_amat16(amat_bytes, this->mat);
-    __m512i amat512   = _mm512_broadcast_i32x4(_mm_load_si128((__m128i *)amat_bytes));
+    __m512i amat512   = _mm512_broadcast_i32x4(_mm_load_si128((__m128i *)bsw_amat_bytes_));
     __m512i three512  = _mm512_set1_epi16(3);
 
     // PR: 32-entry int16 LUT for the symmetric-path permutexvar prepass
     // (SBT_PREPASS16_LUT). Built once per invocation; consumed only when
     // !gen_mat. Requires the asymmetric AMBR16/AMBQ16 SoA encoding from
     // getScores16 (gen_mat there matches gen_mat here).
-    int16_t pmat16_lut[32] __attribute__((aligned(64)));
-    build_pmat16_lut(pmat16_lut, this->w_match, this->w_mismatch, this->w_ambig);
-    __m512i pmat16_512 = _mm512_load_si512((__m512i *) pmat16_lut);
+    // Cached in the constructor (bsw_pmat16_lut_); loadu tolerates the member's
+    // natural alignment, and the loaded value is identical to the aligned load.
+    __m512i pmat16_512 = _mm512_loadu_si512((__m512i *) bsw_pmat16_lut_);
 
     __m512i e_del512    = _mm512_set1_epi16(this->e_del);
     __m512i oe_del512   = _mm512_set1_epi16(this->o_del + this->e_del);
@@ -3903,9 +4068,10 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
             /* Part of main code MAIN_CODE */
             __m512i bmaxRS = maxRS1, blend512;                                      
             maxRS1 =_mm512_max_epi16(maxRS1, h11);                          
-            __mmask32 cmpA = _mm512_cmpgt_epi16_mask(maxRS1, bmaxRS);                   
-            __mmask32 cmpB =_mm512_cmpeq_epi16_mask(maxRS1, h11);                   
-            cmpA = cmpA | cmpB;
+            // maxRS1 = max_epi16(bmaxRS,h11): cmpgt(maxRS1,bmaxRS) is a strict
+            // subset of cmpeq(maxRS1,h11); the OR was redundant (mirrors the AVX2
+            // twin). Drops a cmpgt + kor per cell.
+            __mmask32 cmpA = _mm512_cmpeq_epi16_mask(maxRS1, h11);
             cmp1 = _mm512_cmpgt_epi16_mask(j512, tail512);
             cmp1 = cmp1 | cmp2;         
             blend512 = _mm512_mask_blend_epi16(cmpA, y1_512, j512);
@@ -4124,6 +4290,94 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
 #endif
 }
 
+// blendv_fullmask8: byte-wise select (b where mask set, a where clear) for a
+// mask that is ALREADY full-width -- every byte exactly 0x00 or 0xFF. That holds
+// for every mask fed to blendv in the 128-bit banded-SW kernels: they come from
+// _mm_cmpeq_epi8/_mm_cmpgt_epi8 (or _epi16/_epi32 compares, or AND/OR/NOT of
+// those, or cvtepi8_epi32 of a 0x00/0xFF byte), all of which set every selected
+// bit uniformly. Result is identical to _mm_blendv_epi8(a, b, mask) for such a
+// mask. On NEON this skips the sign-broadcast vshrq_n_s8(mask, 7) that sse2neon's
+// _mm_blendv_epi8 issues to rebuild a full mask it was already handed -- pure
+// redundant port pressure on a port-bound kernel. x86 keeps native PBLENDVB,
+// which reads the high bit directly with no separate maskgen, so it is unchanged.
+static inline __m128i blendv_fullmask8(__m128i a, __m128i b, __m128i mask)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vreinterpretq_m128i_u8(vbslq_u8(vreinterpretq_u8_m128i(mask),
+                                           vreinterpretq_u8_m128i(b),
+                                           vreinterpretq_u8_m128i(a)));
+#else
+    return _mm_blendv_epi8(a, b, mask);
+#endif
+}
+
+// any_lane_set8 / all_lanes_set8: reduce a FULL-WIDTH mask (every byte 0x00 or
+// 0xFF -- as produced by the _epi8/_epi16 compares in these kernels) to a
+// boolean, for the band-trim loop guards. Those previously routed through
+// _mm_movemask_epi8, which sse2neon expands on NEON to ~10 instructions
+// including a constant-pool load; vmaxvq_u8 / vminvq_u8 answer "any lane set" /
+// "all lanes set" in 3. A byte-wise reduction gives the same all/any result at
+// any lane width, because a full-width lane's bytes agree (a 16-bit lane is
+// 0x0000 or 0xFFFF). x86 keeps the native movemask (== 0xFFFF is "all set" for a
+// full-width mask regardless of lane width, matching the old & dmask16 form).
+//
+// NEON any_lane_set8 note: on ARM the reduce is vmaxvq_u8(v) != 0, which is true
+// iff ANY byte of v is nonzero -- so it answers correctly for a numeric (not
+// 0x00/0xFF) input too. The Apple-only 8-bit z-drop epilogue gate relies on this:
+// it ORs the byte-domain need_z difference (0..255) into the mask before calling
+// any_lane_set8. Do NOT extend that numeric-input use to the x86 branch:
+// _mm_movemask_epi8 tests each byte's high bit only, so a small nonzero byte
+// (e.g. 0x01) reads as unset -- correct only for a true 0x00/0xFF mask. No
+// numeric caller compiles on x86 (the gate is __APPLE__-only, hence NEON).
+static inline bool any_lane_set8(__m128i mask)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vmaxvq_u8(vreinterpretq_u8_m128i(mask)) != 0;
+#else
+    return _mm_movemask_epi8(mask) != 0;
+#endif
+}
+static inline bool all_lanes_set8(__m128i mask)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vminvq_u8(vreinterpretq_u8_m128i(mask)) == 0xFF;
+#else
+    return _mm_movemask_epi8(mask) == 0xFFFF;
+#endif
+}
+
+// hmax_epi8 / hmin_epi8: horizontal max / min of the 16 SIGNED bytes of a
+// 128-bit vector, for the EXT-13 per-row max(head)/min(tail) reduce. NEON has a
+// one-op reduce (vmaxvq_s8 / vminvq_s8); x86 has no single-op signed-byte
+// horizontal reduce, so fall back to a store + scalar lane loop -- identical
+// result, run once per row. Same two-way arch guard as the any_lane_set8 /
+// all_lanes_set8 reduces above (Apple Silicon defines __aarch64__). The 16 is
+// the __m128i byte count, not a tier lane count.
+static inline int hmax_epi8(__m128i v)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vmaxvq_s8(vreinterpretq_s8_m128i(v));
+#else
+    int8_t a[16] __attribute((aligned(16)));
+    _mm_store_si128((__m128i *) a, v);
+    int m = -128;
+    for (int l = 0; l < 16; l++) if (a[l] > m) m = a[l];
+    return m;
+#endif
+}
+static inline int hmin_epi8(__m128i v)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vminvq_s8(vreinterpretq_s8_m128i(v));
+#else
+    int8_t a[16] __attribute((aligned(16)));
+    _mm_store_si128((__m128i *) a, v);
+    int m = 127;
+    for (int l = 0; l < 16; l++) if (a[l] < m) m = a[l];
+    return m;
+#endif
+}
+
 #define ZSCORE16(i4_128, y4_128)                                            \
     {                                                                   \
         __m128i tmpi = _mm_sub_epi16(i4_128, x128);                     \
@@ -4133,10 +4387,26 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
         __m128i insdel = _mm_blendv_epi16(e_ins128, e_del128, cmp);     \
         __m128i sub_a128 = _mm_sub_epi16(tmpi, tmpj);                   \
         __m128i sub_b128 = _mm_sub_epi16(tmpj, tmpi);                   \
-        tmp = _mm_blendv_epi16(sub_b128, sub_a128, cmp);                \
-        tmp = _mm_sub_epi16(score128, tmp);                             \
+        __m128i drift128 = _mm_blendv_epi16(sub_b128, sub_a128, cmp);   \
+        /* Weight the z-drop drift by the gap-extend penalty, matching      \
+         * scalarBandedSWA and the 8-bit kernels: (max-m) - |drift| *       \
+         * e_{del|ins}. The product is formed in wide int32 (sign-extend    \
+         * via unpack, _mm_mullo_epi32) and narrowed with a SATURATING      \
+         * _mm_packs_epi32, so |drift|*e can never wrap int16 -- on         \
+         * overflow the true drop is deeply negative and the z-drop cannot  \
+         * fire, which the INT16 saturation reproduces exactly. The per-    \
+         * lane unpack/pack interleave cancels, so lane order is preserved. \
+         * At the default -E 1 (e==1) this equals the old |drift| term, so  \
+         * it is byte-identical there. */                                   \
+        __m128i dsgn = _mm_srai_epi16(drift128, 15);                    \
+        __m128i esgn = _mm_srai_epi16(insdel, 15);                      \
+        __m128i dif_lo = _mm_mullo_epi32(_mm_unpacklo_epi16(drift128, dsgn), \
+                                         _mm_unpacklo_epi16(insdel, esgn)); \
+        __m128i dif_hi = _mm_mullo_epi32(_mm_unpackhi_epi16(drift128, dsgn), \
+                                         _mm_unpackhi_epi16(insdel, esgn)); \
+        tmp = _mm_sub_epi16(score128, _mm_packs_epi32(dif_lo, dif_hi)); \
         cmp = _mm_cmpgt_epi16(tmp, zdrop128);                           \
-        exit0 = _mm_blendv_epi16(exit0, zero128, cmp);                  \
+        if (zdrop > 0) exit0 = _mm_blendv_epi16(exit0, zero128, cmp);                  \
     }
 
 
@@ -4152,6 +4422,24 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
         sbt11_out = _mm_blendv_epi16(sbt_, w_ambig_128, tmp_);          \
     }
 
+// shuffle_lut_lowidx8: byte-gather tbl[idx] for a LUT index whose every lane is
+// provably in [0,15] with the high bit clear (the score-LUT gathers: idx = s^s'
+// over the small N-encoding, reachable range [0,12]). For such indices pshufb and
+// vqtbl1q agree, so on NEON this skips the vandq_u8(idx, 0x8F) that sse2neon's
+// _mm_shuffle_epi8 must emit to reproduce pshufb's index-mask / high-bit-zero
+// semantics for the general case -- 2 wasted vand/cell in the hot 8-bit DP loop.
+// x86 keeps native PSHUFB. NOT for indices that can reach [16,127] (e.g. the AMAT
+// (s1<<2)|s2 path on N lanes), where masked-pshufb and raw-vqtbl differ.
+static inline __m128i shuffle_lut_lowidx8(__m128i tbl, __m128i idx)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vreinterpretq_m128i_u8(vqtbl1q_u8(vreinterpretq_u8_m128i(tbl),
+                                             vreinterpretq_u8_m128i(idx)));
+#else
+    return _mm_shuffle_epi8(tbl, idx);
+#endif
+}
+
 // 128-bit (SSE2/NEON) byte-LUT prepass: replaces the 5-op SYM sequence with a
 // single _mm_shuffle_epi8 (NEON vqtbl) over the 16-byte int8 pmat128 built by
 // build_pmat16, then a slli+srai to discard the shuffle's pmat[0] high byte and
@@ -4162,7 +4450,7 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
 #define SBT_PREPASS16_LUT128(s1, s2, sbt11_out, pmat128) \
     {                                                                   \
         __m128i xor_ = _mm_xor_si128(s1, s2);                          \
-        __m128i lu_  = _mm_shuffle_epi8(pmat128, xor_);                \
+        __m128i lu_  = shuffle_lut_lowidx8(pmat128, xor_);                \
         lu_ = _mm_slli_epi16(lu_, 8);                                  \
         sbt11_out = _mm_srai_epi16(lu_, 8);                            \
     }
@@ -4312,6 +4600,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].len2 = 0;
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
@@ -4336,16 +4629,25 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         uint8_t *seq2;
         uint16_t h0[SIMD_WIDTH16]  __attribute__((aligned(64)));
         uint16_t qlen[SIMD_WIDTH16] __attribute__((aligned(64)));
+        int32_t qlen_scaled[SIMD_WIDTH16] __attribute__((aligned(64)));  /* len2*max_sc for the band-clamp reach, in a wide int32 slot (the narrow uint16 qlen[] overflows it for long reads / -A>1). qlen[] itself is refilled with len2 by smithWaterman*_16 for the DP. */
         int32_t bsize = 0;
 
-        // PR: SoA N-encoding for the 128-bit 16-bit prepass. On the symmetric
-        // (!gen_mat) path the byte-LUT prepass needs the small asymmetric codes
-        // (ref-N=AMBIG=4, query-N=8, matching the 8-bit path) so XORs stay <=15;
-        // the generic-matrix (RANK1/AMAT) paths keep the legacy N=0xFFFF.
-        const bool gen_mat16 = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
-                               || bsw_force_generic_matrix();
+        // SoA N-encoding for the 128-bit 16-bit prepass, chosen per architecture.
+        // On x86 (SSE4.1/4.2) the symmetric (!gen_mat) path uses the byte-LUT
+        // prepass, which needs the small asymmetric codes (ref-N=AMBIG=4, query-N=8,
+        // matching the 8-bit path) so XORs stay <=15; the generic-matrix (RANK1/AMAT)
+        // paths keep the legacy N=0xFFFF. On NEON the byte-LUT prepass is a measured
+        // ~3% regression (the vqtbl lookup + sign-extend cost more than the cheap
+        // SYM sequence it replaces on Neoverse), so the symmetric path stays on SYM
+        // and every path uses the legacy N=0xFFFF encoding SYM expects.
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        const uint16_t ambRef = (uint16_t)0xFFFF;
+        const uint16_t ambQer = (uint16_t)0xFFFF;
+#else
+        const bool gen_mat16 = bsw_gen_mat_;   // cached in ctor (== per-call value)
         const uint16_t ambRef = gen_mat16 ? (uint16_t)0xFFFF : (uint16_t)AMBIG;
         const uint16_t ambQer = gen_mat16 ? (uint16_t)0xFFFF : (uint16_t)8;
+#endif
 
         int16_t *H1 = H16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
         int16_t *H2 = H16__ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
@@ -4355,8 +4657,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         __m128i oe_ins128 = _mm_set1_epi16(o_ins + e_ins);
         __m128i o_del128  = _mm_set1_epi16(o_del);
         __m128i e_del128  = _mm_set1_epi16(e_del);
-        __m128i eb_ins128 = _mm_set1_epi16(eb - o_ins);
-        __m128i eb_del128 = _mm_set1_epi16(eb - o_del);
         
         int16_t max = 0;
         if (max < w_match) max = w_match;
@@ -4383,12 +4683,16 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 SeqPair sp = pairArray[i + j];
                 h0[j] = sp.h0;
                 seq1 = seqBufRef + (int64_t)sp.idr;
+                if (sp.len1 < 0 || sp.len1 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d is out of range [0, MAX_SEQ_LEN16=%d)", sp.len1, sp.id, MAX_SEQ_LEN16);
+                if (sp.len2 < 0 || sp.len2 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d is out of range [0, MAX_SEQ_LEN16=%d)", sp.len2, sp.id, MAX_SEQ_LEN16);
                 
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG ? ambRef : seq1[k]);
                 }
-                qlen[j] = sp.len2 * max;
+                qlen_scaled[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
             }
 
@@ -4462,25 +4766,29 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             }           
 //------------------------
             uint16_t myband[SIMD_WIDTH16] __attribute__((aligned(64)));
-            uint16_t temp[SIMD_WIDTH16] __attribute__((aligned(64)));
             {
-                __m128i qlen128 = _mm_load_si128((__m128i *) qlen);
-                __m128i sum128 = _mm_add_epi16(qlen128, eb_ins128);
-                _mm_store_si128((__m128i *) temp, sum128);              
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_ins + 1.0;
-                    int max_ins = (int) val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(bsize, max_ins);
-                }
-                sum128 = _mm_add_epi16(qlen128, eb_del128);
-                _mm_store_si128((__m128i *) temp, sum128);              
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_del + 1.0;
-                    int max_ins = (int) val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(myband[l], max_ins);
-                    bsize = bsize < myband[l] ? myband[l] : bsize;                  
+                /* Per-lane band clamp in WIDE arithmetic, mirroring
+                 * scalarBandedSWA's "adjust $w if it is too large" block and the
+                 * 8-bit wrappers' fix. The previous 16-bit form added
+                 * qlen*max_sc + (end_bonus - o) with a 16-bit modular add and read
+                 * the sum back through uint16_t, so a negative or >65535 reach
+                 * wrapped -- silently disabling the clamp and running a far wider
+                 * band than the scalar reference on non-default gap penalties.
+                 * qlen_scaled[l] holds len2*max_sc in a wide int32 slot (the narrow
+                 * uint16_t qlen[] fill overflowed it for long reads), so reach is
+                 * qlen_scaled[l] + end_bonus. Per-batch (SIMD_WIDTH16 lanes), not
+                 * per-cell, so wide math is free. */
+                for (int l = 0; l < SIMD_WIDTH16; l++) {
+                    const int ql    = qlen_scaled[l];
+                    const int reach = ql + eb;
+                    int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
+                    if (max_ins < 1) max_ins = 1;
+                    int max_del = (int)((double)(reach - o_del) / e_del + 1.0);
+                    if (max_del < 1) max_del = 1;
+                    int band = bsize;
+                    if (max_ins < band) band = max_ins;
+                    if (max_del < band) band = max_del;
+                    myband[l] = (uint16_t) band;
                 }
             }
 
@@ -4542,23 +4850,27 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     // overlaid on the symmetric base (SBT_PREPASS16_AMAT). The default aligner
     // matrix is symmetric, so gen_mat is false on the hot path and the kernel
     // uses the original cheap SBT_PREPASS16_SYM — no perf cost when not needed.
-    const bool forced  = bsw_force_generic_matrix();
-    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
-                         || forced;
-    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    // Matrix-derived state (gen_mat / fc / the amat LUT) is cached once in the
+    // constructor (bsw_build_mat_cache): pure functions of the construction-fixed
+    // matrix, so reading the cache is bit-identical to the former per-SIMD-batch
+    // recompute, off the hot path.
+    const bool gen_mat = bsw_gen_mat_;
+    const BswFreedCell fc = bsw_fc_;
     __m128i frref128  = _mm_set1_epi16(fc.ref);
     __m128i frread128 = _mm_set1_epi16(fc.read);
-    int8_t amat_bytes[16] __attribute__((aligned(16)));
-    build_amat16(amat_bytes, this->mat);
-    __m128i amat128 = _mm_load_si128((__m128i *)amat_bytes);
+    __m128i amat128 = _mm_load_si128((__m128i *)bsw_amat_bytes_);
     __m128i three128 = _mm_set1_epi16(3);                    // ACGT mask (base <= 3)
 
-    // PR: 16-byte int8 LUT for the symmetric-path byte-LUT prepass
+    // 16-byte int8 LUT for the x86 symmetric-path byte-LUT prepass
     // (SBT_PREPASS16_LUT128). Reuses build_pmat16 (the 8-bit XOR LUT); the small
     // asymmetric N-encoding (ref-N=4, query-N=8) from getScores16 keeps XOR<=15.
-    int8_t pmat16_bytes[16] __attribute__((aligned(16)));
-    build_pmat16(pmat16_bytes, (int8_t)this->w_match, (int8_t)this->w_mismatch, (int8_t)this->w_ambig);
-    __m128i pmat16_128 = _mm_load_si128((__m128i *)pmat16_bytes);
+    // NEON keeps the SYM prepass (the LUT form regresses there), so this LUT is
+    // built only for the x86 tiers that use it.
+#if !(defined(__ARM_NEON) || defined(__aarch64__))
+    // Same bytes as the ctor-cached bsw_pmat_bytes_ (build_pmat16 over the int8
+    // fields; the casts here were no-ops). Read the cache.
+    __m128i pmat16_128 = _mm_load_si128((__m128i *)bsw_pmat_bytes_);
+#endif
 
     __m128i e_del128    = _mm_set1_epi16(this->e_del);
     __m128i oe_del128   = _mm_set1_epi16(this->o_del + this->e_del);
@@ -4569,7 +4881,9 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     int16_t *H_h    = H16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
     int16_t *H_v = H16__ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
 
-    int16_t i, j;
+    /* int, not int16_t: int16 loop counters cost a sign-extension per iteration
+     * on arm64 (sxth/sbfiz in the cell loop); values are bounded by nrow/ncol. */
+    int i, j;
 
     uint16_t tlen[SIMD_WIDTH16];
     uint16_t tail[SIMD_WIDTH16] __attribute((aligned(64)));
@@ -4664,10 +4978,11 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i cmpt = _mm_cmpeq_epi16(tail128, ptail128);
         // cmph &= cmpt;
         cmph = _mm_and_si128(cmph, cmpt);
-        //__mmask16 cmp_ht = _mm_movepi16_mask(cmph);
-        __mmask16 cmp_ht = _mm_movemask_epi8(cmph) & dmask16;
-        
-        for (int l=beg; l<end && cmp_ht != dmask16; l++)
+        // All 8 sixteen-bit lanes stopped moving? all-lanes-set on a full-width
+        // mask (was _mm_movemask_epi8 & dmask16 == dmask16).
+        bool cmp_ht_all = all_lanes_set8(cmph);
+
+        for (int l=beg; l<end && !cmp_ht_all; l++)
         {
             __m128i h128 = _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH16));
             __m128i f128 = _mm_load_si128((__m128i *)(F + l * SIMD_WIDTH16));
@@ -4675,15 +4990,14 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             __m128i pj128 = _mm_set1_epi16(l);
             __m128i j128 = _mm_set1_epi16(l+1);
             __m128i cmp1 = _mm_cmpgt_epi16(head128, pj128);
-            // uint32_t cval = _mm_movemask_epi16(cmp1);
-            // uint16_t cval = _mm_movepi16_mask(cmp1);
-            uint16_t cval = _mm_movemask_epi8(cmp1) & dmask16;          
-            if (cval == 0x00) break;
+            if (!any_lane_set8(cmp1)) break;
             // __m128i cmp2 = _mm_cmpgt_epi16(pj128, tail128);
             __m128i cmp2 = _mm_cmpgt_epi16(j128, tail128);
             cmp1 = _mm_or_si128(cmp1, cmp2);
-            h128 = _mm_blendv_epi16(h128, zero128, cmp1);
-            f128 = _mm_blendv_epi16(f128, zero128, cmp1);
+            /* cmp1 is a full-width mask (OR of two cmpgt_epi16), so zeroing the
+             * out-of-band lanes is one andnot, not a three-op select. */
+            h128 = _mm_andnot_si128(cmp1, h128);
+            f128 = _mm_andnot_si128(cmp1, f128);
             
             _mm_store_si128((__m128i *)(F + l * SIMD_WIDTH16), f128);
             _mm_store_si128((__m128i *)(H_h + l * SIMD_WIDTH16), h128);
@@ -4713,7 +5027,12 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             for (int jp = beg; jp < end; jp++) {
                 __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH16));
                 __m128i sbt11;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                // NEON: SYM is cheaper than the byte-LUT prepass (see getScores16).
+                SBT_PREPASS16_SYM(s10, s2, sbt11, mismatch128, match128, w_ambig_128, ff128);
+#else
                 SBT_PREPASS16_LUT128(s10, s2, sbt11, pmat16_128);
+#endif
                 _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
             }
         } else if (fc.rank1) {
@@ -4754,14 +5073,15 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             __m128i cmp1 = _mm_cmpgt_epi16(head128, pj128);
             __m128i cmp2 = _mm_cmpgt_epi16(pj128, tail128);
             cmp1 = _mm_or_si128(cmp1, cmp2);
-            h10 = _mm_blendv_epi16(h10, zero128, cmp1);
-            f21 = _mm_blendv_epi16(f21, zero128, cmp1);
+            h10 = _mm_andnot_si128(cmp1, h10);   /* full-width mask: andnot == select-zero */
+            f21 = _mm_andnot_si128(cmp1, f21);
             
-            __m128i bmaxRS = maxRS1;                                        
-            maxRS1 =_mm_max_epi16(maxRS1, h11);                         
-            __m128i cmpA = _mm_cmpgt_epi16(maxRS1, bmaxRS);                 
-            __m128i cmpB =_mm_cmpeq_epi16(maxRS1, h11);                 
-            cmpA = _mm_or_si128(cmpA, cmpB);
+            __m128i bmaxRS = maxRS1;
+            maxRS1 =_mm_max_epi16(maxRS1, h11);
+            // maxRS1 = max_epi16(bmaxRS,h11): cmpgt(maxRS1,bmaxRS) is a strict
+            // subset of cmpeq(maxRS1,h11); the OR was redundant (mirrors the
+            // AVX2 and 128-bit-8 twins). Runs on NEON and x86 SSE4.1.
+            __m128i cmpA = _mm_cmpeq_epi16(maxRS1, h11);
             cmp1 = _mm_cmpgt_epi16(j128, tail128); // change
             cmp1 = _mm_or_si128(cmp1, cmp2);            // change           
             cmpA = _mm_blendv_epi16(y1_128, j128, cmpA);
@@ -4796,7 +5116,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i cmp1 = _mm_cmpgt_epi16(head128, j128);
         __m128i cmp2 = _mm_cmpgt_epi16(j128, tail128);
         cmp1 = _mm_or_si128(cmp1, cmp2);
-        h10 = _mm_blendv_epi16(h10, zero128, cmp1);
+        h10 = _mm_andnot_si128(cmp1, h10);
             
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH16), h10);
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH16), zero128);
@@ -4947,7 +5267,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             tmp = _mm_and_si128(tmp,tmpb);
             l128 = _mm_sub_epi16(l128, one128);
             // NEW
-            index128 = _mm_blendv_epi8(index128, l128, tmp);
+            index128 = blendv_fullmask8(index128, l128, tmp);
 
             tmpb = tmp;
         }
@@ -5034,7 +5354,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 #define SBT_PREPASS8_XOR(s1, s2, sbt11_out, pmat128)                    \
     {                                                                   \
         __m128i xor_ = _mm_xor_si128(s1, s2);                           \
-        sbt11_out = _mm_shuffle_epi8(pmat128, xor_);                    \
+        sbt11_out = shuffle_lut_lowidx8(pmat128, xor_);                    \
     }
 
 // D3 generic-matrix seam (gated on an asymmetric matrix; the default symmetric
@@ -5066,9 +5386,9 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 #define SBT_PREPASS8_RANK1(s1, s2, rowfreed, sbt11_out, pmat128, match128, frread128) \
     {                                                                   \
         __m128i xor_  = _mm_xor_si128(s1, s2);                          \
-        __m128i sbt_  = _mm_shuffle_epi8(pmat128, xor_);                \
+        __m128i sbt_  = shuffle_lut_lowidx8(pmat128, xor_);                \
         __m128i freed_ = _mm_and_si128(rowfreed, _mm_cmpeq_epi8(s2, frread128)); \
-        sbt11_out = _mm_blendv_epi8(sbt_, match128, freed_);            \
+        sbt11_out = blendv_fullmask8(sbt_, match128, freed_);            \
     }
 
 // MAIN_CODE8_CORE_SPLIT runs the cell-update half of MAIN_CODE8 from a score
@@ -5085,7 +5405,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
          * adds_epu8 (no wrap past 255) then subs_epu8 (floors at 0). */       \
         __m128i m11 = _mm_subs_epu8(_mm_adds_epu8(h00, sbt_pos), sbt_neg); \
         __m128i cmp11 = _mm_cmpeq_epi8(h00, zero128);                   \
-        m11 = _mm_blendv_epi8(m11, zero128, cmp11);  /* h00==0 -> local restart */ \
+        m11 = blendv_fullmask8(m11, zero128, cmp11);  /* h00==0 -> local restart */ \
         h11 = _mm_max_epu8(m11, e11);                                   \
         h11 = _mm_max_epu8(h11, f11);                                   \
         /* Gaps open from m11 (bwa-mem2 convention), not h11: m11 does not \
@@ -5151,8 +5471,8 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i cmp1 = _mm_cmpgt_epi8(head128, pj128);                  \
         __m128i cmp2 = _mm_cmpgt_epi8(pj128, tail128);                  \
         cmp1 = _mm_or_si128(cmp1, cmp2);                                \
-        h10 = _mm_blendv_epi8(h10, zero128, cmp1);                      \
-        f21 = _mm_blendv_epi8(f21, zero128, cmp1);                      \
+        h10 = blendv_fullmask8(h10, zero128, cmp1);                     \
+        f21 = blendv_fullmask8(f21, zero128, cmp1);                     \
                                                                         \
         /* got this block out of MAIN_CODE */                           \
         __m128i bmaxRS = maxRS1;                                        \
@@ -5160,9 +5480,9 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);                     \
         cmp1 = _mm_cmpgt_epi8(j128, tail128);                           \
         cmp1 = _mm_or_si128(cmp1, cmp2);                                \
-        cmpA = _mm_blendv_epi8(y1_128, j128, cmpA);                     \
-        y1_128 = _mm_blendv_epi8(cmpA, y1_128, cmp1);                   \
-        maxRS1 = _mm_blendv_epi8(maxRS1, bmaxRS, cmp1);                 \
+        cmpA = blendv_fullmask8(y1_128, j128, cmpA);                    \
+        y1_128 = blendv_fullmask8(cmpA, y1_128, cmp1);                  \
+        maxRS1 = blendv_fullmask8(maxRS1, bmaxRS, cmp1);                \
                                                                         \
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), f21);         \
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);       \
@@ -5175,13 +5495,80 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128)); \
             cmp = _mm_and_si128(cmp, qlen_valid128);                    \
             cmp = _mm_and_si128(cmp, exit0);                            \
-            hqe128   = _mm_blendv_epi8(hqe128, h11, cmp);               \
-            qfire128 = _mm_blendv_epi8(qfire128, ff128, cmp);          \
+            hqe128   = blendv_fullmask8(hqe128, h11, cmp);               \
+            qfire128 = blendv_fullmask8(qfire128, ff128, cmp);          \
+        }                                                               \
+    }
+
+// EXT-13: unmasked fast-regime twin of DP_CELL_BODY8_128. For columns where
+// EVERY active lane is strictly in band -- pj in [max(head), min(tail)) over
+// active lanes -- the band mask (head>pj)|(pj>tail) is provably all-zero, so the
+// two store blends AND the argmax's cmp1 exclusion all fold to identity. This
+// body drops them: it computes the DP cell, updates the row argmax unconditionally
+// (y1_128 <- j128 where h11 is the new max), and stores h10/f21 unmasked. Every
+// other observable -- h/e/f recurrence, the h10=h11 carry, and the gscore
+// query-end capture -- is bit-identical to the masked body. Callers MUST restrict
+// this to [fast_lo, fast_hi) computed from all_lanes_set8(exit0); outside that
+// range the mask is not all-ones and this body would corrupt out-of-band cells.
+// Debug-only (off by default) guard for the three EXT-13 fast bodies. Each is
+// correct only while EVERY lane's pre-increment column pj is in [head, tail): the
+// store mask (head>pj)|(pj>tail) and the argmax's (jpost>tail) exclusion both fold
+// to identity there. That precondition lives only in the fast_lo/fast_hi arithmetic
+// and comments, so a later change to the diagonal-offset band frame would silently
+// corrupt out-of-band H_h/F/maxRS1/y1 (changing score/qle/max_off). Build with
+// `make EXTRA_CXXFLAGS=-DBSW8_ASSERT_ENVELOPE` to trap loudly instead. Same opt-in
+// idiom as the BSW8_ASSERT_ENVELOPE byte-ceiling checks above.
+#ifdef BSW8_ASSERT_ENVELOPE
+#define BSW8_ASSERT_FAST8_128(pjv)                                             \
+    do {                                                                       \
+        __m128i _pj  = (pjv);                                                  \
+        __m128i _msk = _mm_or_si128(_mm_cmpgt_epi8(head128, _pj),              \
+                                    _mm_cmpgt_epi8(_mm_add_epi8(_pj, one128),  \
+                                                   tail128));                  \
+        assert(!any_lane_set8(_msk) &&                                         \
+               "EXT-13: DP_CELL_BODY8_128_FAST ran a column with a non-empty " \
+               "band mask -- fast_lo/fast_hi no longer bound the in-band range"); \
+    } while (0)
+#else
+#define BSW8_ASSERT_FAST8_128(pjv) ((void) 0)
+#endif
+#define DP_CELL_BODY8_128_FAST(sbt_pos, sbt_neg)                        \
+    {                                                                   \
+        __m128i f11, f21;                                               \
+        h00 = _mm_load_si128((__m128i *)(H_h + j * SIMD_WIDTH8));       \
+        f11 = _mm_load_si128((__m128i *)(F + j * SIMD_WIDTH8));         \
+                                                                        \
+        BSW8_ASSERT_FAST8_128(j128);                                    \
+        j128 = _mm_add_epi8(j128, one128);                             \
+                                                                        \
+        MAIN_CODE8_CORE_SPLIT(sbt_pos, sbt_neg, h00, h11, e11, f11, f21, zero128, \
+                              e_ins128, oe_ins128, e_del128, oe_del128); \
+                                                                        \
+        /* Unmasked argmax: cmp1 (out-of-band) is all-zero here, so the masked \
+         * body's `y1_128 = cmp1 ? y1_128 : (cmpA ? j128 : y1_128)` and         \
+         * `maxRS1 = cmp1 ? bmaxRS : maxRS1` reduce to the two lines below. */   \
+        maxRS1 = _mm_max_epu8(maxRS1, h11);                            \
+        __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);                     \
+        y1_128 = blendv_fullmask8(y1_128, j128, cmpA);                  \
+                                                                        \
+        _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), f21);         \
+        _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);       \
+                                                                        \
+        h10 = h11;                                                      \
+                                                                        \
+        if (j >= minq)                                                  \
+        {                                                               \
+            __m128i cmp = _mm_cmpeq_epi8(j128, qlen_off128);            \
+            cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128)); \
+            cmp = _mm_and_si128(cmp, qlen_valid128);                    \
+            cmp = _mm_and_si128(cmp, exit0);                            \
+            hqe128   = blendv_fullmask8(hqe128, h11, cmp);               \
+            qfire128 = blendv_fullmask8(qfire128, ff128, cmp);          \
         }                                                               \
     }
 
 
-// #define PFD 2 // SSE2
+#define PFD 2 // SSE2
 void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint8_t *seqBufRef,
                                   uint8_t *seqBufQer,
@@ -5228,7 +5615,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         fprintf(stderr, "Error! Mem not allocated!!!\n");
         exit(EXIT_FAILURE);
     }
-    
+
     int32_t ii;
     int32_t roundNumPairs = ((numPairs + SIMD_WIDTH8 - 1)/SIMD_WIDTH8 ) * SIMD_WIDTH8;
     // assert(roundNumPairs < BATCH_SIZE * SEEDS_PER_READ);
@@ -5237,6 +5624,20 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        // Zero idr/idq so padded lanes carry the all-tier padding contract: the
+        // per-lane compute loop below still forms seqBufRef+idr / seqBufQer+idq
+        // for padded lanes (i+j reaches up to roundNumPairs-1) even though it
+        // never dereferences them (len1==len2==0). With idr/idq==0 that pointer
+        // is seqBuf+0 (in-bounds), so no lane forms a pointer from an
+        // indeterminate offset. Matches the 512-bit 8-bit and all 16-bit padding
+        // loops. Byte-identical: padded lanes contribute nothing to output.
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
@@ -5259,7 +5660,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         uint8_t *seq1;
         uint8_t *seq2;
         uint8_t h0[SIMD_WIDTH8]   __attribute__((aligned(64)));
-        uint8_t qlen[SIMD_WIDTH8] __attribute__((aligned(64)));
+        int32_t qlen_scaled[SIMD_WIDTH8] __attribute__((aligned(64)));  /* len2*max_sc for the band-clamp reach, in a wide int32 slot (a narrow uint8 slot overflows it for long reads / -A>1). The 8-bit DP kernel takes no qlen[], so unlike the 16-bit tiers there is no narrow companion array here. */
         int32_t bsize = 0;
 
         int8_t *H1 = H8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
@@ -5294,9 +5695,21 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             int maxLen2 = 0;
             //bsize = 100;
             bsize = w;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* The lane-count invariant (SIMD_WIDTH8 == 16) is asserted inside
+             * neon_soa_pack16 itself; see neon_soa_pack.h. */
+            const uint8_t *seq1p[SIMD_WIDTH8], *seq2p[SIMD_WIDTH8];
+            int len1a[SIMD_WIDTH8], len2a[SIMD_WIDTH8];
+#endif
             
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
+                if ((i + j + PFD) < numPairs) { // prefetch only real successors; a padded successor (>= numPairs) is non-existent, so there is no useful line to prefetch
+                    SeqPair spf = pairArray[i + j + PFD];
+                    _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr, _MM_HINT_NTA);
+                    _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr + 64, _MM_HINT_NTA);
+                }
+
                 SeqPair sp = pairArray[i + j];
                 // Seed the H arrays from the raw seed score h0. The 8-bit state is
                 // now a plain unsigned [0,255] absolute score (the re-baseline floor
@@ -5316,15 +5729,29 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
-
+                if (sp.len1 < 0 || sp.len1 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d is out of range [0, MAX_SEQ_LEN8=%d)", sp.len1, sp.id, MAX_SEQ_LEN8);
+                if (sp.len2 < 0 || sp.len2 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d is out of range [0, MAX_SEQ_LEN8=%d)", sp.len2, sp.id, MAX_SEQ_LEN8);
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                seq1p[j] = seq1;
+                len1a[j] = sp.len1;
+#else
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
                 }
-                qlen[j] = sp.len2 * max;
+#endif
+                qlen_scaled[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
             }
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* Tiled 16x16 transpose in place of the strided byte scatter (see
+             * neon_soa_pack.h): bases (N stays 4), then DUMMY1 from len1 through
+             * row maxLen1 inclusive -- byte-for-byte what the scalar loops wrote. */
+            neon_soa_pack16(mySeq1SoA, seq1p, len1a, len1a, maxLen1 + 1, DUMMY1, DUMMY1, false);
+#else
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
                 SeqPair sp = pairArray[i + j];
@@ -5333,6 +5760,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = DUMMY1;
                 }
             }
+#endif
             /* B5: the h0-prefix deletion seed below fully overwrites H2 rows
              * [0, maxLen1); only the boundary row H2[maxLen1] survives to be read
              * as the column edge. Write just that row (all lanes = DUMMY1) here
@@ -5355,17 +5783,32 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 
             for(j = 0; j < SIMD_WIDTH8; j++)
             {               
+                if ((i + j + PFD) < numPairs) { // prefetch only real successors; a padded successor (>= numPairs) is non-existent, so there is no useful line to prefetch
+                    SeqPair spf = pairArray[i + j + PFD];
+                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
+                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
+                }
+
                 SeqPair sp = pairArray[i + j];
                 // seq2 = seqBuf + (2 * (int64_t)sp.id + 1) * MAX_SEQ_LEN;
                 seq2 = seqBufQer + (int64_t)sp.idq;
-                
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                seq2p[j] = seq2;
+                len2a[j] = sp.len2;
+#else
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
                 }
+#endif
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* Query side: bases with N (4) -> 8, then DUMMY2 from len2 through
+             * column maxLen2 inclusive. */
+            neon_soa_pack16(mySeq2SoA, seq2p, len2a, len2a, maxLen2 + 1, DUMMY2, DUMMY2, true);
+#else
             //maxLen2 = ((maxLen2  + 3) >> 2) * 4;
 
             for(j = 0; j < SIMD_WIDTH8; j++)
@@ -5376,6 +5819,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY2;
                 }
             }
+#endif
             /* B5: the h0-prefix insertion seed below fully overwrites H1 rows
              * [0, maxLen2); only the boundary row H1[maxLen2] survives as the row
              * edge (value 0). Write just that row here instead of the dead
@@ -5415,14 +5859,14 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 // explored cells scalar never visits, and returned different gscore/gtle
                 // (the query-end fields) -- for example qlen=10, end_bonus=5, -O16 gives
                 // 10 + 5 - 16 = -1 -> 255. Reachable at bwa's DEFAULT -O6 as soon as
-                // end_bonus is small and the query is short (1 + 0 - 6 < 0). qlen[l]
-                // already holds qlen*max_sc (see the qlen SoA fill), so reach is just
-                // qlen[l] + end_bonus; that scaled reach does not fit int8, and this
+                // end_bonus is small and the query is short (1 + 0 - 6 < 0). qlen_scaled[l]
+                // holds len2*max_sc (see the SoA fill above), so reach is just
+                // qlen_scaled[l] + end_bonus; that scaled reach does not fit int8, and this
                 // loop is per-batch (16 lanes), not per-cell, so there is nothing to
                 // gain by vectorizing it.
                 // Regression: test/unit/test_bandedswa_band_clamp.cpp.
                 for (int l = 0; l < SIMD_WIDTH8; l++) {
-                    const int ql   = (int) qlen[l];
+                    const int ql   = qlen_scaled[l];
                     const int reach = ql + eb;
                     int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
                     if (max_ins < 1) max_ins = 1;
@@ -5489,15 +5933,15 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // LUT (SBT_PREPASS8_XOR, pmat128); an asymmetric matrix (bisulfite OT/OB)
     // uses the target-major LUT amat[(ref<<2)|read] (SBT_PREPASS8_AMAT). gen_mat
     // is false on the hot path, so symmetric scoring keeps its original speed.
-    const bool forced  = bsw_force_generic_matrix();
-    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
-                         || forced;
-    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    // Matrix-derived state (gen_mat / fc / the pmat & amat LUTs) is cached once
+    // in the constructor (bsw_build_mat_cache): all pure functions of the
+    // construction-fixed matrix, so reading the cache here is bit-identical to
+    // the former per-SIMD-batch recompute, off the hot path.
+    const bool gen_mat = bsw_gen_mat_;
+    const BswFreedCell fc = bsw_fc_;
     __m128i frref128  = _mm_set1_epi8(fc.ref);
     __m128i frread128 = _mm_set1_epi8(fc.read);
-    int8_t pmat_bytes[16] __attribute__((aligned(16)));
-    build_pmat16(pmat_bytes, this->w_match, this->w_mismatch, this->w_ambig);
-    __m128i pmat128 = _mm_load_si128((__m128i *)pmat_bytes);
+    __m128i pmat128 = _mm_load_si128((__m128i *)bsw_pmat_bytes_);
     // EXT-11: two per-band split LUTs for the symmetric XOR fast path.
     // sbt_pos = max(sbt,0) and sbt_neg = max(-sbt,0) are an ELEMENTWISE transform
     // of the pmat entries, so transforming the whole 16-byte LUT once per pair and
@@ -5507,9 +5951,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // MAIN_CODE8_CORE split bit-for-bit.
     __m128i pmat_pos128, pmat_neg128;
     SBT_SPLIT8(pmat128, pmat_pos128, pmat_neg128, _mm_setzero_si128());
-    int8_t amat_bytes[16] __attribute__((aligned(16)));
-    build_amat16(amat_bytes, this->mat);
-    __m128i amat128 = _mm_load_si128((__m128i *)amat_bytes);
+    __m128i amat128 = _mm_load_si128((__m128i *)bsw_amat_bytes_);
     __m128i three128 = _mm_set1_epi8(3);                     // N threshold (base > 3)
 
     __m128i e_del128    = _mm_set1_epi8(this->e_del);
@@ -5730,22 +6172,22 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         __m128i cmpt = _mm_cmpeq_epi8(tail128, ptail128);
         // cmph &= cmpt;
         cmph = _mm_and_si128(cmph, cmpt);
-        // __mmask32 cmp_ht = _mm_movemask_epi8(cmph);
-        __mmask16 cmp_ht = _mm_movemask_epi8(cmph);
+        // Loop-invariant "did head & tail both stop moving in every lane?" —
+        // all-lanes-set test on a full-width mask (was _mm_movemask_epi8 != dmask).
+        bool cmp_ht_all = all_lanes_set8(cmph);
 
-        for (int l=beg; l<end && cmp_ht != dmask; l++)
+        for (int l=beg; l<end && !cmp_ht_all; l++)
         {
             __m128i h128 = _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH8));
             __m128i f128 = _mm_load_si128((__m128i *)(F + l * SIMD_WIDTH8));
 
             __m128i pj128 = _mm_set1_epi8(l - i);   // diagonal offset of column l
             __m128i cmp1 = _mm_cmpgt_epi8(head128, pj128);
-            uint32_t cval = _mm_movemask_epi8(cmp1);
-            if (cval == 0x00) break;
+            if (!any_lane_set8(cmp1)) break;
             __m128i cmp2 = _mm_cmpgt_epi8(pj128, tail128);
             cmp1 = _mm_or_si128(cmp1, cmp2);
-            h128 = _mm_blendv_epi8(h128, zero128, cmp1);
-            f128 = _mm_blendv_epi8(f128, zero128, cmp1);
+            h128 = blendv_fullmask8(h128, zero128, cmp1);
+            f128 = blendv_fullmask8(f128, zero128, cmp1);
 
             _mm_store_si128((__m128i *)(F + l * SIMD_WIDTH8), f128);
             _mm_store_si128((__m128i *)(H_h + l * SIMD_WIDTH8), h128);
@@ -5764,7 +6206,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         cmpht = _mm_cmpgt_epi8(head128, tail128);
         cmpim = _mm_or_si128(cmpim, cmpht);
 
-        exit0 = _mm_blendv_epi8(exit0, zero128, cmpim);
+        exit0 = blendv_fullmask8(exit0, zero128, cmpim);
 
         /* Row-invariant part of the gscore query-end gate (see the per-cell block
          * below). Of its four terms, only cmpeq(j128, qlen_off128) varies with j:
@@ -5817,38 +6259,78 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         // s10 nor s2 is mutated by the DP body, so the fused score is identical to
         // the pre-pass score.
         j128 = _mm_set1_epi8(beg - i);   // diagonal offset of first band column
+
+        // EXT-13: unmasked fast-regime bounds. When EVERY lane is active the
+        // band mask (head>pj)|(pj>tail) is empty (all-zero) for columns pj in
+        // [max(head), min(tail)) over the lanes, so the middle sub-loop runs
+        // DP_CELL_BODY8_128_FAST (mask folded away). head128/tail128 are
+        // diagonal offsets (col - i), matching pj, so
+        // the column split is [i+max(head), i+min(tail)). When a lane has finished
+        // (exit0 zero) the all-lanes gate fails and fast_lo == fast_hi == beg, so
+        // the whole band falls through the third (masked) sub-loop -- byte-identical
+        // to the un-split loop. j128 is advanced only inside the cell bodies, so the
+        // three consecutive sub-loops carry it seamlessly. Applied to the 8-bit tiers
+        // only; the parallel 16-bit kernels (smithWaterman*_16) share this band-mask
+        // shape but stay masked as the cold high-score fallback.
+        int fast_lo = beg, fast_hi = beg;
+        if (all_lanes_set8(exit0)) {
+            // Horizontal max(head)/min(tail) over the lanes, run once per row,
+            // via the cross-ISA hmax_epi8 / hmin_epi8 helpers (NEON one-op reduce,
+            // x86 store + scalar fallback).
+            const int maxhead = hmax_epi8(head128);
+            const int mintail = hmin_epi8(tail128);
+            fast_lo = i + maxhead;
+            fast_hi = i + mintail;
+            if (fast_lo < beg) fast_lo = beg;
+            if (fast_lo > end) fast_lo = end;
+            if (fast_hi < fast_lo) fast_hi = fast_lo;
+            if (fast_hi > end) fast_hi = end;
+        }
+
+        // EXT-13 three-way band split, defined once: the masked/unmasked/masked
+        // sub-loops are identical across the three matrix branches -- only the
+        // per-cell score prologue (SBT_PROLOGUE, which declares sbt_pos/sbt_neg)
+        // differs. Parameterising it here keeps the beg->fast_lo->fast_hi->end
+        // traversal in one place so a future change can't drift between branches.
+#define EXT13_RUN_SPLIT8_128(SBT_PROLOGUE) \
+        do { \
+            for (j = beg; j < fast_lo; j++)     { SBT_PROLOGUE DP_CELL_BODY8_128(sbt_pos, sbt_neg); }      \
+            for (j = fast_lo; j < fast_hi; j++) { SBT_PROLOGUE DP_CELL_BODY8_128_FAST(sbt_pos, sbt_neg); } \
+            for (j = fast_hi; j < end; j++)     { SBT_PROLOGUE DP_CELL_BODY8_128(sbt_pos, sbt_neg); }      \
+        } while (0)
         if (!gen_mat) {
-            for (j = beg; j < end; j++) {
-                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8));
-                __m128i xor_ = _mm_xor_si128(s10, s2);
-                __m128i sbt_pos = _mm_shuffle_epi8(pmat_pos128, xor_);
-                __m128i sbt_neg = _mm_shuffle_epi8(pmat_neg128, xor_);
-                DP_CELL_BODY8_128(sbt_pos, sbt_neg);
-            }
+#define EXT13_SBT8_XOR \
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
+                __m128i xor_ = _mm_xor_si128(s10, s2); \
+                __m128i sbt_pos = shuffle_lut_lowidx8(pmat_pos128, xor_); \
+                __m128i sbt_neg = shuffle_lut_lowidx8(pmat_neg128, xor_);
+            EXT13_RUN_SPLIT8_128(EXT13_SBT8_XOR);
+#undef EXT13_SBT8_XOR
         } else if (fc.rank1) {
             __m128i rowfreed = _mm_cmpeq_epi8(s10, frref128);
-            for (j = beg; j < end; j++) {
-                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8));
-                __m128i sbt11;
-                SBT_PREPASS8_RANK1(s10, s2, rowfreed, sbt11, pmat128, match128, frread128);
-                __m128i sbt_pos, sbt_neg;
+#define EXT13_SBT8_RANK1 \
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
+                __m128i sbt11; \
+                SBT_PREPASS8_RANK1(s10, s2, rowfreed, sbt11, pmat128, match128, frread128); \
+                __m128i sbt_pos, sbt_neg; \
                 SBT_SPLIT8(sbt11, sbt_pos, sbt_neg, zero128);
-                DP_CELL_BODY8_128(sbt_pos, sbt_neg);
-            }
+            EXT13_RUN_SPLIT8_128(EXT13_SBT8_RANK1);
+#undef EXT13_SBT8_RANK1
         } else {
-            for (j = beg; j < end; j++) {
-                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8));
-                __m128i sbt11;
-                SBT_PREPASS8_AMAT(s10, s2, sbt11, amat128, w_ambig_128, three128);
-                __m128i sbt_pos, sbt_neg;
+#define EXT13_SBT8_AMAT \
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
+                __m128i sbt11; \
+                SBT_PREPASS8_AMAT(s10, s2, sbt11, amat128, w_ambig_128, three128); \
+                __m128i sbt_pos, sbt_neg; \
                 SBT_SPLIT8(sbt11, sbt_pos, sbt_neg, zero128);
-                DP_CELL_BODY8_128(sbt_pos, sbt_neg);
-            }
+            EXT13_RUN_SPLIT8_128(EXT13_SBT8_AMAT);
+#undef EXT13_SBT8_AMAT
         }
+#undef EXT13_RUN_SPLIT8_128
         __m128i cmp1 = _mm_cmpgt_epi8(head128, j128);
         __m128i cmp2 = _mm_cmpgt_epi8(j128, tail128);
         cmp1 = _mm_or_si128(cmp1, cmp2);
-        h10 = _mm_blendv_epi8(h10, zero128, cmp1);
+        h10 = blendv_fullmask8(h10, zero128, cmp1);
             
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), zero128);
@@ -5884,20 +6366,20 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 __m128i gba = _mm_loadu_si128((const __m128i *)(gbest_abs + base));
                 __m128i ge  = _mm_xor_si128(_mm_cmpgt_epi32(gba, hqeg), ff128); // hqe >= gba
                 __m128i gmask = _mm_and_si128(qfg, ge);
-                gba = _mm_blendv_epi8(gba, hqeg, gmask);
+                gba = blendv_fullmask8(gba, hqeg, gmask);
                 _mm_storeu_si128((__m128i *)(gbest_abs + base), gba);
                 __m128i ierg = _mm_loadu_si128((const __m128i *)(ierow + base));
-                ierg = _mm_blendv_epi8(ierg, _mm_set1_epi32(i + 1), gmask);
+                ierg = blendv_fullmask8(ierg, _mm_set1_epi32(i + 1), gmask);
                 _mm_storeu_si128((__m128i *)(ierow + base), ierg);
             }
             break;
         }
 
         // _mm_store_si128((__m128i *) temp, exit0);
-        exit0 = _mm_blendv_epi8(exit0, zero128,  tmp);
+        exit0 = blendv_fullmask8(exit0, zero128,  tmp);
 
         __m128i score128 = _mm_max_epu8(maxScore128, maxRS1);   // epi8 not present, modif
-        maxScore128 = _mm_blendv_epi8(maxScore128, score128, exit0);
+        maxScore128 = blendv_fullmask8(maxScore128, score128, exit0);
 
         // UNSIGNED >: maxScore128 (post-update, = max_epu8 of old & maxRS1 on
         // alive lanes, else unchanged) is >= bmaxScore128, so (>u) == (!=).
@@ -5905,7 +6387,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         __m128i cmp = _mm_xor_si128(_mm_cmpeq_epi8(maxScore128, bmaxScore128), ff128);
         // y128 (best col) stays a diagonal offset captured in the best row's
         // frame; the best row itself moves to the wide xrow[] side channel.
-        y128 = _mm_blendv_epi8(y128, y1_128, cmp);
+        y128 = blendv_fullmask8(y128, y1_128, cmp);
 
         // max_off = max running diagonal-distance of the row-max from the main
         // diagonal: |y1col - (i+1)| = |y1_off - 1| in the offset frame.
@@ -5915,12 +6397,50 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         tmp = _mm_abs_epi8(y1_minus1);                    // |y1_off - 1|
         __m128i bmax_off128 = max_off128;
         tmp = _mm_max_epu8(max_off128, tmp);  // modif
-        max_off128 = _mm_blendv_epi8(bmax_off128, tmp, cmp);
+        max_off128 = blendv_fullmask8(bmax_off128, tmp, cmp);
 
         // Per-lane wide updates (O(rows)): best-score row (xrow), best-gscore
         // row (ierow), and the z-drop test — all done in wide scalars so row
         // distances that exceed int8 for long reads are handled exactly.
-        {
+        //
+        // Run the block only on rows where some lane can actually change:
+        //   * xrow / best_abs change only where cmp is set (the global max
+        //     advanced this row; best_abs is always >= maxScore128 otherwise,
+        //     so max(best_abs, ms) is the identity);
+        //   * gbest_abs / ierow change only where qfire128 is set;
+        //   * a lane can z-drop only if drop - dif > zdrop with dif >= 0, so
+        //     drop > zdrop is necessary, and drop = maxScore128 - maxRS1 is
+        //     exact in bytes on alive lanes (both are [0,255] under the routing
+        //     envelope). subs_epu8 twice: nonzero iff drop > zdrop. Dead lanes
+        //     may read as "needed" here; the block masks them with exit0 anyway,
+        //     so that only costs a skipped skip.
+        // With the certified adaptive band defaulting to w = 20, a row is ~41
+        // cells and this block (~140 instructions plus its stack round trips)
+        // was roughly a third of it; most rows set none of the three.
+        // Byte-identical: when the gate is clear every store below is a no-op.
+        //
+        // Apple silicon only. The gate is a win there (+1 to +2.5% on the
+        // isolated kernel) but a loss on Neoverse V2 (-0.5 to -1.5%): the per-row
+        // reduction and branch cost more than the block they skip on the minority
+        // of post-peak rows. Other targets run the block on every row, exactly as
+        // before. NOTE: do not gate on APPLE_SILICON here -- simd_compat.h defines
+        // it as 1 for EVERY aarch64/NEON build (it is the codebase-wide NEON
+        // synonym), so it is true on Graviton too and cannot express "Apple only".
+        // __APPLE__ alone is NOT enough either: Intel macOS also defines __APPLE__
+        // but compiles the x86 SSE branch of any_lane_set8, whose _mm_movemask_epi8
+        // tests each byte's high bit only -- so the numeric need_z input (0..255)
+        // ORed into the mask below would mis-read small nonzero bytes (0x01..0x7f)
+        // as unset, wrongly skip the wide z-drop block, and change alignment
+        // fields. Require Apple AND ARM so Intel macOS falls to the safe #else.
+#if defined(__APPLE__) && (defined(__ARM_NEON) || defined(__aarch64__))
+        const __m128i need_z = (zdrop > 0)
+            ? _mm_subs_epu8(_mm_subs_epu8(maxScore128, maxRS1), zdrop128)
+            : zero128;
+        const bool need_wide = any_lane_set8(_mm_or_si128(_mm_or_si128(cmp, qfire128), need_z));
+#else
+        const bool need_wide = true;
+#endif
+        if (need_wide) {
             int8_t  cmp_a[SIMD_WIDTH8]      __attribute((aligned(16)));
             int8_t  y1_a[SIMD_WIDTH8]       __attribute((aligned(16)));
             int8_t  y_a[SIMD_WIDTH8]        __attribute((aligned(16)));
@@ -5965,7 +6485,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 
                 // (1) best-score row: xrow = cmp ? i+1 : xrow
                 __m128i xrg = _mm_loadu_si128((const __m128i *)(xrow + base));
-                xrg = _mm_blendv_epi8(xrg, vip1, cmpg);
+                xrg = blendv_fullmask8(xrg, vip1, cmpg);
                 _mm_storeu_si128((__m128i *)(xrow + base), xrg);
 
                 // (2) best_abs = max(best_abs, (uint8)ms)
@@ -5977,10 +6497,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 __m128i gba = _mm_loadu_si128((const __m128i *)(gbest_abs + base));
                 __m128i ge  = _mm_xor_si128(_mm_cmpgt_epi32(gba, hqeg), ff128); // hqe >= gba
                 __m128i gmask = _mm_and_si128(qfg, ge);
-                gba = _mm_blendv_epi8(gba, hqeg, gmask);
+                gba = blendv_fullmask8(gba, hqeg, gmask);
                 _mm_storeu_si128((__m128i *)(gbest_abs + base), gba);
                 __m128i ierg = _mm_loadu_si128((const __m128i *)(ierow + base));
-                ierg = _mm_blendv_epi8(ierg, vip1, gmask);
+                ierg = blendv_fullmask8(ierg, vip1, gmask);
                 _mm_storeu_si128((__m128i *)(ierow + base), ierg);
 
                 // (4) z-drop (alive lanes): dif = |((i+1)-xr) - (y1c-yc)|,
@@ -6004,7 +6524,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 // z-drop gap term weighted by gap-extend penalty, matching the
                 // scalar reference (drift>0 -> deletion side *e_del, else *e_ins).
                 __m128i zdelta = _mm_sub_epi32(tmpi, tmpj);
-                __m128i zesel  = _mm_blendv_epi8(veins, vedel,
+                __m128i zesel  = blendv_fullmask8(veins, vedel,
                                      _mm_cmpgt_epi32(zdelta, _mm_setzero_si128()));
                 __m128i dif  = _mm_mullo_epi32(_mm_abs_epi32(zdelta), zesel);
                 __m128i drop = _mm_sub_epi32(msg, rsg);
@@ -6015,7 +6535,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             __m128i die01 = _mm_packs_epi32(die_g[0], die_g[1]);
             __m128i die23 = _mm_packs_epi32(die_g[2], die_g[3]);
             __m128i die_bytes = _mm_packs_epi16(die01, die23);
-            exit0 = _mm_andnot_si128(die_bytes, exit0);
+            if (zdrop > 0) exit0 = _mm_andnot_si128(die_bytes, exit0);
         }
 
 #if RDT
@@ -6092,7 +6612,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             tmp = _mm_and_si128(tmp,tmpb);
             l128 = _mm_add_epi8(l128, one128);
             // NEW
-            head128 = _mm_blendv_epi8(head128, l128, tmp);
+            head128 = blendv_fullmask8(head128, l128, tmp);
 
             tmpb = tmp;
         }
@@ -6122,7 +6642,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             tmp = _mm_and_si128(tmp,tmpb);
             l128 = _mm_sub_epi8(l128, one128);
             // NEW
-            index128 = _mm_blendv_epi8(index128, l128, tmp);
+            index128 = blendv_fullmask8(index128, l128, tmp);
 
             tmpb = tmp;
         }

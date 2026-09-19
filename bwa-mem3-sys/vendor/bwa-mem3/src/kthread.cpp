@@ -36,9 +36,6 @@
 #include <string.h>
 #include <stdint.h>
 
-#if AFF && (__linux__)
-extern int affy[256];
-#endif
 
 /* Apple Silicon QoS (Quality of Service) support
  * This helps the scheduler preferentially place compute threads on P-cores
@@ -96,13 +93,9 @@ static inline long steal_work(kt_for_t *t)
 static void ktf_run(ktf_worker_t *w)
 {
 	long i;
-	int tid = w->i;
 	double _c0 = sp_enabled() ? sp_thread_cpu() : 0.0;
 	if (sp_enabled()) sp_encode_reset();
 
-#if AFF && (__linux__)
-	fprintf(stderr, "i: %d, CPU: %d\n", tid , sched_getcpu());
-#endif
 
 	for (;;) {
 		i = __sync_fetch_and_add(&w->i, w->t->n_threads);
@@ -179,7 +172,10 @@ static void kt_pool_init(int n_threads)
 {
 	g_kt_pool.n_threads = n_threads;
 	g_kt_pool.threads = (pthread_t*) malloc(n_threads * sizeof(pthread_t));
-	g_kt_pool.w       = (ktf_worker_t*) malloc(n_threads * sizeof(ktf_worker_t));
+	/* L27: cache-line-aligned so each worker's steal counter sits on its own
+	 * line (sizeof(ktf_worker_t) is padded to 64, so n_threads*sizeof is a
+	 * multiple of 64 as aligned_alloc requires). free() handles it. */
+	g_kt_pool.w       = (ktf_worker_t*) aligned_alloc(64, n_threads * sizeof(ktf_worker_t));
 	if (g_kt_pool.threads == NULL || g_kt_pool.w == NULL) {
 		perror("Allocation of kt_for worker pool failed");
 		exit(EXIT_FAILURE);
@@ -200,12 +196,6 @@ static void kt_pool_init(int n_threads)
 		pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INITIATED, 0);
 #endif
 	for (int i = 0; i < n_threads; ++i) {
-#if AFF && (__linux__)
-		cpu_set_t cpus;
-		CPU_ZERO(&cpus);
-		CPU_SET(affy[i], &cpus);
-		pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpus);
-#endif
 		/* A failed worker would leave kt_for() waiting on cv_done for a
 		 * completion that never arrives (deadlock), so fail loudly instead.
 		 * pthread_create() returns the error code directly rather than via
@@ -277,7 +267,7 @@ void kt_for(void (*func)(void*, int, int, int), void *data, int n)
 	 * pool's worker slots can be read without the lock here. */
 	if (sp_enabled()) {
 		double *busy = (double*) malloc(n_threads * sizeof(double));
-		assert(busy != NULL);
+		xassert(busy != NULL, "out of memory: busy");
 		double sum = 0, esum = 0;
 		for (int i = 0; i < n_threads; ++i) { busy[i] = g_kt_pool.w[i].cpu_busy; sum += busy[i]; esum += g_kt_pool.w[i].encode; }
 		g_ktfor.proc_cpu += sum;                        /* accumulate across kt_for calls in a step */

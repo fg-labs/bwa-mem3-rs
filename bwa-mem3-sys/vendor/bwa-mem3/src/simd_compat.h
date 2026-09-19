@@ -32,10 +32,14 @@
 #define SIMD_COMPAT_H
 
 /*
- * Platform detection and SIMD abstraction layer
+ * ARM/sse2neon compatibility shim -- ARM targets ONLY.
  *
- * On x86: Use native SSE/AVX intrinsics via immintrin.h
- * On ARM: Use sse2neon for SSE->NEON translation, plus native NEON for hot paths
+ * This header is the sse2neon-based SSE->NEON translation layer plus the
+ * native-NEON hot-path helper (_mm_movemask_epi16). It is NOT a cross-tier SIMD
+ * abstraction: every
+ * consumer includes it only under `#if defined(__ARM_NEON) || defined(__aarch64__)`,
+ * so on x86 it is never seen and x86 uses <immintrin.h> directly. The `#else`
+ * guard below enforces that invariant -- do not add x86/AVX/SSE branches here.
  */
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
@@ -53,8 +57,13 @@
     #define SIMD_WIDTH16 8   /* 128-bit / 16-bit = 8 elements */
     #endif
 
-    /* Memory allocation compatibility */
+    /* Memory allocation compatibility.
+     * Default cache-line size is 128 (Apple Silicon). A build targeting a
+     * 64-byte-line ARM core (e.g. Graviton4 / Neoverse V2) overrides this on the
+     * command line via -DCACHE_LINE_BYTES=64; the guard lets that value win. */
+    #ifndef CACHE_LINE_BYTES
     #define CACHE_LINE_BYTES 128  /* Apple Silicon uses 128-byte cache lines */
+    #endif
 
     static inline void* _mm_malloc_compat(size_t size, size_t align) {
         void* ptr = NULL;
@@ -143,53 +152,12 @@
         return (int)vaddv_u8(vand_u8(narrow, bit_mask));
     }
 
-    /*
-     * Optimized blendv for 16-bit elements using NEON vbsl (bitwise select).
-     * This is more efficient than sse2neon's _mm_blendv_epi8 for 16-bit data.
-     */
-    static inline __m128i _mm_blendv_epi16_fast(__m128i x, __m128i y, __m128i mask) {
-        /* Use vbsl: select y where mask bits are 1, else x */
-        return vreinterpretq_m128i_s16(
-            vbslq_s16(vreinterpretq_u16_m128i(mask),
-                      vreinterpretq_s16_m128i(y),
-                      vreinterpretq_s16_m128i(x)));
-    }
-
-#elif defined(__AVX512BW__)
-    /* x86 with AVX-512 */
-    #include <immintrin.h>
-    #define CACHE_LINE_BYTES 64
-
-#elif defined(__AVX2__)
-    /* x86 with AVX2 */
-    #include <immintrin.h>
-    #define CACHE_LINE_BYTES 64
-
-#elif defined(__SSE4_1__) || defined(__SSE2__)
-    /* x86 with SSE */
-    #include <smmintrin.h>
-    #include <emmintrin.h>
-    #define CACHE_LINE_BYTES 64
-    #ifndef __mmask8
-    typedef uint8_t __mmask8;
-    #endif
-    #ifndef __mmask16
-    typedef uint16_t __mmask16;
-    #endif
-
 #else
-    /* Scalar fallback */
-    #define CACHE_LINE_BYTES 64
-    #warning "No SIMD support detected, using scalar code paths"
-#endif
-
-/* Cross-platform aligned allocation macro */
-#ifdef APPLE_SILICON
-    #define SIMD_ALIGNED_ALLOC(size, align) _mm_malloc_compat(size, (align) < 128 ? 128 : (align))
-    #define SIMD_ALIGNED_FREE(ptr) free(ptr)
-#else
-    #define SIMD_ALIGNED_ALLOC(size, align) _mm_malloc(size, align)
-    #define SIMD_ALIGNED_FREE(ptr) _mm_free(ptr)
+    /* This header is the ARM/sse2neon compatibility shim only. It must never be
+     * compiled on a non-ARM target: on x86 the consumers include <immintrin.h>
+     * directly and never reach this header. A non-ARM include here means a guard
+     * regressed -- fail loudly rather than silently first-activating dead code. */
+    #error "simd_compat.h is ARM-only; include it under #if defined(__ARM_NEON) || defined(__aarch64__)"
 #endif
 
 #endif /* SIMD_COMPAT_H */

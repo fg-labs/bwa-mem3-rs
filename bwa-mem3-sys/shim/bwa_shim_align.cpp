@@ -903,8 +903,8 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
      * coordinates is what keeps the pair adjacent under coordinate sort, which
      * most downstream tools rely on.
      *
-     * 0x4/0x8 are deliberately NOT recomputed here. pair_and_emit already set
-     * them from the ORIGINAL rids, which matches upstream's ordering: it
+     * 0x4/0x8 are deliberately NOT recomputed here. The pair resolve already
+     * set them from the ORIGINAL rids, which matches upstream's ordering: it
      * derives those two before the copy and 0x10/0x20 after it. */
     int32_t eff_rid    = p->rid;
     int64_t eff_pos    = p->pos;
@@ -1105,8 +1105,8 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     uint16_t nc = (uint16_t) n_cigar;
     memcpy(w, &nc, 2); w += 2;
 
-    /* The packed FLAG is 16 bits, but pair_and_emit marks MEM_F_NO_MULTI split
-     * hits with upstream's internal 0x10000 (bit 16). Remap it to the BAM
+    /* The packed FLAG is 16 bits, but the pair resolve marks MEM_F_NO_MULTI
+     * split hits with upstream's internal 0x10000 (bit 16). Remap it to the BAM
      * secondary bit 0x100 here, exactly as mem_aln2sam does at write time.
      * Keeping the marker at 0x10000 internally (not 0x100) is deliberate: it
      * lets emit_sa_tag still list NO_MULTI splits in SA:Z (its skip test is
@@ -1114,7 +1114,7 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     /* 0x10/0x20 are recomputed from the POST-copy strands (upstream derives
      * them after the rewrite above), so an unmapped record placed at its
      * mate's coordinates inherits that mate's strand. Clearing first matters:
-     * pair_and_emit set them from the raw values. */
+     * the pair resolve set them from the raw values. */
     uint32_t flag_raw = (p->flag & ~(uint32_t)(0x10 | 0x20));
     if (eff_is_rev)       flag_raw |= 0x10;
     if (m && mate_is_rev) flag_raw |= 0x20;
@@ -1311,20 +1311,14 @@ void shim_seeds_free(ShimSeeds *s) {
 
 /* ------------------ Phase 3: cohort pestat + pair/emit ------------------ */
 
-/* Defined below (just before shim_extend_batch); forward-declared so
- * shim_pair_emit can drive it. */
-static void pair_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
-                          const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                          bseq1_t *s, mem_alnreg_v *a, const mem_pestat_t pes[4]);
-
 /* Defined after emit_resolved_pair; forward-declared so shim_pair_emit can
  * drive it after the pair loop. */
 static void single_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
                             const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                             bseq1_t *s, mem_alnreg_v *a);
 
-/* Defined below (with pair_resolve_scalar); forward-declared so the batched
- * mate-rescue path in shim_pair_emit can emit each resolved pair. */
+/* Defined below; forward-declared so the batched mate-rescue path in
+ * shim_pair_emit can emit each resolved pair. */
 static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
                                const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                                bseq1_t *s, mem_alnreg_v *a, const mem_pestat_t pes[4],
@@ -1384,8 +1378,12 @@ int shim_pair_emit(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc, Shi
 
     mem_opt_t opt_pe = *opts; opt_pe.n_threads = 1; opt_pe.flag |= MEM_F_PE;
     ShimEmit e = { sc, sink, ctx, 0u /* BWA_ORIGIN_PAIR */ };
-#if BWAMEM_BATCHED_MATESW
-    /* The CLI's worker_sam path on AVX2/AVX-512/NEON (bwamem.cpp:2826-2879):
+    /* Batched mate rescue is the only mate-rescue path upstream ships: the
+     * scalar mem_sam_pe / mem_pair_resolve pairing path (and the
+     * BWAMEM_BATCHED_MATESW / DISABLE_BATCHED_MATESW gate) were removed in
+     * fg-labs/bwa-mem3#513, which requires AVX2+ on x86 (NEON on arm).
+     *
+     * The CLI's worker_sam path on AVX2/AVX-512/NEON (bwamem.cpp:2826-2879):
      * gather every pair's rescue jobs, run them through the SIMD kswv kernel
      * once, then resolve + emit per pair. tid = 0: one ShimScratch per thread. */
     if (r->n_pairs > 0) {
@@ -1438,11 +1436,6 @@ int shim_pair_emit(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc, Shi
             _mm_free(aln);
         }
     }
-#else
-    for (size_t i = 0; i < r->n_pairs; ++i)
-        pair_and_emit(&e, i, ids.first_pair_id + (uint64_t)i,
-                      &opt_pe, bns, pac, r->seqs + 2*i, r->regs + 2*i, pestat);
-#endif
     /* Singles after pairs: SE group emitted with MEM_F_PE cleared, ids from
      * first_single_id, one origin_idx per single (index into batch->singles).
      * BWA_ORIGIN_SINGLE (1) distinguishes them from pairs at the sink. */
@@ -1482,26 +1475,11 @@ static ShimAlignOutput *alloc_align_output(size_t n_pairs) {
     return out;
 }
 
-/* Resolve half of the former pair_and_emit: run upstream's full pairing
- * decision (mate-rescue SW + mem_mark_primary_se + optional MEM_F_PRIMARY5
- * reorder + mem_pair + is_multi + q_pe/q_se + secondary<->primary switch),
- * writing the resolved indices/flags into the out-params. Split out so Task 10
- * can swap the scalar resolve for the batched one. On the paired branch
- * extra_flag already includes 0x2 (if the paired alignment was preferred); on
- * the no_pairing branch the emit half ORs it in after running mem_infer_dir
- * itself, matching mem_sam_pe's no_pairing block. */
-static void pair_resolve_scalar(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                                const mem_pestat_t pes[4], uint64_t id,
-                                bseq1_t s[2], mem_alnreg_v a[2],
-                                int n_pri[2], int z[2], int q_se[2],
-                                int *extra_flag, int *paired)
-{
-    *extra_flag = 0; *paired = 0;
-    mem_pair_resolve(opt, bns, pac, pes, id, s, a, n_pri, z, q_se, extra_flag, paired);
-}
-
-/* Emission half of the former pair_and_emit: everything after mem_pair_resolve.
- * Split out so Task 10 can swap the scalar resolve for the batched one. */
+/* Emission half of a resolved pair: everything after the pair resolve
+ * (mem_pair_resolve_batch_post) has decided primaries/flags. On the paired
+ * branch extra_flag already includes 0x2 (if the paired alignment was
+ * preferred); on the no_pairing branch this half ORs it in after running
+ * mem_infer_dir itself, matching mem_sam_pe's no_pairing block. */
 static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
                                const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                                bseq1_t *s, mem_alnreg_v *a, const mem_pestat_t pes[4],
@@ -1569,7 +1547,7 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
     /* Convert each side's regions to mem_aln_t arrays for emission and mark
      * which ones actually get emitted, mirroring mem_reg2sam: secondary
      * alignments are folded into the primary's XA:Z tag (via mem_gen_alt, which
-     * requires the mem_mark_primary_se that mem_pair_resolve ran) rather than
+     * requires the mem_mark_primary_se that mem_pair_resolve_batch_post ran) rather than
      * emitted as their own records, and sub-threshold regions are dropped.
      * Without this the shim emits every surviving alnreg — over-emitting
      * secondaries on multi-mapping reads (including --meth's collapsed-scoring
@@ -1627,7 +1605,7 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
             if (e && ar->secondary >= 0 && ar->secondary < INT_MAX
                 && ar->score < a[k].a[ar->secondary].score * opt->drop_ratio)
                 e = false;
-            /* Paired branch, z[k] != 0: mem_pair_resolve promoted the
+            /* Paired branch, z[k] != 0: mem_pair_resolve_batch_post promoted the
              * paired-selected region a[k].a[z[k]] (secondary set to -2) and ran
              * the secondary_all switch, which reassigns the old SE-primary
              * (region 0) to z[k]'s group — leaving it with secondary < 0 but
@@ -1693,7 +1671,7 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
     }
 
     /* No-pairing branch 0x2 decision (mirrors mem_sam_pe's post-resolve block):
-     * when mem_pair_resolve didn't take the paired branch, decide the
+     * when mem_pair_resolve_batch_post didn't take the paired branch, decide the
      * proper-pair bit from the two sides' regions.
      *
      * v0.9.0 factored this out of mem_sam_pe into mem_proper_pair_extra_flag
@@ -1768,7 +1746,7 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
      * primary of the other side (z[!k] on the paired branch, 0 otherwise —
      * matching bwamem_pair.cpp:545-556's use of &a[!i].a[z[!i]] as the mate
      * anchor). Without this the paired branch would use lists[!k][0] even when
-     * mem_pair_resolve picked a non-zero primary, driving RNEXT/PNEXT/TLEN/MC
+     * mem_pair_resolve_batch_post picked a non-zero primary, driving RNEXT/PNEXT/TLEN/MC
      * off the wrong mate alignment. */
     for (int k = 0; k < 2; ++k) {
         int mate_idx = 0;
@@ -1848,19 +1826,6 @@ static void single_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
     free(aa);
     if (XA) { for (int k = 0; k < (int)a->n; ++k) free(XA[k]); free(XA); }
     free(HN);
-}
-
-/* One pair: resolve then emit. `id` is the GLOBAL pair ordinal
- * ((n_processed >> 1) + pos in worker_sam, bwamem.cpp:2819); it seeds the
- * hash_64 tie-breaks in mem_mark_primary_se / mem_pair, so a different id can
- * legitimately pick a different primary among equal-score hits. */
-static void pair_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
-                          const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                          bseq1_t *s, mem_alnreg_v *a, const mem_pestat_t pes[4])
-{
-    int n_pri[2], z[2], q_se[2], extra_flag, paired;
-    pair_resolve_scalar(opt, bns, pac, pes, id, s, a, n_pri, z, q_se, &extra_flag, &paired);
-    emit_resolved_pair(e, origin_idx, opt, bns, pac, s, a, pes, n_pri, z, q_se, extra_flag, paired);
 }
 
 /* Legacy emit half: per-batch pestat + pair/emit into a ShimAlignOutput, over a

@@ -53,7 +53,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define BWA_PA_TEXT_MAX 20
 
 typedef struct {
-	// bwt2_t   *bwt2;
 	bwt_t    *bwt; // FM-index
 	bntseq_t *bns; // information on the reference sequences
 	uint8_t  *pac; // the actual 2-bit encoded reference sequences with 'N' converted to a random base
@@ -150,22 +149,17 @@ extern "C" {
 	 * and not worth building. Pass 1 only to emit it for an external consumer
 	 * that still requires the unpacked file (e.g. bwa-mem2). `int` (not bool)
 	 * and a C++-only default keep this declaration valid C: bwa.h is inside
-	 * extern "C" and is transitively included by fast_reader_bseq.c. */
+	 * extern "C" and is transitively included by fast_reader_bseq.c.
+	 *
+	 * sa_compx=3 (the default) reproduces the historical SA sample rate
+	 * (1/8) byte-for-byte; `bwa-mem3 index -u INT` overrides it, validated
+	 * to [0,6] by the CLI before it reaches here. */
 #ifdef __cplusplus
-	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref = 0);
+	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref = 0, int sa_compx = 3);
 #else
-	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref);
+	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref, int sa_compx);
 #endif
 
-	char *bwa_idx_infer_prefix(const char *hint);
-	bwt_t *bwa_idx_load_bwt(const char *hint);
-	bwt2_t *bwa_idx_load_bwt2(const char *hint);
-	
-	bwaidx_t *bwa_idx_load_from_shm(const char *hint);
-	bwaidx_t *bwa_idx_load_from_disk(const char *hint, int which);
-	bwaidx_t *bwa_idx_load(const char *hint, int which);
-	
-	void bwa_idx_destroy(bwaidx_t *idx);
 	/* `compat` selects the output-compatibility target whose @HD policy the
 	 * header follows; NULL means COMPAT_TARGET_OFF (bwa-mem3's native output).
 	 * It shapes only the default @HD -- a user's -H or the index sidecar still

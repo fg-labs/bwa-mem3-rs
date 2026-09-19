@@ -59,6 +59,14 @@ typedef struct {
  * blocks that name it still type-check; defined unconditionally in stage_prof.cpp. */
 extern __thread prof_chunk_t g_ktfor;
 
+/* sp_read_add() sub-stage buckets. Declared unconditionally (outside STAGE_PROF)
+ * so call sites name them in both the instrumented and no-op builds. */
+enum {
+    SP_READ_DISKWAIT   = 0,   /* time blocked on the underlying read()    */
+    SP_READ_DECOMPRESS = 1,   /* time in gzip inflate / BGZF block decode */
+    SP_READ_PARSE      = 2,   /* time tokenizing records into bseq1_t     */
+};
+
 #ifdef STAGE_PROF
 
 /* The on/off flag is exposed so sp_enabled() is a header inline: when --profile
@@ -80,15 +88,22 @@ double sp_run_elapsed(void);   /* sp_wall() - run-start anchor (for chunk_start)
 
 void   sp_chunk_init(prof_chunk_t *c);
 void   sp_add_chunk(const prof_chunk_t *c);
+/* Test-only fault-injection seam: arm the next `n` chunk-buffer growths in
+ * sp_add_chunk to behave as if realloc returned NULL, so the out-of-memory
+ * drop-and-count path (g_n_dropped plus the "report is incomplete" diagnostic)
+ * can be exercised deterministically without depending on host OOM. Present only
+ * in STAGE_PROF builds; the aligner never calls it. */
+void   sp_test_arm_realloc_fail(int n);
 /* Accumulate pipeline-worker idle seconds, attributed to the step it was about
  * to run (0=read 1=process 2=write); also adds to the total. */
 void   sp_add_idle(int next_step, double seconds);
 void   sp_thread_stats(prof_chunk_t *c, const double *busy, int n);
 void   sp_finish(double total_wall, double mean_cores_busy, double peak_rss_mb);
 
-/* Per-thread read-stage accumulators (the step-0 worker owns these). which:
- * 0=diskwait 1=decompress 2=parse. sp_read_bytes() adds fd/compressed bytes and
- * BGZF block counts harvested via sp_read_get_bytes(). */
+/* Per-thread read-stage accumulators (the step-0 worker owns these).
+ * sp_read_add()'s `which` selects the sub-stage bucket (see SP_READ_* above);
+ * sp_read_bytes() adds fd/compressed bytes and BGZF block counts harvested via
+ * sp_read_get_bytes(). */
 void   sp_read_reset(void);
 void   sp_read_add(int which, double seconds);
 void   sp_read_get(double *diskwait, double *decompress, double *parse);

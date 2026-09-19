@@ -32,7 +32,8 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
                               const char *idx_hdr_lines,
                               const char *hdr_line, const char *bwa_pg,
                               int compression_level,
-                              const compat_target_t *compat)
+                              const compat_target_t *compat,
+                              int n_bgzf_threads)
 {
     if (path == NULL || bns == NULL) return NULL;
     if (compat == NULL) compat = &COMPAT_TARGET_OFF;
@@ -118,9 +119,11 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
             /* The n + 2 bound above is derived from bwa_hdr_next_line never
              * yielding a phantom empty final record. Pin that derivation here:
              * if the iterator's trailing-newline handling ever changes, this
-             * trips in a debug/ASAN build instead of silently overflowing the
-             * buffer by one byte again. */
-            assert(w <= n + 1);
+             * aborts (xassert is live in every build -- NDEBUG is never defined)
+             * instead of silently overflowing the buffer by one byte again.
+             * (Post-hoc detection; a per-line pre-write bound check would be the
+             * fuller fix.) */
+            xassert(w <= n + 1, "bam_writer: header filter overran its buffer");
             filtered[w] = '\0';
             to_add = filtered;
         }
@@ -140,6 +143,18 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
         snprintf(mode, sizeof(mode), "wb%d", compression_level);
         htsFile *fp = hts_open(path, mode);
         if (fp == NULL) goto fail;
+        /* Attach a BGZF compression thread pool. htslib's ordered tpool
+         * emits blocks in dispatch order, so the compressed byte stream is
+         * identical to the serial path (the same guarantee `samtools -@`
+         * relies on) -- only the per-block deflate moves off the writer
+         * thread. Non-fatal if it fails; the writer stays serial, but warn so
+         * the user knows --bam-threads was not applied. */
+        if (n_bgzf_threads > 0 && hts_set_threads(fp, n_bgzf_threads) < 0)
+            fprintf(stderr,
+                    "WARNING: --bam-threads %d could not be applied (htslib "
+                    "thread-pool setup failed); compressing BGZF on the single "
+                    "writer thread.\n",
+                    n_bgzf_threads);
         if (sam_hdr_write(fp, hdr) < 0) { hts_close(fp); goto fail; }
         bam_writer_t *w = (bam_writer_t *)calloc(1, sizeof(*w));
         if (w == NULL) { hts_close(fp); goto fail; }
@@ -283,12 +298,18 @@ int mem_aln_to_bam(struct bam1_t *b,
     /* Remap primary CIGAR: bwa-mem3 ops -> BAM ops, + soft->hard for supp */
     uint32_t *bam_cigar = NULL;
     size_t    bam_n_cigar = 0;
+    int64_t   p_rlen = 0;   /* F3: primary ref-consumed length, folded from the
+                             * remap loop below to avoid a second CIGAR walk for
+                             * TLEN. Read op (0=M,2=D) BEFORE the soft->hard remap
+                             * (which only touches 3/4), so the M/D sum matches
+                             * cigar_ref_len_mem(p.cigar, p.n_cigar) exactly. */
     if (p.n_cigar > 0) {
         bam_cigar = bs.ensure_cigar((size_t)p.n_cigar);
         if (bam_cigar == NULL) return -1;
         for (int i = 0; i < p.n_cigar; ++i) {
             int op  = p.cigar[i] & 0xf;
             int len = p.cigar[i] >> 4;
+            if (op == 0 || op == 2) p_rlen += len;
             if (!(opt->flag & MEM_F_SOFTCLIP) && !p.is_alt && (op == 3 || op == 4))
                 op = which ? 4 : 3;
             uint32_t bam_op = (op >= 0 && op < 5) ? BAM_OP_FROM_MEM[op] : 0;
@@ -300,8 +321,8 @@ int mem_aln_to_bam(struct bam1_t *b,
     hts_pos_t tlen = 0;
     if (mp && mp->rid >= 0 && p.rid == mp->rid && p.n_cigar > 0 && m.n_cigar > 0) {
         /* TLEN uses ref-consumed lengths. bwa-mem3 and BAM both encode
-         * M=0, D=2, so we can count directly on the pre-remap CIGARs. */
-        int64_t p_rlen = cigar_ref_len_mem(p.cigar, p.n_cigar);
+         * M=0, D=2, so we can count directly on the pre-remap CIGARs.
+         * p_rlen was accumulated in the remap loop above (F3). */
         int64_t m_rlen = cigar_ref_len_mem(m.cigar, m.n_cigar);
         int64_t p0 = p.pos + (p.is_rev ? p_rlen - 1 : 0);
         int64_t p1 = m.pos + (m.is_rev ? m_rlen - 1 : 0);

@@ -460,7 +460,7 @@ fn run_shim_keys(
 }
 
 /// Regression guard for the batched mate-rescue chunking (finding [1]):
-/// `shim_pair_emit`'s `BWAMEM_BATCHED_MATESW` path now processes the batch's
+/// `shim_pair_emit`'s batched mate-rescue path processes the batch's
 /// pairs in `BATCH_SIZE`-sized chunks, resetting the kswv `pcnt`/`gcnt`/ref-window
 /// offset per chunk exactly like the CLI's `kt_for`-dispatched `worker_sam` — so
 /// the int32 `SeqPair.idr` seqBuf offset can never run past 2^31 and trip
@@ -479,13 +479,12 @@ fn run_shim_keys(
 /// pass vacuously). `-K` is large enough to keep the CLI in one `-K` cohort, so
 /// its pestat matches the shim's single-cohort estimate.
 ///
-/// This is also the batched-vs-scalar mate-rescue divergence guard (finding
-/// [19]): CI runs this exact target twice -- once in the default BATCHED build
-/// and once with `CXXFLAGS=-DDISABLE_BATCHED_MATESW=1` (the scalar A/B step in
-/// `.github/workflows/check.yml`). The batched run asserts `batched == CLI` and
-/// the scalar run asserts `scalar == CLI` on this same rescue-firing fixture, so
-/// transitively `batched == scalar` where rescue actually fires -- no separate
-/// batched-vs-scalar test is needed.
+/// The batched SIMD kswv kernel is the only mate-rescue path upstream ships:
+/// fg-labs/bwa-mem3#513 removed the scalar mate-rescue path (and the
+/// BWAMEM_BATCHED_MATESW / DISABLE_BATCHED_MATESW gate) and requires AVX2+ on
+/// x86 (NEON on arm), so there is no scalar variant to A/B against -- this
+/// asserts `batched == CLI` on a rescue-firing, multi-chunk fixture, which is
+/// the whole guard.
 #[test]
 fn batched_rescue_spanning_multiple_chunks_matches_bwa_mem3_cli() {
     let Some(bwa) = bwa_bin() else {

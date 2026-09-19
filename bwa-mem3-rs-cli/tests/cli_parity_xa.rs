@@ -1,5 +1,5 @@
 //! Non-meth CLI-parity over a MULTI-MAPPING reference — pins the shim's
-//! `XA:Z` folding (`pair_and_emit` mirrors upstream `mem_reg2sam`).
+//! `XA:Z` folding (`emit_resolved_pair` mirrors upstream `mem_reg2sam`).
 //!
 //! The reference embeds one 160 bp motif twice, so reads drawn from it map to
 //! both copies. Upstream folds the second hit into the primary's `XA:Z` tag

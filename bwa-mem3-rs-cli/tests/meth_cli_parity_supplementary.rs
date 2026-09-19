@@ -164,7 +164,7 @@ fn meth_cli_parity_supplementary_is_hard_clipped() {
     //
     // Selected on 0x900, not 0x800: under --meth the CLI marks the split arm
     // SECONDARY (0x100) rather than supplementary. That is the MEM_F_NO_MULTI
-    // path -- `pair_and_emit` tags the region with upstream's internal 0x10000
+    // path -- `emit_resolved_pair` tags the region with upstream's internal 0x10000
     // and `append_bam_record` remaps it to 0x100 on write (see the comment at
     // bwa_shim_align.cpp's FLAG packing, and CLAUDE.md gotcha #12). The record
     // still goes through `which != 0`, so it is hard-clipped and trimmed

@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -114,6 +117,31 @@ jobs:
       # those, but the upstream Makefile does — so for the e2e build we
       # clone fresh at the same SHA with all submodules.
       # TODO: switch back to `bioconda::bwa-mem3` once published.
+      - name: Install clang-19 (verified LLVM apt repo)
+        # The vendored bwa-mem3 Makefile requires clang >= 19 / gcc >= 15 (the
+        # runner ships gcc 13), and clang's -fopenmp (libsais LIBSAIS_OPENMP)
+        # needs libomp. Install from apt.llvm.org via a pinned repo whose signing
+        # key is fingerprint-verified before use -- not `llvm.sh | sudo bash` --
+        # so a tampered mirror or installer can't run code as root (CWE-494).
+        # Mirrors fg-labs/bwa-mem3's release.yml.
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
+          expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ "$got_fpr" != "$expected_fpr" ]; then
+            echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
+            exit 1
+          fi
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
+          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-19.list
+          sudo apt-get update
+          sudo apt-get install -y clang-19 libomp-19-dev
+          clang++-19 --version | head -1
       - name: Build bwa-mem3 from upstream at vendored COMMIT
         run: |
           set -euo pipefail
@@ -127,9 +155,11 @@ jobs:
           git -C /tmp/bwa-mem3 fetch --filter=blob:none --no-tags --depth=1 origin "$sha"
           git -C /tmp/bwa-mem3 checkout FETCH_HEAD
           git -C /tmp/bwa-mem3 submodule update --init --recursive --depth 1
-          # Single-arch build: PhiX e2e doesn't need the multi-SIMD
-          # launcher (which compiles 5 variants).
-          make -C /tmp/bwa-mem3 arch=sse41 -j"$(nproc)" all
+          # Single-arch build: PhiX e2e doesn't need the multi-SIMD launcher.
+          # arch=avx2 (the x86 default): fg-labs/bwa-mem3#513 retired the
+          # pre-AVX2 tiers (sse41/sse42/avx). clang-19 satisfies the Makefile's
+          # clang>=19 / gcc>=15 compiler floor.
+          make -C /tmp/bwa-mem3 arch=avx2 CXX=clang++-19 CC=clang-19 -j"$(nproc)" all
           echo "BWA_MEM3_BIN=/tmp/bwa-mem3/bwa-mem3" >> "$GITHUB_ENV"
       # All bwa-mem3-rs-cli targets, not just --test e2e: the byte-parity
       # targets (cli_parity_xa, cli_parity_pair_select, meth_e2e,
@@ -139,8 +169,9 @@ jobs:
       # BWA_MEM3_RS_REQUIRE_TOOLS makes a missing tool fail rather than skip,
       # so this job cannot silently degrade into a no-op. Also runs
       # bwa-mem3-sys itself (three_phase_ffi, three_phase_cli_parity) so the
-      # sys crate's own FFI/parity tests are validated against the real CLI
-      # in this default BATCHED config, not only in the scalar A/B run below.
+      # sys crate's own FFI/parity tests are validated against the real CLI in
+      # the batched mate-rescue config -- the only mate-rescue path upstream
+      # ships since fg-labs/bwa-mem3#513 removed the scalar path.
       # bwa-mem3-rs is included too: its wrapper-level three-phase tests
       # (byte identity, cross-thread Send, panic-across-FFI-unwind) build a
       # small PhiX index at test time and so run here where bwa-mem3 is on
@@ -156,18 +187,8 @@ jobs:
         env:
           BWA_MEM3_RS_REQUIRE_TOOLS: "1"
         run: cargo test -p bwa-mem3-sys -p bwa-mem3-rs -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
-      # A/B: the run above exercises the shim's BATCHED mate-rescue path (the
-      # AVX2 baseline on ubuntu-latest x86_64 sets BWAMEM_BATCHED_MATESW=1); this
-      # second run forces the shim's SCALAR path so both are checked against the
-      # reference CLI every time. Both must be byte-identical to the CLI (gotcha
-      # #18). cargo clean -p bwa-mem3-sys forces build.rs to recompile the shim
-      # (and the vendored TUs) with the new CXXFLAGS. Re-runs bwa-mem3-sys's own
-      # FFI/parity tests (three_phase_ffi, three_phase_cli_parity) too, this time
-      # in scalar mode, mirroring the batched run above.
-      - name: Run CLI test suite with the shim's scalar mate rescue (A/B)
-        env:
-          BWA_MEM3_RS_REQUIRE_TOOLS: "1"
-          CXXFLAGS: "-DDISABLE_BATCHED_MATESW=1"
-        run: |
-          cargo clean -p bwa-mem3-sys
-          cargo test -p bwa-mem3-sys -p bwa-mem3-rs -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
+      # Note: there is no scalar mate-rescue A/B run. fg-labs/bwa-mem3#513
+      # removed the scalar mate-rescue path (and the BWAMEM_BATCHED_MATESW /
+      # DISABLE_BATCHED_MATESW gate) and requires AVX2+ on x86 (NEON on arm), so
+      # the batched kernel exercised above is the only mate-rescue path upstream
+      # ships. The shim carries no scalar fallback to A/B against.

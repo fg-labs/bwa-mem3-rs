@@ -39,7 +39,13 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  *   'B'=0x42 'W'=0x57 'A'=0x41 'M'=0x4D 'E'=0x45 'M'=0x4D '2'=0x32 '\0'=0x00
  * little-endian => bytes 0x42 0x57 0x41 0x4D 0x45 0x4D 0x32 0x00 read as u64. */
 #define BWA_SHM_MAGIC          0x00324D454D415742ull
-#define BWA_SHM_VERSION        1u
+/* Bumped 1 -> 2 when FMI_SCALARS grew from 56 to 64 bytes (sa_compx appended).
+ * A stale v1 segment would otherwise pass bwa_shm_attach() and then hard-fail
+ * the 64-byte FMI_SCALARS size check in load_index_from_shm() with no disk
+ * fallback; rejecting it at attach lets load_index() fall back to disk.
+ * Increment whenever any packed section layout (e.g. BWA_SHM_FMI_SCALARS_BYTES)
+ * changes. */
+#define BWA_SHM_VERSION        2u
 #define BWA_SHM_CTL_NAME       "/bwactl"
 #define BWA_SHM_IDX_PREFIX     "/bwaidx-"
 #define BWA_SHM_CTL_SIZE       0x10000   /* 64 KiB. Must equal bwa.h::BWA_CTL_SIZE
@@ -47,8 +53,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
                                           * bwa_shm.cpp will enforce equality once
                                           * that translation unit is added. */
 
-/* FMI_SCALARS section: int64_t reference_seq_len, count[5], sentinel_index. */
-#define BWA_SHM_FMI_SCALARS_BYTES (sizeof(int64_t) * 7)
+/* FMI_SCALARS section: int64_t reference_seq_len, count[5], sentinel_index,
+ * sa_compx. sa_compx (the SA sample-rate shift) is carried so a non-default
+ * `-u`-built index attached via shm is sized correctly rather than assuming
+ * the compile-time default. */
+#define BWA_SHM_FMI_SCALARS_BYTES (sizeof(int64_t) * 8)
 
 /* Section kinds — see implementation plan for what each holds. */
 #define BWA_SHM_SEC_FMI_SCALARS  1u
@@ -87,7 +96,16 @@ extern "C" {
 	 * are packed, but PAC and REF_STRING (.0123) are omitted (zero-length
 	 * sections) because `mem --meth` never reads the seed pac/.0123. The seed
 	 * `.0123` need not even exist on disk. Saves ~14.5 GB of shm on hg38. */
-	int       bwa_shm_stage(const char *prefix, bool bns_only = false); /* loads from disk, packs, stages */
+	/* target_sa_compx: if in [0, disk_sa_compx), the staged SA sample table is
+	 * densified to this shift on the fly (see bwa-mem3 shm -u); -1 (default)
+	 * stages the disk sample rate unchanged. Densifying trades a one-time
+	 * staging cost + extra shm for faster per-query SA resolution, without
+	 * rebuilding the on-disk index.
+	 * n_threads: worker count for the densify pass (the per-sample LF-walks are
+	 * independent); <=0 or 1 runs it serially. Ignored when not densifying. */
+	int       bwa_shm_stage(const char *prefix, bool bns_only = false,
+	                        int target_sa_compx = -1,
+	                        int n_threads = 1); /* loads from disk, packs, stages */
 	int       bwa_shm_destroy(void);                                 /* drops all (matches v1 -d) */
 	int       bwa_shm_list(void);                                    /* prints staged indices to stdout */
 	int       main_shm(int argc, char *argv[]);                      /* CLI entry — see src/main.cpp dispatch */
@@ -107,6 +125,12 @@ extern "C" {
 		int64_t  reference_seq_len;
 		int64_t  count[5];               /* +1-adjusted, ready to write */
 		int64_t  sentinel_index;
+		int64_t  sa_compx;                /* SA sample-rate shift STAGED into shm. Equals
+		                                   * disk_sa_compx unless `shm -u` densified it. */
+		int64_t  disk_sa_compx;           /* SA shift on disk (tail-detected). Source stride
+		                                   * for a densify pass; == sa_compx when not densifying. */
+		int       densify_threads;        /* worker count for the SA densify pass (>=1);
+		                                   * 1 == serial. Ignored when not densifying. */
 		int64_t  ref_string_len;         /* file size of <prefix>.0123 */
 		uint64_t total_size;
 		uint32_t n_sections;
@@ -116,7 +140,9 @@ extern "C" {
 	/* Compute layout and load BNS. Returns 0 on success, -1 on error. When
 	 * bns_only=true, the PAC and REF_STRING sections are sized to zero and the
 	 * `.0123` is not stat'd (the seed `.0123` need not exist) — see bwa_shm_stage. */
-	int  bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only = false);
+	int  bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout,
+	                     bool bns_only = false, int target_sa_compx = -1,
+	                     int n_threads = 1);
 
 	/* Pack the index described by `layout` into `dest`, which must be at least
 	 * layout->total_size bytes. Streams cp_occ / sa_* / pac / ref_string from
