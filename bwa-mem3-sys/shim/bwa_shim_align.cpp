@@ -325,9 +325,13 @@ static int shim_meth_orig_ref_load(const char *prefix,
     return 0;
 }
 
-void *shim_align_idx_load(const char *prefix) {
+/* As shim_align_idx_load, loading the FM-index with `n_threads` (>= 1)
+ * threads (the CLI's `-t` behavior for index load, fastmap.cpp:2868).
+ * `n_threads < 1` is clamped to 1. */
+void *shim_align_idx_load_threads(const char *prefix, int n_threads) {
+    if (n_threads < 1) n_threads = 1;
     FMI_search *fmi = new FMI_search(prefix);
-    fmi->load_index();
+    fmi->load_index(/*load_pac=*/true, n_threads);
     BwaShimIndex *idx = (BwaShimIndex *) calloc(1, sizeof(BwaShimIndex));
     if (!idx) {
         delete fmi;
@@ -341,6 +345,10 @@ void *shim_align_idx_load(const char *prefix) {
         return nullptr;
     }
     return static_cast<void *>(idx);
+}
+
+void *shim_align_idx_load(const char *prefix) {
+    return shim_align_idx_load_threads(prefix, /*n_threads=*/1);
 }
 
 /* D3 (--meth): load a dual index. `seed_prefix` is the converted seed index

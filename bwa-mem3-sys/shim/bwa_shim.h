@@ -111,6 +111,10 @@ mem_pestat_t *bwa_shim_pestat_zero(void);
 void                 bwa_shim_pestat_free(mem_pestat_t *pestat);
 
 BwaIndex *bwa_shim_idx_load(const char *prefix);
+/* As bwa_shim_idx_load, loading the FM-index with `n_threads` (>= 1) threads —
+ * the CLI's `-t` behavior for index load (fastmap.cpp:2868). `n_threads < 1`
+ * is clamped to 1. */
+BwaIndex *bwa_shim_idx_load_threads(const char *prefix, int n_threads);
 /* D3 (--meth): load a dual index — `seed_prefix` = converted `<ref>.meth`,
  * `orig_prefix` = un-converted `<ref>`. Use with meth_mode set on the opts. */
 BwaIndex *bwa_shim_idx_load_meth(const char *seed_prefix, const char *orig_prefix);

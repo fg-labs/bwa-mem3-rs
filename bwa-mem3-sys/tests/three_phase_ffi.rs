@@ -584,6 +584,66 @@ fn unmapped_single_emits_one_unmapped_record() {
     }
 }
 
+/// A parallel load must produce the same contig table and the same
+/// alignments as the serial load.
+#[test]
+fn idx_load_threads_matches_serial_load() {
+    let Some((_dir, prefix)) = common::phix_index() else {
+        return;
+    };
+    let a = common::load_idx(&prefix);
+    let b = unsafe { sys::bwa_shim_idx_load_threads(prefix.as_ptr(), 4) };
+    assert!(!b.is_null(), "{}", common::last_error());
+    unsafe {
+        assert_eq!(
+            sys::bwa_shim_idx_n_contigs(a),
+            sys::bwa_shim_idx_n_contigs(b)
+        );
+        for i in 0..sys::bwa_shim_idx_n_contigs(a) {
+            assert_eq!(
+                sys::bwa_shim_idx_contig_len(a, i),
+                sys::bwa_shim_idx_contig_len(b, i)
+            );
+        }
+    }
+    let opts = common::new_opts();
+    let fx = common::simulate(100, 100, 300, 29);
+    let pairs = fx.pairs();
+    assert_eq!(
+        common::align_batch_records(a, opts, &pairs),
+        common::align_batch_records(b, opts, &pairs)
+    );
+    unsafe {
+        sys::bwa_shim_opts_free(opts);
+        sys::bwa_shim_idx_free(a);
+        sys::bwa_shim_idx_free(b);
+    }
+}
+
+/// `n_threads < 1` must be clamped to 1, not passed through raw (which upstream's
+/// FMI_search::load_index would treat as "no threads").
+#[test]
+fn idx_load_threads_clamps_non_positive_n_threads() {
+    let Some((_dir, prefix)) = common::phix_index() else {
+        return;
+    };
+    let a = common::load_idx(&prefix);
+    for n in [0, -1, -100] {
+        let b = unsafe { sys::bwa_shim_idx_load_threads(prefix.as_ptr(), n) };
+        assert!(!b.is_null(), "n_threads={n}: {}", common::last_error());
+        unsafe {
+            assert_eq!(
+                sys::bwa_shim_idx_n_contigs(a),
+                sys::bwa_shim_idx_n_contigs(b)
+            );
+            sys::bwa_shim_idx_free(b);
+        }
+    }
+    unsafe {
+        sys::bwa_shim_idx_free(a);
+    }
+}
+
 /// `pestat` may be omitted only for a pair-free batch; a paired batch without
 /// a model is an error, not a silent per-batch re-estimate (gotcha #14).
 #[test]

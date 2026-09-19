@@ -59,6 +59,7 @@ extern "C" {
     struct ShimAlignOutput;
 
     void *shim_align_idx_load(const char *prefix);
+    void *shim_align_idx_load_threads(const char *prefix, int n_threads);
     void *shim_align_idx_load_meth(const char *seed_prefix, const char *orig_prefix);
     int   shim_align_idx_is_meth(void *fmi);
     void  shim_align_idx_free(void *fmi);
@@ -320,6 +321,29 @@ extern "C" BwaIndex *bwa_shim_idx_load(const char *prefix) {
         return NULL;
     }
     h->fmi = shim_align_idx_load(prefix);
+    if (!h->fmi) {
+        shim_set_err("FMI_search load failed for '%s'", prefix);
+        free(h);
+        return NULL;
+    }
+    return h;
+}
+
+/* As bwa_shim_idx_load, loading the FM-index with `n_threads` (>= 1)
+ * threads — the CLI's `-t` behavior for index load (fastmap.cpp:2868).
+ * `n_threads < 1` is clamped to 1. */
+extern "C" BwaIndex *bwa_shim_idx_load_threads(const char *prefix, int n_threads) {
+    shim_clear_err();
+    if (!prefix) {
+        shim_set_err("null prefix");
+        return NULL;
+    }
+    BwaIndex *h = (BwaIndex *) calloc(1, sizeof(BwaIndex));
+    if (!h) {
+        shim_set_err("calloc failed");
+        return NULL;
+    }
+    h->fmi = shim_align_idx_load_threads(prefix, n_threads);
     if (!h->fmi) {
         shim_set_err("FMI_search load failed for '%s'", prefix);
         free(h);
