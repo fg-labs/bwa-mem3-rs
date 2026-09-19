@@ -663,10 +663,13 @@ fn generate_bindings(manifest: &Path, _vendor_src: &Path, out: &Path) {
         .allowlist_type("BwaRegs")
         .allowlist_type("BwaReadBatch")
         .allowlist_type("BwaSingleRead")
+        .allowlist_type("BwaIdBases")
+        .allowlist_type("BwaRecordSinkFn")
         .allowlist_type("mem_opt_t")
         .allowlist_type("mem_pestat_t")
         .allowlist_function("bwa_shim_.*")
         .allowlist_var("MEM_F_.*")
+        .allowlist_var("BWA_ORIGIN_.*")
         .derive_default(true)
         .generate()
         .expect("bindgen failed");

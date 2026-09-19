@@ -335,6 +335,19 @@ concerned.)
 `compat_target.cpp` for changes to the `off` row. A new switch will compile
 clean and read as "off" everywhere.
 
+### 16. Byte parity across batches needs the global pair id AND a cohort pestat
+
+Two things in bwa-mem3's pairing depend on state outside the pair: the
+insert-size model (`mem_pestat`, once per `-K` cohort) and the read ordinal
+(`(n_processed >> 1) + pos` for pairs, `n_processed + i` for singles,
+`bwamem.cpp:2795-2884`) that seeds the `hash_64` tie-breaks. The three-phase
+API makes both explicit: `bwa_shim_pestat_cohort` over every batch of the
+cohort, then `bwa_shim_pair_emit` with `BwaIdBases` derived from the cohort's
+global read offset. The legacy `align_batch` uses ids from 0 and a per-batch
+pestat — which is why it is CLI-identical only when the batch IS the cohort.
+`three_phase_ffi.rs::first_pair_id_reaches_the_tie_break_hash` pins that the
+id is plumbed; the CLI-crate `three_phase_parity.rs` pins the formulas.
+
 ## Commit / PR conventions
 
 - Conventional Commits; sign with `-S`; see `CONTRIBUTING.md`.

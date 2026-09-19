@@ -111,6 +111,15 @@ extern "C" {
     size_t       shim_regs_heap_bytes(const ShimRegs *r);
     ShimSeeds   *shim_seeds_from_regs(ShimRegs *r);
 
+    /* Phase 3: cohort pestat + sink-based pair/emit (Task 4). */
+    struct ShimIdBases { uint64_t first_single_id; uint64_t first_pair_id; };
+    typedef void (*ShimRecordSinkFn)(void *ctx, uint32_t origin_kind, size_t origin_idx,
+                                     const uint8_t *body, size_t body_len);
+    int shim_pestat_cohort(void *fmi, const mem_opt_t *opts, const ShimRegs *const *regs,
+                           size_t n_regs, mem_pestat_t *out);
+    int shim_pair_emit(void *fmi, const mem_opt_t *opts, ShimScratch *sc, ShimRegs *regs,
+                       const mem_pestat_t *pestat, ShimIdBases ids, ShimRecordSinkFn sink, void *ctx);
+
     size_t         shim_align_out_n_recs(ShimAlignOutput *out);
     size_t         shim_align_out_pair_idx(ShimAlignOutput *out, size_t i);
     const uint8_t *shim_align_out_rec_ptr(ShimAlignOutput *out, size_t i);
@@ -528,6 +537,37 @@ extern "C" BwaSeeds *bwa_shim_seeds_from_regs(BwaRegs *r) {
     s->inner = shim_seeds_from_regs(r->inner);
     free(r);
     return s;
+}
+
+extern "C" int bwa_shim_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
+                                      const BwaRegs *const *regs, size_t n_regs, mem_pestat_t *out) {
+    shim_clear_err();
+    if (!idx || !opts || !out || (n_regs > 0 && !regs)) { shim_set_err("null arg"); return -1; }
+    /* Unwrap the handles into a bridge array. */
+    const ShimRegs **inner = (const ShimRegs **) malloc((n_regs ? n_regs : 1) * sizeof(*inner));
+    for (size_t k = 0; k < n_regs; ++k) {
+        if (!regs[k]) { free(inner); shim_set_err("null regs[%zu]", k); return -1; }
+        inner[k] = regs[k]->inner;
+    }
+    int rc = shim_pestat_cohort(idx->fmi, opts, inner, n_regs, out);
+    free(inner);
+    if (rc != 0) shim_set_err("pestat_cohort failed");
+    return rc;
+}
+
+extern "C" int bwa_shim_pair_emit(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *sc,
+                                  BwaRegs *regs, const mem_pestat_t *pestat, BwaIdBases ids,
+                                  BwaRecordSinkFn sink, void *ctx) {
+    shim_clear_err();
+    if (!regs) { shim_set_err("null regs"); return -1; }
+    ShimRegs *inner = regs->inner; regs->inner = NULL; free(regs);   /* consumed on every path */
+    if (!idx || !opts || !sc || !sink) { shim_regs_free(inner); shim_set_err("null arg"); return -1; }
+    ShimIdBases sids = { ids.first_single_id, ids.first_pair_id };
+    int rc = shim_pair_emit(idx->fmi, opts, sc->inner, inner, pestat, sids,
+                            reinterpret_cast<ShimRecordSinkFn>(sink), ctx);
+    if (rc == -2) { shim_set_err("pair_emit: a batch with pairs requires a cohort pestat (pass bwa_shim_pestat_cohort's output)"); return -1; }
+    if (rc != 0)  { shim_set_err("pair_emit failed"); return -1; }
+    return 0;
 }
 
 extern "C" size_t bwa_shim_batch_n_records(const BwaBatch *b) {

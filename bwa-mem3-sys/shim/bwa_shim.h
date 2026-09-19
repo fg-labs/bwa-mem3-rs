@@ -167,6 +167,38 @@ size_t   bwa_shim_regs_heap_bytes(const BwaRegs *r);
  * bwa_shim_extend_batch can consume it. Takes ownership of `r`. */
 BwaSeeds *bwa_shim_seeds_from_regs(BwaRegs *r);
 
+/* Origin kinds for the record sink: whether a record came from the batch's
+ * pairs (interleaved R1/R2) or its singles. */
+#define BWA_ORIGIN_PAIR   0u
+#define BWA_ORIGIN_SINGLE 1u
+
+/* Global read ordinals, reproducing bwa-mem3's worker_sam id formulas
+ * (bwamem.cpp:2795-2884): pair i of this batch gets id first_pair_id + i
+ * (== (n_processed >> 1) + pos in the CLI); single i gets first_single_id + i
+ * (== n_processed + i). The caller derives both from the cohort's global
+ * read offset and the SE/PE group layout (fastmap.cpp:924-944). */
+typedef struct { uint64_t first_single_id; uint64_t first_pair_id; } BwaIdBases;
+
+/* Called once per emitted record with the packed BAM BODY (no u32 block_size
+ * prefix). `origin_idx` indexes the batch's pairs or singles. The pointer is
+ * valid only for the duration of the call. */
+typedef void (*BwaRecordSinkFn)(void *ctx, uint32_t origin_kind, size_t origin_idx,
+                                const uint8_t *body, size_t body_len);
+
+/* Cohort insert-size model over the PE reads of several phase-1 batches
+ * (mem_pestat once, over the concatenated per-read alnreg headers, in the
+ * order given). Singles are ignored. `out` = mem_pestat_t[4]. Returns 0. */
+int bwa_shim_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
+                           const BwaRegs *const *regs, size_t n_regs, mem_pestat_t *out);
+
+/* Phase 3: pairing + mate rescue + primary marking + emission (worker_sam).
+ * Consumes `regs` (freed on every return path). `pestat` may be NULL only
+ * when the batch has no pairs. Records are emitted in input order: pairs
+ * (R1 side then R2 side, primary then supplementary), then singles. */
+int bwa_shim_pair_emit(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *sc,
+                       BwaRegs *regs, const mem_pestat_t *pestat, BwaIdBases ids,
+                       BwaRecordSinkFn sink, void *ctx);
+
 size_t         bwa_shim_batch_n_records (const BwaBatch *b);
 size_t         bwa_shim_batch_pair_idx  (const BwaBatch *b, size_t rec);
 const uint8_t *bwa_shim_batch_record_ptr(const BwaBatch *b, size_t rec);
