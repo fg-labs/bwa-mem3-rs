@@ -388,10 +388,11 @@ fn fixture_se_edge_cases(seed: u64) -> Vec<Read> {
     out
 }
 
-/// Runs the three-phase path and the CLI over `reads`, asserts every record
-/// (per [`common::record_key_fields`]) matches, and returns the raw SAM lines
-/// of both so a caller can additionally inspect specific records by name.
-/// Returns `None` (asserting nothing) when the required tools are missing.
+/// Runs the three-phase path and the CLI over `reads`, asserts every record's
+/// raw SAM line is byte-identical between the two (full-line `assert_eq!`,
+/// not just `common::record_key_fields`), and returns the SAM lines of both
+/// so a caller can additionally inspect specific records by name. Returns
+/// `None` (asserting nothing) when the required tools are missing.
 fn check_parity(
     label: &str,
     reads: &[Read],

@@ -10,6 +10,20 @@
 //! runs seed + SE extension + `mem_pestat` only, skipping pairing and
 //! emission.
 //!
+//! The three-phase cohort API splits alignment further so a caller can share
+//! one insert-size model across several sub-batches: [`seed_extend`] runs
+//! seeding and SE extension for one sub-batch of reads, producing per-read
+//! [`AlnRegs`]; [`MemPeStat::infer_cohort`] folds the `AlnRegs` from all of a
+//! cohort's sub-batches into a single insert-size model; and [`pair_emit`]
+//! takes that model plus one sub-batch's `AlnRegs` and performs pairing,
+//! mate rescue, and emission, streaming packed BAM records to a caller-
+//! supplied [`RecordSink`] as they're produced. Callers own reusable
+//! [`AlignScratch`] buffers across calls (avoiding per-batch allocation) and
+//! assign each read a global ordinal via [`IdBases`] so record IDs stay
+//! stable regardless of how reads are split into sub-batches. Loading a
+//! shared, thread-safe index for this API goes through
+//! [`BwaIndex::load_with_threads`].
+//!
 //! [bwa-mem3]: https://github.com/fg-labs/bwa-mem3
 
 pub mod align;

@@ -366,7 +366,10 @@ and commit the result; CI's `bindings` job fails on drift.
 `patches/0001-mem-pair-resolve-batch-post.patch` until it lands upstream; on
 a vendor refresh, diff it against `mem_sam_pe_batch_post` (the emission-free
 twin must track any change to the resolve half). CI runs the CLI suites twice,
-once per shim path (`CXXFLAGS=-DDISABLE_BATCHED_MATESW=1`).
+once per shim path (`CXXFLAGS=-DDISABLE_BATCHED_MATESW=1`). A non-SIMD build
+(e.g. `arch=sse41`/`sse42`, no AVX2/AVX-512/NEON) takes the scalar
+`mem_pair_resolve` path unconditionally — same code CI's `#else` A/B run
+exercises — and is byte-identical to the CLI.
 
 ## Commit / PR conventions
 

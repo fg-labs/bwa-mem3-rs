@@ -91,7 +91,10 @@ fn main() {
         &build_dir.join("bwa-mem3"),
     );
 
-    // 3. Apply any patches in patches/ lexicographic order. Expected empty in v1.
+    // 3. Apply any patches in patches/ lexicographic order. Currently ships
+    // one: 0001-mem-pair-resolve-batch-post.patch (carries
+    // mem_pair_resolve_batch_post until it lands upstream; see CLAUDE.md
+    // gotcha #18).
     let patches_dir = manifest.join("patches");
     if patches_dir.is_dir() {
         let mut patches: Vec<_> = fs::read_dir(&patches_dir)
