@@ -80,18 +80,25 @@ pub fn index_custom_ref(seq: &[u8]) -> Option<(tempfile::TempDir, CString)> {
 }
 
 pub fn load_idx(prefix: &CStr) -> *mut sys::BwaIndex {
+    // SAFETY: `prefix` is a valid NUL-terminated C string alive for the call;
+    // the shim only reads it (copies what it needs) and returns an owned index
+    // handle, which is null on failure (asserted below).
     let idx = unsafe { sys::bwa_shim_idx_load(prefix.as_ptr()) };
     assert!(!idx.is_null(), "index load failed");
     idx
 }
 
 pub fn new_opts() -> *mut sys::mem_opt_t {
+    // SAFETY: takes no arguments; returns an owned `mem_opt_t` handle that is
+    // null only on allocation failure (asserted below).
     let o = unsafe { sys::bwa_shim_opts_new() };
     assert!(!o.is_null());
     o
 }
 
 pub fn new_pestat() -> *mut sys::mem_pestat_t {
+    // SAFETY: takes no arguments; returns an owned zeroed `mem_pestat_t[4]`
+    // handle that is null only on allocation failure (asserted below).
     let p = unsafe { sys::bwa_shim_pestat_zero() };
     assert!(!p.is_null());
     p
@@ -181,8 +188,13 @@ impl Fixture {
 
 /// `(pair_idx, [u32 block_size][body])` per record, in emission order.
 pub fn collect_records(b: *const sys::BwaBatch) -> Vec<(usize, Vec<u8>)> {
+    // SAFETY: `b` is a valid non-null batch handle (from `bwa_shim_align_batch`)
+    // that outlives this call; querying its record count only reads it.
     let n = unsafe { sys::bwa_shim_batch_n_records(b) };
     (0..n)
+        // SAFETY: `i < n`, so record `i` exists in `b`; `ptr`/`len` describe a
+        // live buffer owned by `b` and valid for `len` bytes, copied out here
+        // before `b` is freed.
         .map(|i| unsafe {
             let ptr = sys::bwa_shim_batch_record_ptr(b, i);
             let len = sys::bwa_shim_batch_record_len(b, i);
@@ -201,6 +213,10 @@ pub fn align_batch_records(
     pairs: &[sys::BwaReadPair],
 ) -> Vec<(usize, Vec<u8>)> {
     let pes = new_pestat();
+    // SAFETY: `idx`/`opts`/`pes` are valid non-null handles from the
+    // constructors above; `pairs.as_ptr()`/`pairs.len()` describe a live slice
+    // of `BwaReadPair`, each borrowing fixture bytes that outlive the call; the
+    // null `mem_pestat_t*` argument tells the shim to estimate the model itself.
     let b = unsafe {
         sys::bwa_shim_align_batch(
             idx,
@@ -213,6 +229,8 @@ pub fn align_batch_records(
     };
     assert!(!b.is_null(), "align_batch failed: {}", last_error());
     let recs = collect_records(b);
+    // SAFETY: `b` and `pes` are the live owned handles just produced; each is
+    // freed exactly once here and never used afterward.
     unsafe {
         sys::bwa_shim_batch_free(b);
         sys::bwa_shim_pestat_free(pes);
@@ -221,6 +239,9 @@ pub fn align_batch_records(
 }
 
 pub fn last_error() -> String {
+    // SAFETY: `bwa_shim_last_error` returns either null or a pointer to a
+    // NUL-terminated thread-local error string valid until the next shim call;
+    // it is copied into an owned `String` here before any further shim call.
     unsafe {
         let p = sys::bwa_shim_last_error();
         if p.is_null() {

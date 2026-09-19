@@ -110,6 +110,8 @@ fn seeding_sees_the_forced_pe_flag_not_the_callers_raw_flag() {
     };
 
     let opts = common::new_opts();
+    // SAFETY: `opts` is a valid, uniquely-owned `mem_opt_t` from `new_opts`, so
+    // writing its POD fields through the raw pointer is sound.
     unsafe {
         // Mirror the bug scenario exactly: the caller's own flag has
         // MEM_F_PE off. `bwa_shim_align_batch` must still align as a pair
@@ -142,6 +144,8 @@ fn seeding_sees_the_forced_pe_flag_not_the_callers_raw_flag() {
          locus, not the ~450bp-further discordant one"
     );
 
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);

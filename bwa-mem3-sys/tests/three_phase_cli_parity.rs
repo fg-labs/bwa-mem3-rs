@@ -42,6 +42,10 @@ fn bwa_bin() -> Option<String> {
 
 struct Sink(Vec<(u32, usize, Vec<u8>)>);
 
+/// # Safety
+/// `ctx` must be a valid `*mut Sink` that outlives the call, and `body`/`len`
+/// must describe a readable buffer of `len` bytes -- both guaranteed by the
+/// shim when it invokes this callback from `bwa_shim_pair_emit`.
 unsafe extern "C" fn sink_fn(
     ctx: *mut std::ffi::c_void,
     kind: u32,
@@ -49,15 +53,23 @@ unsafe extern "C" fn sink_fn(
     body: *const u8,
     len: usize,
 ) {
+    // SAFETY: `ctx` is the `&mut Sink` the caller passed as the callback context.
     let sink = &mut *ctx.cast::<Sink>();
+    // SAFETY: `body`/`len` describe a valid record buffer for this call (see the
+    // `# Safety` section); the bytes are copied out immediately.
     sink.0
         .push((kind, idx, std::slice::from_raw_parts(body, len).to_vec()));
 }
 
 /// Contig names of a loaded index, indexed by refID.
 fn contig_names(idx: *const sys::BwaIndex) -> Vec<String> {
+    // SAFETY: `idx` is a valid non-null index handle alive for the call; the
+    // accessor only reads it.
     let n = unsafe { sys::bwa_shim_idx_n_contigs(idx) };
     (0..n)
+        // SAFETY: `i < n`, so contig `i` exists; the shim returns a pointer to a
+        // NUL-terminated name owned by `idx` and valid while `idx` lives, copied
+        // into an owned `String` here.
         .map(|i| unsafe {
             std::ffi::CStr::from_ptr(sys::bwa_shim_idx_contig_name(idx, i))
                 .to_string_lossy()
@@ -275,6 +287,8 @@ fn single_end_matches_bwa_mem3_cli() {
     shim.sort();
     assert_eq!(shim, cli, "single-end records diverge from bwa-mem3 CLI");
 
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
@@ -371,6 +385,8 @@ fn mixed_matches_bwa_mem3_cli_smart_pairing() {
     shim.sort();
     assert_eq!(shim, cli, "mixed -p records diverge from bwa-mem3 CLI");
 
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
@@ -387,6 +403,7 @@ fn run_shim_keys(
     first_pair_id: u64,
     contigs: &[String],
 ) -> Vec<String> {
+    // SAFETY: constructor with no arguments; returns an owned scratch handle.
     let sc = unsafe { sys::bwa_shim_scratch_new() };
     let batch = sys::BwaReadBatch {
         pairs: pairs.as_ptr(),
@@ -394,10 +411,14 @@ fn run_shim_keys(
         singles: singles.as_ptr(),
         n_singles: singles.len(),
     };
+    // SAFETY: valid `idx`/`opts`/`sc`; `batch` names live `pairs`/`singles`
+    // slices with matching `n_pairs`/`n_singles` counts, alive for the call.
     let regs = unsafe { sys::bwa_shim_seed_extend(idx, opts, sc, &batch) };
     assert!(!regs.is_null(), "{}", common::last_error());
     let pes = common::new_pestat();
     let regs_c: [*const sys::BwaRegs; 1] = [regs.cast_const()];
+    // SAFETY: valid `idx`/`opts`/`pes`; `regs_c` is a 1-element array of the live
+    // `regs` pointer and the count `1` matches it.
     let rc = unsafe { sys::bwa_shim_pestat_cohort(idx, opts, regs_c.as_ptr(), 1, pes) };
     assert_eq!(rc, 0);
     let mut sink = Sink(Vec::new());
@@ -410,6 +431,9 @@ fn run_shim_keys(
     } else {
         pes.cast_const()
     };
+    // SAFETY: valid `idx`/`opts`/`sc`/`regs`; `pes_arg` is the live pestat for a
+    // paired batch or null for a pair-free one (the shim's contract); `sink_fn`'s
+    // context is `&mut sink`, live for the whole call (see `sink_fn`'s `# Safety`).
     let rc = unsafe {
         sys::bwa_shim_pair_emit(
             idx,
@@ -423,6 +447,8 @@ fn run_shim_keys(
         )
     };
     assert_eq!(rc, 0, "{}", common::last_error());
+    // SAFETY: `pes`/`sc` are the live owned handles; each freed once, not used
+    // afterward.
     unsafe {
         sys::bwa_shim_pestat_free(pes);
         sys::bwa_shim_scratch_free(sc);
@@ -452,6 +478,14 @@ fn run_shim_keys(
 /// `align_batch`-vs-`three_phase` self-comparison would share the buggy code and
 /// pass vacuously). `-K` is large enough to keep the CLI in one `-K` cohort, so
 /// its pestat matches the shim's single-cohort estimate.
+///
+/// This is also the batched-vs-scalar mate-rescue divergence guard (finding
+/// [19]): CI runs this exact target twice -- once in the default BATCHED build
+/// and once with `CXXFLAGS=-DDISABLE_BATCHED_MATESW=1` (the scalar A/B step in
+/// `.github/workflows/check.yml`). The batched run asserts `batched == CLI` and
+/// the scalar run asserts `scalar == CLI` on this same rescue-firing fixture, so
+/// transitively `batched == scalar` where rescue actually fires -- no separate
+/// batched-vs-scalar test is needed.
 #[test]
 fn batched_rescue_spanning_multiple_chunks_matches_bwa_mem3_cli() {
     let Some(bwa) = bwa_bin() else {
@@ -558,6 +592,8 @@ fn batched_rescue_spanning_multiple_chunks_matches_bwa_mem3_cli() {
         "mate rescue did not fire across chunks ({mapped_r2} mapped R2)"
     );
 
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);

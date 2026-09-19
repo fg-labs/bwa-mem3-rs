@@ -1,5 +1,22 @@
 //! C-level behavior tests for the shim, through the raw FFI. Each test builds
 //! a PhiX index (skips when `bwa-mem3` is absent) and asserts on bytes.
+//!
+//! ## Safety invariants shared by the `unsafe` blocks below
+//!
+//! Every raw shim call here relies on the same handful of invariants, noted
+//! tersely per block and spelled out once here (per CONTRIBUTING.md, each
+//! `unsafe` block still carries its own comment):
+//! - `idx`/`opts`/`sc`/`pes`/`regs` are valid, non-null handles returned by the
+//!   matching shim constructor (`common::load_idx`/`common::new_opts`/
+//!   `bwa_shim_scratch_new`/`common::new_pestat`/`bwa_shim_seed_extend`) and
+//!   stay alive for the whole call.
+//! - Read pointers -- `BwaReadPair`/`BwaReadBatch`/`BwaSingleRead` and the
+//!   name/seq/qual buffers they reference -- borrow fixture-owned data that
+//!   outlives the call, and every `n_*` count matches its backing slice.
+//! - Each handle is freed exactly once, at the end of its test, and is not used
+//!   afterward.
+//! - The sink callback `sink_fn` receives a `ctx` that is a live `&mut Sink` for
+//!   the call and a `body`/`len` describing a buffer valid for the callback.
 
 mod common;
 
@@ -7,8 +24,11 @@ use bwa_mem3_sys as sys;
 
 #[test]
 fn version_and_build_info_are_exposed_from_c() {
+    // SAFETY: both return pointers to static NUL-terminated C strings valid for
+    // the whole program, so wrapping them in `CStr` is sound.
     let v = unsafe { std::ffi::CStr::from_ptr(sys::bwa_shim_version()) };
     assert_eq!(v.to_str().unwrap(), sys::build_info::VERSION);
+    // SAFETY: static NUL-terminated C string valid for the program lifetime.
     let b = unsafe { std::ffi::CStr::from_ptr(sys::bwa_shim_build_info()) };
     assert!(b.to_str().unwrap().contains(sys::build_info::COMPILER));
 }
@@ -25,16 +45,23 @@ fn align_batch_does_not_mutate_caller_opts() {
     };
     let idx = common::load_idx(&prefix);
     let opts = common::new_opts();
+    // SAFETY: `opts` is a valid, uniquely-owned `mem_opt_t` from `new_opts`, so
+    // writing its POD fields through the raw pointer is sound.
     unsafe {
         (*opts).n_threads = 8;
         (*opts).flag &= !(sys::MEM_F_PE as i32);
     }
+    // SAFETY: `opts` points to an initialized `mem_opt_t`; `ptr::read` takes a
+    // bitwise POD snapshot for the before/after byte comparison.
     let before = unsafe { std::ptr::read(opts) };
 
     let fx = common::simulate(64, 100, 300, 7);
     let recs = common::align_batch_records(idx, opts, &fx.pairs());
 
+    // SAFETY: `opts` is still the valid initialized struct; bitwise POD snapshot.
     let after = unsafe { std::ptr::read(opts) };
+    // SAFETY: `o` is a live `mem_opt_t`; viewing its `size_of::<mem_opt_t>()`
+    // bytes as a `u8` slice is valid for reading a POD struct's bytes.
     let bytes = |o: &sys::mem_opt_t| unsafe {
         std::slice::from_raw_parts(
             (o as *const sys::mem_opt_t).cast::<u8>(),
@@ -47,6 +74,7 @@ fn align_batch_does_not_mutate_caller_opts() {
         bytes(&after),
         "mem_opt_t was mutated by align_batch"
     );
+    // SAFETY: `opts` is still valid; this reads a single field.
     assert_eq!(unsafe { (*opts).n_threads }, 8);
 
     // Still paired: every record carries FLAG 0x1 (offset 14 in the body after the u32 prefix).
@@ -55,6 +83,8 @@ fn align_batch_does_not_mutate_caller_opts() {
         let flag = u16::from_le_bytes([r[4 + 14], r[4 + 15]]);
         assert_ne!(flag & 0x1, 0, "record is not flagged paired");
     }
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
@@ -80,17 +110,22 @@ fn seed_extend_reports_shape_and_heap_bytes() {
     };
     let idx = common::load_idx(&prefix);
     let opts = common::new_opts();
+    // SAFETY: constructor with no arguments; returns an owned scratch handle.
     let sc = unsafe { sys::bwa_shim_scratch_new() };
     assert!(!sc.is_null());
 
     let fx = common::simulate(50, 100, 300, 11);
     let pairs = fx.pairs();
+    // SAFETY: valid `idx`/`opts`/`sc` handles; `batch_of(&pairs)` borrows the
+    // live `pairs` slice (fixture-owned) for the duration of the call.
     let regs = unsafe { sys::bwa_shim_seed_extend(idx, opts, sc, &batch_of(&pairs)) };
     assert!(
         !regs.is_null(),
         "seed_extend failed: {}",
         common::last_error()
     );
+    // SAFETY: `regs`/`sc`/`opts`/`idx` are the live owned handles; the accessors
+    // only read `regs`, and each handle is then freed once and unused after.
     unsafe {
         assert_eq!(sys::bwa_shim_regs_n_pairs(regs), 50);
         assert_eq!(sys::bwa_shim_regs_n_singles(regs), 0);
@@ -127,6 +162,8 @@ fn scratch_reuse_is_byte_stable_and_matches_legacy() {
             "phase path diverged from legacy align_batch"
         );
     }
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
@@ -142,9 +179,14 @@ fn seed_extend_empty_batch_is_ok() {
     };
     let idx = common::load_idx(&prefix);
     let opts = common::new_opts();
+    // SAFETY: constructor with no arguments; returns an owned scratch handle.
     let sc = unsafe { sys::bwa_shim_scratch_new() };
+    // SAFETY: valid `idx`/`opts`/`sc`; `batch_of(&[])` is an empty (zero-count)
+    // batch with null read pointers, which the shim accepts as a valid no-op.
     let regs = unsafe { sys::bwa_shim_seed_extend(idx, opts, sc, &batch_of(&[])) };
     assert!(!regs.is_null(), "{}", common::last_error());
+    // SAFETY: live owned handles; the accessor reads `regs`, then each is freed
+    // once and unused afterward.
     unsafe {
         assert_eq!(sys::bwa_shim_regs_n_pairs(regs), 0);
         sys::bwa_shim_regs_free(regs);
@@ -158,6 +200,10 @@ fn seed_extend_empty_batch_is_ok() {
 /// results compare directly with `common::collect_records`.
 struct Sink(Vec<(u32, usize, Vec<u8>)>);
 
+/// # Safety
+/// `ctx` must be a valid `*mut Sink` that outlives the call, and `body`/`len`
+/// must describe a readable buffer of `len` bytes -- both guaranteed by the
+/// shim when it invokes this callback from `bwa_shim_pair_emit`.
 unsafe extern "C" fn sink_fn(
     ctx: *mut std::ffi::c_void,
     kind: u32,
@@ -165,9 +211,12 @@ unsafe extern "C" fn sink_fn(
     body: *const u8,
     len: usize,
 ) {
+    // SAFETY: `ctx` is the `&mut Sink` the test handed to `pair_emit` as context.
     let sink = &mut *ctx.cast::<Sink>();
     let mut rec = Vec::with_capacity(4 + len);
     rec.extend_from_slice(&(len as u32).to_le_bytes());
+    // SAFETY: `body`/`len` describe a valid record buffer for this call (see the
+    // `# Safety` section); the bytes are copied out immediately.
     rec.extend_from_slice(std::slice::from_raw_parts(body, len));
     sink.0.push((kind, idx, rec));
 }
@@ -181,11 +230,14 @@ fn three_phase(
     sub: usize,
     first_pair_id: u64,
 ) -> Vec<(usize, Vec<u8>)> {
+    // SAFETY: constructor with no arguments; returns an owned scratch handle.
     let sc = unsafe { sys::bwa_shim_scratch_new() };
     let chunks: Vec<&[sys::BwaReadPair]> = pairs.chunks(sub.max(1)).collect();
     let regs: Vec<*mut sys::BwaRegs> = chunks
         .iter()
         .map(|c| {
+            // SAFETY: valid `idx`/`opts`/`sc`; `batch_of(c)` borrows the live
+            // chunk slice `c` (fixture-owned) for the duration of the call.
             let r = unsafe { sys::bwa_shim_seed_extend(idx, opts, sc, &batch_of(c)) };
             assert!(!r.is_null(), "{}", common::last_error());
             r
@@ -193,6 +245,9 @@ fn three_phase(
         .collect();
     let pes = common::new_pestat();
     let regs_const: Vec<*const sys::BwaRegs> = regs.iter().map(|r| r.cast_const()).collect();
+    // SAFETY: valid `idx`/`opts`/`pes`; `regs_const` holds `regs_const.len()`
+    // live `BwaRegs` pointers (owned by `regs`, still alive), and the length
+    // matches the pointer array.
     let rc = unsafe {
         sys::bwa_shim_pestat_cohort(idx, opts, regs_const.as_ptr(), regs_const.len(), pes)
     };
@@ -206,6 +261,9 @@ fn three_phase(
             first_single_id: 0,
             first_pair_id: first_pair_id + offset as u64,
         };
+        // SAFETY: valid `idx`/`opts`/`sc`/`r`/`pes` handles; `sink_fn`'s context
+        // is `&mut sink`, a live local for the whole call (see `sink_fn`'s
+        // `# Safety`); `ids` is a plain POD value.
         let rc = unsafe {
             sys::bwa_shim_pair_emit(
                 idx,
@@ -225,6 +283,8 @@ fn three_phase(
         }
         offset += c.len();
     }
+    // SAFETY: `pes`/`sc` are the live owned handles; each freed once, not used
+    // afterward.
     unsafe {
         sys::bwa_shim_pestat_free(pes);
         sys::bwa_shim_scratch_free(sc);
@@ -252,6 +312,8 @@ fn three_phase_is_invariant_to_sub_batch_size_and_matches_legacy() {
             "sub={sub}: bytes diverged from legacy align_batch"
         );
     }
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
@@ -320,6 +382,8 @@ fn first_pair_id_reaches_the_tie_break_hash() {
         shifted, at_zero,
         "first_pair_id had no observable effect; the id is not plumbed"
     );
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
@@ -365,6 +429,8 @@ fn pair_emit_orders_records_by_pair_then_side() {
             "pair {p}: second record is not R2: {flags:x?}"
         );
     }
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
@@ -421,6 +487,7 @@ fn run_mixed(
     singles: &[sys::BwaSingleRead],
     ids: sys::BwaIdBases,
 ) -> Vec<(u32, usize, Vec<u8>)> {
+    // SAFETY: constructor with no arguments; returns an owned scratch handle.
     let sc = unsafe { sys::bwa_shim_scratch_new() };
     let batch = sys::BwaReadBatch {
         pairs: pairs.as_ptr(),
@@ -428,14 +495,19 @@ fn run_mixed(
         singles: singles.as_ptr(),
         n_singles: singles.len(),
     };
+    // SAFETY: valid `idx`/`opts`/`sc`; `batch` names live `pairs`/`singles`
+    // slices with matching `n_pairs`/`n_singles` counts, alive for the call.
     let regs = unsafe { sys::bwa_shim_seed_extend(idx, opts, sc, &batch) };
     assert!(!regs.is_null(), "{}", common::last_error());
+    // SAFETY: `regs` is the live handle just returned; the accessors only read it.
     unsafe {
         assert_eq!(sys::bwa_shim_regs_n_pairs(regs), pairs.len());
         assert_eq!(sys::bwa_shim_regs_n_singles(regs), singles.len());
     }
     let pes = common::new_pestat();
     let regs_c: [*const sys::BwaRegs; 1] = [regs.cast_const()];
+    // SAFETY: valid `idx`/`opts`/`pes`; `regs_c` is a 1-element array of the live
+    // `regs` pointer and the count `1` matches it.
     let rc = unsafe { sys::bwa_shim_pestat_cohort(idx, opts, regs_c.as_ptr(), 1, pes) };
     assert_eq!(rc, 0);
     let mut sink = Sink(Vec::new());
@@ -444,6 +516,9 @@ fn run_mixed(
     } else {
         pes.cast_const()
     };
+    // SAFETY: valid `idx`/`opts`/`sc`/`regs`; `pes_arg` is the live pestat for a
+    // paired batch or null for a pair-free one (the shim's contract); `sink_fn`'s
+    // context is `&mut sink`, live for the whole call (see `sink_fn`'s `# Safety`).
     let rc = unsafe {
         sys::bwa_shim_pair_emit(
             idx,
@@ -457,6 +532,8 @@ fn run_mixed(
         )
     };
     assert_eq!(rc, 0, "{}", common::last_error());
+    // SAFETY: `pes`/`sc` are the live owned handles; each freed once, not used
+    // afterward.
     unsafe {
         sys::bwa_shim_pestat_free(pes);
         sys::bwa_shim_scratch_free(sc);
@@ -501,6 +578,8 @@ fn single_end_batch_emits_unpaired_records() {
             "read {i}: mate fields must be unset"
         );
     }
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
@@ -544,6 +623,8 @@ fn mixed_batch_is_the_union_of_its_groups() {
     assert!(mixed[first_single..]
         .iter()
         .all(|(k, _, _)| *k == sys::BWA_ORIGIN_SINGLE));
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
@@ -578,6 +659,8 @@ fn unmapped_single_emits_one_unmapped_record() {
     let recs = run_mixed(idx, opts, &[], &single, ids);
     assert_eq!(recs.len(), 1);
     assert_ne!(flag_of(&recs[0].2) & 0x4, 0);
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
@@ -592,8 +675,12 @@ fn idx_load_threads_matches_serial_load() {
         return;
     };
     let a = common::load_idx(&prefix);
+    // SAFETY: `prefix` is a valid NUL-terminated C string alive for the call;
+    // returns an owned index handle (null on failure, asserted below).
     let b = unsafe { sys::bwa_shim_idx_load_threads(prefix.as_ptr(), 4) };
     assert!(!b.is_null(), "{}", common::last_error());
+    // SAFETY: `a`/`b` are live index handles; the accessors only read them and
+    // `i` stays within `n_contigs`.
     unsafe {
         assert_eq!(
             sys::bwa_shim_idx_n_contigs(a),
@@ -613,6 +700,8 @@ fn idx_load_threads_matches_serial_load() {
         common::align_batch_records(a, opts, &pairs),
         common::align_batch_records(b, opts, &pairs)
     );
+    // SAFETY: `opts`/`a`/`b` are the live owned handles; each freed once, not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(a);
@@ -629,8 +718,12 @@ fn idx_load_threads_clamps_non_positive_n_threads() {
     };
     let a = common::load_idx(&prefix);
     for n in [0, -1, -100] {
+        // SAFETY: `prefix` is a valid NUL-terminated C string alive for the call;
+        // `n` is exercised precisely because the shim must clamp it to >= 1.
         let b = unsafe { sys::bwa_shim_idx_load_threads(prefix.as_ptr(), n) };
         assert!(!b.is_null(), "n_threads={n}: {}", common::last_error());
+        // SAFETY: `a`/`b` are live index handles; the accessor reads them, then
+        // `b` is freed once.
         unsafe {
             assert_eq!(
                 sys::bwa_shim_idx_n_contigs(a),
@@ -639,6 +732,7 @@ fn idx_load_threads_clamps_non_positive_n_threads() {
             sys::bwa_shim_idx_free(b);
         }
     }
+    // SAFETY: `a` is the live owned handle; freed once, not used afterward.
     unsafe {
         sys::bwa_shim_idx_free(a);
     }
@@ -653,15 +747,21 @@ fn pair_emit_requires_pestat_for_pairs() {
     };
     let idx = common::load_idx(&prefix);
     let opts = common::new_opts();
+    // SAFETY: constructor with no arguments; returns an owned scratch handle.
     let sc = unsafe { sys::bwa_shim_scratch_new() };
     let fx = common::simulate(4, 100, 300, 9);
     let pairs = fx.pairs();
+    // SAFETY: valid `idx`/`opts`/`sc` handles; `batch_of(&pairs)` borrows the
+    // live `pairs` slice (fixture-owned) for the duration of the call.
     let regs = unsafe { sys::bwa_shim_seed_extend(idx, opts, sc, &batch_of(&pairs)) };
     let mut sink = Sink(Vec::new());
     let ids = sys::BwaIdBases {
         first_single_id: 0,
         first_pair_id: 0,
     };
+    // SAFETY: valid `idx`/`opts`/`sc`/`regs`; the null `pestat` argument is the
+    // point of the test (a paired batch without a model must be rejected, not
+    // UB); `sink_fn`'s context is `&mut sink`, live for the call.
     let rc = unsafe {
         sys::bwa_shim_pair_emit(
             idx,
@@ -681,6 +781,8 @@ fn pair_emit_requires_pestat_for_pairs() {
         common::last_error()
     );
     assert!(sink.0.is_empty());
+    // SAFETY: `sc`/`opts`/`idx` are the live owned handles; each freed once, not
+    // used afterward.
     unsafe {
         sys::bwa_shim_scratch_free(sc);
         sys::bwa_shim_opts_free(opts);
@@ -732,6 +834,8 @@ fn rescue_heavy_fixture_matches_between_batched_and_legacy_paths() {
         mapped_r2 > 50,
         "rescue did not fire ({mapped_r2} mutated R2 mapped)"
     );
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
     unsafe {
         sys::bwa_shim_opts_free(opts);
         sys::bwa_shim_idx_free(idx);
