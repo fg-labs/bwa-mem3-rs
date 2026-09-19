@@ -62,6 +62,27 @@ let results: Vec<_> = batches
 
 The crate itself never spawns threads. Every public function blocks its calling thread and is safe to call concurrently from multiple threads sharing the same `BwaIndex`.
 
+### Cohort-exact output from a work-stealing pool
+
+`align_batch` estimates the insert-size model from whatever it is given, so output matches `bwa-mem3 mem` only when one call covers one `-K` cohort. The three-phase API keeps per-read work fine-grained and the model cohort-wide:
+
+```rust
+use bwa_mem3_rs::*;
+let idx = BwaIndex::load_with_threads("hg38.fa", 8)?;
+let opts = MemOpts::new()?;
+let mut scratch = AlignScratch::new()?;               // one per worker thread
+let regs: Vec<AlnRegs> = cohort_sub_batches.iter()   // any size, any thread
+    .map(|b| seed_extend(&idx, &opts, &mut scratch, &ReadBatch { pairs: b, singles: &[] }))
+    .collect::<Result<_>>()?;
+let pestat = MemPeStat::infer_cohort(&idx, &opts, &regs.iter().collect::<Vec<_>>())?;
+for (k, r) in regs.into_iter().enumerate() {
+    let ids = IdBases { first_single_id: 0, first_pair_id: cohort_first_pair_id + (k * sub) as u64 };
+    pair_emit(&idx, &opts, &mut scratch, r, Some(&pestat), ids, &mut my_sink)?;
+}
+```
+
+`IdBases` carries the global read ordinal bwa-mem3 uses for tie-breaks; see the type's docs for the `-p` cohort formulas. `AlignScratch` is `Send`, `AlnRegs` is `Send`, `BwaIndex`/`MemOpts`/`MemPeStat` are `Send + Sync`.
+
 ## CLI
 
 The `bwa-mem3-rs-cli` crate ships a minimal `bwa-rs` binary that wraps the library:
