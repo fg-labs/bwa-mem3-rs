@@ -26,6 +26,8 @@ extern "C" {
 typedef struct BwaIndex BwaIndex;
 typedef struct BwaSeeds BwaSeeds;
 typedef struct BwaBatch BwaBatch;
+typedef struct BwaScratch BwaScratch;
+typedef struct BwaRegs    BwaRegs;
 
 typedef struct {
     const char    *r1_name;  size_t r1_name_len;
@@ -35,6 +37,20 @@ typedef struct {
     const uint8_t *r2_seq;   size_t r2_seq_len;
     const uint8_t *r2_qual;
 } BwaReadPair;
+
+/* A single-end read. Layout mirrors the bridge's ShimSingleRead. */
+typedef struct {
+    const char    *name;  size_t name_len;
+    const uint8_t *seq;   size_t seq_len;
+    const uint8_t *qual;
+} BwaSingleRead;
+
+/* One work item: pairs (r1/r2 interleaved into seqs[0..2*n_pairs)) followed by
+ * singles (seqs[2*n_pairs..)). Either slice may be empty. */
+typedef struct {
+    const BwaReadPair   *pairs;   size_t n_pairs;
+    const BwaSingleRead *singles; size_t n_singles;
+} BwaReadBatch;
 
 /* Options lifecycle. `opts_new` returns a heap-allocated mem_opt_t populated
  * with bwa-mem3 defaults (mem_opt_init). `opts_free` releases it. Field-level
@@ -95,6 +111,10 @@ mem_pestat_t *bwa_shim_pestat_zero(void);
 void                 bwa_shim_pestat_free(mem_pestat_t *pestat);
 
 BwaIndex *bwa_shim_idx_load(const char *prefix);
+/* As bwa_shim_idx_load, loading the FM-index with `n_threads` (>= 1) threads —
+ * the CLI's `-t` behavior for index load (fastmap.cpp:2868). `n_threads < 1`
+ * is clamped to 1. */
+BwaIndex *bwa_shim_idx_load_threads(const char *prefix, int n_threads);
 /* D3 (--meth): load a dual index — `seed_prefix` = converted `<ref>.meth`,
  * `orig_prefix` = un-converted `<ref>`. Use with meth_mode set on the opts. */
 BwaIndex *bwa_shim_idx_load_meth(const char *seed_prefix, const char *orig_prefix);
@@ -128,6 +148,60 @@ int bwa_shim_estimate_pestat(
     const BwaReadPair *pairs, size_t n_pairs,
     mem_pestat_t *pestat_out);
 
+/* ---- Three-phase API (caller-owned parallelism, cohort-exact output) ---- */
+
+/* Per-thread reusable scratch: banded-SW buffers, SMEM buffers, chain/seed
+ * windows, record-building buffers. ~24 MB after first use. Send, not Sync. */
+BwaScratch *bwa_shim_scratch_new(void);
+void        bwa_shim_scratch_free(BwaScratch *sc);
+
+/* Phase 1: seed + single-end-extend every read of `batch` (the fused
+ * `worker_bwt_aln` work). Per-read independent: safe to split a cohort into
+ * any number of batches on any number of threads. Returns NULL + last_error
+ * on failure. `opts` is never written. */
+BwaRegs *bwa_shim_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
+                              BwaScratch *sc, const BwaReadBatch *batch);
+void     bwa_shim_regs_free(BwaRegs *r);
+size_t   bwa_shim_regs_n_pairs(const BwaRegs *r);
+size_t   bwa_shim_regs_n_singles(const BwaRegs *r);
+/* Bytes held on the C heap by `r`: copied names/seqs/quals + alnreg arrays. */
+size_t   bwa_shim_regs_heap_bytes(const BwaRegs *r);
+
+/* Origin kinds for the record sink: whether a record came from the batch's
+ * pairs (interleaved R1/R2) or its singles. */
+#define BWA_ORIGIN_PAIR   0u
+#define BWA_ORIGIN_SINGLE 1u
+
+/* Global read ordinals, reproducing bwa-mem3's worker_sam id formulas
+ * (bwamem.cpp:2795-2884): pair i of this batch gets id first_pair_id + i
+ * (== (n_processed >> 1) + pos in the CLI); single i gets first_single_id + i
+ * (== n_processed + i). The caller derives both from the cohort's global
+ * read offset and the SE/PE group layout (fastmap.cpp:924-944). */
+typedef struct { uint64_t first_single_id; uint64_t first_pair_id; } BwaIdBases;
+
+/* Called once per emitted record with the packed BAM BODY (no u32 block_size
+ * prefix). `origin_idx` indexes the batch's pairs or singles. The pointer is
+ * valid only for the duration of the call. */
+typedef void (*BwaRecordSinkFn)(void *ctx, uint32_t origin_kind, size_t origin_idx,
+                                const uint8_t *body, size_t body_len);
+
+/* Cohort insert-size model over the PE reads of several phase-1 batches
+ * (mem_pestat once, over the concatenated per-read alnreg headers, in the
+ * order given). Singles are ignored. `out` = mem_pestat_t[4]. Returns 0 on
+ * success, -1 on a null argument (idx/opts/out, or a null regs array or a null
+ * regs[k] when n_regs > 0) or an internal allocation failure; callers rely on
+ * that -1. */
+int bwa_shim_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
+                           const BwaRegs *const *regs, size_t n_regs, mem_pestat_t *out);
+
+/* Phase 3: pairing + mate rescue + primary marking + emission (worker_sam).
+ * Consumes `regs` (freed on every return path). `pestat` may be NULL only
+ * when the batch has no pairs. Records are emitted in input order: pairs
+ * (R1 side then R2 side, primary then supplementary), then singles. */
+int bwa_shim_pair_emit(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *sc,
+                       BwaRegs *regs, const mem_pestat_t *pestat, BwaIdBases ids,
+                       BwaRecordSinkFn sink, void *ctx);
+
 size_t         bwa_shim_batch_n_records (const BwaBatch *b);
 size_t         bwa_shim_batch_pair_idx  (const BwaBatch *b, size_t rec);
 const uint8_t *bwa_shim_batch_record_ptr(const BwaBatch *b, size_t rec);
@@ -136,6 +210,11 @@ void           bwa_shim_batch_free      (BwaBatch *b);
 
 const char *bwa_shim_last_error(void);
 void        bwa_shim_set_verbosity(int level);
+
+/* Vendored bwa-mem3 version (PACKAGE_VERSION, e.g. "0.9.0") — for `@PG VN:`. */
+const char *bwa_shim_version(void);
+/* Human-readable build description: "bwa-mem3 <version>; compiler: <line>". */
+const char *bwa_shim_build_info(void);
 
 /* Shared-memory index lifecycle. Thin wrappers over bwa-mem3's bwa_shm.h
  * (POSIX shm_open + a control segment named "/bwactl"). The shim's

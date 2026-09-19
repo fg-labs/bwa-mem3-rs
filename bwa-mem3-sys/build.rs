@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+include!("build_support/compiler_floor.rs");
+
 /// Kernel TUs: bwa-mem3 v0.2.0 compiles these once per SIMD tier on x86_64
 /// (`sse41`, `sse42`, `avx`, `avx2`, `avx512bw`) with `-DKERNEL_VARIANT=_<tier>`
 /// so each per-tier compile emits mangled symbols (`make_kswv_kernel_avx2`,
@@ -89,7 +91,10 @@ fn main() {
         &build_dir.join("bwa-mem3"),
     );
 
-    // 3. Apply any patches in patches/ lexicographic order. Expected empty in v1.
+    // 3. Apply any patches in patches/ lexicographic order. None ship today:
+    // mem_pair_resolve_batch_post landed upstream in fg-labs/bwa-mem3#515, so
+    // the vendored tree provides it directly (see CLAUDE.md gotcha #18). The
+    // loop stays so a future refresh can carry a patch without a build.rs edit.
     let patches_dir = manifest.join("patches");
     if patches_dir.is_dir() {
         let mut patches: Vec<_> = fs::read_dir(&patches_dir)
@@ -129,6 +134,19 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let is_x86 = target_arch == "x86_64";
 
+    // Version string for `@PG VN:` and PACKAGE_VERSION. Upstream's Makefile
+    // generates version.h from scripts/version.sh (Makefile:635); the pruned
+    // vendor tree has no git metadata, so version.txt is the source of truth.
+    // Computed here (before the kernel loop below) so every compiled TU --
+    // the five per-tier kernel builds in 4a and the main build in 4b -- gets
+    // the same `-DPACKAGE_VERSION` define.
+    let version = fs::read_to_string(vendor_root.join("version.txt"))
+        .expect("vendor/bwa-mem3/version.txt")
+        .trim()
+        .to_string();
+    println!("cargo:rustc-env=BWA_MEM3_SYS_VERSION={version}");
+    println!("cargo:rerun-if-changed=vendor/bwa-mem3/version.txt");
+
     // 4a. Per-tier kernel TUs (x86_64 only). bwa-mem3 v0.2.0 picks the
     // matching tier at runtime in `simd_dispatch.cpp`; we must supply all
     // five mangled tier copies of bandedSWA/kswv/ksw/sam_encode so the
@@ -153,6 +171,7 @@ fn main() {
             k_build.define("ENABLE_PREFETCH", None);
             k_build.define("V17", Some("1"));
             k_build.define("MATE_SORT", Some("0"));
+            k_build.define("PACKAGE_VERSION", Some(format!("\"{version}\"").as_str()));
             // kernel_dispatch.h mangles every exported kernel symbol to
             // `<name><KERNEL_VARIANT>` (e.g. `_avx2`). The dispatcher in
             // simd_dispatch.cpp expects this exact suffix per tier.
@@ -221,7 +240,30 @@ fn main() {
     build.define("ENABLE_PREFETCH", None);
     build.define("V17", Some("1"));
     build.define("MATE_SORT", Some("0"));
+    build.define("PACKAGE_VERSION", Some(format!("\"{version}\"").as_str()));
     apply_common_warning_silencing(&mut build);
+
+    // Compiler floor. cc enforces nothing, so at least say so loudly.
+    let compiler_line = compiler_version_line(&build);
+    let (toolchain, major) = parse_version_line(&compiler_line);
+    if let Some(w) = floor_warning(toolchain, major) {
+        println!("cargo:warning={w}");
+    }
+    println!("cargo:rustc-env=BWA_MEM3_SYS_COMPILER={compiler_line}");
+    build.define(
+        "BWA_SHIM_COMPILER_LINE",
+        Some(format!("\"{}\"", compiler_line.replace('"', "'")).as_str()),
+    );
+    let tiers = if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+        KERNEL_TIERS_X86
+            .iter()
+            .map(|(t, _)| *t)
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        String::new()
+    };
+    println!("cargo:rustc-env=BWA_MEM3_SYS_X86_TIERS={tiers}");
 
     build.compile("bwa-mem3");
 
@@ -235,7 +277,23 @@ fn main() {
     }
 
     // 5. Generate Rust bindings for the shim header.
-    generate_bindings(&manifest, &vendor_src, &out);
+    check_or_regenerate_bindings(&manifest, &out);
+}
+
+/// First line of `<cxx> --version`, or a placeholder when the compiler cannot
+/// be run (the build itself will fail later with the real error).
+fn compiler_version_line(build: &cc::Build) -> String {
+    let compiler = build.get_compiler();
+    let out = Command::new(compiler.path()).arg("--version").output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        _ => format!("unknown ({})", compiler.path().display()),
+    }
 }
 
 fn apply_common_warning_silencing(build: &mut cc::Build) {
@@ -297,6 +355,11 @@ fn apply_simd_flags(build: &mut cc::Build) {
 fn extract_makefile_defines(makefile: &str) -> Vec<String> {
     let mut out: Vec<String> = makefile
         .lines()
+        // A `#` begins a Makefile comment to end-of-line, so strip it before
+        // tokenizing: a `-D...` that appears only in explanatory comment text
+        // (e.g. the `-DTAG=x` build-stamp example in the vendored Makefile) is
+        // documentation, not a compiler define this crate must mirror.
+        .map(|line| line.split('#').next().unwrap_or(""))
         .flat_map(str::split_whitespace)
         .filter_map(|tok| tok.strip_prefix("-D"))
         .map(|def| def.trim_matches('"').to_owned())
@@ -319,11 +382,6 @@ const DEFINES_DELIBERATELY_OMITTED: &[(&str, &str)] = &[
         "CACHE_LINE_BYTES",
         "no mirror in build.rs -- see the tracking issue; changing it is a perf change \
          needing its own benchmark",
-    ),
-    (
-        "DISABLE_BATCHED_MATESW",
-        "upstream sets this only for the proto-neon-kswv CI's on/off A/B test of the \
-         batched mate-rescue SW port, never for a normal build",
     ),
     (
         "KERNEL_VARIANT",
@@ -589,29 +647,65 @@ endif
             ("KERNEL_VARIANT", "_avx2")
         );
         assert_eq!(
-            canonical_define("DISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)"),
-            ("DISABLE_BATCHED_MATESW", "$(DISABLE_BATCHED_MATESW)")
+            canonical_define("SOME_DEF=$(SOME_VAR)"),
+            ("SOME_DEF", "$(SOME_VAR)")
         );
     }
 }
 
-fn generate_bindings(manifest: &Path, _vendor_src: &Path, out: &Path) {
-    let shim_dir = manifest.join("shim");
-    let bindings = bindgen::Builder::default()
-        .header(shim_dir.join("bwa_shim.h").to_string_lossy())
-        .clang_arg(format!("-I{}", shim_dir.display()))
-        .allowlist_type("BwaReadPair")
-        .allowlist_type("BwaIndex")
-        .allowlist_type("BwaSeeds")
-        .allowlist_type("BwaBatch")
-        .allowlist_type("mem_opt_t")
-        .allowlist_type("mem_pestat_t")
-        .allowlist_function("bwa_shim_.*")
-        .allowlist_var("MEM_F_.*")
-        .derive_default(true)
-        .generate()
-        .expect("bindgen failed");
-    bindings
-        .write_to_file(out.join("bindings.rs"))
-        .expect("failed to write bindings.rs");
+/// Bindings are committed (`src/bindings.rs`) so downstream builds need no
+/// libclang. Under `regenerate-bindings` the header is re-run through bindgen
+/// and compared byte-for-byte; drift fails the build unless
+/// `BWA_MEM3_SYS_WRITE_BINDINGS=1`, in which case the committed file is
+/// rewritten (then commit it).
+fn check_or_regenerate_bindings(manifest: &Path, out: &Path) {
+    println!("cargo:rerun-if-env-changed=BWA_MEM3_SYS_WRITE_BINDINGS");
+    #[cfg(feature = "regenerate-bindings")]
+    {
+        let shim_dir = manifest.join("shim");
+        let generated = bindgen::Builder::default()
+            .header(shim_dir.join("bwa_shim.h").to_string_lossy())
+            .clang_arg(format!("-I{}", shim_dir.display()))
+            .allowlist_type("BwaReadPair")
+            .allowlist_type("BwaIndex")
+            .allowlist_type("BwaSeeds")
+            .allowlist_type("BwaBatch")
+            .allowlist_type("BwaScratch")
+            .allowlist_type("BwaRegs")
+            .allowlist_type("BwaReadBatch")
+            .allowlist_type("BwaSingleRead")
+            .allowlist_type("BwaIdBases")
+            .allowlist_type("BwaRecordSinkFn")
+            .allowlist_type("mem_opt_t")
+            .allowlist_type("mem_pestat_t")
+            .allowlist_function("bwa_shim_.*")
+            .allowlist_var("MEM_F_.*")
+            .allowlist_var("BWA_ORIGIN_.*")
+            .derive_default(true)
+            .generate()
+            .expect("bindgen failed")
+            .to_string();
+        let committed_path = manifest.join("src/bindings.rs");
+        let committed = fs::read_to_string(&committed_path).unwrap_or_default();
+        if committed != generated {
+            if env::var_os("BWA_MEM3_SYS_WRITE_BINDINGS").is_some() {
+                fs::write(&committed_path, &generated).expect("write src/bindings.rs");
+                println!(
+                    "cargo:warning=rewrote {}; commit it",
+                    committed_path.display()
+                );
+            } else {
+                panic!(
+                    "src/bindings.rs is out of date with shim/bwa_shim.h; run \
+                     `BWA_MEM3_SYS_WRITE_BINDINGS=1 cargo build -p bwa-mem3-sys --features regenerate-bindings`"
+                );
+            }
+        }
+        fs::write(out.join("bindings.rs"), &generated).expect("write OUT_DIR bindings");
+    }
+    #[cfg(not(feature = "regenerate-bindings"))]
+    {
+        let _ = (manifest, out);
+        println!("cargo:rerun-if-changed=src/bindings.rs");
+    }
 }

@@ -115,6 +115,33 @@ impl BwaIndex {
         Ok(BwaIndex { handle })
     }
 
+    /// As [`load`](Self::load), but loads the FM-index with `n_threads`
+    /// threads (the CLI's `-t` behavior for index load). `0` is treated as `1`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`load`](Self::load).
+    pub fn load_with_threads(prefix: impl AsRef<Path>, n_threads: usize) -> Result<Self> {
+        let path = prefix.as_ref();
+
+        if !crate::shm::is_staged(path).unwrap_or(false) {
+            check_index_files(path)?;
+        }
+
+        let c = prefix_to_cstring(path, "prefix")?;
+        let n = i32::try_from(n_threads.max(1)).unwrap_or(i32::MAX);
+        // SAFETY: `c` is a valid, NUL-terminated C string for the duration of
+        // this call.
+        let handle = unsafe { bwa_mem3_sys::bwa_shim_idx_load_threads(c.as_ptr(), n) };
+        if handle.is_null() {
+            return Err(Error::IndexLoad {
+                path: path.to_owned(),
+                msg: shim_err("idx load").to_string(),
+            });
+        }
+        Ok(BwaIndex { handle })
+    }
+
     /// Load a bisulfite (BS-seq) **dual index** for `--meth` alignment.
     ///
     /// `seed_prefix` is the converted seed index (`<ref>.meth`, built by

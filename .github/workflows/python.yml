@@ -82,7 +82,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bwa_arch: sse41
+            bwa_arch: avx2
           - os: ubuntu-24.04-arm
             bwa_arch: arm64
     runs-on: ${{ matrix.os }}
@@ -105,6 +105,31 @@ jobs:
       # doesn't compile them), but upstream's Makefile does — so for the
       # bwa-mem3 binary we re-fetch with submodules.
       # TODO: switch back to `bioconda::bwa-mem3` once published.
+      - name: Install clang-19 (verified LLVM apt repo)
+        # The vendored bwa-mem3 Makefile requires clang >= 19 / gcc >= 15 (the
+        # runner ships gcc 13), and clang's -fopenmp (libsais LIBSAIS_OPENMP)
+        # needs libomp. Install from apt.llvm.org via a pinned repo whose signing
+        # key is fingerprint-verified before use -- not `llvm.sh | sudo bash` --
+        # so a tampered mirror or installer can't run code as root (CWE-494).
+        # Mirrors fg-labs/bwa-mem3's release.yml.
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
+          expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ "$got_fpr" != "$expected_fpr" ]; then
+            echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
+            exit 1
+          fi
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
+          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-19.list
+          sudo apt-get update
+          sudo apt-get install -y clang-19 libomp-19-dev
+          clang++-19 --version | head -1
       - name: Build bwa-mem3 from upstream at vendored COMMIT
         run: |
           set -euo pipefail
@@ -114,7 +139,9 @@ jobs:
           git -C /tmp/bwa-mem3 fetch --filter=blob:none --no-tags --depth=1 origin "$sha"
           git -C /tmp/bwa-mem3 checkout FETCH_HEAD
           git -C /tmp/bwa-mem3 submodule update --init --recursive --depth 1
-          make -C /tmp/bwa-mem3 arch=${{ matrix.bwa_arch }} -j"$(nproc)" all
+          # fg-labs/bwa-mem3#513 retired the pre-AVX2 x86 tiers, so x86 builds
+          # arch=avx2; clang-19 satisfies the compiler floor.
+          make -C /tmp/bwa-mem3 arch=${{ matrix.bwa_arch }} CXX=clang++-19 CC=clang-19 -j"$(nproc)" all
           echo "BWA_MEM3_BIN=/tmp/bwa-mem3/bwa-mem3" >> "$GITHUB_ENV"
       - uses: prefix-dev/setup-pixi@8ca4608ef7f4daeb54f5205b20d0b7cb42f11143 # v0.8.1
         with:

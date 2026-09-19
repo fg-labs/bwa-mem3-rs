@@ -77,7 +77,7 @@ typedef struct {
 	 *
 	 * Derived from anns[].offset and NOT serialized. Both ends uphold that:
 	 * every writer that copies this struct wholesale detaches the pointer
-	 * first so the image carries NULL (bwa_shm_pack_into, bwa_idx2mem), and
+	 * first so the image carries NULL (bwa_shm_pack_into), and
 	 * every restore path that memcpy's it back (shm attach, mem-blob restore)
 	 * resets this to NULL and rebuilds via bns_build_pos2rid before the first
 	 * lookup. The reader-side reset is deliberately unconditional rather than
@@ -88,6 +88,16 @@ typedef struct {
 } bntseq_t;
 
 extern unsigned char nst_nt4_table[256];
+
+/* Re-encode one sequence byte to its nt4 code. A value already in [0, limit)
+ * passes through (limit is 4 for the plain path, 5 for callers that already hold
+ * N=4); anything else is mapped through nst_nt4_table. The parameter is
+ * unsigned char, so a signed `char` argument converts value-mod-256 at the call
+ * boundary -- a high-bit byte (>= 0x80) can never sneak past the guard as a
+ * negative value and be stored verbatim / index the table out of bounds. */
+static inline unsigned char nst_nt4_decode(unsigned char c, unsigned char limit) {
+    return c < limit ? c : nst_nt4_table[c];
+}
 
 /* 2-bit pac primitives — published so callers in other TUs (e.g. the
  * meth XM:Z slice path) can decode bases inline without going through

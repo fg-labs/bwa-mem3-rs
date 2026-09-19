@@ -51,7 +51,7 @@ Ownership layers:
 
 ### 1. Vendored Makefile must retain `MATE_SORT=0`
 
-Our shim delegates the paired-end decision to upstream's `mem_pair_resolve` (exposed by fg-labs/bwa-mem3 PR #9) and then runs our own BAM emission. `mem_pair_resolve`'s internal branching is guarded on `#if MATE_SORT` vs. the default; only the `MATE_SORT=0` path is exercised (and audited) by our shim. If `main` ever flips the default, the pairing logic would swap to an untested branch. `build.rs` asserts `-DMATE_SORT=0` at build time.
+Our shim delegates the paired-end decision to upstream's `mem_pair_resolve_batch_post` (fg-labs/bwa-mem3 #515) and then runs our own BAM emission. That function's internal branching is guarded on `#if MATE_SORT` vs. the default; only the `MATE_SORT=0` path is exercised (and audited) by our shim. If `main` ever flips the default, the pairing logic would swap to an untested branch. `build.rs` asserts `-DMATE_SORT=0` at build time.
 
 ### 2. `mem_opt_t` / `mem_pestat_t` layouts are mirrored in two places
 
@@ -182,15 +182,15 @@ same struct carries `emit_mq = 1`, which bears on the `MQ:i` tag this crate
 deliberately never emits (`DELIBERATELY_ASYMMETRIC_TAG_KEYS`). All meth code is gated on `opt->meth_mode` /
 non-NULL `meth_orig_*`, so the non-meth path is unchanged. Output matches the
 CLI byte-for-byte on every record including secondaries/`XA:Z`
-(`bwa-mem3-rs-cli/tests/meth_e2e.rs` pins this), because `pair_and_emit`
+(`bwa-mem3-rs-cli/tests/meth_e2e.rs` pins this), because `emit_resolved_pair`
 replicates `mem_reg2sam`'s XA folding (see gotcha #12).
 
-### 12. `pair_and_emit` folds secondaries into `XA:Z` like `mem_reg2sam`
+### 12. `emit_resolved_pair` folds secondaries into `XA:Z` like `mem_reg2sam`
 
 The shim emits records from the per-read alnreg list itself rather than calling
 upstream's `mem_reg2sam`, so it must reproduce that function's output policy:
-after `mem_pair_resolve` (which runs `mem_mark_primary_se`), `pair_and_emit`
-calls `mem_gen_alt` to build each read's `XA:Z` string and then, per alnreg,
+after `mem_pair_resolve_batch_post` (which runs `mem_mark_primary_se`),
+`emit_resolved_pair` calls `mem_gen_alt` to build each read's `XA:Z` string and then, per alnreg,
 **skips** any region that is secondary (`ar->secondary >= 0`, folded into the
 primary's `XA:Z`), below `opt->T`, or below `drop_ratio` — emitting only
 primaries + supplementaries (2nd+ emitted region gets `0x800` and its MAPQ
@@ -202,7 +202,7 @@ weak hits). `lists[k]` stays 1:1 with `a[k]` so the pairing indices (`z[k]`)
 and mate/SA logic are unaffected; a parallel `emit[k]` mask gates the append.
 
 One paired-branch subtlety the unified emission must reproduce: when
-`mem_pair` selects a non-top region (`z[k] != 0`), `mem_pair_resolve` promotes
+`mem_pair` selects a non-top region (`z[k] != 0`), `mem_pair_resolve_batch_post` promotes
 `a[k].a[z[k]]` (sets its `secondary` to `-2`) and runs the `secondary_all`
 switch, which reassigns the old SE-primary (region 0) into `z[k]`'s group —
 leaving it with `secondary < 0` but `secondary_all >= 0`. `mem_gen_alt` folds
@@ -334,6 +334,40 @@ concerned.)
 **On every refresh**, diff `compat_target.h` for new fields and
 `compat_target.cpp` for changes to the `off` row. A new switch will compile
 clean and read as "off" everywhere.
+
+### 16. Byte parity across batches needs the global pair id AND a cohort pestat
+
+Two things in bwa-mem3's pairing depend on state outside the pair: the
+insert-size model (`mem_pestat`, once per `-K` cohort) and the read ordinal
+(`(n_processed >> 1) + pos` for pairs, `n_processed + i` for singles,
+`bwamem.cpp:2795-2884`) that seeds the `hash_64` tie-breaks. The three-phase
+API makes both explicit: `bwa_shim_pestat_cohort` over every batch of the
+cohort, then `bwa_shim_pair_emit` with `BwaIdBases` derived from the cohort's
+global read offset. The legacy `align_batch` uses ids from 0 and a per-batch
+pestat — which is why it is CLI-identical only when the batch IS the cohort.
+`three_phase_ffi.rs::first_pair_id_reaches_the_tie_break_hash` pins that the
+id is plumbed; the CLI-crate `three_phase_parity.rs` pins the formulas.
+
+### 17. Bindings are committed; regenerate them when `bwa_shim.h` changes
+
+`bwa-mem3-sys/src/bindings.rs` is bindgen output checked in so consumers
+(fgumi's `aligner-bwa-mem3` feature, EC2 bench hosts) need no libclang. After
+any edit to `shim/bwa_shim.h` run
+`BWA_MEM3_SYS_WRITE_BINDINGS=1 cargo build -p bwa-mem3-sys --features regenerate-bindings`
+and commit the result; CI's `bindings` job fails on drift.
+
+### 18. Mate rescue runs the batched kernel where the CLI does
+
+`shim_pair_emit` uses `mem_sam_pe_batch_pre` → `sort_classify` →
+`mem_sam_pe_batch` → `mem_pair_resolve_batch_post`, the same path the CLI's
+`worker_sam` takes. This is now the *only* mate-rescue path: fg-labs/bwa-mem3#513
+removed the scalar `mem_pair_resolve` path (and the `BWAMEM_BATCHED_MATESW` /
+`DISABLE_BATCHED_MATESW` gate) and requires AVX2+ on x86 (NEON on arm), so the
+shim carries no scalar fallback and there is no scalar A/B CI run.
+`mem_pair_resolve_batch_post` is upstream since #515, so the crate no longer
+carries a `patches/0001-*.patch` for it — the vendored tree provides it
+directly. Byte-identity is asserted against `bwa-mem3 mem` on the batched
+kernel (the CLI parity suites + `batched_rescue_spanning_multiple_chunks_*`).
 
 ## Commit / PR conventions
 

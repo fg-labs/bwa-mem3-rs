@@ -49,6 +49,9 @@ typedef struct mem_opt_t {
     int max_extend_chains;
     int mate_concordant_window;
     int est_insert_high;
+    float extend_tie_frac;
+    int extend_csub;
+    int extend_tie_floor;
     /* upstream type is `seed_order_t`, a plain (int-sized) enum in bwamem.h;
      * mirrored as int for layout. The Rust API exposes it as the `SeedOrder`
      * enum (bwa-mem3-rs `MemOpts::seed_order`). */
@@ -79,8 +82,10 @@ typedef struct mem_opt_t {
     int8_t mat_ob[25];
     int    bam_mode;
     int    bam_level;
+    int    bam_threads;
     int    meth_mode;
     int    meth_scoring;
+    int    meth_seed_prune;
     /* v0.9.0 */
     int    meth_chem;
     int    meth_tags;
@@ -94,6 +99,7 @@ typedef struct mem_opt_t {
     int    alnreg_sort_fast;
     int    skip_contained_ext;
     int    band_start;
+    int    band_cert;
     /* v0.9.0. Upstream's type is `const compat_target_t *`; mirrored as an
      * opaque `const void *` because the POD only has to reproduce the LAYOUT
      * (pointer size and alignment), and pulling in compat_target_t would drag

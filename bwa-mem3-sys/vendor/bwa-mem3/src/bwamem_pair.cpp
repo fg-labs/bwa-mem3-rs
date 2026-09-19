@@ -37,7 +37,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwamem.h"
 #include "bam_writer.h"
 #include "kvec.h"
-#include "u8vec_scratch.h"
 #include "utils.h"
 #include "ksw.h"
 #include "bandedSWA.h"
@@ -297,6 +296,18 @@ static void matesw_sort_partitions_by_len(SeqPair *sp, int64_t pcnt8, int64_t pc
     std::sort(sp, sp + pcnt8, by_len1);
     if (pcnt > pcnt8) std::sort(sp + pcnt8, sp + pcnt, by_len1);
 }
+
+/* T5/L3: RAII holder for mem_pair's per-thread scratch vectors. Retaining a
+ * vector's grown capacity across calls (reset n=0, keep .a/.m) removes two
+ * malloc/free pairs per read-pair, but a bare `static thread_local pair64_v`
+ * is a POD with no destructor: its backing .a allocation would never be freed
+ * and LeakSanitizer (the ASan CI row runs LSan) flags it as a per-thread leak
+ * at exit. Wrapping the vector in a type whose destructor frees .a releases the
+ * buffer when the worker thread ends, so the reuse is genuinely leak-free. */
+struct pair64_scratch {
+    pair64_v v = {0, 0, 0};
+    ~pair64_scratch() { free(v.a); }
+};
 } // namespace
 
 /* File-scope forward declaration of the dedup/patch entry point defined in
@@ -519,209 +530,91 @@ void mem_pestat(const mem_opt_t *opt, int64_t l_pac, int n,
         }
 }
 
-int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
-               const uint8_t *pac, const mem_pestat_t pes[4],
-               const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
-               mem_alnreg_v *ma, const char *ms_orig = NULL,
-               const int8_t *mat = NULL, int mate_meth_ot = -1)
-{
-    /* D3 (--meth): the mate-rescue dedup at the bottom of this function still
-     * passes mat=NULL (resolving to opt->mat) — but those calls pass
-     * bns/pac/query = 0 (dedup-only, no patch SW), so the matrix is unused
-     * there regardless; leaving them on opt->mat is correct.
-     *
-     * The per-hypothesis scorer below no longer consults the `mat` parameter
-     * under --meth: it derives the matrix from the rescued mate's own read#
-     * chemistry (mate_meth_ot ^ is_rev — see the use_mat selection below). The
-     * caller-supplied `mat` (rmat = mem_opt_meth_mat(opt, !a->meth_hypothesis)
-     * in mem_pair_resolve) is therefore dead code under --meth: it is discarded
-     * here and recomputed from the mate read#. sw_mat/`mat` survives only as the
-     * non-meth default. */
-    /* Outside --meth, mat is NULL and ms_orig is NULL: behavior is byte-for-byte
-     * identical to the historical symmetric/projected mate rescue. */
-    const int8_t *sw_mat = mat ? mat : opt->mat;
-    /* D3 (--meth, PR-6): when ms_orig is set, score the ORIGINAL (unconverted)
-     * mate bases against the original ref window instead of the projected mate.
-     * meth_orig_seq is ASCII in the SAME orientation as `ms`/`seq` (bwa.h
-     * contract), so 2-bit-encode it here and let the existing per-orientation
-     * RC below reverse-complement it EXACTLY as it does the projected mate.
-     * Allocated AFTER the skip-all early return below so the consistent-pair
-     * fast path (the common case) does not leak it. */
-    uint8_t *ms2 = NULL;
-    #if MATE_SORT
-    extern int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                               const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
-    extern void sort_alnreg_re(int n, mem_alnreg_t* a);
-    extern void sort_alnreg_score(int n, mem_alnreg_t* a);
-    #endif
-    
-    //int tid = omp_get_thread_num();
-    int64_t l_pac = bns->l_pac;
-    int i, r, skip[4], n = 0, rid = -1;
-    for (r = 0; r < 4; ++r)
-        skip[r] = pes[r].failed? 1 : 0;
+/* ------------------------------------------------------------------------- *
+ * u8 mate-rescue admission (tier selection)
+ *
+ * Mate rescue routes each pair to the 8-bit (u8) or 16-bit SW kernel. The u8
+ * kernel biases scores by `shift` and stores them in a uint8_t, so it is only
+ * byte-identical to the 16-bit kernel while the max attainable biased score
+ * cannot saturate/early-break the u8 DP. The binding limit is the u8-only
+ * early break `gmax + q->shift >= 255` in ksw.cpp (ksw_u8), i.e. the biased
+ * max score must be <= 254; the batched kswv u8 kernel saturates one unit
+ * later, so 254 is the tighter, shared bound.
+ *
+ * `shift` is the kernel's score bias: ksw derives it as `256 - min(matrix)`
+ * taken as a uint8_t, which equals `-(min matrix entry)` for every matrix
+ * bwa-mem3 builds (>= 1 in practice; the floor guards a degenerate matrix).
+ *
+ * There is a second, geometric provability condition. The u8 and 16-bit paths
+ * pad the query to different widths (16*ceil(l/16) vs 8*ceil(l/8)); a pair may
+ * flip tier only when those pad widths are equal, otherwise the two kernels run
+ * different padded column counts and their tie-break/XS scan can diverge. That
+ * equality holds exactly when l % 16 == 0 || l % 16 >= 9. Pairs already routed
+ * to u8 under the historical `l_ms*a < 250` bound keep their routing regardless
+ * (they were u8 before and stay u8), so the geometry clause only gates the new
+ * admissions the tightened bound opens up.
+ * ------------------------------------------------------------------------- */
 
-
-    for (i = 0; i < ma->n; ++i) { // check which orinentation has been found
-        int64_t dist;
-        r = mem_infer_dir(l_pac, a->rb, ma->a[i].rb, &dist);
-        
-        if (dist >= pes[r].low && dist <= pes[r].high) {
-            skip[r] = 1;
-        }
-    }
-
-    if (skip[0] + skip[1] + skip[2] + skip[3] == 4) return 0; // consistent pair exist; no need to perform SW
-
-    if (ms_orig != NULL) {
-        ms2 = (uint8_t*) malloc(l_ms);
-        xassert(ms2 != NULL, "out of memory: ms2");
-        for (int k = 0; k < l_ms; ++k) {
-            unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
-        }
-        ms = ms2; // alias the projected-mate pointer to the original bases
-    }
-
-    for (r = 0; r < 4; ++r) {
-        int is_rev, is_larger;
-        uint8_t *seq, *rev = 0, *ref = 0;
-        int64_t rb, re;
-        if (skip[r]) continue;
-        is_rev = (r>>1 != (r&1)); // whether to reverse complement the mate
-        is_larger = !(r>>1); // whether the mate has larger coordinate
-        if (is_rev) {
-            rev = (uint8_t*) malloc(l_ms); // this is the reverse complement of $ms
-            xassert(rev != NULL, "out of memory: rev");
-            for (i = 0; i < l_ms; ++i) rev[l_ms - 1 - i] = ms[i] < 4? 3 - ms[i] : 4;
-            seq = rev;
-        } else seq = (uint8_t*)ms;
-        if (!is_rev) {
-            rb = is_larger? a->rb + pes[r].low : a->rb - pes[r].high;
-            re = (is_larger? a->rb + pes[r].high: a->rb - pes[r].low) + l_ms; // if on the same strand, end position should be larger to make room for the seq length
-        } else {
-            rb = (is_larger? a->rb + pes[r].low : a->rb - pes[r].high) - l_ms; // similarly on opposite strands
-            re = is_larger? a->rb + pes[r].high: a->rb - pes[r].low;
-        }
-        if (rb < 0) rb = 0;
-        if (re > l_pac<<1) re = l_pac<<1;
-        static thread_local u8vec_scratch_t t_ref;
-        if (rb < re) {
-            size_t want = (size_t)((re - rb) + 64);
-            if (t_ref.v.m < want) kv_resize(uint8_t, t_ref.v, want);
-            int64_t rlen;
-            bns_fetch_seq_into(bns, pac, &rb, (rb+re)>>1, &re, &rid, t_ref.v.a, &rlen);
-            ref = t_ref.v.a;
-        }
-        if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
-            kswr_t aln;
-            mem_alnreg_t b;
-            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
-
-            /* D3 (--meth): score the rescued mate under ITS OWN read-number
-             * chemistry (mate_meth_ot: R1=1/OT, R2=0/OB), flipped by the rescue
-             * strand because this path RC's the READ (seq=rev) against the forward
-             * reference window. One SW pass with the correct matrix — no try-both:
-             * the mate's read# is the chemistry that frees its conversions at its
-             * true locus, so the crippling that a wrong seed-derived guess caused
-             * cannot happen. matesw_hyp is the genome-strand hypothesis recorded on
-             * the rescued alnreg for the XG/XM output layer. */
-            const int8_t *use_mat = sw_mat;
-            int matesw_hyp = -1;
-            if (opt->meth_mode && mate_meth_ot >= 0) {
-                matesw_hyp = (mate_meth_ot ^ is_rev) & 1;
-                use_mat = mem_opt_meth_mat(opt, matesw_hyp);
-            }
-            assert(ref !=0 && re - rb >= 0);
-            aln = ksw_align2(l_ms, seq, re - rb, ref, 5,
-                             use_mat, opt->o_del, opt->e_del,
-                             opt->o_ins, opt->e_ins, xtra, 0);
-
-            memset(&b, 0, sizeof(mem_alnreg_t));
-            if (aln.score >= opt->min_seed_len && aln.qb >= 0 && aln.qe < l_ms) { // something goes wrong if aln.qb < 0, or if aln.qe runs past the read
-                b.rid = a->rid;
-                b.is_alt = a->is_alt;
-                /* D3 (--meth): record the rescued mate's genome-strand hypothesis
-                 * (matesw_hyp = mate read# XOR rescue strand, computed with the SW
-                 * above) so the XG/XM output layer sources the right strand. -1
-                 * anchor (non-meth) stays -1. Coordinates are already ORIGINAL
-                 * (l_pac is the original l_pac via the original bns), so the 6a
-                 * coordinate fix holds. */
-                b.meth_hypothesis = matesw_hyp;
-                b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
-                b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
-                b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
-                b.re = is_rev? (l_pac<<1) - (rb + aln.tb) : rb + aln.te + 1;
-                b.score = aln.score;
-                b.csub = aln.score2;
-                b.secondary = -1;
-                b.seedcov = (b.re - b.rb < b.qe - b.qb? b.re - b.rb : b.qe - b.qb) >> 1;
-                b.chain_n_hits = 1; // mate-rescue has no SMEM evidence; treat as unique anchor
-
-                kv_push(mem_alnreg_t, *ma, b); // make room for a new element
-
-                #if !MATE_SORT
-                // move b s.t. ma is sorted
-                for (i = 0; i < ma->n - 1; ++i) // find the insertion point
-                    if (ma->a[i].score < b.score) break;
-                tmp = i;
-                for (i = ma->n - 1; i > tmp; --i) ma->a[i] = ma->a[i-1];
-                ma->a[i] = b;
-                
-                #else
-                
-                int resort = 0;
-                for (i = 0; i < ma->n - 1; ++i) { // find the insertion point
-                    if (ma->a[i].re == b.re) {
-                        resort = 1;
-                        break;
-                    }
-                    if (ma->a[i].re > b.re) {
-                        break;
-                    }
-                }
-                if (resort) {
-                    // Don't know where to put this alignment. So let the scores decide
-                    sort_alnreg_score(ma->n - 1, ma->a);
-                    for (i = 0; i < ma->n - 1; ++i) { // find the insertion point
-                        if (ma->a[i].score < b.score) {
-                            break;
-                        }
-                    }
-                    tmp = i;
-                    for (i = ma->n - 1; i > tmp; --i) ma->a[i] = ma->a[i-1];
-                    ma->a[i] = b;
-                    // Now we can sort based on end position
-                    sort_alnreg_re(ma->n, ma->a);
-                }
-                else {
-                    tmp = i;
-                    for (i = ma->n - 1; i > tmp; --i) ma->a[i] = ma->a[i-1];
-                    ma->a[i] = b;
-                }
-                #endif
-                tprof[PE26][0] ++;
-            }
-            ++n;
-        }
-        #if !MATE_SORT
-        if (n) ma->n = mem_sort_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
-        #else
-        if (n) ma->n = mem_dedup_patch(opt, 0, 0, 0, ma->n, ma->a); // sam_improvements
-        #endif
-        if (rev) free(rev);
-        /* ref aliases t_ref thread-local scratch; do not free. */
-    }
-    if (ms2) free(ms2); // D3 (--meth): original-mate 2-bit scratch
-    return n;
+/* Kernel score bias for a 5x5 scoring matrix, matching ksw_qinit's
+ * `256 - (uint8_t)min` reduction. >= 1 for any real matrix (min <= 0). */
+static inline int matesw_u8_shift(const int8_t *mat) {
+    int mn = 0;
+    for (int i = 0; i < 25; ++i) if (mat[i] < mn) mn = mat[i];
+    int s = -mn;
+    return s < 1 ? 1 : s;
 }
+
+/* Worst-case (max) bias across every matrix the SW at a site could use. Taking
+ * the max only ever routes MORE pairs to the safe 16-bit tier, so it can never
+ * over-admit. Under --meth the actual matrix is one of mat_ot/mat_ob (chosen by
+ * the rescued mate's read#); folding both in keeps the batched pre/post split
+ * consistent no matter which hypothesis a pair ends up scored under. */
+static inline int matesw_u8_shift_for(const mem_opt_t *opt, const int8_t *base_mat) {
+    int s = matesw_u8_shift(base_mat);
+    if (opt->meth_mode) {
+        int so = matesw_u8_shift(opt->mat_ot);
+        int sb = matesw_u8_shift(opt->mat_ob);
+        if (so > s) s = so;
+        if (sb > s) s = sb;
+    }
+    return s;
+}
+
+/* True iff a mate of query length l_ms may be scored on the u8 tier
+ * byte-identically. `a` is the match reward (opt->a); `shift` the kernel bias
+ * from matesw_u8_shift_for(). */
+static inline int matesw_use_u8(int l_ms, int a, int shift) {
+    int prod = l_ms * a;                              /* max attainable SW score */
+    return (prod + shift <= 254)                      /* no u8 saturation / early break */
+        && (prod < 250                                /* historical admissions keep routing */
+            || l_ms % 16 == 0 || (l_ms % 16) >= 9);   /* new admissions: pad geometry equal */
+}
+
 
 int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_pestat_t pes[4], bseq1_t s[2], mem_alnreg_v a[2], int id, int *sub, int *n_sub, int z[2], int n_pri[2])
 {
-    pair64_v v, u;
+    /* T5/L3: v and u are pure per-call working buffers -- rebuilt from n=0 every
+     * call, only [0,n) is ever read, and no state survives the return. Making
+     * them thread-local persistent buffers (reset n=0, keep the grown capacity)
+     * removes two malloc/free pairs per read-pair without changing any bytes:
+     * a reset-to-empty vector with retained capacity behaves identically to a
+     * fresh kv_init'd one. The pair64_scratch wrapper frees .a at thread exit
+     * (LSan-clean; see its definition above). */
+    static thread_local pair64_scratch v_buf, u_buf;
+    pair64_v &v = v_buf.v, &u = u_buf.v;
     int r, i, k, y[4], ret; // y[] keeps the last hit
     int64_t l_pac = bns->l_pac;
-    kv_init(v); kv_init(u);
+    /* Bound the retained capacity so one pathological high-cardinality pair does
+     * not pin a large allocation for the worker thread's lifetime. Below the cap
+     * the grown buffer is reused as-is; above it we release and let the next call
+     * re-grow from empty. Capacity-only -- [0,n) content and output are
+     * byte-identical either way. The cap (64Ki entries = 1 MiB per buffer) sits
+     * orders of magnitude above any realistic per-pair candidate count, so the
+     * common path never trims. */
+    const size_t PAIR_SCRATCH_MAX_M = (size_t)1 << 16;
+    if (v.m > PAIR_SCRATCH_MAX_M) { free(v.a); v.a = 0; v.m = 0; }
+    if (u.m > PAIR_SCRATCH_MAX_M) { free(u.a); u.a = 0; u.m = 0; }
+    v.n = 0; u.n = 0;
     for (r = 0; r < 2; ++r) { // loop through read number
         for (i = 0; i < n_pri[r]; ++i) {
             pair64_t key;
@@ -733,7 +626,18 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
         }
     }
 
-    ks_introsort_128(v.n, v.a);
+    /* Both sorts in this function run on keys that are pairwise distinct by
+     * construction: v's `y` ends in `i << 2 | strand << 1 | r`, and (i, r) is
+     * distinct per element (score and strand ride along); u's `y` is the
+     * (k, i) pair, pushed at most once per (k, i). So the sorted order is
+     * unique and pdqsort gives the same array as the klib introsort it
+     * replaces (faster on the sort microbench's 9-32 element bucket; measured
+     * whole-aligner in the PR). Tested against ks_introsort_128 in
+     * test/unit/test_pair64_sort.cpp. The strict-order check after each sort
+     * turns a future key change that breaks distinctness into a hard failure
+     * instead of a silently different pairing on ties. */
+    if (v.n > 1) pdqsort_128(v.n, v.a);  // v.a is null when no candidates were pushed; PDQSORT_INIT forms a + n, UB on a null pointer
+    xassert(pair64_strictly_sorted(v.n, v.a), "mem_pair: candidate keys must be pairwise distinct");
     y[0] = y[1] = y[2] = y[3] = -1;
     for (i = 0; i < v.n; ++i) {
         for (r = 0; r < 2; ++r) { // loop through direction
@@ -751,7 +655,12 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
                 //printf("%d: %lld\n", k, dist);
                 if (dist > pes[dir].high) break;
                 if (dist < pes[dir].low)  continue;
-                ns = (dist - pes[dir].avg) / pes[dir].std;
+                // Guard std==0 (from -I mean,0 or a fixed-insert cohort where
+                // mem_pestat yields std=0): every surviving candidate already has
+                // dist==avg, so ns=0 is the right limit. Without this the divide
+                // is 0/0=NaN, the (int) cast of NaN is UB, and pairing silently
+                // collapses (q=0 for every pair).
+                ns = pes[dir].std > 0. ? (dist - pes[dir].avg) / pes[dir].std : 0.;
                 q = (int)((v.a[i].y>>32) + (v.a[k].y>>32) + .721 * log(2. * erfc(fabs(ns) * M_SQRT1_2)) * opt->a + .499); // .721 = 1/log(4)
                 if (q < 0) q = 0;
                 p = kv_pushp(pair64_t, u);
@@ -765,7 +674,8 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
         int tmp = opt->a + opt->b;
         tmp = tmp > opt->o_del + opt->e_del? tmp : opt->o_del + opt->e_del;
         tmp = tmp > opt->o_ins + opt->e_ins? tmp : opt->o_ins + opt->e_ins;
-        ks_introsort_128(u.n, u.a);
+        pdqsort_128(u.n, u.a);   /* unique keys, see above */
+        xassert(pair64_strictly_sorted(u.n, u.a), "mem_pair: pair keys must be pairwise distinct");
         i = u.a[u.n-1].y >> 32; k = u.a[u.n-1].y << 32 >> 32;
         z[v.a[i].y&1] = v.a[i].y<<32>>34; // index of the best pair
         z[v.a[k].y&1] = v.a[k].y<<32>>34;
@@ -775,7 +685,8 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
             if (*sub - (int)(u.a[i].x>>32) <= tmp) ++*n_sub;
 
     } else ret = 0, *sub = 0, *n_sub = 0;
-    free(u.a); free(v.a);
+    /* T5/L3: no per-call free -- v/u keep their capacity for reuse across calls;
+     * the pair64_scratch destructor releases .a when the worker thread exits. */
     return ret;
 }
 
@@ -784,300 +695,30 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq
 #define raw_mapq(diff, a) ((int)(6.02 * (diff) / (a) + .499))
 
 
-// Core pairing decision for a single read pair.
-//
-// Performs, in order:
-//   1. Mate-rescue SW (unless MEM_F_NO_RESCUE) — may add entries to a[].
-//   2. mem_mark_primary_se on both reads — mutates a[] and fills n_pri[].
-//   3. mem_reorder_primary5 if MEM_F_PRIMARY5 — mutates a[].
-//   4. Pairing attempt via mem_pair, is-multi sanity check, q_pe / q_se
-//      computation, and the secondary<->primary secondary_all patch.
-//
-// On exit:
-//   *paired_out = 1 if the paired branch was taken (extra_flag includes 0x2
-//                   iff o > score_un, i.e. paired alignment is preferred).
-//               = 0 if pairing fell through (MEM_F_NOPAIRING set, neither
-//                   read has a primary, mem_pair returned 0, or is_multi).
-//                   Callers must treat z[]/q_se[] as undefined in this case:
-//                   mem_pair() may already have populated z[] before an
-//                   early return (e.g. is_multi), so paired_out is the only
-//                   validity check. Callers take the "no_pairing" emission
-//                   path here.
-//   extra_flag_out carries the common extra_flag bits (always has 0x1).
-//                   On the paired path it is fully assembled and includes
-//                   0x2 iff the paired alignment was preferred. On the
-//                   no-pairing path it is only partial — the caller (or
-//                   mem_sam_pe's no_pairing emission block) is responsible
-//                   for OR-ing in 0x2 itself.
-//   n_pri[] is always populated.
-//   z[], q_se[] are valid only when *paired_out == 1.
-//
-// Returns the number of mate-rescue hits produced (same meaning as the
-// historical `n` return from mem_sam_pe — i.e. a caller-visible accounting
-// of mate-SW work done).
-int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
-                     const uint8_t *pac, const mem_pestat_t pes[4],
-                     uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
-                     int n_pri[2], int z[2], int q_se[2],
-                     int *extra_flag_out, int *paired_out)
+/* --extend-csub (PE): estimate the pair score of a competitor pruned before
+ * extension, so the pairing MAPQ raw_mapq(o - subo) reflects it. Each mate contributes
+ * its pruned-competitor SE score, estimated from the dropped chain weight scaled by that
+ * mate's OBSERVED per-base score rate (score/span). Note this is deliberately gentler
+ * than the all-match upper bound (weight * a) that mem_seed_capped_sub uses on the SE
+ * side: a pair score is the sum of two such estimates, so the generous bound would
+ * overstate subo roughly twice over. The sum is clamped strictly below o, so q_pe drops
+ * proportionally to a near-tie rather than being forced to 0.
+ * Returns a floor for subo, or 0 to leave subo unchanged. */
+int mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o)
 {
-    extern int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
-    extern int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a);
-
-    #if MATE_SORT
-    extern void sort_alnreg_re(int n, mem_alnreg_t* a);
-    extern void sort_alnreg_score(int n, mem_alnreg_t* a);
-    /* D3 (--meth, PR-6): this dedup call passes bns/pac/query = 0 (dedup-only,
-     * no patch SW), so its matrix is never consulted — opt->mat default is
-     * correct; the per-hypothesis asymmetric scoring lives in mem_matesw. */
-    #endif
-
-    int n = 0, i, j, o, subo, n_sub, extra_flag = 1;
-
-    *paired_out = 0;
-    *extra_flag_out = extra_flag;
-
-    if (!(opt->flag & MEM_F_NO_RESCUE)) { // then perform SW for the best alignment
-
-        mem_alnreg_v b[2];
-        kv_init(b[0]); kv_init(b[1]);
-        for (i = 0; i < 2; ++i)
-            for (j = 0; j < a[i].n; ++j)
-                if (a[i].a[j].score >= a[i].a[0].score  - opt->pen_unpaired)
-                    kv_push(mem_alnreg_t, b[i], a[i].a[j]);
-
-        #if MATE_SORT
-        for (i = 0; i < 2; ++i) {
-            sort_alnreg_re(a[!i].n, a[!i].a);
-            int val = 0, swcount = 0;
-            for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
-                /* D3 (--meth): rescue read !i against the original ref using its
-                 * ORIGINAL bases (ms_orig). `rmat` is vestigial — mem_matesw now
-                 * derives the matrix from the mate's own read# chemistry
-                 * (mate_meth_ot ^ is_rev) and discards `mat` under --meth, so rmat
-                 * is dead code (recomputed inside mem_matesw). Outside --meth both
-                 * stay NULL and mem_matesw is identical to before. */
-                const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
-                const int8_t *rmat    = opt->meth_mode
-                    ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
-                int val = mem_matesw(opt, bns, pac, pes, &b[i].a[j], s[!i].l_seq, (uint8_t*)s[!i].seq, &a[!i], ms_orig, rmat, opt->meth_mode ? i : -1);
-                n += val;
-                swcount += val;
-            }
-            if (swcount > 0) {
-                mem_alnreg_v* ma = &a[!i];
-                ma->n = mem_sort_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
-            }
-            else {
-                sort_alnreg_score(a[!i].n, a[!i].a);
-            }
-        }
-
-        #else
-
-        for (i = 0; i < 2; ++i)
-            for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
-                /* D3 (--meth): see MATE_SORT branch above — original mate bases;
-                 * rmat is vestigial (mem_matesw derives its matrix from the mate
-                 * read# and discards `mat` under --meth). */
-                const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
-                const int8_t *rmat    = opt->meth_mode
-                    ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
-                int val = mem_matesw(opt, bns, pac, pes, &b[i].a[j], s[!i].l_seq, (uint8_t*)s[!i].seq, &a[!i], ms_orig, rmat, opt->meth_mode ? i : -1);
-                n += val;
-            }
-        #endif
-        free(b[0].a); free(b[1].a);
+    long est = 0;
+    for (int i = 0; i < 2; i++) {
+        if (a[i].capped_w <= 0 || z[i] < 0 || (size_t)z[i] >= a[i].n) continue;
+        const mem_alnreg_t *p = &a[i].a[z[i]];
+        int span = p->qe - p->qb;
+        if (span > 0 && p->score > 0)
+            est += (long)a[i].capped_w * p->score / span;
     }
-
-    n_pri[0] = mem_mark_primary_se(opt, a[0].n, a[0].a, id<<1|0);
-    n_pri[1] = mem_mark_primary_se(opt, a[1].n, a[1].a, id<<1|1);
-
-    #if V17
-    if (opt->flag & MEM_F_PRIMARY5) {
-        mem_reorder_primary5(opt->T, &a[0]);
-        mem_reorder_primary5(opt->T, &a[1]);
-    }
-    #endif
-
-    if (opt->flag & MEM_F_NOPAIRING) {
-        *extra_flag_out = extra_flag;
-        return n;
-    }
-
-    // pairing single-end hits
-    if (!(n_pri[0] && n_pri[1] &&
-          (o = mem_pair(opt, bns, pac, pes, s, a, id, &subo, &n_sub, z, n_pri)) > 0)) {
-        *extra_flag_out = extra_flag;
-        return n;
-    }
-
-    int is_multi[2], q_pe, score_un;
-    for (i = 0; i < 2; ++i) {
-        for (j = 1; j < n_pri[i]; ++j)
-            if (a[i].a[j].secondary < 0 && a[i].a[j].score >= opt->T) break;
-        is_multi[i] = j < n_pri[i] ? 1 : 0;
-    }
-    if (is_multi[0] || is_multi[1]) { // TODO: in rare cases, the true hit may be long but with low score
-        *extra_flag_out = extra_flag;
-        return n;
-    }
-
-    // compute mapQ for the best SE hit
-    score_un = a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
-    subo = subo > score_un ? subo : score_un;
-    q_pe = raw_mapq(o - subo, opt->a);
-    if (n_sub > 0) q_pe -= (int)(4.343 * log(n_sub + 1) + .499);
-    if (q_pe < 0) q_pe = 0;
-    if (q_pe > 60) q_pe = 60;
-    q_pe = (int)(q_pe * (1. - .5 * (a[0].a[0].frac_rep + a[1].a[0].frac_rep)) + .499);
-
-    // the following assumes no split hits
-    if (o > score_un) { // paired alignment is preferred
-        mem_alnreg_t *c[2];
-        c[0] = &a[0].a[z[0]]; c[1] = &a[1].a[z[1]];
-        for (i = 0; i < 2; ++i) {
-            if (c[i]->secondary >= 0)
-                c[i]->sub = a[i].a[c[i]->secondary].score, c[i]->secondary = -2;
-            q_se[i] = mem_approx_mapq_se(opt, c[i]);
-        }
-        q_se[0] = q_se[0] > q_pe ? q_se[0] : q_pe < q_se[0] + 40 ? q_pe : q_se[0] + 40;
-        q_se[1] = q_se[1] > q_pe ? q_se[1] : q_pe < q_se[1] + 40 ? q_pe : q_se[1] + 40;
-        extra_flag |= 2;
-
-        // cap at the tandem repeat score
-        q_se[0] = q_se[0] < raw_mapq(c[0]->score - c[0]->csub, opt->a) ? q_se[0] : raw_mapq(c[0]->score - c[0]->csub, opt->a);
-        q_se[1] = q_se[1] < raw_mapq(c[1]->score - c[1]->csub, opt->a) ? q_se[1] : raw_mapq(c[1]->score - c[1]->csub, opt->a);
-    } else { // the unpaired alignment is preferred
-        z[0] = z[1] = 0;
-        q_se[0] = mem_approx_mapq_se(opt, &a[0].a[0]);
-        q_se[1] = mem_approx_mapq_se(opt, &a[1].a[0]);
-    }
-
-    for (i = 0; i < 2; ++i) {
-        int k = a[i].a[z[i]].secondary_all;
-        if (k >= 0 && k < n_pri[i]) { // switch secondary and primary if both of them are non-ALT
-            assert(a[i].a[k].secondary_all < 0);
-            for (j = 0; j < a[i].n; ++j)
-                if (a[i].a[j].secondary_all == k || j == k)
-                    a[i].a[j].secondary_all = z[i];
-            a[i].a[z[i]].secondary_all = -1;
-        }
-    }
-
-    *paired_out = 1;
-    *extra_flag_out = extra_flag;
-    return n;
+    if (est <= 0) return 0;
+    if (est > (long)o - 1) est = (long)o - 1;   /* clamp: never force q_pe to 0 */
+    return (int)est;
 }
 
-
-int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
-               const uint8_t *pac, const mem_pestat_t pes[4],
-               uint64_t id, bseq1_t s[2], mem_alnreg_v a[2])
-{
-    extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
-    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn, const char *meth_orig_query);
-
-    int i, j, z[2], extra_flag, n_pri[2], q_se[2], n_aa[2], paired;
-    kstring_t str;
-    mem_aln_t h[2], g[2], aa[2][2];
-
-    str.l = str.m = 0; str.s = 0;
-    memset(h, 0, sizeof(mem_aln_t) * 2);
-    memset(g, 0, sizeof(mem_aln_t) * 2);
-    n_aa[0] = n_aa[1] = 0;
-
-    int n = mem_pair_resolve(opt, bns, pac, pes, id, s, a, n_pri, z, q_se,
-                             &extra_flag, &paired);
-
-    if (paired) {
-        char **XA[2];
-        int *HN[2] = { 0, 0 };
-        if (!(opt->flag & MEM_F_ALL)) {
-            for (i = 0; i < 2; ++i)
-                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i], s[i].meth_orig_seq);
-        } else XA[0] = XA[1] = 0;
-        // write SAM
-        for (i = 0; i < 2; ++i) {
-            h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[z[i]], s[i].meth_orig_seq);
-            h[i].mapq = q_se[i];
-
-            h[i].flag |= 0x40<<i | extra_flag;
-            h[i].XA = XA[i]? XA[i][z[i]] : 0;
-            h[i].HN = HN[i]? HN[i][z[i]] : -1;
-            aa[i][n_aa[i]++] = h[i];
-            if (n_pri[i] < a[i].n) { // the read has ALT hits
-                mem_alnreg_t *p = &a[i].a[n_pri[i]];
-                if (p->score < opt->T || p->secondary >= 0 || !p->is_alt) continue;
-                g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p, s[i].meth_orig_seq);
-                g[i].flag |= 0x800 | 0x40<<i | extra_flag;
-                g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
-                g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
-                if (opt->supp_rep_hard_cap > 0 && p->chain_n_hits >= opt->supp_rep_hard_cap)
-                    g[i].mapq = 0; // fg-labs: force repetitive-supp MAPQ to 0
-                aa[i][n_aa[i]++] = g[i];
-            }
-        }
-        for (i = 0; i < n_aa[0]; ++i)
-            mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]);
-
-        if (mem_opt_records_are_bam(opt)) {
-            /* bam1_t path (meth or generic): mem_aln2sam short-circuited into
-             * s->bams, leaving str untouched. Skip the str.s dance. Note this
-             * is NOT opt->bam_mode — --meth without --bam still builds bam1_t
-             * and would hit the `assert(str.s != 0)` below. */
-            s[0].sam = NULL;
-            str.l = 0;
-            for (i = 0; i < n_aa[1]; ++i)
-                mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]);
-            s[1].sam = NULL;
-            free(str.s); str.s = NULL; str.m = 0;
-        } else {
-            assert(str.s != 0);
-            s[0].sam = strdup(str.s); str.l = 0;
-            for (i = 0; i < n_aa[1]; ++i)
-                mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]); // write read2 hits
-            s[1].sam = str.s;
-        }
-        if (strcmp(s[0].name, s[1].name) != 0) err_fatal(__func__, "paired reads have different names: \"%s\", \"%s\"\n", s[0].name, s[1].name);
-        // free
-        for (i = 0; i < 2; ++i) {
-            free(h[i].cigar); free(g[i].cigar);
-            free(HN[i]);
-            if (XA[i] == 0) continue;
-            for (j = 0; j < a[i].n; ++j) free(XA[i][j]);
-            free(XA[i]);
-        }
-        return n;
-    }
-
-    // no_pairing
-    int which[2] = { -1, -1 };
-    for (i = 0; i < 2; ++i) {
-        if (a[i].n) {
-            if (a[i].a[0].score >= opt->T) which[i] = 0;
-            else if (n_pri[i] < a[i].n && a[i].a[n_pri[i]].score >= opt->T)
-                which[i] = n_pri[i];
-        }
-        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]], s[i].meth_orig_seq);
-        else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
-    }
-    // Proper-pair bit. Which alignment it is derived from -- the top-scoring
-    // region a[0] (both upstreams, the default) or the emitted a[which] (#17,
-    // opt-in via --proper-pair-from-emitted) -- lives in one place so this block
-    // and its verbatim twin cannot drift apart; see mem_proper_pair_extra_flag.
-    if (!(opt->flag & MEM_F_NOPAIRING) && which[0] >= 0 && which[1] >= 0 &&
-        h[0].rid == h[1].rid && h[0].rid >= 0)
-        extra_flag |= mem_proper_pair_extra_flag(opt, bns->l_pac, a, which, pes);
-    mem_reg2sam(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &h[1]);
-    mem_reg2sam(opt, bns, pac, &s[1], &a[1], 0x81|extra_flag, &h[0]);
-    if (strcmp(s[0].name, s[1].name) != 0)
-        err_fatal(__func__, "paired reads have different names: \"%s\", \"%s\"\n",
-                  s[0].name, s[1].name);
-
-    free(h[0].cigar); free(h[1].cigar);
-    return n;
-}
 
 int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
@@ -1211,14 +852,9 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     for (int i=0; i<slice_pcnt-slice_pcnt8; i++)
         pairs[slice_pcnt + MAX_LINE_LEN - 1 - i] = pairs[slice_pcnt-i-1];
 
-#if BWAMEM_BATCHED_MATESW
     pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, slice_pcnt8, nthreads, 0);
     pwsw->getScores16(pairs + slice_pcnt8 + MAX_LINE_LEN, seqBufRef, seqBufQer,
                       aln, slice_pcnt-slice_pcnt8, nthreads, 0);
-#else
-    fprintf(stderr, "Error: mem_sam_pe_batch reached without a batched kswv kernel\n");
-    exit(EXIT_FAILURE);
-#endif
 
     // Post-processing
     int pos = 0, pos8 = 0, pos16 = 0;
@@ -1261,13 +897,8 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     assert(pos8 + pos16 == pcnt2);
     (void) pcnt2;
 
-#if BWAMEM_BATCHED_MATESW
     pwsw->getScores16(pairs + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
     pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
-#else
-    fprintf(stderr, "Error: mem_sam_pe_batch reached without a batched kswv kernel\n");
-    exit(EXIT_FAILURE);
-#endif
 }
 
 // This function is equivalent to align2() for axv512
@@ -1407,19 +1038,35 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     return 1;
 }
 
-int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
-                          const uint8_t *pac, const mem_pestat_t pes[4],
-                          uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
-                          kswr_t **myaln, mem_cache *mmc, 
-                          int32_t &gcnt, int tid)
+/* Resolve half of mem_sam_pe_batch_post (below): mate rescue over the batched
+ * kswv results plus the full pairing decision, with SAM/BAM emission left to
+ * the caller. Provided so external callers can drive the batched SIMD
+ * mate-rescue kernel and then emit however they like. As of this commit it is
+ * NOT a separate copy: mem_sam_pe_batch_post calls it for its resolve half and
+ * then only emits, so the two share this one implementation and cannot drift.
+ *
+ * Computes the resolve half of mem_sam_pe_batch_post -- byte-identical to the
+ * former scalar mem_pair_resolve in non-meth mode; under --meth the PE MAPQ
+ * follows the current hardened path (folds each end's second-best SE hit into
+ * the pair MAPQ), so it differs from the removed scalar resolver there.
+ *
+ * See bwamem.h for the full out-param contract. In brief: n_pri[] is always
+ * set; q_se[] is valid only when *paired_out == 1, and z[] is valid only when
+ * *paired_out == 1 (mem_pair may modify z before the no-pairing / is_multi
+ * early returns, which leave *paired_out == 0), so callers must gate both
+ * arrays on *paired_out. On *paired_out == 0 the caller takes the
+ * no-pairing emission path and owns the proper-pair 0x2 FLAG bit itself, as
+ * mem_sam_pe_batch_post does. */
+int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
+                                const uint8_t *pac, const mem_pestat_t pes[4],
+                                uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
+                                kswr_t **myaln, mem_cache *mmc, int32_t &gcnt, int tid,
+                                int n_pri[2], int z[2], int q_se[2],
+                                int *extra_flag_out, int *paired_out)
 {
     extern int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
+    extern void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);
     extern int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a);
-    extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                            bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
-    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                              const mem_alnreg_v *a, int l_query, const char *query,
-                              int **out_hn, const char *meth_orig_query);
     #if MATE_SORT
     extern void sort_alnreg_re(int n, mem_alnreg_t* a);
     extern void sort_alnreg_score(int n, mem_alnreg_t* a);
@@ -1429,17 +1076,12 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     #endif
 
     int32_t *gar = (int32_t*) mmc->seqPairArrayAux[tid];
-    
-    int n = 0, i, j, z[2], o, subo, n_sub, extra_flag = 1, n_pri[2], n_aa[2];
-    kstring_t str;
-    mem_aln_t h[2], g[2], aa[2][2];
-    // int tid = omp_get_thread_num();
-    
-    str.l = str.m = 0; str.s = 0;
-    memset(h, 0, sizeof(mem_aln_t) * 2);
-    memset(g, 0, sizeof(mem_aln_t) * 2);
-    n_aa[0] = n_aa[1] = 0;
-    
+
+    int n = 0, i, j, o, subo, n_sub, extra_flag = 1;
+
+    *paired_out = 0;
+    *extra_flag_out = extra_flag;
+
     if (!(opt->flag & MEM_F_NO_RESCUE)) { // then perform SW for the best alignment
         mem_alnreg_v b[2];
         kv_init(b[0]); kv_init(b[1]);
@@ -1447,7 +1089,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             for (j = 0; j < a[i].n; ++j)
                 if (a[i].a[j].score >= a[i].a[0].score  - opt->pen_unpaired)
                     kv_push(mem_alnreg_t, b[i], a[i].a[j]);
-                
+
         for (int l=0; l<a[0].n; l++)
             a[0].a[l].flg = 0;
         for (int l=0; l<a[1].n; l++)
@@ -1473,7 +1115,6 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                                                 ms_orig, rmat, opt->meth_mode ? i : -1);
                 n += val;
                 swcount += val;
-                // ncnt++;
                 gcnt += 4;
             }
             if (swcount > 0) {
@@ -1496,7 +1137,6 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                                                 &a[!i], myaln, gcnt, gar, mmc,
                                                 ms_orig, rmat, opt->meth_mode ? i : -1);
                 n += val;
-                // ncnt++;
                 gcnt += 4;
             }
         }
@@ -1513,81 +1153,131 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         mem_reorder_primary5(opt->T, &a[1]);
     }
     #endif
-    
-    if (opt->flag&MEM_F_NOPAIRING) goto no_pairing;
+
+    /* --extend-csub: seed each end's primary competitor score from the chains the
+     * cap/gate dropped, before pairing/MAPQ below reads csub. No-op when off. */
+    mem_seed_capped_sub(&a[0], opt->a);
+    mem_seed_capped_sub(&a[1], opt->a);
+
+    if (opt->flag & MEM_F_NOPAIRING) { *extra_flag_out = extra_flag; return n; }
 
     // pairing single-end hits
-    if (n_pri[0] && n_pri[1] && (o = mem_pair(opt, bns, pac, pes, s, a, id, &subo, &n_sub, z, n_pri)) > 0)
+    if (!(n_pri[0] && n_pri[1] &&
+          (o = mem_pair(opt, bns, pac, pes, s, a, id, &subo, &n_sub, z, n_pri)) > 0)) {
+        *extra_flag_out = extra_flag;
+        return n;
+    }
+
+    int is_multi[2], q_pe, score_un;
+    // check if an end has multiple hits even after mate-SW
+    for (i = 0; i < 2; ++i) {
+        for (j = 1; j < n_pri[i]; ++j)
+            if (a[i].a[j].secondary < 0 && a[i].a[j].score >= opt->T) break;
+        is_multi[i] = j < n_pri[i]? 1 : 0;
+    }
+    if (is_multi[0] || is_multi[1]) { *extra_flag_out = extra_flag; return n; } // TODO: in rare cases, the true hit may be long but with low score
+
+    // compute mapQ for the best SE hit
+    score_un = a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
+    subo = subo > score_un? subo : score_un;
+    if (opt->extend_csub) { int fl = mem_capped_pair_subo(a, z, o); if (fl > subo) subo = fl; }
     {
-        int is_multi[2], q_pe, score_un, q_se[2];
+        /* Meth PE MAPQ hardening (dragmap-style, cf. minibwa r404): fold each
+         * end's SECOND-best single-end hit into the pair MAPQ so a repeat on
+         * either end deflates confidence even when one paired alignment looks
+         * clean. Meth-gated so non-meth PE MAPQ is byte-identical. */
+        int qdiff = o - subo;
+        if (opt->meth_mode) {
+            int se2_0 = (n_pri[0] > 1) ? a[0].a[1].score : 0;
+            int se2_1 = (n_pri[1] > 1) ? a[1].a[1].score : 0;
+            int cap = o + 4 * opt->a - (se2_0 + se2_1);
+            if (qdiff > cap) qdiff = cap;
+        }
+        if (qdiff < 0) qdiff = 0;
+        q_pe = raw_mapq(qdiff, opt->a);
+    }
+
+    if (n_sub > 0) q_pe -= (int)(4.343 * log(n_sub+1) + .499);
+    if (q_pe < 0) q_pe = 0;
+    if (q_pe > 60) q_pe = 60;
+
+    q_pe = (int)(q_pe * (1. - .5 * (a[0].a[0].frac_rep + a[1].a[0].frac_rep)) + .499);
+
+    // the following assumes no split hits
+    if (o > score_un) { // paired alignment is preferred
+        mem_alnreg_t *c[2];
+        c[0] = &a[0].a[z[0]]; c[1] = &a[1].a[z[1]];
+        for (i = 0; i < 2; ++i) {
+            if (c[i]->secondary >= 0)
+                c[i]->sub = a[i].a[c[i]->secondary].score, c[i]->secondary = -2;
+            q_se[i] = mem_approx_mapq_se(opt, c[i]);
+        }
+
+        q_se[0] = q_se[0] > q_pe? q_se[0] : q_pe < q_se[0] + 40? q_pe : q_se[0] + 40;
+        q_se[1] = q_se[1] > q_pe? q_se[1] : q_pe < q_se[1] + 40? q_pe : q_se[1] + 40;
+        extra_flag |= 2;
+
+        // cap at the tandem repeat score
+        q_se[0] = q_se[0] < raw_mapq(c[0]->score - c[0]->csub, opt->a)? q_se[0] : raw_mapq(c[0]->score - c[0]->csub, opt->a);
+        q_se[1] = q_se[1] < raw_mapq(c[1]->score - c[1]->csub, opt->a)? q_se[1] : raw_mapq(c[1]->score - c[1]->csub, opt->a);
+
+    } else { // the unpaired alignment is preferred
+        z[0] = z[1] = 0;
+        q_se[0] = mem_approx_mapq_se(opt, &a[0].a[0]);
+        q_se[1] = mem_approx_mapq_se(opt, &a[1].a[0]);
+
+    }
+    for (i = 0; i < 2; ++i) {
+        int k = a[i].a[z[i]].secondary_all;
+        if (k >= 0 && k < n_pri[i]) { // switch secondary and primary if both of them are non-ALT
+            xassert(a[i].a[k].secondary_all < 0,
+                    "mem_pair_resolve_batch_post: secondary_all switch target must be a primary");
+            for (j = 0; j < a[i].n; ++j)
+                if (a[i].a[j].secondary_all == k || j == k)
+                    a[i].a[j].secondary_all = z[i];
+            a[i].a[z[i]].secondary_all = -1;
+        }
+    }
+
+    *paired_out = 1;
+    *extra_flag_out = extra_flag;
+    return n;
+}
+
+int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
+                          const uint8_t *pac, const mem_pestat_t pes[4],
+                          uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
+                          kswr_t **myaln, mem_cache *mmc,
+                          int32_t &gcnt, int tid)
+{
+    extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                            bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
+    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                              const mem_alnreg_v *a, int l_query, const char *query,
+                              int **out_hn, const char *meth_orig_query);
+
+    int i, j, z[2], n_pri[2], n_aa[2], q_se[2], extra_flag, paired;
+    kstring_t str;
+    mem_aln_t h[2], g[2], aa[2][2];
+
+    str.l = str.m = 0; str.s = 0;
+    memset(h, 0, sizeof(mem_aln_t) * 2);
+    memset(g, 0, sizeof(mem_aln_t) * 2);
+    n_aa[0] = n_aa[1] = 0;
+
+    /* Resolve half -- mate rescue over the batched kswv results plus the full
+     * pairing decision (mem_mark_primary_se, PRIMARY5, mem_seed_capped_sub,
+     * mem_pair, is_multi, q_pe/q_se, secondary_all switch) -- is shared with the
+     * emission-free mem_pair_resolve_batch_post so that ~180 lines of logic live
+     * in exactly one place; this function only emits. It mutates a[] and returns
+     * the mate-rescue hit count. On the paired path z[]/q_se[]/extra_flag carry
+     * the pairing outputs; on the no-pairing path (paired == 0) only n_pri[] is
+     * valid and this function assembles the proper-pair 0x2 FLAG bit itself. */
+    int n = mem_pair_resolve_batch_post(opt, bns, pac, pes, id, s, a, myaln, mmc,
+                                        gcnt, tid, n_pri, z, q_se, &extra_flag, &paired);
+
+    if (paired) {
         char **XA[2];
-        // check if an end has multiple hits even after mate-SW
-        for (i = 0; i < 2; ++i) {
-            for (j = 1; j < n_pri[i]; ++j)
-                if (a[i].a[j].secondary < 0 && a[i].a[j].score >= opt->T) break;
-            is_multi[i] = j < n_pri[i]? 1 : 0;
-        }
-        if (is_multi[0] || is_multi[1]) goto no_pairing; // TODO: in rare cases, the true hit may be long but with low score
-        // compute mapQ for the best SE hit
-        score_un = a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
-        //q_pe = o && subo < o? (int)(MEM_MAPQ_COEF * (1. - (double)subo / o) * log(a[0].a[z[0]].seedcov + a[1].a[z[1]].seedcov) + .499) : 0;
-        subo = subo > score_un? subo : score_un;
-        {
-            /* Meth PE MAPQ hardening (dragmap-style, cf. minibwa r404): fold each
-             * end's SECOND-best single-end hit into the pair MAPQ so a repeat on
-             * either end deflates confidence even when one paired alignment looks
-             * clean. Meth-gated so non-meth PE MAPQ is byte-identical. */
-            int qdiff = o - subo;
-            if (opt->meth_mode) {
-                int se2_0 = (n_pri[0] > 1) ? a[0].a[1].score : 0;
-                int se2_1 = (n_pri[1] > 1) ? a[1].a[1].score : 0;
-                int cap = o + 4 * opt->a - (se2_0 + se2_1);
-                if (qdiff > cap) qdiff = cap;
-            }
-            if (qdiff < 0) qdiff = 0;
-            q_pe = raw_mapq(qdiff, opt->a);
-        }
-
-        if (n_sub > 0) q_pe -= (int)(4.343 * log(n_sub+1) + .499);
-        if (q_pe < 0) q_pe = 0;
-        if (q_pe > 60) q_pe = 60;
-
-        q_pe = (int)(q_pe * (1. - .5 * (a[0].a[0].frac_rep + a[1].a[0].frac_rep)) + .499);
-
-        // the following assumes no split hits
-        if (o > score_un) { // paired alignment is preferred
-            mem_alnreg_t *c[2];
-            c[0] = &a[0].a[z[0]]; c[1] = &a[1].a[z[1]];
-            for (i = 0; i < 2; ++i) {
-                if (c[i]->secondary >= 0)
-                    c[i]->sub = a[i].a[c[i]->secondary].score, c[i]->secondary = -2;
-                q_se[i] = mem_approx_mapq_se(opt, c[i]);
-            }
-
-            q_se[0] = q_se[0] > q_pe? q_se[0] : q_pe < q_se[0] + 40? q_pe : q_se[0] + 40;
-            q_se[1] = q_se[1] > q_pe? q_se[1] : q_pe < q_se[1] + 40? q_pe : q_se[1] + 40;
-            extra_flag |= 2;
-
-            // cap at the tandem repeat score
-            q_se[0] = q_se[0] < raw_mapq(c[0]->score - c[0]->csub, opt->a)? q_se[0] : raw_mapq(c[0]->score - c[0]->csub, opt->a);
-            q_se[1] = q_se[1] < raw_mapq(c[1]->score - c[1]->csub, opt->a)? q_se[1] : raw_mapq(c[1]->score - c[1]->csub, opt->a);
-
-        } else { // the unpaired alignment is preferred
-            z[0] = z[1] = 0;
-            q_se[0] = mem_approx_mapq_se(opt, &a[0].a[0]);
-            q_se[1] = mem_approx_mapq_se(opt, &a[1].a[0]);
-
-        }
-        for (i = 0; i < 2; ++i) {
-            int k = a[i].a[z[i]].secondary_all;
-            if (k >= 0 && k < n_pri[i]) { // switch secondary and primary if both of them are non-ALT
-                assert(a[i].a[k].secondary_all < 0);
-                for (j = 0; j < a[i].n; ++j)
-                    if (a[i].a[j].secondary_all == k || j == k)
-                        a[i].a[j].secondary_all = z[i];
-                a[i].a[z[i]].secondary_all = -1;
-            }
-        }
         int *HN[2] = { 0, 0 };
         if (!(opt->flag & MEM_F_ALL)) {
             for (i = 0; i < 2; ++i)
@@ -1644,10 +1334,12 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             for (j = 0; j < a[i].n; ++j) free(XA[i][j]);
             free(XA[i]);
         }
-    } else goto no_pairing;
-    return n;
+        return n;
+    }
 
-no_pairing:
+    // No proper pair (MEM_F_NOPAIRING, an end lacks a primary, mem_pair == 0, or
+    // is_multi): emit each end independently. z[]/q_se[] are undefined here, so
+    // this block reads only n_pri[]/a[] and assembles the 0x2 bit on its own.
     int which[2] = { -1, -1 };
     for (i = 0; i < 2; ++i) {
         if (a[i].n) {
@@ -1745,7 +1437,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
         xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+            ms2[k] = nst_nt4_decode(c, 4);
         }
         ms = ms2;
     }
@@ -1850,7 +1542,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             }
             //kswr_t aln;
             //mem_alnreg_t b;
-            int xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
+            int u8_shift = matesw_u8_shift_for(opt, opt->mat);
+            int xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             /* D3 (--meth): enqueue ONE SW, scored under the rescued mate's own
              * read-number chemistry (mate_meth_ot: R1=1/OT, R2=0/OB) flipped by
@@ -1885,7 +1578,14 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 sp.len2 = l_ms;
                 sp.id = sp.score = sp.seqid = sp.gtle = sp.tle = sp.qle = sp.max_off = sp.gscore = -1; // not needed, remove while code cleaning
             
-                assert(sp.len1 >= 0 && sp.len2 >= 0);
+                /* Both lengths are cast to size_t as memcpy counts into the
+                 * staged seqBufRef/seqBufQer below, so a negative value here
+                 * is a heap overrun rather than a wrong answer. re > rb holds
+                 * only through the enclosing `re - rb >= opt->min_seed_len`
+                 * guard, and -k is an unvalidated atoi, so keep the check live
+                 * in every build (cf. the post-grow capacity xasserts below). */
+                xassert(sp.len1 >= 0 && sp.len2 >= 0,
+                        "mate rescue: negative reference-window or mate length");
                 if (refOffset + sp.len1 >= *wsize_buf_ref)
                 {
                     if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufRefs in %s\n",
@@ -1894,7 +1594,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     *wsize_buf_ref = seqbuf_grow_capacity(tmp);
                     if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
                         seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
-                    assert(*wsize_buf_ref > refOffset + sp.len1);
+                    xassert(*wsize_buf_ref >= refOffset + sp.len1,
+                            "mate rescue: reference window exceeds seqBufRef capacity after grow");
 
                     uint8_t *seqBufRef_ = (uint8_t*)
                         _mm_realloc(seqBufRef, tmp, *wsize_buf_ref, sizeof(uint8_t)); 
@@ -1914,7 +1615,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     *wsize_buf_qer = seqbuf_grow_capacity(tmp);
                     if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
                         seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
-                    assert(*wsize_buf_qer > qerOffset + sp.len2);
+                    xassert(*wsize_buf_qer >= qerOffset + sp.len2,
+                            "mate rescue: mate query exceeds seqBufQer capacity after grow");
 
                     uint8_t *seqBufQer_ = (uint8_t*)
                         _mm_realloc(seqBufQer, tmp, *wsize_buf_qer, sizeof(uint8_t)); 
@@ -1930,17 +1632,22 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 {
                     if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairs in %s\n", tid, __func__);
                     *wsize_pair += 1024;
-                    mmc->seqPairArrayAux[tid] = (SeqPair *) realloc(mmc->seqPairArrayAux[tid],
-                                                        (*wsize_pair + MAX_LINE_LEN)
-                                                        * sizeof(SeqPair));
-                    mmc->seqPairArrayLeft128[tid] = (SeqPair *) realloc(mmc->seqPairArrayLeft128[tid],
-                                                        (*wsize_pair + MAX_LINE_LEN)
-                                                        * sizeof(SeqPair));
-                    mmc->seqPairArrayRight128[tid] = (SeqPair *) realloc(mmc->seqPairArrayRight128[tid],
-                                                        (*wsize_pair + MAX_LINE_LEN)
-                                                        * sizeof(SeqPair));
+                    // realloc into a temp + xassert: a failed grow must not leak
+                    // the old block and leave a NULL slot that later writes deref.
+                    SeqPair *tmp_aux = (SeqPair *) realloc(mmc->seqPairArrayAux[tid],
+                                                        (*wsize_pair + MAX_LINE_LEN) * sizeof(SeqPair));
+                    xassert(tmp_aux != NULL, "out of memory: seqPairArrayAux");
+                    mmc->seqPairArrayAux[tid] = tmp_aux;
+                    SeqPair *tmp_left = (SeqPair *) realloc(mmc->seqPairArrayLeft128[tid],
+                                                        (*wsize_pair + MAX_LINE_LEN) * sizeof(SeqPair));
+                    xassert(tmp_left != NULL, "out of memory: seqPairArrayLeft128");
+                    mmc->seqPairArrayLeft128[tid] = tmp_left;
+                    SeqPair *tmp_right = (SeqPair *) realloc(mmc->seqPairArrayRight128[tid],
+                                                        (*wsize_pair + MAX_LINE_LEN) * sizeof(SeqPair));
+                    xassert(tmp_right != NULL, "out of memory: seqPairArrayRight128");
+                    mmc->seqPairArrayRight128[tid] = tmp_right;
                     seqPairArray = mmc->seqPairArrayLeft128[tid];
-                    gar = (int32_t*) (mmc->seqPairArrayAux[tid]);               
+                    gar = (int32_t*) (mmc->seqPairArrayAux[tid]);
                 }
 
                 if (maxRefLen < sp.len1) maxRefLen = sp.len1;
@@ -2070,7 +1777,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+            ms2[k] = nst_nt4_decode(c, 4);
         }
         ms = ms2;
     }
@@ -2110,7 +1817,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             // overwritten below with the mate read#-derived hypothesis
             // ((mate_meth_ot ^ is_rev) & 1), mirroring the scalar mem_matesw.
             int meth_won_hyp = -1;
-            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
+            int u8_shift = matesw_u8_shift_for(opt, opt->mat);
+            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             //aln = **myaln;
             //(*myaln)++;

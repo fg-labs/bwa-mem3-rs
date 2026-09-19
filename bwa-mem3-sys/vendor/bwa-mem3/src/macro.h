@@ -31,6 +31,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define _MACRO_HPP
 
 #include <stdio.h>
+#include <assert.h>  /* static_assert below is the <assert.h> macro in C11/gnu17 TUs (a keyword only in C++ and C23), so include it to keep macro.h self-contained */
 
 #define VER 0
 #define printf_(x,y...)								\
@@ -66,27 +67,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 // scratch (chain_scratch/seed_scratch) is sized from the thread count.
 #define NREADS_ESTIMATE_AVG_BASES 100
 
-/* BWAMEM_BATCHED_MATESW:
- *   1 -> worker_sam takes the batched mate-rescue SW path
- *        (mem_sam_pe_batch_pre / mem_sam_pe_batch / mem_sam_pe_batch_post,
- *        feeding kswv::getScores8 / getScores16).
- *   0 -> worker_sam takes the legacy scalar mem_sam_pe + ksw_align2 path.
- *
- * Historically gated on __AVX512BW__ only, which routed non-AVX-512 builds
- * (ARM, AVX2-only x86) to the scalar path even though batched kernels can
- * be implemented for those architectures. As of the NEON + AVX2 ports this
- * gate accepts any arch with a batched kswv kernel.
- * DISABLE_BATCHED_MATESW is an escape hatch for the A/B test in CI. */
-#ifndef BWAMEM_BATCHED_MATESW
-  #if DISABLE_BATCHED_MATESW
-    #define BWAMEM_BATCHED_MATESW 0
-  #elif __AVX512BW__ || __AVX2__ \
-        || defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
-    #define BWAMEM_BATCHED_MATESW 1
-  #else
-    #define BWAMEM_BATCHED_MATESW 0
-  #endif
-#endif
+/* Mate rescue is always the batched SIMD path (mem_sam_pe_batch_pre/run/post ->
+ * kswv::getScores8/16). The legacy scalar mem_sam_pe/mem_matesw path and its
+ * BWAMEM_BATCHED_MATESW / DISABLE_BATCHED_MATESW gate were removed together with
+ * the pre-AVX2 x86 build tiers: every supported target (AVX2+/AVX-512/NEON) has
+ * a batched kswv kernel, so there is nothing to gate. */
 
 /* Apple Silicon has larger L2 caches (4-16MB per cluster) and benefits from
  * larger batch sizes to better utilize cache locality. M1/M2/M3/M4 all have
@@ -122,6 +107,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * per-stage profiling sites. Sized to MAX_THREADS so the two move
  * together. */
 #define LIM_C 256
+static_assert(LIM_C >= MAX_THREADS, "LIM_C must stay >= MAX_THREADS: tprof[][tid] writes for tid up to n_threads-1 corrupt adjacent globals otherwise");
 
 #define SA_COMPRESSION 1
 #define SA_COMPX 03 // (= power of 2)
@@ -348,10 +334,10 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * watermark past LIM_R would silently overflow tprof[]/prof[] at runtime.
  * UGP_L_CAT_FIN_END is the largest UGP index in use today (=279).
  *
- * Note: this header is included only from C++ TUs (every consumer ends in
- * .cpp), so the C++11 `static_assert` keyword resolves cleanly. If a C TU
- * ever pulls macro.h in, swap to `_Static_assert` (C11) or include
- * <assert.h> first. */
+ * Note: macro.h is pulled in by C TUs too (e.g. fast_reader_bseq.c via
+ * bwa.h), where `static_assert` is the <assert.h> macro rather than a keyword;
+ * the <assert.h> included at the top of this header makes that resolve
+ * regardless of include order. */
 static_assert(UGP_L_CAT_FIN_END <= LIM_R,
               "LIM_R too small for UGP counters; bump LIM_R in macro.h");
 

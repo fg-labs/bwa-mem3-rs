@@ -108,15 +108,29 @@ extern "C" int bwamem3_format_host_floor_error(char *buf, size_t bufsz,
     if (buf == NULL || bufsz == 0) return -1;
     const char *host_name  = bwamem3_simd_tier_name(host_tier);
     const char *build_name = bwamem3_simd_tier_name(build_tier);
+    /* avx2 is the lowest x86 build floor (the Makefile refuses any lower
+     * BASELINE_ARCH), so the remedy depends on the host: a host at avx2 or
+     * above (only reachable when the build is avx512bw) can run a binary
+     * rebuilt down to its own tier; a host below avx2 cannot run any build. */
+    char remedy[256];
+    if (host_tier >= BWAMEM3_TIER_AVX2) {
+        snprintf(remedy, sizeof(remedy),
+                 "To run on this host, rebuild bwa-mem3 with BASELINE_ARCH=%s "
+                 "(avx2 is the lowest supported floor), or use a binary built "
+                 "for a lower SIMD floor.", host_name);
+    } else {
+        snprintf(remedy, sizeof(remedy),
+                 "bwa-mem3's lowest supported floor is BASELINE_ARCH=avx2; this "
+                 "host is below avx2 and cannot run bwa-mem3.");
+    }
     int n = snprintf(buf, bufsz,
         "[E::bwamem3] this binary was compiled for SIMD floor %s and emits %s "
         "instructions in non-kernel translation units. The host CPU does not "
         "support %s (detected: %s). Running would SIGILL on the first %s "
         "instruction.\n"
         "\n"
-        "To run on this host, rebuild bwa-mem3 with BASELINE_ARCH=%s (or "
-        "lower), or use a binary built for a lower SIMD floor.\n",
-        build_name, build_name, build_name, host_name, build_name, host_name);
+        "%s\n",
+        build_name, build_name, build_name, host_name, build_name, remedy);
     if (n < 0 || (size_t)n >= bufsz) {
         buf[bufsz - 1] = '\0';
         return -1;
@@ -133,15 +147,41 @@ extern "C" int bwamem3_host_meets_floor(void)
 extern "C" void bwamem3_enforce_host_floor(void)
 {
     bwamem3_simd_init();
-    if (bwamem3_check_host_floor(g_host_capability, g_build_tier)) {
-        return;
+    if (!bwamem3_check_host_floor(g_host_capability, g_build_tier)) {
+        char buf[1024];
+        bwamem3_format_host_floor_error(buf, sizeof(buf),
+                                        g_host_capability, g_build_tier);
+        fputs(buf, stderr);
+        /* exit (not _exit) so stdio flushes before the process tears down. */
+        exit(2);
     }
-    char buf[1024];
-    bwamem3_format_host_floor_error(buf, sizeof(buf),
-                                    g_host_capability, g_build_tier);
-    fputs(buf, stderr);
-    /* exit (not _exit) so stdio flushes before the process tears down. */
-    exit(2);
+
+    /* The host meets the build floor, but a BWAMEM3_FORCE_TIER downgrade can
+     * still have pushed the effective tier below AVX2 on x86: the force is a
+     * downgrade-only knob (init_body applies it after g_tier = host tier), and
+     * the host-floor check above keys off the raw host capability, not the
+     * forced tier. The batched mate-rescue kswv kernel has no sub-AVX2
+     * implementation -- getScores8()/getScores16() on the sse41/sse42/avx
+     * tiers are exit() stubs -- so a paired-end run that reached mate rescue
+     * would abort mid-run. Refuse up front with the same clean exit(2). Since
+     * g_tier defaults to the host tier (>= avx2 here, or this precheck would
+     * already have exited), g_tier < avx2 can only be a forced downgrade.
+     * `version`/help never call this, so forcing a sub-AVX2 tier stays
+     * available there for introspection. */
+#if defined(__x86_64__) || defined(__i386__)
+    if (g_tier < BWAMEM3_TIER_AVX2) {
+        const char *force = getenv("BWAMEM3_FORCE_TIER");
+        fprintf(stderr,
+            "[E::bwamem3] BWAMEM3_FORCE_TIER=%s selects the %s tier, which has "
+            "no batched mate-rescue kernel and is unsupported at runtime "
+            "(a paired-end run would otherwise abort mid-alignment). avx2 is "
+            "the lowest supported runtime tier -- unset BWAMEM3_FORCE_TIER or "
+            "force avx2/avx512bw.\n",
+            (force != NULL) ? force : "",
+            bwamem3_simd_tier_name(g_tier));
+        exit(2);
+    }
+#endif
 }
 
 extern "C" void bwamem3_print_version_simd(FILE *f)
@@ -190,11 +230,10 @@ extern "C" void bwamem3_print_version_simd(FILE *f)
      * in CI scripts isn't contaminated by the warning line. */
     if (!bwamem3_check_host_floor(g_host_capability, g_build_tier)) {
         fprintf(stderr, "[W::bwa-mem3] this host (%s) is below the binary's floor "
-                   "(%s); 'bwa-mem3 mem' will refuse to run. Rebuild with "
-                   "BASELINE_ARCH=%s (or lower) to run on this host.\n",
+                   "(%s); 'bwa-mem3 mem' will refuse to run. avx2 is the lowest "
+                   "supported floor.\n",
                 bwamem3_simd_tier_name(g_host_capability),
-                bwamem3_simd_tier_name(g_build_tier),
-                bwamem3_simd_tier_name(g_host_capability));
+                bwamem3_simd_tier_name(g_build_tier));
     }
 }
 
@@ -243,9 +282,9 @@ static void bwamem3_simd_init_body(void)
      *
      * Earlier versions of bwa-mem3 emitted a [W::] warning here promising
      * "10-15%% slower hot paths, rebuild with BASELINE_ARCH=<host_tier>
-     * to recover". Empirically (c7a / c7i wgs-5M shm-warmed bare-metal,
-     * tricord) the gap is much smaller than that and the recommendation
-     * is not always applicable:
+     * to recover". Empirically (c7a / c7i, a 5M-read WGS slice,
+     * shm-warmed bare-metal) the gap is much smaller than that and the
+     * recommendation is not always applicable:
      *   - avx2 -> avx512bw: c7a -2.2%%, c7i -0.7%% (wash, both cases)
      *   - avx2 -> avx512bw + -mprefer-vector-width=256 (the default for
      *     arch=avx512bw): c7a -4.4%%, c7i -0.7%%
@@ -472,6 +511,14 @@ extern "C" int ksw_extend##suffix(int qlen, const uint8_t *query, int tlen,     
 extern "C" int ksw_global2##suffix(int qlen, const uint8_t *query, int tlen,          \
     const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,            \
     int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);                     \
+extern "C" int ksw_global2_scalar_ref##suffix(int qlen, const uint8_t *query,         \
+    int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,  \
+    int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);                     \
+extern "C" unsigned long ksw_g2_wave_exec_count##suffix(void);                        \
+extern "C" unsigned long ksw_g2_wave16_exec_count##suffix(void);                      \
+extern "C" int ksw_g2_wave16_wmin##suffix(void);                                      \
+extern "C" int ksw_g2_wave_wmin##suffix(void);                                        \
+extern "C" unsigned long ksw_g2_wave_zr_capacity##suffix(void);                       \
 extern "C" int ksw_global##suffix(int qlen, const uint8_t *query, int tlen,           \
     const uint8_t *target, int m, const int8_t *mat, int gapo, int gape,              \
     int w, int *n_cigar, uint32_t **cigar);                                           \
@@ -525,6 +572,47 @@ extern "C" int ksw_global2(int qlen, const uint8_t *query, int tlen,
     bwamem3_simd_init();
     KSW_DISPATCH_CALL(ksw_global2, qlen, query, tlen, target, m, mat, o_del, e_del,
                       o_ins, e_ins, w, n_cigar, cigar);
+}
+
+/* Test-only: routes to the current tier's scalar reference behind ksw_global2.
+ * Lets the wavefront byte-identity unit test call the scalar oracle for the
+ * same (input, w) the SIMD path takes. Not used on any production path. */
+extern "C" int ksw_global2_scalar_ref(int qlen, const uint8_t *query, int tlen,
+    const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,
+    int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_global2_scalar_ref, qlen, query, tlen, target, m, mat, o_del, e_del,
+                      o_ins, e_ins, w, n_cigar, cigar);
+}
+
+/* Test-only: wavefront-exec counters for the active tier (see ksw.cpp). The
+ * int16 variant counts only int16-kernel entries. */
+extern "C" unsigned long ksw_g2_wave_exec_count(void) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_g2_wave_exec_count);
+}
+
+extern "C" unsigned long ksw_g2_wave16_exec_count(void) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_g2_wave16_exec_count);
+}
+
+/* Test-only: the wavefront width crossovers the active tier was compiled with
+ * (see ksw.cpp); 0 where the tier has no such kernel. */
+extern "C" int ksw_g2_wave16_wmin(void) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_g2_wave16_wmin);
+}
+
+extern "C" int ksw_g2_wave_wmin(void) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_g2_wave_wmin);
+}
+
+/* Test-only: retained zr capacity for the active tier (see ksw.cpp). */
+extern "C" unsigned long ksw_g2_wave_zr_capacity(void) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_g2_wave_zr_capacity);
 }
 
 extern "C" int ksw_global(int qlen, const uint8_t *query, int tlen,

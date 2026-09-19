@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -53,6 +56,20 @@ jobs:
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
       - run: cargo ci-lint
 
+  bindings:
+    # The committed bindgen output must match the shim header on every arch.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install build deps + libclang
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev libclang-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - run: cargo build -p bwa-mem3-sys --features regenerate-bindings
+
   scripts:
     # The vendor-bump automation is bash, so unit-test it like anything else.
     # shellcheck runs alongside: these scripts push branches and open PRs, so
@@ -100,6 +117,31 @@ jobs:
       # those, but the upstream Makefile does — so for the e2e build we
       # clone fresh at the same SHA with all submodules.
       # TODO: switch back to `bioconda::bwa-mem3` once published.
+      - name: Install clang-19 (verified LLVM apt repo)
+        # The vendored bwa-mem3 Makefile requires clang >= 19 / gcc >= 15 (the
+        # runner ships gcc 13), and clang's -fopenmp (libsais LIBSAIS_OPENMP)
+        # needs libomp. Install from apt.llvm.org via a pinned repo whose signing
+        # key is fingerprint-verified before use -- not `llvm.sh | sudo bash` --
+        # so a tampered mirror or installer can't run code as root (CWE-494).
+        # Mirrors fg-labs/bwa-mem3's release.yml.
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
+          expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ "$got_fpr" != "$expected_fpr" ]; then
+            echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
+            exit 1
+          fi
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
+          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-19.list
+          sudo apt-get update
+          sudo apt-get install -y clang-19 libomp-19-dev
+          clang++-19 --version | head -1
       - name: Build bwa-mem3 from upstream at vendored COMMIT
         run: |
           set -euo pipefail
@@ -113,9 +155,11 @@ jobs:
           git -C /tmp/bwa-mem3 fetch --filter=blob:none --no-tags --depth=1 origin "$sha"
           git -C /tmp/bwa-mem3 checkout FETCH_HEAD
           git -C /tmp/bwa-mem3 submodule update --init --recursive --depth 1
-          # Single-arch build: PhiX e2e doesn't need the multi-SIMD
-          # launcher (which compiles 5 variants).
-          make -C /tmp/bwa-mem3 arch=sse41 -j"$(nproc)" all
+          # Single-arch build: PhiX e2e doesn't need the multi-SIMD launcher.
+          # arch=avx2 (the x86 default): fg-labs/bwa-mem3#513 retired the
+          # pre-AVX2 tiers (sse41/sse42/avx). clang-19 satisfies the Makefile's
+          # clang>=19 / gcc>=15 compiler floor.
+          make -C /tmp/bwa-mem3 arch=avx2 CXX=clang++-19 CC=clang-19 -j"$(nproc)" all
           echo "BWA_MEM3_BIN=/tmp/bwa-mem3/bwa-mem3" >> "$GITHUB_ENV"
       # All bwa-mem3-rs-cli targets, not just --test e2e: the byte-parity
       # targets (cli_parity_xa, cli_parity_pair_select, meth_e2e,
@@ -123,7 +167,18 @@ jobs:
       # so running only e2e left them unexercised everywhere in CI. They all
       # build their own PhiX-scale index and need no large reference.
       # BWA_MEM3_RS_REQUIRE_TOOLS makes a missing tool fail rather than skip,
-      # so this job cannot silently degrade into a no-op.
+      # so this job cannot silently degrade into a no-op. Also runs
+      # bwa-mem3-sys itself (three_phase_ffi, three_phase_cli_parity) so the
+      # sys crate's own FFI/parity tests are validated against the real CLI in
+      # the batched mate-rescue config -- the only mate-rescue path upstream
+      # ships since fg-labs/bwa-mem3#513 removed the scalar path.
+      # bwa-mem3-rs is included too: its wrapper-level three-phase tests
+      # (byte identity, cross-thread Send, panic-across-FFI-unwind) build a
+      # small PhiX index at test time and so run here where bwa-mem3 is on
+      # PATH -- the ci-test build job never installs it, so this is the only
+      # place they execute. Its remaining integration tests stay gated on
+      # BWA_MEM3_RS_TEST_REF (a full index), which this job does not set, so
+      # they skip; only the PhiX-backed ones run.
       # --no-fail-fast: without it, a failure in one target (e.g.
       # cli_parity_pair_select) stops the run before later targets execute,
       # hiding whether a regression's scope is one target or several. Suite
@@ -131,4 +186,9 @@ jobs:
       - name: Run CLI test suite (e2e + byte-parity)
         env:
           BWA_MEM3_RS_REQUIRE_TOOLS: "1"
-        run: cargo test -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
+        run: cargo test -p bwa-mem3-sys -p bwa-mem3-rs -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
+      # Note: there is no scalar mate-rescue A/B run. fg-labs/bwa-mem3#513
+      # removed the scalar mate-rescue path (and the BWAMEM_BATCHED_MATESW /
+      # DISABLE_BATCHED_MATESW gate) and requires AVX2+ on x86 (NEON on arm), so
+      # the batched kernel exercised above is the only mate-rescue path upstream
+      # ships. The shim carries no scalar fallback to A/B against.

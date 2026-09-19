@@ -35,6 +35,17 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
+/* SIMD 2-bit->byte unpack fast path in bns_get_seq_into. Written once in SSE2/SSSE3;
+ * on ARM it runs via sse2neon (as the rest of the aligner's SSE does), natively on x86.
+ * Requires SSSE3 (pshufb) for the reverse strand; the x86 baseline is -mssse3, and
+ * sse2neon provides it. Any build below SSSE3 falls back to the scalar LUT (no regression). */
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include "simd_compat.h"
+#define BNS_SIMD_UNPACK 1
+#elif defined(__SSSE3__)
+#include <immintrin.h>
+#define BNS_SIMD_UNPACK 1
+#endif
 #include "bntseq.h"
 #include "utils.h"
 #include "macro.h"
@@ -276,8 +287,11 @@ static uint8_t *add1(const kseq_t *seq, bntseq_t *bns, uint8_t *pac, int64_t *m_
 	int i, lasts;
 	if (bns->n_seqs == *m_seqs) {
 		*m_seqs <<= 1;
-		bns->anns = (bntann1_t*)realloc(bns->anns, *m_seqs * sizeof(bntann1_t));
-        xassert(bns->anns != NULL, "out of memory: bns->anns");
+		/* Grow via a temp so a failed realloc neither leaks the old block nor
+		 * leaves the live pointer NULL (deref'd below). */
+		bntann1_t *tmp = (bntann1_t*)realloc(bns->anns, *m_seqs * sizeof(bntann1_t));
+		xassert(tmp != NULL, "out of memory: bns->anns");
+		bns->anns = tmp;
 	}
 	p = bns->anns + bns->n_seqs;
 	p->name = strdup((char*)seq->name.s);
@@ -286,14 +300,18 @@ static uint8_t *add1(const kseq_t *seq, bntseq_t *bns, uint8_t *pac, int64_t *m_
 	p->offset = (bns->n_seqs == 0)? 0 : (p-1)->offset + (p-1)->len;
 	p->n_ambs = 0;
 	for (i = lasts = 0; i < seq->seq.l; ++i) {
-		int c = nst_nt4_table[(int)seq->seq.s[i]];
+		int c = nst_nt4_table[(unsigned char)seq->seq.s[i]];
 		if (c >= 4) { // N
 			if (lasts == seq->seq.s[i]) { // contiguous N
 				++(*q)->len;
 			} else {
 				if (bns->n_holes == *m_holes) {
 					(*m_holes) <<= 1;
-					bns->ambs = (bntamb1_t*)realloc(bns->ambs, (*m_holes) * sizeof(bntamb1_t));
+					/* temp + check: a failed realloc-onto-self would leak the old
+					 * block and NULL bns->ambs, then *q below derefs it. */
+					bntamb1_t *tmp = (bntamb1_t*)realloc(bns->ambs, (*m_holes) * sizeof(bntamb1_t));
+					xassert(tmp != NULL, "out of memory: bns->ambs");
+					bns->ambs = tmp;
 				}
 				*q = bns->ambs + bns->n_holes;
 				(*q)->len = 1;
@@ -308,7 +326,11 @@ static uint8_t *add1(const kseq_t *seq, bntseq_t *bns, uint8_t *pac, int64_t *m_
 			if (c >= 4) c = lrand48()&3;
 			if (bns->l_pac == *m_pac) { // double the pac size
 				*m_pac <<= 1;
-				pac = (uint8_t*) realloc(pac, *m_pac/4);
+				/* temp + check: without it a failed realloc leaks the old pac and
+				 * the memset below derefs the NULL it left behind. */
+				uint8_t *tmp = (uint8_t*) realloc(pac, *m_pac/4);
+				if (tmp == NULL) { perror("Reallocation of pac failed"); exit(EXIT_FAILURE); }
+				pac = tmp;
 				memset(pac + bns->l_pac/4, 0, (*m_pac - bns->l_pac)/4);
 			}
 			_set_pac(pac, bns->l_pac, c);
@@ -351,8 +373,10 @@ int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only)
 	while (kseq_read(seq) >= 0) pac = add1(seq, bns, pac, &m_pac, &m_seqs, &m_holes, &q);
 	if (!for_only) { // add the reverse complemented sequence
 		m_pac = (bns->l_pac * 2 + 3) / 4 * 4;
-		pac = (uint8_t*) realloc(pac, m_pac/4);
-		if (pac == NULL) { perror("Reallocation of pac failed"); exit(EXIT_FAILURE); }
+		/* temp + check so a failed grow doesn't leak the old pac before aborting. */
+		uint8_t *tmp = (uint8_t*) realloc(pac, m_pac/4);
+		if (tmp == NULL) { perror("Reallocation of pac failed"); exit(EXIT_FAILURE); }
+		pac = tmp;
 		memset(pac + (bns->l_pac+3)/4, 0, (m_pac - (bns->l_pac+3)/4*4) / 4);
 		for (l = bns->l_pac - 1; l >= 0; --l, ++bns->l_pac)
 			_set_pac(pac, bns->l_pac, 3-_get_pac(pac, l));
@@ -424,6 +448,22 @@ void bns_build_pos2rid(bntseq_t *bns)
 	}
 }
 
+/* Read the [lo, hi] rid bracket the pos2rid table records for bucket `b`:
+ * bucket[b] is the last contig starting at or before this bucket's first
+ * position, bucket[b+1] the last one starting at or before the NEXT bucket's
+ * first position, so any pos_f inside bucket `b` resolves to some rid in
+ * [lo, hi]. lo == hi means no contig start falls inside the bucket window, so
+ * the whole window is rid == lo. This is the single reader of pos2rid_bucket[]
+ * shared by bns_pos2rid (which then narrows a non-empty bracket) and the
+ * bns_intv2rid fast path (which only needs the lo == hi shortcut), so the two
+ * cannot drift apart in how they decode the table. Requires a built table and
+ * 0 <= b <= n_buckets (the trailing bracket entry is filled, so b+1 is valid). */
+static inline void bns_bucket_bracket(const bntseq_t *bns, int64_t b, int *lo, int *hi)
+{
+	*lo = bns->pos2rid_bucket[b];
+	*hi = bns->pos2rid_bucket[b + 1];
+}
+
 int bns_pos2rid(const bntseq_t *bns, int64_t pos_f)
 {
 	if (pos_f >= bns->l_pac) return -1;
@@ -432,15 +472,11 @@ int bns_pos2rid(const bntseq_t *bns, int64_t pos_f)
 		// Negative pos_f clamps to bucket 0, matching the binary-search branch
 		// below (which returns rid 0 for any pos_f < anns[0].offset).
 		int64_t b = pos_f < 0? 0 : (pos_f >> BNS_POS2RID_SHIFT);
-		// bucket[b] is the last contig starting at or before this bucket's
-		// first position, so anns[bucket[b]].offset <= pos_f; bucket[b+1] is
-		// the last one starting at or before the NEXT bucket's first position,
-		// which pos_f is below. So the answer is bracketed by [lo, hi], and
-		// hi - lo is just the number of contig starts inside this bucket
-		// window. The common case (no contig starts inside the window) has
-		// lo == hi and returns without touching anns[] at all.
-		lo = bns->pos2rid_bucket[b];
-		hi = bns->pos2rid_bucket[b + 1];
+		// The answer is bracketed by [lo, hi] (see bns_bucket_bracket): hi - lo
+		// is the number of contig starts inside this bucket window, and the
+		// common case (no contig starts inside the window) has lo == hi and
+		// returns without touching anns[] at all.
+		bns_bucket_bracket(bns, b, &lo, &hi);
 		// Narrow to the largest rid with anns[rid].offset <= pos_f. This is
 		// the exact same predicate the binary search resolves, so the returned
 		// rid is byte-identical (including on-offset boundaries and, since
@@ -475,8 +511,34 @@ int bns_intv2rid(const bntseq_t *bns, int64_t rb, int64_t re)
 	int is_rev, rid_b, rid_e;
 	if (rb < bns->l_pac && re > bns->l_pac) return -2;
 	assert(rb <= re);
-	rid_b = bns_pos2rid(bns, bns_depos(bns, rb, &is_rev));
-	rid_e = rb < re? bns_pos2rid(bns, bns_depos(bns, re - 1, &is_rev)) : rid_b;
+	int64_t dpos_b = bns_depos(bns, rb, &is_rev);
+	if (rb >= re) // degenerate empty interval: single lookup (matches rid_e = rid_b)
+		return bns_pos2rid(bns, dpos_b);
+	int64_t dpos_e = bns_depos(bns, re - 1, &is_rev);
+	/* Single-bucket fast path (byte-identical): the two ends resolve to the same
+	 * rid iff they land in the same contig. When the pos2rid bucket table is
+	 * built and both depos'd ends fall in the SAME bucket whose bracket is empty
+	 * (no contig start inside the 16 kb window -- the overwhelmingly common case
+	 * for a short seed), that bracket's rid covers BOTH ends, so we return it
+	 * once without the second bns_pos2rid call or any anns[] access. bb == be
+	 * means both ends share one bracket, so bns_bucket_bracket(bb) -- the same
+	 * table read bns_pos2rid uses -- yields the answer for both. Every other case
+	 * (different bucket, a contig boundary inside the window, out-of-range, or
+	 * the unbuilt-table fallback) drops to the exact original two-call form, so
+	 * the returned rid is unchanged. */
+	if (bns->pos2rid_bucket != NULL
+	    && dpos_b >= 0 && dpos_b < bns->l_pac
+	    && dpos_e >= 0 && dpos_e < bns->l_pac) {
+		int64_t bb = dpos_b >> BNS_POS2RID_SHIFT;
+		int64_t be = dpos_e >> BNS_POS2RID_SHIFT;
+		if (bb == be) {
+			int lo, hi;
+			bns_bucket_bracket(bns, bb, &lo, &hi);
+			if (lo == hi) return lo; // empty bracket: both ends are rid == lo
+		}
+	}
+	rid_b = bns_pos2rid(bns, dpos_b);
+	rid_e = bns_pos2rid(bns, dpos_e);
 	return rid_b == rid_e? rid_b : -1;
 }
 
@@ -566,6 +628,24 @@ const Pac2Nt4Lut &pac2nt4_lut() {
 }
 }  // namespace
 
+#ifdef BNS_SIMD_UNPACK
+/* Expand 16 packed bytes (64 2-bit bases) into four __m128i, then interleave to base order.
+ * In-byte positions are bits [7:6],[5:4],[3:2],[1:0] (MSB-first, matching _get_pac); a
+ * 16-bit shift + &3 isolates each position per byte (cross-byte bits are masked away).
+ * The unpack ladder interleaves the four position vectors to base0,base1,base2,base3 per
+ * byte, so o0..o3 hold bases [0..63] in ascending order. */
+static inline void bns_expand4(__m128i v, __m128i *o0, __m128i *o1, __m128i *o2, __m128i *o3)
+{
+	const __m128i m3 = _mm_set1_epi8(3);
+	__m128i b0 = _mm_and_si128(_mm_srli_epi16(v, 6), m3), b1 = _mm_and_si128(_mm_srli_epi16(v, 4), m3);
+	__m128i b2 = _mm_and_si128(_mm_srli_epi16(v, 2), m3), b3 = _mm_and_si128(v, m3);
+	__m128i lo01 = _mm_unpacklo_epi8(b0, b1), hi01 = _mm_unpackhi_epi8(b0, b1);
+	__m128i lo23 = _mm_unpacklo_epi8(b2, b3), hi23 = _mm_unpackhi_epi8(b2, b3);
+	*o0 = _mm_unpacklo_epi16(lo01, lo23); *o1 = _mm_unpackhi_epi16(lo01, lo23);
+	*o2 = _mm_unpacklo_epi16(hi01, hi23); *o3 = _mm_unpackhi_epi16(hi01, hi23);
+}
+#endif
+
 void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
                       int64_t beg, int64_t end,
                       uint8_t *dst, int64_t *len_out)
@@ -583,6 +663,27 @@ void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
 			k = end_f;
 			// leading partial bases until k is the last base of its byte
 			for (; k > beg_f && (k & 3) != 3; --k) dst[l++] = 3 - _get_pac(pac, k);
+#ifdef BNS_SIMD_UNPACK
+			// SIMD reverse: forward-expand the 16-byte block [k-63, k], then reverse the byte
+			// order (pshufb) and complement (^3). k is the last base of its byte, so the block
+			// stays byte-aligned; byte-identical to the rev-LUT below (verified over 200k windows).
+			// The load reads pac[(k>>2)-15 .. k>>2] -- the same span the scalar loop below reads;
+			// the guard (k-64 >= beg_f, and beg_f >= -1 after the end<=2*l_pac clamp) keeps the low
+			// index >= 0, so it never reads before pac[0].
+			{
+				const __m128i rmask = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+				const __m128i m3 = _mm_set1_epi8(3);
+				for (; k - 64 >= beg_f; k -= 64) {
+					__m128i v = _mm_loadu_si128((const __m128i *)(pac + ((k >> 2) - 15))), o0, o1, o2, o3;
+					bns_expand4(v, &o0, &o1, &o2, &o3);   // o0..o3 = forward bases [k-63, k] ascending
+					_mm_storeu_si128((__m128i *)(dst + l),      _mm_xor_si128(_mm_shuffle_epi8(o3, rmask), m3));
+					_mm_storeu_si128((__m128i *)(dst + l + 16), _mm_xor_si128(_mm_shuffle_epi8(o2, rmask), m3));
+					_mm_storeu_si128((__m128i *)(dst + l + 32), _mm_xor_si128(_mm_shuffle_epi8(o1, rmask), m3));
+					_mm_storeu_si128((__m128i *)(dst + l + 48), _mm_xor_si128(_mm_shuffle_epi8(o0, rmask), m3));
+					l += 64;
+				}
+			}
+#endif
 			// whole packed bytes: expand 4 rev-complemented bases per indexed load
 			for (; k - 4 >= beg_f; k -= 4) {
 				const uint8_t *q = rev[pac[k >> 2]];
@@ -595,6 +696,19 @@ void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
 			k = beg;
 			// leading partial bases until k is byte-aligned
 			for (; k < end && (k & 3) != 0; ++k) dst[l++] = _get_pac(pac, k);
+#ifdef BNS_SIMD_UNPACK
+			// SIMD: 16 packed bytes -> 64 bases per step; byte-identical to the LUT below
+			// (verified vs it over 200k random windows), ~3x faster on ~150 bp windows.
+			for (; k + 64 <= end; k += 64) {
+				__m128i v = _mm_loadu_si128((const __m128i *)(pac + (k >> 2))), o0, o1, o2, o3;
+				bns_expand4(v, &o0, &o1, &o2, &o3);
+				_mm_storeu_si128((__m128i *)(dst + l),      o0);
+				_mm_storeu_si128((__m128i *)(dst + l + 16), o1);
+				_mm_storeu_si128((__m128i *)(dst + l + 32), o2);
+				_mm_storeu_si128((__m128i *)(dst + l + 48), o3);
+				l += 64;
+			}
+#endif
 			// whole packed bytes: expand 4 bases per indexed load
 			for (; k + 4 <= end; k += 4) {
 				const uint8_t *q = fwd[pac[k >> 2]];

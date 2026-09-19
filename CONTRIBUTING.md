@@ -59,6 +59,21 @@ CLI output. It requires:
 - `BWA_MEM3_RS_TEST_REF=/path/to/index/prefix`
 - `samtools` on `PATH`
 
+### Regenerating FFI bindings
+
+`bwa-mem3-sys/src/bindings.rs` is bindgen output checked into the repo, so
+the default build needs only a C++17 compiler — no libclang. After editing
+`bwa-mem3-sys/shim/bwa_shim.h`, regenerate and commit the result:
+
+```bash
+BWA_MEM3_SYS_WRITE_BINDINGS=1 cargo build -p bwa-mem3-sys --features regenerate-bindings
+```
+
+Building with `--features regenerate-bindings` but without
+`BWA_MEM3_SYS_WRITE_BINDINGS=1` re-runs bindgen and fails the build if its
+output differs from the committed file (drift). CI's `bindings` job runs this
+check on both x86_64 and arm64 Linux.
+
 ## Code style
 
 - Follow the Rust API Guidelines; prefer `impl Trait` over `Box<dyn Trait>` on

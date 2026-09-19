@@ -18,6 +18,12 @@ struct LibsaisBuildOpts {
      * host detection. Only affects diagnostics: a "retry on a bigger host"
      * hint is noise when the binding constraint is the user's own flag. */
     bool        max_memory_user_specified = false;
+    /* SA sample-rate shift passed to the streaming FM-index writer: one SA
+     * row in (1<<sa_compx) is stored. Defaults to the historical rate (3,
+     * i.e. 1/8) so a caller that doesn't set it builds byte-identical
+     * indexes to before this field existed; a CLI flag to override it is
+     * wired up by the caller in bwtindex.cpp, not here. */
+    int         sa_compx           = 3;
 };
 
 // True when a doubled text of length `N` forces libsais's 64-bit SA path,
@@ -25,7 +31,7 @@ struct LibsaisBuildOpts {
 bool libsais_sa_is_64bit(int64_t N);
 
 // Estimated peak bytes for a libsais build over a doubled text of length `N`
-// (= 2 * l_pac). 6 B/base on the int32 SA path, 12 B/base once `N` forces the
+// (= 2 * l_pac). 8 B/base on the int32 SA path, 12 B/base once `N` forces the
 // int64 SA; both cover measured peaks with margin for libsais aux arrays and
 // OMP/allocator overhead. Exposed so callers can preflight a build they have
 // not started yet.

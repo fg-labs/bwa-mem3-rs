@@ -32,6 +32,7 @@
 #ifndef __AC_KBTREE_H
 #define __AC_KBTREE_H
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -39,6 +40,23 @@
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
 #endif
+
+/* Allocation-failure guard for the node/stack allocations below.
+ *
+ * Every allocation in this header is written through on the very next line
+ * (a calloc'd node gets its header filled, a grown stack gets a pointer
+ * pushed). A NULL return would therefore be a NULL-deref, not a recoverable
+ * condition, so the check has to hold in every build rather than depend on
+ * assert(). This header is vendored and pulls in nothing from the surrounding
+ * project, so the guard is self-contained -- the same shape as the
+ * kv_realloc_or_die() helper in kvec.h -- instead of routing through the
+ * project's fatal-error macro. OOM is unrecoverable here: abort loudly with a
+ * diagnostic, matching kvec.h. */
+static inline void kb_oom_abort(size_t n)
+{
+	fprintf(stderr, "[kbtree] out of memory: failed to (re)allocate %zu bytes\n", n);
+	abort();
+}
 
 typedef struct {
 	int32_t is_internal:1, n:31;
@@ -60,7 +78,7 @@ typedef struct {
 	{																	\
 		kbtree_##name##_t *b;											\
 		b = (kbtree_##name##_t*)calloc(1, sizeof(kbtree_##name##_t));	\
-        assert(b != NULL);                                              \
+        if (b == NULL) kb_oom_abort(sizeof(kbtree_##name##_t)); \
 		b->t = ((size - 4 - sizeof(void*)) / (sizeof(void*) + sizeof(key_t)) + 1) >> 1; \
 		if (b->t < 2) {													\
 			free(b); return 0;											\
@@ -70,7 +88,7 @@ typedef struct {
 		b->ilen = (4 + sizeof(void*) + b->n * (sizeof(void*) + sizeof(key_t)) + 3) >> 2 << 2; \
 		b->elen = (b->off_ptr + 3) >> 2 << 2;							\
 		b->root = (kbnode_t*)calloc(1, b->ilen);						\
-        assert(b->root != NULL);                                        \
+        if (b->root == NULL) kb_oom_abort(b->ilen); \
 		++b->n_nodes;													\
 		return b;														\
 	}
@@ -80,7 +98,7 @@ typedef struct {
 		kbnode_t *x, **top, **stack = 0;								\
 		if (b) {														\
 			top = stack = (kbnode_t**)calloc(max, sizeof(kbnode_t*));	\
-            assert(top != NULL);                                        \
+            if (top == NULL) kb_oom_abort(max * sizeof(kbnode_t*)); \
 			*top++ = (b)->root;											\
 			while (top != stack) {										\
 				x = *--top;												\
@@ -89,7 +107,9 @@ typedef struct {
 					if (__KB_PTR(b, x)[i]) {							\
 						if (top - stack == max) {						\
 							max <<= 1;									\
-							stack = (kbnode_t**)realloc(stack, max * sizeof(kbnode_t*)); \
+							kbnode_t **kb_grown = (kbnode_t**)realloc(stack, max * sizeof(kbnode_t*)); \
+							if (kb_grown == NULL) kb_oom_abort(max * sizeof(kbnode_t*)); \
+							stack = kb_grown;							\
 							top = stack + (max>>1);						\
 						}												\
 						*top++ = __KB_PTR(b, x)[i];						\
@@ -189,7 +209,7 @@ typedef struct {
 	{																	\
 		kbnode_t *z;													\
 		z = (kbnode_t*)calloc(1, y->is_internal? b->ilen : b->elen);	\
-        assert(z != NULL);                                              \
+        if (z == NULL) kb_oom_abort(y->is_internal? b->ilen : b->elen); \
 		++b->n_nodes;													\
 		z->is_internal = y->is_internal;								\
 		z->n = b->t - 1;												\
@@ -228,7 +248,7 @@ typedef struct {
 		if (r->n == 2 * b->t - 1) {										\
 			++b->n_nodes;												\
 			s = (kbnode_t*)calloc(1, b->ilen);							\
-            assert(s != NULL);                                          \
+            if (s == NULL) kb_oom_abort(b->ilen); \
 			b->root = s; s->is_internal = 1; s->n = 0;					\
 			__KB_PTR(b, s)[0] = r;										\
 			__kb_split_##name(b, s, 0, r);								\
@@ -342,6 +362,51 @@ typedef struct {
 		return kb_delp_##name(b, &k);									\
 	}
 
+#define __KB_RESET(name, key_t)											\
+	/* BWA-MEM3 local addition (not in upstream klib): __KB_RESET / kb_reset.	\
+	 * Reset a tree to the fresh kb_init state, reusing the root buffer	\
+	 * instead of freeing and reallocating it. Valid only for a pure-grow	\
+	 * tree (no interleaved kb_del) -- the chaining B-tree qualifies. The	\
+	 * result is byte-for-byte the state kb_init leaves: every constant		\
+	 * field (t, n, off_key, off_ptr, ilen, elen) is preserved, the root is	\
+	 * returned to an empty leaf, and the key/node counters are zeroed. Node	\
+	 * addresses never affect output (comparisons are value-only, traversal	\
+	 * is structural), so reusing the buffer is observably identical to a	\
+	 * destroy+init. The common single-leaf-root case performs ZERO			\
+	 * allocations; only an internal root (rare) walks to free descendants,	\
+	 * mirroring __kb_destroy's stack discipline. */						\
+	static void kb_reset_##name(kbtree_##name##_t *b)					\
+	{																	\
+		if (b == 0 || b->root == 0) return;								\
+		if (b->root->is_internal) { /* rare: free descendants, keep root */	\
+			int i, max = 8;												\
+			kbnode_t *x, **top, **stack;								\
+			top = stack = (kbnode_t**)malloc(max * sizeof(kbnode_t*));	\
+			if (stack == NULL) kb_oom_abort(max * sizeof(kbnode_t*)); \
+			*top++ = b->root;											\
+			while (top != stack) {										\
+				x = *--top;												\
+				if (x->is_internal)										\
+					for (i = 0; i <= x->n; ++i)							\
+						if (__KB_PTR(b, x)[i]) {						\
+							if (top - stack == max) {					\
+								max <<= 1;								\
+								kbnode_t **grown = (kbnode_t**)realloc(stack, max * sizeof(kbnode_t*)); \
+								if (grown == NULL) kb_oom_abort(max * sizeof(kbnode_t*)); \
+								stack = grown;								\
+								top = stack + (max>>1);					\
+							}											\
+							*top++ = __KB_PTR(b, x)[i];					\
+						}											\
+				if (x != b->root) free(x); /* keep the root buffer */	\
+			}															\
+			free(stack);												\
+		}																\
+		memset(b->root, 0, b->ilen);									\
+		b->n_keys = 0;													\
+		b->n_nodes = 1;													\
+	}
+
 typedef struct {
 	kbnode_t *x;
 	int i;
@@ -351,13 +416,15 @@ typedef struct {
 		int __kmax = 8;													\
 		__kbstack_t *__kstack, *__kp;									\
 		__kp = __kstack = (__kbstack_t*)calloc(__kmax, sizeof(__kbstack_t)); \
-        assert(__kp != NULL);                                           \
+        if (__kp == NULL) kb_oom_abort(__kmax * sizeof(__kbstack_t)); \
 		__kp->x = (b)->root; __kp->i = 0;								\
 		for (;;) {														\
 			while (__kp->x && __kp->i <= __kp->x->n) {					\
 				if (__kp - __kstack == __kmax - 1) {					\
 					__kmax <<= 1;										\
-					__kstack = (__kbstack_t*)realloc(__kstack, __kmax * sizeof(__kbstack_t)); \
+					__kbstack_t *__kb_grown = (__kbstack_t*)realloc(__kstack, __kmax * sizeof(__kbstack_t)); \
+					if (__kb_grown == NULL) kb_oom_abort(__kmax * sizeof(__kbstack_t)); \
+					__kstack = __kb_grown;								\
 					__kp = __kstack + (__kmax>>1) - 1;					\
 				}														\
 				(__kp+1)->i = 0; (__kp+1)->x = __kp->x->is_internal? __KB_PTR(b, __kp->x)[__kp->i] : 0; \
@@ -379,7 +446,8 @@ typedef struct {
 	__KB_GET(name, key_t)						\
 	__KB_INTERVAL(name, key_t)					\
 	__KB_PUT(name, key_t, __cmp)				\
-	__KB_DEL(name, key_t)
+	__KB_DEL(name, key_t)						\
+	__KB_RESET(name, key_t)
 
 #define KB_DEFAULT_SIZE 512
 
@@ -394,6 +462,7 @@ typedef struct {
 #define kb_putp(name, b, k) kb_putp_##name(b, k)
 #define kb_delp(name, b, k) kb_delp_##name(b, k)
 #define kb_intervalp(name, b, k, l, u) kb_intervalp_##name(b, k, l, u)
+#define kb_reset(name, b) kb_reset_##name(b)
 
 #define kb_size(b) ((b)->n_keys)
 

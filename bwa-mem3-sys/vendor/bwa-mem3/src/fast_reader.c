@@ -33,6 +33,7 @@ struct fast_reader {
     /* gzip */
     zng_stream zs;
     int      zs_active;
+    int      gz_member_open;   /* a gzip member is mid-decode (set on Z_OK, cleared at Z_STREAM_END) */
 
     /* bgzf */
     struct libdeflate_decompressor *ld;
@@ -75,12 +76,12 @@ static int fr_fill(fast_reader_t *fr)
     double _t0 = sp_enabled() ? sp_wall() : 0.0;
     while (fr->cin_len < fr->cin_cap && !fr->eof_in) {
         ssize_t r = read(fr->fd, fr->cin + fr->cin_len, fr->cin_cap - fr->cin_len);
-        if (r < 0) { if (errno == EINTR) continue; if (sp_enabled()) sp_read_add(0, sp_wall()-_t0); return -1; }
+        if (r < 0) { if (errno == EINTR) continue; if (sp_enabled()) sp_read_add(SP_READ_DISKWAIT, sp_wall()-_t0); return -1; }
         if (r == 0) { fr->eof_in = 1; break; }
         fr->cin_len += (size_t)r;
         if (sp_enabled()) sp_read_bytes((long)r, 0);   /* fd (on-disk) bytes */
     }
-    if (sp_enabled()) sp_read_add(0, sp_wall() - _t0);
+    if (sp_enabled()) sp_read_add(SP_READ_DISKWAIT, sp_wall() - _t0);
     return 0;
 }
 
@@ -103,7 +104,7 @@ fast_reader_t *fast_reader_dopen(int fd, const char **err)
 
     fr_format_t fmt = fr_detect(hdr, got);
     if (fmt == FR_UNSUPPORTED) {
-        FR_DOPEN_FAIL("unsupported compression format; bwa-mem3 supports plain, gzip, and bgzip");
+        FR_DOPEN_FAIL("unsupported compression format; bwa-mem3 supports plain, gzip, and BGZF");
     }
 
     fast_reader_t *fr = (fast_reader_t *)calloc(1, sizeof *fr);
@@ -155,12 +156,12 @@ static int fr_read_plain(fast_reader_t *fr, unsigned char *buf, int len)
     double _t0 = sp_enabled() ? sp_wall() : 0.0;
     while (out < len && !fr->eof_in) {
         ssize_t r = read(fr->fd, buf + out, len - out);
-        if (r < 0) { if (errno == EINTR) continue; if (sp_enabled()) sp_read_add(0, sp_wall()-_t0); return -1; }
+        if (r < 0) { if (errno == EINTR) continue; if (sp_enabled()) sp_read_add(SP_READ_DISKWAIT, sp_wall()-_t0); return -1; }
         if (r == 0) { fr->eof_in = 1; break; }
         out += (int)r;
         if (sp_enabled()) sp_read_bytes((long)r, 0);   /* fd (on-disk) bytes */
     }
-    if (sp_enabled()) sp_read_add(0, sp_wall() - _t0);
+    if (sp_enabled()) sp_read_add(SP_READ_DISKWAIT, sp_wall() - _t0);
     return out;
 }
 
@@ -171,24 +172,32 @@ static int fr_read_gzip(fast_reader_t *fr, unsigned char *buf, int len)
     while (fr->zs.avail_out > 0) {
         if (fr->zs.avail_in == 0) {
             if (fr_fill(fr) < 0) return -1;
-            if (fr->cin_len - fr->cin_pos == 0) break;     /* no more input */
+            if (fr->cin_len - fr->cin_pos == 0) {           /* no more input */
+                if (fr->gz_member_open) return -1;          /* member truncated mid-stream */
+                break;
+            }
             fr->zs.next_in = fr->cin + fr->cin_pos;
             fr->zs.avail_in = (uInt)(fr->cin_len - fr->cin_pos);
         }
         double _td = sp_enabled() ? sp_wall() : 0.0;
         int ret = zng_inflate(&fr->zs, Z_NO_FLUSH);
-        if (sp_enabled()) sp_read_add(1, sp_wall() - _td);
+        if (sp_enabled()) sp_read_add(SP_READ_DECOMPRESS, sp_wall() - _td);
         fr->cin_pos = fr->cin_len - fr->zs.avail_in;       /* track consumed */
         if (ret == Z_STREAM_END) {                          /* member done */
+            fr->gz_member_open = 0;
             if (zng_inflateReset(&fr->zs) != Z_OK) return -1;
             if (fr->zs.avail_in == 0 && fr->eof_in) break;  /* nothing follows */
             continue;                                       /* next member */
         }
         if (ret == Z_BUF_ERROR) {                           /* needs more input */
-            if (fr->eof_in && fr->zs.avail_in == 0) break;
+            if (fr->eof_in && fr->zs.avail_in == 0) {
+                if (fr->gz_member_open) return -1;              /* truncated: EOF mid-member */
+                break;
+            }
             continue;
         }
         if (ret != Z_OK) return -1;                         /* hard error */
+        fr->gz_member_open = 1;                              /* Z_OK: member mid-decode */
     }
     return len - (int)fr->zs.avail_out;
 }
@@ -249,7 +258,7 @@ static int fr_next_bgzf_block(fast_reader_t *fr)
         enum libdeflate_result r =
             libdeflate_deflate_decompress(fr->ld, p + cdata_off, cdata_len,
                                           fr->bout, isize, &actual);
-        if (sp_enabled()) sp_read_add(1, sp_wall() - _td);
+        if (sp_enabled()) sp_read_add(SP_READ_DECOMPRESS, sp_wall() - _td);
         if (r != LIBDEFLATE_SUCCESS || actual != isize) return -1;
         if (libdeflate_crc32(0, fr->bout, isize) != crc) return -1;
 

@@ -840,9 +840,19 @@ mod tests {
         assert_eq!(o.max_extend_chains(), 0);
         assert_eq!(o.mate_concordant_window(), 0);
         assert!(!o.smem_dedup());
-        assert!(!o.skip_contained_ext());
         assert_eq!(o.band_start(), 0);
         assert_eq!(o.seed_order().unwrap(), SeedOrder::Off);
+    }
+
+    #[test]
+    fn skip_contained_ext_defaults_on() {
+        // Upstream (fg-labs/bwa-mem3 since the contained-seed extension skip
+        // became a byte-identical default) initializes skip_contained_ext = 1:
+        // it is a pure speed lever with output identical to the reference path,
+        // so it is on by default rather than opt-in. `--keep-contained-ext`
+        // (set_skip_contained_ext(false)) opts out.
+        let o = MemOpts::new().unwrap();
+        assert!(o.skip_contained_ext());
     }
 
     #[test]
@@ -852,14 +862,17 @@ mod tests {
             .set_max_extend_chains(4)
             .set_mate_concordant_window(-1)
             .set_smem_dedup(true)
-            .set_skip_contained_ext(true)
+            // default is on (see skip_contained_ext_defaults_on), so toggle it
+            // OFF here to actually exercise the setter (the --keep-contained-ext
+            // opt-out direction).
+            .set_skip_contained_ext(false)
             .set_band_start(20)
             .set_seed_order(SeedOrder::MostAbsorb);
         assert_eq!(o.min_ext_len(), 25);
         assert_eq!(o.max_extend_chains(), 4);
         assert_eq!(o.mate_concordant_window(), -1);
         assert!(o.smem_dedup());
-        assert!(o.skip_contained_ext());
+        assert!(!o.skip_contained_ext());
         assert_eq!(o.band_start(), 20);
         assert_eq!(o.seed_order().unwrap(), SeedOrder::MostAbsorb);
     }

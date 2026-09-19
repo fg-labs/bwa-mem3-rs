@@ -282,6 +282,29 @@ pub fn setup_phix_index(dir: &Path, bwa_mem3_bin: &str, phix_seq: &str) -> PathB
     setup_phix_index_inner(dir, bwa_mem3_bin, phix_seq, &[], "fa.bwt.2bit.64")
 }
 
+/// Build a bwa-mem3 index for an arbitrary single-contig reference `seq` named
+/// `contig` under `dir`. Returns the FASTA path (usable as an index prefix).
+/// Same machinery as [`setup_phix_index`] but for a caller-supplied sequence --
+/// e.g. a tandem-repeat reference whose equal-score loci make the id-seeded
+/// tie-break observable, which a unique-mapping PhiX reference never can.
+pub fn setup_ref_index(dir: &Path, bwa_mem3_bin: &str, contig: &str, seq: &[u8]) -> PathBuf {
+    let ref_fa = dir.join(format!("{contig}.fa"));
+    let mut f = fs::File::create(&ref_fa).unwrap();
+    writeln!(f, ">{contig}").unwrap();
+    for chunk in seq.chunks(72) {
+        f.write_all(chunk).unwrap();
+        writeln!(f).unwrap();
+    }
+    drop(f);
+    let status = Command::new(bwa_mem3_bin)
+        .arg("index")
+        .arg(&ref_fa)
+        .status()
+        .expect("run bwa-mem3 index");
+    assert!(status.success(), "bwa-mem3 index failed");
+    ref_fa
+}
+
 /// Like [`setup_phix_index`] but builds the bisulfite dual index
 /// (`bwa-mem3 index --meth`), producing `<ref>.*` + `<ref>.meth.*`.
 pub fn setup_phix_meth_index(dir: &Path, bwa_mem3_bin: &str, phix_seq: &str) -> PathBuf {
@@ -322,4 +345,40 @@ fn setup_phix_index_inner(
         "bwa-mem3 index did not produce {expect_suffix}"
     );
     ref_fa
+}
+
+/// Minimal BGZF BAM around packed record bodies (no block_size prefix), so
+/// `samtools view` can render them for comparison with the CLI's output.
+pub fn write_bam(
+    path: &Path,
+    idx: &bwa_mem3_rs::BwaIndex,
+    opts: &bwa_mem3_rs::MemOpts,
+    bodies: &[Vec<u8>],
+) {
+    let mut w = noodles_bgzf::io::Writer::new(fs::File::create(path).unwrap());
+    let mut text = String::new();
+    if let Some(hd) = opts.compat_hd_line() {
+        text.push_str(hd);
+        text.push('\n');
+    }
+    for (name, len) in idx.contigs() {
+        text.push_str(&format!("@SQ\tSN:{name}\tLN:{len}\n"));
+    }
+    w.write_all(b"BAM\x01").unwrap();
+    w.write_all(&(text.len() as u32).to_le_bytes()).unwrap();
+    w.write_all(text.as_bytes()).unwrap();
+    w.write_all(&(idx.n_contigs() as u32).to_le_bytes())
+        .unwrap();
+    for (name, len) in idx.contigs() {
+        w.write_all(&((name.len() + 1) as u32).to_le_bytes())
+            .unwrap();
+        w.write_all(name.as_bytes()).unwrap();
+        w.write_all(b"\0").unwrap();
+        w.write_all(&(len as u32).to_le_bytes()).unwrap();
+    }
+    for b in bodies {
+        w.write_all(&(b.len() as u32).to_le_bytes()).unwrap();
+        w.write_all(b).unwrap();
+    }
+    w.finish().unwrap();
 }

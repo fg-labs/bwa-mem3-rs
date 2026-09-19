@@ -1,4 +1,4 @@
-//! Flag-parity tests for `pair_and_emit`.
+//! Flag-parity tests for `emit_resolved_pair`.
 //!
 //! Aligns simulated PhiX paired reads via `bwa_mem3_rs::align_batch`, parses
 //! the packed BAM bytes, and asserts the SAM flag bits for each record match

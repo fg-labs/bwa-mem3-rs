@@ -10,8 +10,24 @@
  * the very fields this shapes -- bwa emits MQ:i and a default @HD, bwa-mem2
  * emits neither -- so "compat" is a choice among targets, not an on/off switch.
  *
- * Compat targets shape OUTPUT ONLY. They never change an alignment, a score, a
- * flag, or any tag's value. See docs/src/whats-different/equivalence.md.
+ * A compat target reproduces ITS upstream's output, records and header alike.
+ * Almost every field here is header or tag shaping and changes no alignment,
+ * no score and no flag -- and that remains what a new field should expect to
+ * be.
+ *
+ * `chain_flt_resurrect_empty` and `sa_sentinel_drop_offset` are the two known
+ * records on which bwa and bwa-mem2 emit DIFFERENT ALIGNMENTS for the same
+ * read -- both places where bwa-mem2's port is not faithful to bwa -- so a
+ * row records whichever behavior ITS target has, alignment-affecting or not:
+ * a `--compat=bwa-mem2` that returned bwa's alignment there would not be a
+ * weaker guarantee, it would be a false one. The `off` row (no --compat) takes
+ * bwa's answer on both, the principled one: without --compat, bwa-mem3 is
+ * bwa-mem2 plus bug fixes.
+ *
+ * This does not license `--fast` or `--proper-pair-from-emitted` into a row:
+ * those deviate from BOTH targets, so asking for target parity and for a
+ * deviation from it in one command stays incoherent, and main_mem still
+ * rejects the pair. See docs/src/whats-different/equivalence.md.
  */
 
 #ifndef BWAMEM3_COMPAT_TARGET_H
@@ -73,6 +89,49 @@ typedef struct compat_target_t {
     /* Emit the HN:i hit-count tag. Genuinely bwa-mem3-only: absent from both
      * upstreams. */
     int emit_hn;
+
+    /* When mem_chain_flt's weight filter drops EVERY chain for a read, hand
+     * slot 0 -- a chain the filter just rejected -- back to the caller with
+     * kept = 3 (1), or report zero survivors (0).
+     *
+     * One of the two records on which bwa-mem2's port is not faithful to bwa
+     * (the other is `sa_sentinel_drop_offset`). bwa returns 0: `n_chn = k`
+     * with no post-filter check, so its tail loops are bounded by 0 and the
+     * function returns 0 (bwa 0.7.19 bwamem.c). bwa-mem2's seqid-range
+     * machinery synthesizes the range {0,1} for an emptied array, so n_chn
+     * comes back as 1, the unconditional `kept[0] = 3` becomes load-bearing,
+     * and the rejected chain is extended. bwa-mem3 inherited the latter at the
+     * fork point (fg-labs/bwa-mem3#310).
+     *
+     * Reachable only when min_chain_weight > 0 -- never the default -- via -W
+     * or the -x pacbio/pbref/ont2d presets. Measured on 500 HiFi reads at
+     * -x pacbio it never fires (real long reads build chains far above the
+     * threshold); with -W above the read length it fires on every read.
+     *
+     * `off` and `bwa-mem` report zero survivors: bwa's answer, and the
+     * principled one, since extending a chain the filter just rejected is a
+     * bookkeeping artifact rather than a decision. `bwa-mem2` resurrects,
+     * because reproducing that release's records, this divergence included,
+     * is the entire contract of that target. */
+    int chain_flt_resurrect_empty;
+
+    /* When the compressed suffix-array lookup's LF walk reaches the sentinel
+     * ($) row, report coordinate 0 (1) or the accumulated walk offset (0).
+     *
+     * The suffix at the sentinel row starts at text position 0, so a walk of
+     * `offset` steps that lands there belongs to text position `offset`. bwa's
+     * bwt_sa accounts for that (bwt_invPsi returns 0 at the primary and
+     * bwt->sa[0] = -1 compensates); bwa-mem2's pipelined lookup (call_one_step)
+     * set sa_entry = 0 there and dropped the walk, placing any hit whose walk
+     * reaches the sentinel before a sampled row up to `offset` bases too far
+     * left. Reachable only for hits in the first few bases of the concatenated
+     * reference (contig 0's opening bases), i.e. never on hg38, which opens
+     * with an N run, but real on small and custom references.
+     *
+     * `off` and `bwa-mem` report the correct coordinate; `bwa-mem2` keeps the
+     * drop, because reproducing bwa-mem2 v2.2.1's records is that target's
+     * contract and this is one of its alignments (fg-labs/bwa-mem3#469). */
+    int sa_sentinel_drop_offset;
 } compat_target_t;
 
 /* The `off` row: bwa-mem3's own native output. Never NULL on any mem_opt_t
