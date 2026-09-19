@@ -537,6 +537,38 @@ static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
     return seqs;
 }
 
+/* Append `n` single reads at seqs[base..base+n). Same ownership rules as
+ * copy_pairs_to_seqs. Under --meth a single is treated as an R1/OT read
+ * (C→T, meth_base_ot = 1), matching upstream's single-file ingest. */
+static void copy_singles_to_seqs(bseq1_t *seqs, size_t base, const ShimSingleRead *singles,
+                                 size_t n, int meth_mode, size_t *heap_bytes)
+{
+    for (size_t i = 0; i < n; ++i) {
+        const ShimSingleRead *p = &singles[i];
+        bseq1_t *s = &seqs[base + i];
+        s->l_seq = (int)p->seq_len;
+        s->name = (char *) malloc(p->name_len + 1);
+        memcpy(s->name, p->name, p->name_len); s->name[p->name_len] = '\0';
+        s->seq = (char *) malloc(p->seq_len + 1);
+        memcpy(s->seq, p->seq, p->seq_len); s->seq[p->seq_len] = '\0';
+        if (p->qual) {
+            s->qual = (char *) malloc(p->seq_len + 1);
+            memcpy(s->qual, p->qual, p->seq_len); s->qual[p->seq_len] = '\0';
+        } else {
+            s->qual = nullptr;
+        }
+        s->sam = nullptr;
+        *heap_bytes += (p->name_len + 1) + (p->seq_len + 1) + (p->qual ? p->seq_len + 1 : 0);
+        if (meth_mode) {
+            s->meth_orig_seq = strdup(s->seq);
+            s->meth_base_ot = 1;
+            for (int j = 0; j < s->l_seq; ++j)
+                if (s->seq[j] == 'C' || s->seq[j] == 'c') s->seq[j] = 'T';
+            *heap_bytes += (size_t)s->l_seq + 1;
+        }
+    }
+}
+
 static void free_seqs(bseq1_t *seqs, int nseqs) {
     if (!seqs) return;
     for (int i = 0; i < nseqs; ++i) {
@@ -1148,24 +1180,40 @@ ShimRegs *shim_seed_extend(void *idx_opaque, const mem_opt_t *opts, ShimScratch 
                            const ShimReadBatch *batch)
 {
     if (!idx_opaque || !opts || !sc || !batch) return nullptr;
-    if (batch->n_singles > 0) return nullptr;   /* Task 5 adds singles; error set by the caller */
     BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
 
     ShimRegs *r = (ShimRegs *) calloc(1, sizeof(ShimRegs));
     if (!r) return nullptr;
     r->n_pairs = batch->n_pairs;
-    r->n_singles = 0;
-    r->n_seqs = (int)(2 * batch->n_pairs);
+    r->n_singles = batch->n_singles;
+    r->n_seqs = (int)(2 * batch->n_pairs + batch->n_singles);
     r->meth_mode = opts->meth_mode;
-    r->seqs = copy_pairs_to_seqs(batch->pairs, batch->n_pairs, opts->meth_mode, &r->heap_bytes);
+
+    /* One contiguous seqs array: [0, 2*n_pairs) hold the pairs (R1/R2
+     * interleaved), then [2*n_pairs, 2*n_pairs+n_singles) hold the singles.
+     * copy_pairs_to_seqs owns its own array, so build the pairs into a temp and
+     * shallow-copy the bseq1_t structs (their name/seq/qual heap now belongs to
+     * r->seqs); copy_singles_to_seqs writes in place after them. */
+    r->seqs = r->n_seqs > 0 ? (bseq1_t *) calloc((size_t)r->n_seqs, sizeof(bseq1_t)) : nullptr;
     if (!r->seqs && r->n_seqs > 0) { free(r); return nullptr; }
+    if (batch->n_pairs > 0) {
+        bseq1_t *pairs_only = copy_pairs_to_seqs(batch->pairs, batch->n_pairs, opts->meth_mode, &r->heap_bytes);
+        if (!pairs_only) { free(r->seqs); free(r); return nullptr; }
+        memcpy(r->seqs, pairs_only, 2 * batch->n_pairs * sizeof(bseq1_t));
+        free(pairs_only);   /* shallow: the strings now belong to r->seqs */
+    }
+    copy_singles_to_seqs(r->seqs, 2 * batch->n_pairs, batch->singles, batch->n_singles,
+                         opts->meth_mode, &r->heap_bytes);
+
     r->regs = r->n_seqs > 0 ? (mem_alnreg_v *) calloc((size_t)r->n_seqs, sizeof(mem_alnreg_v)) : nullptr;
     if (!r->regs && r->n_seqs > 0) { free_seqs(r->seqs, r->n_seqs); free(r); return nullptr; }
 
-    mem_opt_t opt_pe = *opts;
-    opt_pe.n_threads = 1;
-    opt_pe.flag |= MEM_F_PE;
-    if (r->n_seqs > 0) seed_extend_range(sc, r, idx, &opt_pe, 0, r->n_seqs);
+    /* Seed/extend each group under its own MEM_F_PE setting on a per-call copy
+     * (fastmap.cpp:912-921): pairs with the flag SET, singles with it CLEARED. */
+    mem_opt_t opt_pe = *opts; opt_pe.n_threads = 1; opt_pe.flag |=  MEM_F_PE;
+    mem_opt_t opt_se = *opts; opt_se.n_threads = 1; opt_se.flag &= ~MEM_F_PE;
+    if (r->n_pairs > 0)   seed_extend_range(sc, r, idx, &opt_pe, 0, (int)(2 * r->n_pairs));
+    if (r->n_singles > 0) seed_extend_range(sc, r, idx, &opt_se, (int)(2 * r->n_pairs), (int)r->n_singles);
     return r;
 }
 
@@ -1206,11 +1254,26 @@ static void pair_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
                           const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                           bseq1_t *s, mem_alnreg_v *a, const mem_pestat_t pes[4]);
 
+/* Defined after emit_resolved_pair; forward-declared so shim_pair_emit can
+ * drive it after the pair loop. */
+static void single_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
+                            const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                            bseq1_t *s, mem_alnreg_v *a);
+
 /* mem_pestat over the PE reads of several batches, exactly as the CLI runs it
  * once per -K cohort (mem_process_seqs, bwamem.cpp:3030-3050). Only the
  * 24-byte mem_alnreg_v headers are gathered; the alnreg payloads stay put.
  * mem_pestat sorts internally, so gather order only needs to keep each pair's
- * two reads adjacent. */
+ * two reads adjacent.
+ *
+ * MIXED cohorts (pairs + singles): only the PAIR regs (2*n_pairs per batch) are
+ * gathered — singles are excluded. This matches the CLI's `-p` path exactly:
+ * bseq_classify splits the cohort into an SE and a PE group, and only the PE
+ * group's mem_process_seqs call estimates insert size (over the PE reads' regs,
+ * bwamem.cpp:3030-3042); the SE group runs with MEM_F_PE cleared and never
+ * touches pestat (fastmap.cpp:919-946). Singles have no mate and so contribute
+ * nothing to the insert-size distribution either way. Verified against
+ * `bwa-mem3 mem -p` on a mixed interleaved input (three_phase_cli_parity.rs). */
 int shim_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
                        const ShimRegs *const *regs, size_t n_regs, mem_pestat_t *out)
 {
@@ -1253,7 +1316,16 @@ int shim_pair_emit(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc, Shi
         pair_and_emit(&e, i, ids.first_pair_id + (uint64_t)i,
                       &opt_pe, bns, pac, r->seqs + 2*i, r->regs + 2*i, pestat);
     }
-    (void)ids.first_single_id;   /* singles: Task 5 */
+    /* Singles after pairs: SE group emitted with MEM_F_PE cleared, ids from
+     * first_single_id, one origin_idx per single (index into batch->singles).
+     * BWA_ORIGIN_SINGLE (1) distinguishes them from pairs at the sink. */
+    mem_opt_t opt_se = *opts; opt_se.n_threads = 1; opt_se.flag &= ~MEM_F_PE;
+    e.origin_kind = 1u /* BWA_ORIGIN_SINGLE */;
+    for (size_t i = 0; i < r->n_singles; ++i) {
+        size_t k = 2 * r->n_pairs + i;
+        single_and_emit(&e, i, ids.first_single_id + (uint64_t)i,
+                        &opt_se, bns, pac, r->seqs + k, r->regs + k);
+    }
     shim_regs_free(r);
     return 0;
 }
@@ -1557,6 +1629,57 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
         }
         free(HN[k]);
     }
+}
+
+/* Single-end resolve + emit: the SE branch of worker_sam (bwamem.cpp:2880-2887)
+ * followed by mem_reg2sam's emit policy (bwamem.cpp:3227-3287), in BAM. `m` is
+ * always NULL for a single — append_bam_record then writes mtid/mpos = -1,
+ * tlen = 0 and sets no mate/pair flag bits (0x1/0x40/0x80/0x8/0x20). */
+static void single_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
+                            const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                            bseq1_t *s, mem_alnreg_v *a)
+{
+    mem_mark_primary_se(opt, a->n, a->a, (int64_t)id);
+#if V17
+    if (opt->flag & MEM_F_PRIMARY5) mem_reorder_primary5(opt->T, a);
+#endif
+    char **XA = nullptr; int *HN = nullptr;
+    if (!(opt->flag & MEM_F_ALL))
+        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq, &HN, s->meth_orig_seq);
+
+    /* Compact emitted list `aa`, exactly mem_reg2sam's loop. */
+    mem_aln_t *aa = (mem_aln_t *) calloc(a->n ? a->n : 1, sizeof(mem_aln_t));
+    int l = 0;
+    for (int k = 0; k < (int)a->n; ++k) {
+        const mem_alnreg_t *p = &a->a[k];
+        if (p->score < opt->T) continue;
+        if (p->secondary >= 0 && (p->is_alt || !(opt->flag & MEM_F_ALL))) continue;
+        if (p->secondary >= 0 && p->secondary < INT_MAX
+            && p->score < a->a[p->secondary].score * opt->drop_ratio) continue;
+        mem_aln_t q = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, p, s->meth_orig_seq);
+        q.XA = XA ? XA[k] : nullptr;
+        q.HN = HN ? HN[k] : -1;
+        if (p->secondary >= 0) q.sub = -1;
+        if (l && p->secondary < 0) q.flag |= (opt->flag & MEM_F_NO_MULTI) ? 0x10000 : 0x800;
+        if (!(opt->flag & MEM_F_KEEP_SUPP_MAPQ) && l && !p->is_alt && q.mapq > aa[0].mapq)
+            q.mapq = aa[0].mapq;
+        if (opt->supp_rep_hard_cap > 0 && l && p->secondary < 0
+            && p->chain_n_hits >= opt->supp_rep_hard_cap)
+            q.mapq = 0;
+        aa[l++] = q;
+    }
+    if (l == 0) {
+        mem_aln_t t = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, nullptr, s->meth_orig_seq);
+        append_bam_record(e, origin_idx, opt, bns, pac, s, &t, 1, &t, 0, nullptr, 0);
+        free(t.cigar);
+    } else {
+        for (int k = 0; k < l; ++k)
+            append_bam_record(e, origin_idx, opt, bns, pac, s, &aa[k], l, aa, k, nullptr, 0);
+        for (int k = 0; k < l; ++k) free(aa[k].cigar);
+    }
+    free(aa);
+    if (XA) { for (int k = 0; k < (int)a->n; ++k) free(XA[k]); free(XA); }
+    free(HN);
 }
 
 /* One pair: resolve then emit. `id` is the GLOBAL pair ordinal
