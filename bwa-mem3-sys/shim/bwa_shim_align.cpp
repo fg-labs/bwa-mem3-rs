@@ -481,6 +481,10 @@ void shim_opts_apply_meth_defaults(mem_opt_t *opt) {
 
 /* ------------------ Helpers ------------------ */
 
+/* Forward-declared so the copy helpers can unwind a partially-built array on an
+ * allocation failure (free_seqs is NULL-safe on the un-built calloc'd tail). */
+static void free_seqs(bseq1_t *seqs, int nseqs);
+
 static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
                                    int meth_mode, size_t *heap_bytes) {
     *heap_bytes = 0;
@@ -502,14 +506,21 @@ static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
         for (int k = 0; k < 2; ++k) {
             bseq1_t *s = &seqs[2*i + k];
             s->l_seq = (int)sl[k];
+            /* NULL-check every per-read allocation: an OOM here must unwind the
+             * partially-built array and return NULL (the caller's `!pairs_only`
+             * path), not deref NULL. free_seqs() is NULL-safe on the entries not
+             * yet built (calloc leaves them NULL). */
             s->name = (char *) malloc(nl[k] + 1);
+            if (!s->name) { free_seqs(seqs, nseqs); return nullptr; }
             memcpy(s->name, nm[k], nl[k]);
             s->name[nl[k]] = '\0';
             s->seq = (char *) malloc(sl[k] + 1);
+            if (!s->seq) { free_seqs(seqs, nseqs); return nullptr; }
             memcpy(s->seq, sq[k], sl[k]);
             s->seq[sl[k]] = '\0';
             if (ql[k]) {
                 s->qual = (char *) malloc(sl[k] + 1);
+                if (!s->qual) { free_seqs(seqs, nseqs); return nullptr; }
                 memcpy(s->qual, ql[k], sl[k]);
                 s->qual[sl[k]] = '\0';
             } else {
@@ -526,6 +537,7 @@ static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
              * CIGAR/NM/MD and the XM call string. Same orientation as seq. */
             if (meth_mode) {
                 s->meth_orig_seq = strdup(s->seq);
+                if (!s->meth_orig_seq) { free_seqs(seqs, nseqs); return nullptr; }
                 *heap_bytes += (size_t)s->l_seq + 1;
                 /* v0.9.0: read-number chemistry, consumed by the seed filter in
                  * meth_seed_to_orig (bwamem.cpp:1878-1881), which drops any seed
@@ -553,20 +565,27 @@ static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
 
 /* Append `n` single reads at seqs[base..base+n). Same ownership rules as
  * copy_pairs_to_seqs. Under --meth a single is treated as an R1/OT read
- * (C→T, meth_base_ot = 1), matching upstream's single-file ingest. */
-static void copy_singles_to_seqs(bseq1_t *seqs, size_t base, const ShimSingleRead *singles,
-                                 size_t n, int meth_mode, size_t *heap_bytes)
+ * (C→T, meth_base_ot = 1), matching upstream's single-file ingest.
+ *
+ * Returns 0 on success, -1 on allocation failure. On failure the caller owns
+ * `seqs` (it is the caller's r->seqs) and frees it via free_seqs, which is
+ * NULL-safe on the entries this function had not yet built. */
+static int copy_singles_to_seqs(bseq1_t *seqs, size_t base, const ShimSingleRead *singles,
+                                size_t n, int meth_mode, size_t *heap_bytes)
 {
     for (size_t i = 0; i < n; ++i) {
         const ShimSingleRead *p = &singles[i];
         bseq1_t *s = &seqs[base + i];
         s->l_seq = (int)p->seq_len;
         s->name = (char *) malloc(p->name_len + 1);
+        if (!s->name) return -1;
         memcpy(s->name, p->name, p->name_len); s->name[p->name_len] = '\0';
         s->seq = (char *) malloc(p->seq_len + 1);
+        if (!s->seq) return -1;
         memcpy(s->seq, p->seq, p->seq_len); s->seq[p->seq_len] = '\0';
         if (p->qual) {
             s->qual = (char *) malloc(p->seq_len + 1);
+            if (!s->qual) return -1;
             memcpy(s->qual, p->qual, p->seq_len); s->qual[p->seq_len] = '\0';
         } else {
             s->qual = nullptr;
@@ -575,12 +594,14 @@ static void copy_singles_to_seqs(bseq1_t *seqs, size_t base, const ShimSingleRea
         *heap_bytes += (p->name_len + 1) + (p->seq_len + 1) + (p->qual ? p->seq_len + 1 : 0);
         if (meth_mode) {
             s->meth_orig_seq = strdup(s->seq);
+            if (!s->meth_orig_seq) return -1;
             s->meth_base_ot = 1;
             for (int j = 0; j < s->l_seq; ++j)
                 if (s->seq[j] == 'C' || s->seq[j] == 'c') s->seq[j] = 'T';
             *heap_bytes += (size_t)s->l_seq + 1;
         }
     }
+    return 0;
 }
 
 static void free_seqs(bseq1_t *seqs, int nseqs) {
@@ -601,6 +622,10 @@ static void free_seqs(bseq1_t *seqs, int nseqs) {
 static uint8_t *build_ref_string(const bntseq_t *bns, const uint8_t *pac) {
     int64_t ref_len = bns->l_pac * 2;
     uint8_t *s = (uint8_t *) _mm_malloc(ref_len, 64);
+    /* ~2*l_pac bytes (~6 GB on hs38): the largest single alloc in the crate and
+     * the one most likely to fail under memory pressure. Return NULL (both
+     * callers check) rather than deref it below. */
+    if (!s) return nullptr;
     for (int64_t i = 0; i < bns->l_pac; ++i) {
         uint8_t b = (pac[i >> 2] >> ((~i & 3) << 1)) & 3;
         s[i] = b;
@@ -842,6 +867,18 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     int n_cigar = p->n_cigar;
     int ref_len = cigar_ref_len(n_cigar, p->cigar);
 
+    /* BAM field-width validation at the shim boundary. `l_read_name` is written
+     * into a uint8 (max 255, NUL included) but the name is copied at full width,
+     * and `n_cigar` into a uint16 (max 65535). A read name >= 255 bytes or a
+     * CIGAR with >= 65536 ops is pathological but must fail loudly rather than
+     * silently emit a truncated/corrupt record. This TU is compiled without
+     * access to bwa_shim.cpp's shim_set_err and these emit helpers return void,
+     * so mirror worker_alloc: xassert aborts with a message (survives NDEBUG),
+     * matching the surrounding error handling here. Never fires on valid input,
+     * so output stays byte-identical. */
+    xassert(l_read_name <= 255, "read name too long for BAM (>= 255 bytes)");
+    xassert(n_cigar <= 0xffff, "too many CIGAR ops for BAM (> 65535)");
+
     /* Upstream's mem_aln2sam prologue (bwamem.cpp:2457-2462), reproduced here
      * on LOCAL copies exactly as it does with ptmp/mtmp: for a half-mapped
      * pair the unmapped record is rewritten to carry its mate's placement, and
@@ -1009,6 +1046,7 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     if (emit_len > 0) {
         if (p->is_rev) {
             emit_seq_buf = (uint8_t *) malloc(emit_len);
+            xassert(emit_seq_buf != NULL, "out of memory: emit_seq_buf");
             for (int i = 0; i < emit_len; ++i) {
                 uint8_t b = (uint8_t) s->seq[l_seq - 1 - (seq_start + i)];
                 emit_seq_buf[i] = bwa2_complement(b);
@@ -1016,6 +1054,7 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
             emit_seq = emit_seq_buf;
             if (s->qual) {
                 emit_qual_buf = (char *) malloc(emit_len);
+                xassert(emit_qual_buf != NULL, "out of memory: emit_qual_buf");
                 for (int i = 0; i < emit_len; ++i)
                     emit_qual_buf[i] = s->qual[l_seq - 1 - (seq_start + i)];
                 emit_qual = emit_qual_buf;
@@ -1216,8 +1255,12 @@ ShimRegs *shim_seed_extend(void *idx_opaque, const mem_opt_t *opts, ShimScratch 
         memcpy(r->seqs, pairs_only, 2 * batch->n_pairs * sizeof(bseq1_t));
         free(pairs_only);   /* shallow: the strings now belong to r->seqs */
     }
-    copy_singles_to_seqs(r->seqs, 2 * batch->n_pairs, batch->singles, batch->n_singles,
-                         opts->meth_mode, &r->heap_bytes);
+    if (copy_singles_to_seqs(r->seqs, 2 * batch->n_pairs, batch->singles, batch->n_singles,
+                             opts->meth_mode, &r->heap_bytes) != 0) {
+        free_seqs(r->seqs, r->n_seqs);   /* frees the built pairs + partial singles */
+        free(r);
+        return nullptr;
+    }
 
     r->regs = r->n_seqs > 0 ? (mem_alnreg_v *) calloc((size_t)r->n_seqs, sizeof(mem_alnreg_v)) : nullptr;
     if (!r->regs && r->n_seqs > 0) { free_seqs(r->seqs, r->n_seqs); free(r); return nullptr; }
@@ -1243,6 +1286,7 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, const mem_opt_t *opts,
     shim_scratch_free(sc);
     if (!r) return nullptr;
     ShimSeeds *s = (ShimSeeds *) calloc(1, sizeof(ShimSeeds));
+    if (!s) { shim_regs_free(r); return nullptr; }
     s->regs = r;
     return s;
 }
@@ -1250,6 +1294,7 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, const mem_opt_t *opts,
 ShimSeeds *shim_seeds_from_regs(ShimRegs *r) {
     if (!r) return nullptr;
     ShimSeeds *s = (ShimSeeds *) calloc(1, sizeof(ShimSeeds));
+    if (!s) { shim_regs_free(r); return nullptr; }
     s->regs = r;
     return s;
 }
@@ -1416,12 +1461,20 @@ void shim_align_out_free(ShimAlignOutput *out);
 
 static ShimAlignOutput *alloc_align_output(size_t n_pairs) {
     ShimAlignOutput *out = (ShimAlignOutput *) calloc(1, sizeof(ShimAlignOutput));
+    if (!out) return nullptr;
     out->cap = n_pairs > 0 ? n_pairs * 4 : 64;
     out->rec_off  = (size_t *) malloc(out->cap * sizeof(size_t));
     out->rec_len  = (size_t *) malloc(out->cap * sizeof(size_t));
     out->pair_idx = (size_t *) malloc(out->cap * sizeof(size_t));
     out->buf_cap = 4096;
     out->buf = (uint8_t *) malloc(out->buf_cap);
+    /* Any partial failure unwinds the whole output (shim_align_out_free is
+     * NULL-safe on the fields not yet allocated). The legacy callers check the
+     * NULL return. */
+    if (!out->rec_off || !out->rec_len || !out->pair_idx || !out->buf) {
+        shim_align_out_free(out);
+        return nullptr;
+    }
     return out;
 }
 
@@ -1451,10 +1504,27 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
                                const int n_pri[2], const int z[2], const int q_se[2],
                                int extra_flag, int paired)
 {
-    /* n_pri is unused here: it's kept only so this signature stays symmetric
-     * with pair_resolve_scalar (both take the same resolve/emit param set),
-     * making it easy to swap in a batched resolve/emit pair later. */
-    (void)n_pri;
+    /* No-pairing proper-pair selection, computed exactly as upstream
+     * mem_sam_pe's no_pairing block does (bwamem_pair.cpp:1651-1658): the
+     * emitted primary of side k is region 0 if it clears T, else the n_pri[k]
+     * region if THAT clears T, else none (-1). This drives mem_proper_pair_extra_flag
+     * on the no-pairing branch below; `z` is documented undefined when paired==0,
+     * so it must not be used there. Under the default (proper_pair_from_emitted
+     * off) mem_proper_pair_extra_flag ignores `which` entirely and keys off
+     * region 0, so passing the correct `which` here is byte-identical to the old
+     * `z` on every input that does not set --proper-pair-from-emitted; it fixes
+     * the latent garbage-index read only that option would expose. `h_rid[k]` is
+     * the rid of the selected region (== upstream's h[i].rid), captured from
+     * lists[k] below and used to gate the flag exactly as upstream does. */
+    int which[2] = { -1, -1 };
+    int h_rid[2] = { -1, -1 };
+    for (int k = 0; k < 2; ++k) {
+        if (a[k].n) {
+            if (a[k].a[0].score >= opt->T) which[k] = 0;
+            else if (n_pri[k] < (int)a[k].n && a[k].a[n_pri[k]].score >= opt->T)
+                which[k] = n_pri[k];
+        }
+    }
     /* Build a synthetic unmapped mem_aln_t in `dst[0]` (a single-record list).
      * upstream's own unmapped record (mem_reg2aln, bwamem.cpp:2632-2645)
      * comes from `memset(&a, 0, sizeof(mem_aln_t))` followed by an
@@ -1510,9 +1580,11 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
     for (int k = 0; k < 2; ++k) {
         if (a[k].n == 0) {
             lists[k] = (mem_aln_t *) calloc(1, sizeof(mem_aln_t));
+            xassert(lists[k] != NULL, "out of memory: lists[k]");
             fill_unmapped(lists[k]);
             n_lists[k] = 1;
             emit[k] = (bool *) malloc(sizeof(bool));
+            xassert(emit[k] != NULL, "out of memory: emit[k]");
             emit[k][0] = true;
             continue;
         }
@@ -1530,7 +1602,9 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
             XA[k] = mem_gen_alt(opt, bns, pac, &a[k], s[k].l_seq, s[k].seq, &HN[k],
                                 s[k].meth_orig_seq);
         lists[k] = (mem_aln_t *) calloc(a[k].n, sizeof(mem_aln_t));
+        xassert(lists[k] != NULL, "out of memory: lists[k]");
         emit[k] = (bool *) malloc(a[k].n * sizeof(bool));
+        xassert(emit[k] != NULL, "out of memory: emit[k]");
         n_lists[k] = (int)a[k].n;
         int n_emit = 0;
         for (int j = 0; j < (int)a[k].n; ++j) {
@@ -1567,6 +1641,12 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
             emit[k][j] = e;
             if (e) ++n_emit;
         }
+        /* Capture the selected region's rid while lists[k] is still 1:1 with
+         * a[k] (the n_emit==0 branch below replaces lists[k] with a synthetic
+         * single unmapped, so lists[k][which[k]] would be out of bounds after).
+         * lists[k][which[k]] is mem_reg2aln(a[k].a[which[k]]) with the same
+         * args upstream uses, so this rid == upstream's h[k].rid exactly. */
+        if (which[k] >= 0) h_rid[k] = lists[k][which[k]].rid;
         /* No region cleared the threshold → emit a single unmapped record
          * (mem_reg2sam's `aa.n == 0` branch). */
         if (n_emit == 0) {
@@ -1581,9 +1661,11 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
             free(HN[k]);
             HN[k] = nullptr;
             lists[k] = (mem_aln_t *) calloc(1, sizeof(mem_aln_t));
+            xassert(lists[k] != NULL, "out of memory: lists[k]");
             fill_unmapped(lists[k]);
             n_lists[k] = 1;
             emit[k] = (bool *) malloc(sizeof(bool));
+            xassert(emit[k] != NULL, "out of memory: emit[k]");
             emit[k][0] = true;
         }
     }
@@ -1621,10 +1703,9 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
      * already matched the new default -- but only by coincidence, and it could
      * not honour the option at all. */
     if (!paired && (opt->flag & MEM_F_PE) && !(opt->flag & MEM_F_NOPAIRING)
-        && a[0].n > 0 && a[1].n > 0
-        && n_lists[0] > 0 && n_lists[1] > 0
-        && lists[0][0].rid >= 0 && lists[0][0].rid == lists[1][0].rid) {
-        extra_flag |= mem_proper_pair_extra_flag(opt, bns->l_pac, a, z, pes);
+        && which[0] >= 0 && which[1] >= 0
+        && h_rid[0] == h_rid[1] && h_rid[0] >= 0) {
+        extra_flag |= mem_proper_pair_extra_flag(opt, bns->l_pac, a, which, pes);
     }
 
     /* Apply extra_flag (0x1 paired + optional 0x2 proper-pair) to every
@@ -1660,6 +1741,7 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
     int n_aa[2] = {0, 0};
     for (int k = 0; k < 2; ++k) {
         aa[k] = (mem_aln_t *) calloc((size_t)n_lists[k], sizeof(mem_aln_t));
+        xassert(aa[k] != NULL, "out of memory: aa[k]");
         int l = 0;               /* emitted-so-far on this side */
         for (int j = 0; j < n_lists[k]; ++j) {
             if (!emit[k][j]) continue;   /* secondary folded into XA, or dropped */
@@ -1730,6 +1812,7 @@ static void single_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
 
     /* Compact emitted list `aa`, exactly mem_reg2sam's loop. */
     mem_aln_t *aa = (mem_aln_t *) calloc(a->n ? a->n : 1, sizeof(mem_aln_t));
+    xassert(aa != NULL, "out of memory: aa");
     int l = 0;
     for (int k = 0; k < (int)a->n; ++k) {
         const mem_alnreg_t *p = &a->a[k];
@@ -1776,39 +1859,57 @@ static void pair_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
     emit_resolved_pair(e, origin_idx, opt, bns, pac, s, a, pes, n_pri, z, q_se, extra_flag, paired);
 }
 
-ShimAlignOutput *shim_extend_batch(void *idx_opaque, const mem_opt_t *opts, ShimSeeds *s,
-                                   const mem_pestat_t *pestat_in)
+/* Legacy emit half: per-batch pestat + pair/emit into a ShimAlignOutput, over a
+ * caller-supplied scratch so seed and emit can share ONE ~24 MB ShimScratch on
+ * the fused align_batch path (Task [16]). CONSUMES `r` (shim_pair_emit frees it
+ * on every path) but NOT `sc` (the caller owns and frees it). Returns NULL on
+ * OOM or emit failure. */
+static ShimAlignOutput *legacy_emit_with_scratch(void *idx_opaque, const mem_opt_t *opts,
+                                                 ShimScratch *sc, ShimRegs *r,
+                                                 const mem_pestat_t *pestat_in)
 {
-    if (!s) return nullptr;
-    ShimRegs *r = s->regs; s->regs = nullptr; free(s);
     BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
     /* D3 (--meth): after the seed→original remap in the kernels, every
      * downstream consumer (insert-size, pairing, mem_reg2aln, output coords)
-     * runs in ORIGINAL-reference coordinates — use the original bns/pac, not
-     * the converted seed index's. Outside --meth these are the seed index. */
+     * runs in ORIGINAL-reference coordinates — use the original bns, not the
+     * converted seed index's. Outside --meth this is the seed index. */
     const bntseq_t *bns = idx->meth_orig_bns ? idx->meth_orig_bns : idx->fmi->idx->bns;
-    const uint8_t  *pac = idx->meth_orig_pac ? idx->meth_orig_pac : idx->fmi->idx->pac;
 
     mem_opt_t opt_pe = *opts;
     opt_pe.n_threads = 1;
     opt_pe.flag |= MEM_F_PE;
 
     mem_pestat_t pes[4];
+    /* Auto-pestat over the PAIR reads only (2*n_pairs), never r->n_seqs: a mixed
+     * cohort's singles are not mates and must not be fed to mem_pestat as fake
+     * pairs (they would corrupt the insert-size histogram). Mirrors
+     * shim_pestat_cohort. On the legacy path n_singles is always 0, so this is
+     * byte-identical to the former r->n_seqs there. (Task [7]) */
     if (pestat_in) memcpy(pes, pestat_in, sizeof(pes));
-    else           mem_pestat(&opt_pe, bns->l_pac, r->n_seqs, r->regs, pes);
+    else           mem_pestat(&opt_pe, bns->l_pac, 2 * (int)r->n_pairs, r->regs, pes);
 
-    /* The legacy path is now one particular sink over the shared emitter: a
-     * per-batch pestat, ids from 0, records appended to a ShimAlignOutput. */
-    (void)pac;
     ShimAlignOutput *out = alloc_align_output(r->n_pairs);
-    ShimSeeds *again = shim_seeds_from_regs(r);
-    ShimScratch *sc = shim_scratch_new();
+    if (!out) { shim_regs_free(r); return nullptr; }
+    /* Pass `r` straight through — no throwaway ShimSeeds wrap/unwrap (Task [13]).
+     * shim_pair_emit consumes (frees) `r` on every return path. */
     ShimIdBases ids = { 0, 0 };
-    int rc = shim_pair_emit(idx_opaque, opts, sc, again->regs, pes, ids, legacy_out_sink, out);
-    free(again);
-    shim_scratch_free(sc);
+    int rc = shim_pair_emit(idx_opaque, opts, sc, r, pes, ids, legacy_out_sink, out);
     if (rc != 0) { shim_align_out_free(out); return nullptr; }
     memcpy(out->pes, pes, sizeof(pes));
+    return out;
+}
+
+ShimAlignOutput *shim_extend_batch(void *idx_opaque, const mem_opt_t *opts, ShimSeeds *s,
+                                   const mem_pestat_t *pestat_in)
+{
+    if (!s) return nullptr;
+    ShimRegs *r = s->regs; s->regs = nullptr; free(s);
+    /* Standalone extend from pre-seeded regs: the seed phase's scratch is long
+     * gone, so allocate one for the emit phase. */
+    ShimScratch *sc = shim_scratch_new();
+    if (!sc) { shim_regs_free(r); return nullptr; }
+    ShimAlignOutput *out = legacy_emit_with_scratch(idx_opaque, opts, sc, r, pestat_in);
+    shim_scratch_free(sc);
     return out;
 }
 
@@ -1818,9 +1919,16 @@ ShimAlignOutput *shim_align_batch(void *idx_opaque, const mem_opt_t *opts,
                                   const ShimReadPair *pairs, size_t n_pairs,
                                   const mem_pestat_t *pestat_in)
 {
-    ShimSeeds *s = shim_seed_batch(idx_opaque, opts, pairs, n_pairs);
-    if (!s) return nullptr;
-    return shim_extend_batch(idx_opaque, opts, s, pestat_in);
+    /* Fused seed+emit shares ONE ShimScratch instead of seed_batch's and
+     * extend_batch's two separate ~24 MB alloc+free cycles (Task [16]). */
+    ShimReadBatch b = { pairs, n_pairs, nullptr, 0 };
+    ShimScratch *sc = shim_scratch_new();
+    if (!sc) return nullptr;
+    ShimRegs *r = shim_seed_extend(idx_opaque, opts, sc, &b);
+    if (!r) { shim_scratch_free(sc); return nullptr; }
+    ShimAlignOutput *out = legacy_emit_with_scratch(idx_opaque, opts, sc, r, pestat_in);
+    shim_scratch_free(sc);
+    return out;
 }
 
 /* ------------------ estimate_pestat ------------------ */
