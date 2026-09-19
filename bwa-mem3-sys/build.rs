@@ -274,7 +274,7 @@ fn main() {
     }
 
     // 5. Generate Rust bindings for the shim header.
-    generate_bindings(&manifest, &vendor_src, &out);
+    check_or_regenerate_bindings(&manifest, &out);
 }
 
 /// First line of `<cxx> --version`, or a placeholder when the compiler cannot
@@ -650,30 +650,59 @@ endif
     }
 }
 
-fn generate_bindings(manifest: &Path, _vendor_src: &Path, out: &Path) {
-    let shim_dir = manifest.join("shim");
-    let bindings = bindgen::Builder::default()
-        .header(shim_dir.join("bwa_shim.h").to_string_lossy())
-        .clang_arg(format!("-I{}", shim_dir.display()))
-        .allowlist_type("BwaReadPair")
-        .allowlist_type("BwaIndex")
-        .allowlist_type("BwaSeeds")
-        .allowlist_type("BwaBatch")
-        .allowlist_type("BwaScratch")
-        .allowlist_type("BwaRegs")
-        .allowlist_type("BwaReadBatch")
-        .allowlist_type("BwaSingleRead")
-        .allowlist_type("BwaIdBases")
-        .allowlist_type("BwaRecordSinkFn")
-        .allowlist_type("mem_opt_t")
-        .allowlist_type("mem_pestat_t")
-        .allowlist_function("bwa_shim_.*")
-        .allowlist_var("MEM_F_.*")
-        .allowlist_var("BWA_ORIGIN_.*")
-        .derive_default(true)
-        .generate()
-        .expect("bindgen failed");
-    bindings
-        .write_to_file(out.join("bindings.rs"))
-        .expect("failed to write bindings.rs");
+/// Bindings are committed (`src/bindings.rs`) so downstream builds need no
+/// libclang. Under `regenerate-bindings` the header is re-run through bindgen
+/// and compared byte-for-byte; drift fails the build unless
+/// `BWA_MEM3_SYS_WRITE_BINDINGS=1`, in which case the committed file is
+/// rewritten (then commit it).
+fn check_or_regenerate_bindings(manifest: &Path, out: &Path) {
+    println!("cargo:rerun-if-env-changed=BWA_MEM3_SYS_WRITE_BINDINGS");
+    #[cfg(feature = "regenerate-bindings")]
+    {
+        let shim_dir = manifest.join("shim");
+        let generated = bindgen::Builder::default()
+            .header(shim_dir.join("bwa_shim.h").to_string_lossy())
+            .clang_arg(format!("-I{}", shim_dir.display()))
+            .allowlist_type("BwaReadPair")
+            .allowlist_type("BwaIndex")
+            .allowlist_type("BwaSeeds")
+            .allowlist_type("BwaBatch")
+            .allowlist_type("BwaScratch")
+            .allowlist_type("BwaRegs")
+            .allowlist_type("BwaReadBatch")
+            .allowlist_type("BwaSingleRead")
+            .allowlist_type("BwaIdBases")
+            .allowlist_type("BwaRecordSinkFn")
+            .allowlist_type("mem_opt_t")
+            .allowlist_type("mem_pestat_t")
+            .allowlist_function("bwa_shim_.*")
+            .allowlist_var("MEM_F_.*")
+            .allowlist_var("BWA_ORIGIN_.*")
+            .derive_default(true)
+            .generate()
+            .expect("bindgen failed")
+            .to_string();
+        let committed_path = manifest.join("src/bindings.rs");
+        let committed = fs::read_to_string(&committed_path).unwrap_or_default();
+        if committed != generated {
+            if env::var_os("BWA_MEM3_SYS_WRITE_BINDINGS").is_some() {
+                fs::write(&committed_path, &generated).expect("write src/bindings.rs");
+                println!(
+                    "cargo:warning=rewrote {}; commit it",
+                    committed_path.display()
+                );
+            } else {
+                panic!(
+                    "src/bindings.rs is out of date with shim/bwa_shim.h; run \
+                     `BWA_MEM3_SYS_WRITE_BINDINGS=1 cargo build -p bwa-mem3-sys --features regenerate-bindings`"
+                );
+            }
+        }
+        fs::write(out.join("bindings.rs"), &generated).expect("write OUT_DIR bindings");
+    }
+    #[cfg(not(feature = "regenerate-bindings"))]
+    {
+        let _ = (manifest, out);
+        println!("cargo:rerun-if-changed=src/bindings.rs");
+    }
 }

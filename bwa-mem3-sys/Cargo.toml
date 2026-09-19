@@ -29,13 +29,17 @@ default = []
 sse42 = []
 avx512 = []
 native = []
+# Re-run bindgen against shim/bwa_shim.h (needs libclang). The build fails if
+# the output differs from the committed src/bindings.rs; set
+# BWA_MEM3_SYS_WRITE_BINDINGS=1 to overwrite the committed file instead.
+regenerate-bindings = ["dep:bindgen"]
 
 [dependencies]
 libc = "0.2"
 
 [build-dependencies]
 cc = "1"
-bindgen = "0.69"
+bindgen = { version = "0.69", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

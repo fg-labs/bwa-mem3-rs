@@ -53,6 +53,20 @@ jobs:
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
       - run: cargo ci-lint
 
+  bindings:
+    # The committed bindgen output must match the shim header on every arch.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install build deps + libclang
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev libclang-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - run: cargo build -p bwa-mem3-sys --features regenerate-bindings
+
   scripts:
     # The vendor-bump automation is bash, so unit-test it like anything else.
     # shellcheck runs alongside: these scripts push branches and open PRs, so

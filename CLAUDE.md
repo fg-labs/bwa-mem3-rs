@@ -348,6 +348,14 @@ pestat — which is why it is CLI-identical only when the batch IS the cohort.
 `three_phase_ffi.rs::first_pair_id_reaches_the_tie_break_hash` pins that the
 id is plumbed; the CLI-crate `three_phase_parity.rs` pins the formulas.
 
+### 17. Bindings are committed; regenerate them when `bwa_shim.h` changes
+
+`bwa-mem3-sys/src/bindings.rs` is bindgen output checked in so consumers
+(fgumi's `aligner-bwa-mem3` feature, EC2 bench hosts) need no libclang. After
+any edit to `shim/bwa_shim.h` run
+`BWA_MEM3_SYS_WRITE_BINDINGS=1 cargo build -p bwa-mem3-sys --features regenerate-bindings`
+and commit the result; CI's `bindings` job fails on drift.
+
 ## Commit / PR conventions
 
 - Conventional Commits; sign with `-S`; see `CONTRIBUTING.md`.
