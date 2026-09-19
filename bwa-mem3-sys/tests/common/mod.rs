@@ -33,9 +33,12 @@ fn find_bwa_mem3() -> Option<String> {
     }
 }
 
-/// Build a PhiX index in a temp dir. `None` (with a skip message) when
-/// `bwa-mem3` is unavailable, unless `BWA_MEM3_RS_REQUIRE_TOOLS` is set.
-pub fn phix_index() -> Option<(tempfile::TempDir, CString)> {
+/// Write `seq` as a single-contig FASTA named `name` (e.g. `"phix.fa"`) under
+/// a fresh temp dir and index it with `bwa-mem3 index`. `None` (with a skip
+/// message) when `bwa-mem3` is unavailable, unless `BWA_MEM3_RS_REQUIRE_TOOLS`
+/// is set. Shared by `phix_index` and any fixture that needs a purpose-built
+/// (rather than PhiX) reference.
+fn index_seq(seq: &[u8], contig: &str, name: &str) -> Option<(tempfile::TempDir, CString)> {
     let Some(bwa) = find_bwa_mem3() else {
         assert!(
             std::env::var_os("BWA_MEM3_RS_REQUIRE_TOOLS").is_none(),
@@ -45,10 +48,10 @@ pub fn phix_index() -> Option<(tempfile::TempDir, CString)> {
         return None;
     };
     let dir = tempfile::tempdir().expect("tempdir");
-    let fa = dir.path().join("phix.fa");
+    let fa = dir.path().join(name);
     let mut f = std::fs::File::create(&fa).unwrap();
-    writeln!(f, ">phix").unwrap();
-    for chunk in PHIX_SEQ.as_bytes().chunks(72) {
+    writeln!(f, ">{contig}").unwrap();
+    for chunk in seq.chunks(72) {
         f.write_all(chunk).unwrap();
         writeln!(f).unwrap();
     }
@@ -61,6 +64,19 @@ pub fn phix_index() -> Option<(tempfile::TempDir, CString)> {
     assert!(status.success(), "bwa-mem3 index failed");
     let prefix = CString::new(fa.to_str().unwrap()).unwrap();
     Some((dir, prefix))
+}
+
+/// Build a PhiX index in a temp dir. `None` (with a skip message) when
+/// `bwa-mem3` is unavailable, unless `BWA_MEM3_RS_REQUIRE_TOOLS` is set.
+pub fn phix_index() -> Option<(tempfile::TempDir, CString)> {
+    index_seq(PHIX_SEQ.as_bytes(), "phix", "phix.fa")
+}
+
+/// Build+index an arbitrary single-contig reference (same machinery and
+/// skip/require semantics as `phix_index`), for fixtures that need a
+/// purpose-built sequence (e.g. a deliberate repeat) rather than PhiX.
+pub fn index_custom_ref(seq: &[u8]) -> Option<(tempfile::TempDir, CString)> {
+    index_seq(seq, "ref", "ref.fa")
 }
 
 pub fn load_idx(prefix: &CStr) -> *mut sys::BwaIndex {

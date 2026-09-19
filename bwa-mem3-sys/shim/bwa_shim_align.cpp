@@ -1116,7 +1116,11 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, mem_opt_t *opts,
      * internally and asserts on bad input / OOM; we fill in the non-scratch
      * fields afterward. */
     worker_alloc(opts, s->w, s->n_seqs, 1);
-    s->w.opt = opts;
+    /* Seeding/extension kernels read n_threads/MEM_F_PE through w.opt (e.g.
+     * the mate-concordant chain cap at bwamem.cpp:2501 reads opt->flag), so
+     * they must see the same forced copy as the pairing/pestat phases, not
+     * the caller's raw, un-forced opts. */
+    s->w.opt = s->opts;
     s->w.nreads = s->n_seqs;
     s->w.fmi = fmi;
     s->w.seqs = s->seqs;
