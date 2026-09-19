@@ -323,3 +323,45 @@ fn setup_phix_index_inner(
     );
     ref_fa
 }
+
+/// Interleaved FASTQ: one record per element, in the given order. A pair is two
+/// consecutive elements with the same name (what `bwa-mem3 mem -p` classifies).
+pub fn write_interleaved_fastq(path: &Path, reads: &[(String, Vec<u8>)]) {
+    write_fastq(path, reads)
+}
+
+/// Minimal BGZF BAM around packed record bodies (no block_size prefix), so
+/// `samtools view` can render them for comparison with the CLI's output.
+pub fn write_bam(
+    path: &Path,
+    idx: &bwa_mem3_rs::BwaIndex,
+    opts: &bwa_mem3_rs::MemOpts,
+    bodies: &[Vec<u8>],
+) {
+    let mut w = noodles_bgzf::io::Writer::new(fs::File::create(path).unwrap());
+    let mut text = String::new();
+    if let Some(hd) = opts.compat_hd_line() {
+        text.push_str(hd);
+        text.push('\n');
+    }
+    for (name, len) in idx.contigs() {
+        text.push_str(&format!("@SQ\tSN:{name}\tLN:{len}\n"));
+    }
+    w.write_all(b"BAM\x01").unwrap();
+    w.write_all(&(text.len() as u32).to_le_bytes()).unwrap();
+    w.write_all(text.as_bytes()).unwrap();
+    w.write_all(&(idx.n_contigs() as u32).to_le_bytes())
+        .unwrap();
+    for (name, len) in idx.contigs() {
+        w.write_all(&((name.len() + 1) as u32).to_le_bytes())
+            .unwrap();
+        w.write_all(name.as_bytes()).unwrap();
+        w.write_all(b"\0").unwrap();
+        w.write_all(&(len as u32).to_le_bytes()).unwrap();
+    }
+    for b in bodies {
+        w.write_all(&(b.len() as u32).to_le_bytes()).unwrap();
+        w.write_all(b).unwrap();
+    }
+    w.finish().unwrap();
+}
