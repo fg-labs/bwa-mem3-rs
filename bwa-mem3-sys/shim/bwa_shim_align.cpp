@@ -259,13 +259,21 @@ static void legacy_out_sink(void *ctx, uint32_t /*kind*/, size_t origin_idx,
     size_t rec_size = 4 + body_len;
     if (out->buf_len + rec_size > out->buf_cap) {
         while (out->buf_len + rec_size > out->buf_cap) out->buf_cap *= 2;
-        out->buf = (uint8_t *) realloc(out->buf, out->buf_cap);
+        uint8_t *tmp = (uint8_t *) realloc(out->buf, out->buf_cap);
+        xassert(tmp != NULL, "out of memory: legacy_out_sink buf");
+        out->buf = tmp;
     }
     if (out->n_recs == out->cap) {
         out->cap *= 2;
-        out->rec_off  = (size_t *) realloc(out->rec_off,  out->cap * sizeof(size_t));
-        out->rec_len  = (size_t *) realloc(out->rec_len,  out->cap * sizeof(size_t));
-        out->pair_idx = (size_t *) realloc(out->pair_idx, out->cap * sizeof(size_t));
+        size_t *tmp_off = (size_t *) realloc(out->rec_off,  out->cap * sizeof(size_t));
+        xassert(tmp_off != NULL, "out of memory: legacy_out_sink rec_off");
+        out->rec_off = tmp_off;
+        size_t *tmp_len = (size_t *) realloc(out->rec_len,  out->cap * sizeof(size_t));
+        xassert(tmp_len != NULL, "out of memory: legacy_out_sink rec_len");
+        out->rec_len = tmp_len;
+        size_t *tmp_pidx = (size_t *) realloc(out->pair_idx, out->cap * sizeof(size_t));
+        xassert(tmp_pidx != NULL, "out of memory: legacy_out_sink pair_idx");
+        out->pair_idx = tmp_pidx;
     }
     uint32_t bs32 = (uint32_t) body_len;
     memcpy(out->buf + out->buf_len, &bs32, 4);
@@ -723,7 +731,9 @@ static int cigar_ref_len(int n_cigar, const uint32_t *cigar) {
 static void buf_append(uint8_t **buf, size_t *len, size_t *cap, const void *src, size_t n) {
     if (*len + n > *cap) {
         while (*len + n > *cap) *cap = *cap ? *cap * 2 : 1024;
-        *buf = (uint8_t *) realloc(*buf, *cap);
+        uint8_t *tmp = (uint8_t *) realloc(*buf, *cap);
+        xassert(tmp != NULL, "out of memory: buf_append");
+        *buf = tmp;
     }
     memcpy(*buf + *len, src, n);
     *len += n;
@@ -1073,7 +1083,9 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
      * reusable record buffer; the sink prepends the prefix if it wants one. */
     if (block_size > e->sc->rec_cap) {
         while (block_size > e->sc->rec_cap) e->sc->rec_cap *= 2;
-        e->sc->rec_buf = (uint8_t *) realloc(e->sc->rec_buf, e->sc->rec_cap);
+        uint8_t *tmp = (uint8_t *) realloc(e->sc->rec_buf, e->sc->rec_cap);
+        xassert(tmp != NULL, "out of memory: rec_buf");
+        e->sc->rec_buf = tmp;
     }
     uint8_t *w = e->sc->rec_buf;
 
@@ -1284,14 +1296,6 @@ ShimSeeds *shim_seed_batch(void *idx_opaque, const mem_opt_t *opts,
     if (!sc) return nullptr;
     ShimRegs *r = shim_seed_extend(idx_opaque, opts, sc, &b);
     shim_scratch_free(sc);
-    if (!r) return nullptr;
-    ShimSeeds *s = (ShimSeeds *) calloc(1, sizeof(ShimSeeds));
-    if (!s) { shim_regs_free(r); return nullptr; }
-    s->regs = r;
-    return s;
-}
-
-ShimSeeds *shim_seeds_from_regs(ShimRegs *r) {
     if (!r) return nullptr;
     ShimSeeds *s = (ShimSeeds *) calloc(1, sizeof(ShimSeeds));
     if (!s) { shim_regs_free(r); return nullptr; }
