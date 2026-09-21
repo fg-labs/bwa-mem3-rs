@@ -772,6 +772,15 @@ static void aux_put_Z(uint8_t **buf, size_t *len, size_t *cap,
     buf_append(buf, len, cap, &zero, 1);
 }
 
+/* BAM float ('f') aux field: tag[2] + 'f' + 4-byte little-endian float. */
+static void aux_put_f(uint8_t **buf, size_t *len, size_t *cap,
+                      const char tag[2], float v) {
+    uint8_t tmp[3 + 4];
+    tmp[0] = (uint8_t)tag[0]; tmp[1] = (uint8_t)tag[1]; tmp[2] = 'f';
+    memcpy(tmp + 3, &v, 4);
+    buf_append(buf, len, cap, tmp, 7);
+}
+
 /* Emit an SA:Z tag for primary alignments that have supplementary hits. */
 static void emit_sa_tag(uint8_t **buf, size_t *len, size_t *cap,
                         const bntseq_t *bns,
@@ -982,6 +991,17 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
             if (i != which && !(list[i].flag & 0x100)) break;
         if (i < n_list) emit_sa_tag(&aux, &aux_len, &aux_cap, bns, list, n_list, which);
     }
+    /* pa:f — mirrors the vendored BAM writer (bam_writer.cpp:468-474) and
+     * mem_aln2sam: emitted for a non-secondary record whose read has an ALT
+     * competitor (alt_sc > 0), after SA:Z and before XA:Z. `append_bam_record`
+     * previously omitted this entirely, so any ALT-adjacent read diverged from
+     * `bwa-mem3 mem` -- invisible to the PhiX/tandem-repeat fixtures, which have
+     * no `.alt` and so never set alt_sc. Value is the shared bwa_pa_tag_value,
+     * so the --bam and SAM-text writers agree to the last float bit. */
+    if (!(p->flag & 0x100) && p->alt_sc > 0) {
+        float pa_f = bwa_pa_tag_value(p->score, p->alt_sc);
+        aux_put_f(&aux, &aux_len, &aux_cap, "pa", pa_f);
+    }
     if (p->XA) aux_put_Z(&aux, &aux_len, &aux_cap, "XA", p->XA);
     /* HN: total # of hits clustered with this primary under XA_drop_ratio
      * (set by mem_gen_alt above). -1 is upstream's "not computed" sentinel
@@ -1016,6 +1036,11 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
                 char *seq_text = (char *) malloc((size_t)emit_len + 1);
                 uint32_t *bam_cig = (uint32_t *) malloc((size_t)n_cigar * sizeof(uint32_t));
                 if (seq_text && bam_cig) {
+                    /* `p->is_rev` (not `eff_is_rev`, as the primary SEQ RC above
+                     * uses) is correct here: this block is `p->rid >= 0`-gated,
+                     * and the half-mapped is_rev copy only rewrites an *unmapped*
+                     * record (rid < 0), so eff_is_rev == p->is_rev on every path
+                     * that reaches the meth XM builder. */
                     for (int i = 0; i < emit_len; ++i) {
                         seq_text[i] = p->is_rev
                             ? ascii_complement(s->meth_orig_seq[l_seq - 1 - (seq_start + i)])
@@ -1047,14 +1072,22 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
         }
     }
 
-    /* Reverse-complement the bwa-2bit-encoded query if is_rev; otherwise
-     * point at the forward slice. Quality scores mirror the sequence. */
+    /* Reverse-complement the bwa-2bit-encoded query if the EMITTED strand is
+     * reverse; otherwise point at the forward slice. Quality scores mirror the
+     * sequence. Keys off `eff_is_rev`, not `p->is_rev`: for a half-mapped pair
+     * upstream overwrites the unmapped read's `p->is_rev = m->is_rev`
+     * (bwamem.cpp:4575) before mem_aln2sam writes SEQ, so the unmapped mate's
+     * bases come out reverse-complemented to the mapped mate's strand. Keying
+     * off the original `p->is_rev` (0 for an unmapped record) left the unmapped
+     * mate forward while its 0x10 flag said reverse -- a SEQ/QUAL vs FLAG
+     * contradiction, invisible to fixtures whose unmapped mates happen to be
+     * forward. For a mapped read eff_is_rev == p->is_rev, so this is a no-op. */
     uint8_t *emit_seq_buf = nullptr;
     char *emit_qual_buf = nullptr;
     const uint8_t *emit_seq = nullptr;
     const char *emit_qual = nullptr;
     if (emit_len > 0) {
-        if (p->is_rev) {
+        if (eff_is_rev) {
             emit_seq_buf = (uint8_t *) malloc(emit_len);
             xassert(emit_seq_buf != NULL, "out of memory: emit_seq_buf");
             for (int i = 0; i < emit_len; ++i) {
@@ -1486,6 +1519,78 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
                                const int n_pri[2], const int z[2], const int q_se[2],
                                int extra_flag, int paired)
 {
+    /* PAIRED branch: emit exactly what upstream mem_sam_pe_batch_post's paired
+     * block emits (bwamem_pair.cpp:1279-1310) -- the paired-selected primary
+     * a[k].a[z[k]] UNCONDITIONALLY (no opt->T gate), plus at most one ALT
+     * supplementary a[k].a[n_pri[k]] gated on score >= T && secondary < 0 &&
+     * is_alt. The general mem_reg2sam-style emit loop below this block is the
+     * NO-PAIRING / SE emission path; applying it to the paired case (as this
+     * shim previously did) wrongly (a) dropped a paired primary whose score is
+     * below opt->T -- e.g. a rescued partial mate, 28M122S ~= score 28 < T=30 --
+     * to an unmapped record, and (b) emitted a different supplementary/XA set
+     * than upstream on ALT-hit reads (its per-region filter + mate-of-first-
+     * region logic diverges from upstream's z[k]+n_pri[k] structure). Both
+     * surface only against a real reference (partial rescues + a `.alt`), which
+     * no PhiX/tandem-repeat fixture exercises. Mirror upstream verbatim. */
+    if (paired) {
+        char **XA[2] = { nullptr, nullptr };
+        int   *HN[2] = { nullptr, nullptr };
+        if (!(opt->flag & MEM_F_ALL)) {
+            for (int k = 0; k < 2; ++k)
+                XA[k] = mem_gen_alt(opt, bns, pac, &a[k], s[k].l_seq, s[k].seq,
+                                    &HN[k], s[k].meth_orig_seq);
+        }
+        mem_aln_t h[2]; memset(h, 0, sizeof(h));
+        mem_aln_t g[2]; memset(g, 0, sizeof(g));
+        mem_aln_t aa[2][2]; memset(aa, 0, sizeof(aa));
+        int n_aa[2] = { 0, 0 };
+        for (int k = 0; k < 2; ++k) {
+            /* Paired primary: a[k].a[z[k]], emitted unconditionally. */
+            h[k] = mem_reg2aln(opt, bns, pac, s[k].l_seq, s[k].seq,
+                               &a[k].a[z[k]], s[k].meth_orig_seq);
+            h[k].mapq = q_se[k];
+            h[k].flag |= (0x40 << k) | extra_flag;   /* 0x1 paired (+0x2) + first/last */
+            h[k].XA = XA[k] ? XA[k][z[k]] : nullptr;
+            h[k].HN = HN[k] ? HN[k][z[k]] : -1;
+            aa[k][n_aa[k]++] = h[k];
+            if (n_pri[k] < (int) a[k].n) {   /* the read has ALT hits */
+                mem_alnreg_t *p = &a[k].a[n_pri[k]];
+                if (p->score < opt->T || p->secondary >= 0 || !p->is_alt) continue;
+                g[k] = mem_reg2aln(opt, bns, pac, s[k].l_seq, s[k].seq, p,
+                                   s[k].meth_orig_seq);
+                g[k].flag |= 0x800 | (0x40 << k) | extra_flag;   /* supplementary */
+                g[k].XA = XA[k] ? XA[k][n_pri[k]] : nullptr;
+                g[k].HN = HN[k] ? HN[k][n_pri[k]] : -1;
+                if (opt->supp_rep_hard_cap > 0 && p->chain_n_hits >= opt->supp_rep_hard_cap)
+                    g[k].mapq = 0;   /* fg-labs: force repetitive-supp MAPQ to 0 */
+                aa[k][n_aa[k]++] = g[k];
+            }
+        }
+        /* Emit each side's records with the OTHER side's paired primary as the
+         * mate anchor (upstream: aa[0] with &h[1], aa[1] with &h[0]).
+         * append_bam_record derives 0x10/0x20 from the strands and, for a
+         * half-mapped pair, the mate-coordinate copy; both mates are mapped on
+         * the paired branch, so 0x4/0x8 stay clear. */
+        for (int k = 0; k < 2; ++k) {
+            mem_aln_t *mate = &h[!k];
+            for (int j = 0; j < n_aa[k]; ++j)
+                append_bam_record(e, origin_idx, opt, bns, pac, &s[k],
+                                  &aa[k][j], n_aa[k], aa[k], j, mate, k);
+        }
+        /* aa[k][*] are shallow copies sharing h[k]/g[k]'s cigar buffers, so the
+         * cigars are freed once via h[k]/g[k] here (never via aa). */
+        for (int k = 0; k < 2; ++k) {
+            free(h[k].cigar);
+            free(g[k].cigar);
+            free(HN[k]);
+            if (XA[k]) {
+                for (int j = 0; j < (int) a[k].n; ++j) free(XA[k][j]);
+                free(XA[k]);
+            }
+        }
+        return;
+    }
+
     /* No-pairing proper-pair selection, computed exactly as upstream
      * mem_sam_pe's no_pairing block does (bwamem_pair.cpp:1651-1658): the
      * emitted primary of side k is region 0 if it clears T, else the n_pri[k]
@@ -1605,21 +1710,10 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
             if (e && ar->secondary >= 0 && ar->secondary < INT_MAX
                 && ar->score < a[k].a[ar->secondary].score * opt->drop_ratio)
                 e = false;
-            /* Paired branch, z[k] != 0: mem_pair_resolve_batch_post promoted the
-             * paired-selected region a[k].a[z[k]] (secondary set to -2) and ran
-             * the secondary_all switch, which reassigns the old SE-primary
-             * (region 0) to z[k]'s group — leaving it with secondary < 0 but
-             * secondary_all >= 0. mem_gen_alt folds that region into z[k]'s XA:Z,
-             * and upstream mem_sam_pe's paired block emits ONLY z[k] as primary,
-             * never the switched-away region. Our emit filter keys off
-             * `secondary` alone, so without this it would surface the old primary
-             * as an extra record and demote z[k] to a 0x800 supplementary. Drop
-             * the folded region so array order leaves z[k] first (primary). Never
-             * fires when z[k] == 0 (no switch) or on the no_pairing branch (which
-             * returns before the switch, leaving secondary_all == secondary). */
-            if (e && paired && j != z[k] && ar->secondary < 0
-                && ar->secondary_all >= 0)
-                e = false;
+            /* (The paired-branch secondary_all fold that once lived here was
+             * removed with the rest of the dead paired code: this tail now runs
+             * only when paired==0, where `z[]` is undefined and must not be
+             * read. The paired case is handled by the early-return block above.) */
             emit[k][j] = e;
             if (e) ++n_emit;
         }
@@ -1684,7 +1778,10 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
      * --proper-pair-from-emitted. Our previous hand-rolled copy used a[0] and so
      * already matched the new default -- but only by coincidence, and it could
      * not honour the option at all. */
-    if (!paired && (opt->flag & MEM_F_PE) && !(opt->flag & MEM_F_NOPAIRING)
+    /* This tail is the no-pairing path (paired==1 returns early above), so the
+     * proper-pair bit is always derived here from which[]/h_rid[] -- the former
+     * `!paired &&` guard was always true and has been dropped. */
+    if ((opt->flag & MEM_F_PE) && !(opt->flag & MEM_F_NOPAIRING)
         && which[0] >= 0 && which[1] >= 0
         && h_rid[0] == h_rid[1] && h_rid[0] >= 0) {
         extra_flag |= mem_proper_pair_extra_flag(opt, bns->l_pac, a, which, pes);
@@ -1692,22 +1789,10 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
 
     /* Apply extra_flag (0x1 paired + optional 0x2 proper-pair) to every
      * emitted record, matching mem_reg2sam's behavior in the no_pairing
-     * branch. On the paired branch this over-applies 0x2 to non-primary
-     * records relative to mem_sam_pe's stricter primary-only application;
-     * that matches how downstream tools treat 0x2 as a pair-level flag. */
+     * branch. (The paired branch applies extra_flag itself, above.) */
     for (int k = 0; k < 2; ++k) {
         for (int j = 0; j < n_lists[k]; ++j) {
             lists[k][j].flag |= extra_flag;
-        }
-    }
-
-    /* On the paired branch, apply the q_se mapq to the chosen primary
-     * (mirrors `h[i].mapq = q_se[i]` in mem_sam_pe's paired emission). */
-    if (paired) {
-        for (int k = 0; k < 2; ++k) {
-            if ((int)a[k].n > 0 && z[k] < n_lists[k]) {
-                lists[k][z[k]].mapq = q_se[k];
-            }
         }
     }
 
@@ -1732,25 +1817,42 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
                 /* 2nd+ emitted region (all secondary<0 here) is supplementary;
                  * lower its mapq to the primary's unless -5/-q, per mem_reg2sam.
                  * 0x10000 (not 0x100) under MEM_F_NO_MULTI matches upstream's
-                 * internal marker; append_bam_record remaps it to 0x100 on write. */
+                 * internal marker; append_bam_record remaps it to 0x100 on write.
+                 *
+                 * The lowering and the repetitive-supp hard cap key off the
+                 * ALNREG fields (a[k].a[j]), exactly as mem_reg2sam
+                 * (bwamem.cpp:4489-4499). The `!is_alt` guard is load-bearing:
+                 * a supplementary on an ALT/decoy contig (is_alt set via the
+                 * .alt file) keeps its own MAPQ and is NOT lowered to the
+                 * primary's -- omitting it zeroed those, which surfaced only
+                 * against a real `.alt` (both in the supp record's own MAPQ and
+                 * in every SA:Z tag referencing it). lists[k] is 1:1 with a[k]
+                 * on this branch (the n_emit==0 path never reaches l>0). */
                 p.flag |= (opt->flag & MEM_F_NO_MULTI) ? 0x10000 : 0x800;
-                if (!(opt->flag & MEM_F_KEEP_SUPP_MAPQ) && p.mapq > aa[k][0].mapq)
+                if (!(opt->flag & MEM_F_KEEP_SUPP_MAPQ) && !a[k].a[j].is_alt
+                    && p.mapq > aa[k][0].mapq)
                     p.mapq = aa[k][0].mapq;
+                if (opt->supp_rep_hard_cap > 0 && a[k].a[j].secondary < 0
+                    && a[k].a[j].chain_n_hits >= opt->supp_rep_hard_cap)
+                    p.mapq = 0;
             }
             aa[k][l++] = p;
         }
         n_aa[k] = l;
     }
 
-    /* Emit records. For each side k, the pair mate is the paired-selected
-     * primary of the other side (z[!k] on the paired branch, 0 otherwise —
-     * matching bwamem_pair.cpp:545-556's use of &a[!i].a[z[!i]] as the mate
-     * anchor). Without this the paired branch would use lists[!k][0] even when
-     * mem_pair_resolve_batch_post picked a non-zero primary, driving RNEXT/PNEXT/TLEN/MC
-     * off the wrong mate alignment. */
+    /* Emit records. This is the NO-PAIRING branch (the paired branch returns
+     * above), so the mate anchor is the other side's *selected* primary
+     * which[!k] -- exactly upstream's `&h[!k]`, where h[i] =
+     * mem_reg2aln(a[i].a[which[i]]) drives the no-pairing mem_reg2sam calls
+     * (bwamem_pair.cpp:1346-1361). which[!k] is region 0 in the common case,
+     * but n_pri[!k] when region 0 falls below opt->T (e.g. a read whose best
+     * hit is an ALT/decoy) -- using lists[!k][0] there drove RNEXT/PNEXT/TLEN
+     * and the 0x20 mate-strand bit off the wrong region. When which[!k] < 0 the
+     * other side is unmapped: n_emit[!k]==0 left lists[!k] as the synthetic
+     * unmapped at [0], so index 0 is the correct anchor. */
     for (int k = 0; k < 2; ++k) {
-        int mate_idx = 0;
-        if (paired && z[!k] >= 0 && z[!k] < n_lists[!k]) mate_idx = z[!k];
+        int mate_idx = (which[!k] >= 0 && which[!k] < n_lists[!k]) ? which[!k] : 0;
         mem_aln_t *mate = (n_lists[!k] > 0) ? &lists[!k][mate_idx] : nullptr;
         for (int j = 0; j < n_aa[k]; ++j) {
             append_bam_record(e, origin_idx, opt, bns, pac, &s[k],
