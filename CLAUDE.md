@@ -154,7 +154,8 @@ allowlist.)
 the converted, f/r-doubled seed FM-index (`<ref>.meth.*`) plus the original
 un-converted reference (`<ref>.*`). Load both via `BwaIndex::load_meth(seed,
 orig)` → `shim_align_idx_load_meth`; the shim keeps the original `bns`/`pac`
-and a second unpacked `ref_string` resident on `BwaShimIndex`. Seeding runs
+resident on `BwaShimIndex` and pac-fetches the original reference from
+`meth_orig_pac` on demand (nothing unpacked is resident). Seeding runs
 against the converted index; **everything after the seed→original remap in
 `mem_kernel1_core`/`mem_kernel2_core` runs in original coordinates** — insert
 size, pairing, `mem_reg2aln`, output rids, and the reported contigs
