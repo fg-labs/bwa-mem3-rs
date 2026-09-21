@@ -41,7 +41,7 @@ const SEED: u64 = 42;
 
 /// Tags compared by value. The remaining tags are compared by key presence
 /// only, via the `TAGS:` component of [`Record::compare_key`].
-const COMPARED_TAGS: &[&str] = &["NM", "MD", "AS", "XS", "XA", "SA", "MC", "MQ", "HN"];
+const COMPARED_TAGS: &[&str] = &["NM", "MD", "AS", "XS", "XA", "SA", "MC", "MQ", "HN", "pa"];
 
 // ---------------------------------------------------------------------------
 // Environment gating
@@ -225,7 +225,51 @@ fn simulate_pairs(ref_bases: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
         let r2 = mutate(&revcomp(&frag[INSERT - READ_LEN..]), &mut rng);
         out.push((format!("pair{}", out.len()), r1, r2));
     }
+
+    // Half-mapped pairs: exercise the emission paths that clean full-length
+    // substring pairs never reach. When one mate is unmapped, upstream
+    // mem_aln2sam rewrites it to carry its mate's rid/pos/strand and, because it
+    // overwrites the unmapped read's `is_rev = mate.is_rev` before writing SEQ
+    // (bwamem.cpp:4575), reverse-complements the unmapped read's SEQ/QUAL when
+    // the mapped mate is on the reverse strand. The shim keyed that RC off the
+    // record's own is_rev (0 for an unmapped record), leaving SEQ forward while
+    // the 0x10 flag said reverse -- a divergence from `bwa-mem3 mem` invisible
+    // to fully-mapped fixtures. Both orientations are pinned here. The 2000
+    // concordant pairs above establish the insert-size model these rescue off.
+    let mut hard_start = ref_bases.len() / 3;
+    while hard_start + INSERT <= ref_bases.len()
+        && ref_bases[hard_start..hard_start + INSERT].contains(&b'N')
+    {
+        hard_start += INSERT;
+    }
+    if hard_start + INSERT <= ref_bases.len() {
+        let frag = &ref_bases[hard_start..hard_start + INSERT];
+        let clean_fwd = mutate(&frag[..READ_LEN], &mut rng); // maps forward
+        let clean_rev = mutate(&revcomp(&frag[INSERT - READ_LEN..]), &mut rng); // maps reverse
+                                                                                // (a) R1 unmapped, R2 maps to the reverse strand -> R1 inherits reverse,
+                                                                                //     so its SEQ/QUAL must come out reverse-complemented.
+        out.push((
+            "hard_r1unmapped_r2rev".to_string(),
+            random_read(&mut rng, READ_LEN),
+            clean_rev,
+        ));
+        // (b) R1 maps to the forward strand, R2 unmapped -> R2 inherits forward,
+        //     so its SEQ/QUAL must stay as sequenced.
+        out.push((
+            "hard_r1fwd_r2unmapped".to_string(),
+            clean_fwd,
+            random_read(&mut rng, READ_LEN),
+        ));
+    }
     out
+}
+
+/// A random high-complexity read, effectively unmappable against a whole-genome
+/// index (no 19-mer seed is expected to occur), used as the unmapped mate of a
+/// half-mapped pair. Deterministic given the fixture RNG.
+fn random_read(rng: &mut Rng, n: usize) -> Vec<u8> {
+    const BASES: &[u8] = b"ACGT";
+    (0..n).map(|_| BASES[rng.below(BASES.len())]).collect()
 }
 
 fn mutate(seq: &[u8], rng: &mut Rng) -> Vec<u8> {
@@ -634,6 +678,49 @@ fn cli_and_align_batch_agree_on_every_record() {
         with_xa > 0,
         "fixture has no multi-mapping reads, so XA:Z parity is untested"
     );
+
+    // The half-mapped fixtures must stay half-mapped, or the `eff_is_rev`
+    // SEQ/QUAL reverse-complement path they guard goes silently uncovered (a
+    // fixture-region drift could let the "random" mate map). Assert each hard
+    // pair still emits at least one unmapped record (FLAG 0x4) and one mapped,
+    // so coverage loss fails loudly instead of passing green. The unmapped mate
+    // inherits its mapped mate's strand (`is_rev = mate.is_rev`, bwamem.cpp:4575),
+    // which is exactly what drives `eff_is_rev`; pin that inherited strand on the
+    // unmapped record so a strand regression (not just a coverage loss) fails
+    // loudly: r2 maps reverse -> the unmapped r1 carries FLAG 0x10; r1 maps
+    // forward -> the unmapped r2 clears it.
+    for (qn, expect_unmapped_rev) in [
+        ("hard_r1unmapped_r2rev", true),
+        ("hard_r1fwd_r2unmapped", false),
+    ] {
+        let recs: Vec<&Record> = cli.iter().filter(|r| r.qname == qn).collect();
+        // `pick_region` guarantees a window >= 4*INSERT, so `simulate_pairs`
+        // always places these pairs; a missing pair means the fixture silently
+        // stopped covering the path -- fail loudly rather than skip.
+        assert!(
+            !recs.is_empty(),
+            "half-mapped fixture {qn} is absent from CLI output; simulate_pairs \
+             did not place it (chosen window too small?)"
+        );
+        let unmapped_recs: Vec<&Record> =
+            recs.iter().copied().filter(|r| r.flag & 0x4 != 0).collect();
+        let mapped = recs.iter().filter(|r| r.flag & 0x4 == 0).count();
+        assert!(
+            !unmapped_recs.is_empty() && mapped >= 1,
+            "half-mapped fixture {qn} no longer exercises the unmapped-mate path: \
+             {mapped} mapped / {} unmapped of {} records",
+            unmapped_recs.len(),
+            recs.len()
+        );
+        for r in &unmapped_recs {
+            let is_rev = r.flag & 0x10 != 0;
+            assert_eq!(
+                is_rev, expect_unmapped_rev,
+                "half-mapped fixture {qn}: unmapped record FLAG 0x10 = {is_rev}, \
+                 expected {expect_unmapped_rev} (mate-inherited strand not pinned)"
+            );
+        }
+    }
 
     let mut cli_by_key: BTreeMap<(String, u16), &Record> =
         cli.iter().map(|r| (r.key(), r)).collect();
