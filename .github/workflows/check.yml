@@ -187,6 +187,20 @@ jobs:
         env:
           BWA_MEM3_RS_REQUIRE_TOOLS: "1"
         run: cargo test -p bwa-mem3-sys -p bwa-mem3-rs -p bwa-mem3-rs-cli --no-fail-fast -- --nocapture
+      # Re-run the byte-parity suite with the shim's pac-fetch scratch compiled
+      # under -DBWA_MEM3_DEBUG_POISON. `mem` reconstructs each reference window
+      # from `.pac` into a per-thread scratch that the next fetch overwrites; the
+      # poison-fill 0xFFs the prior window so a caller that stale-reads it
+      # produces garbage. Only the crate is rebuilt here — the native oracle at
+      # $BWA_MEM3_BIN was built separately and stays unpoisoned — so a stale read
+      # surfaces as a parity mismatch against upstream instead of a silent pass
+      # (the un-poisoned run above cannot catch it: oracle and shim share the
+      # exact same vendored scratch). See the debug-poison feature in
+      # bwa-mem3-sys/Cargo.toml.
+      - name: Run CLI test suite (poisoned pac-fetch scratch)
+        env:
+          BWA_MEM3_RS_REQUIRE_TOOLS: "1"
+        run: cargo test -p bwa-mem3-sys -p bwa-mem3-rs -p bwa-mem3-rs-cli --features debug-poison --no-fail-fast -- --nocapture
       # Note: there is no scalar mate-rescue A/B run. fg-labs/bwa-mem3#513
       # removed the scalar mate-rescue path (and the BWAMEM_BATCHED_MATESW /
       # DISABLE_BATCHED_MATESW gate) and requires AVX2+ on x86 (NEON on arm), so

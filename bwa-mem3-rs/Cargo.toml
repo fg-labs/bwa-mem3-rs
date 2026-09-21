@@ -14,6 +14,11 @@ readme = "README.md"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+# Passthrough to bwa-mem3-sys/debug-poison; see that crate's feature docs.
+debug-poison = ["bwa-mem3-sys/debug-poison"]
+
 [dependencies]
 bwa-mem3-sys = { version = "0.2.3", path = "../bwa-mem3-sys" }
 thiserror = "1"

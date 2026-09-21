@@ -29,6 +29,13 @@ default = []
 sse42 = []
 avx512 = []
 native = []
+# Compile the vendored pac-fetch path with `-DBWA_MEM3_DEBUG_POISON`, which
+# 0xFF-fills each reference window in the per-thread scratch before the next
+# fetch overwrites it (bntseq.cpp). A caller that stale-reads a prior window
+# then produces garbage that trips the byte-parity suite, turning the
+# single-live-window aliasing hazard into a test failure instead of a silent
+# pass. Off by default; enabled by the debug-poison CI lane only.
+debug-poison = []
 # Re-run bindgen against shim/bwa_shim.h (needs libclang). The build fails if
 # the output differs from the committed src/bindings.rs; set
 # BWA_MEM3_SYS_WRITE_BINDINGS=1 to overwrite the committed file instead.

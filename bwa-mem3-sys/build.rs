@@ -176,6 +176,9 @@ fn main() {
             // `<name><KERNEL_VARIANT>` (e.g. `_avx2`). The dispatcher in
             // simd_dispatch.cpp expects this exact suffix per tier.
             k_build.define("KERNEL_VARIANT", Some(format!("_{}", tier).as_str()));
+            if cfg!(feature = "debug-poison") {
+                k_build.define("BWA_MEM3_DEBUG_POISON", None);
+            }
             apply_common_warning_silencing(&mut k_build);
             k_build.compile(&format!("bwa-mem3-kernel-{}", tier));
         }
@@ -241,6 +244,13 @@ fn main() {
     build.define("V17", Some("1"));
     build.define("MATE_SORT", Some("0"));
     build.define("PACKAGE_VERSION", Some(format!("\"{version}\"").as_str()));
+    // Opt-in stale-window detector for the pac-fetch path (see the debug-poison
+    // feature docs). bntseq.cpp's `bns_get_seq_v2` 0xFF-fills the previous
+    // per-thread scratch window when this is defined, so a stale read shows up
+    // as a byte-parity failure rather than passing silently.
+    if cfg!(feature = "debug-poison") {
+        build.define("BWA_MEM3_DEBUG_POISON", None);
+    }
     apply_common_warning_silencing(&mut build);
 
     // Compiler floor. cc enforces nothing, so at least say so loudly.
