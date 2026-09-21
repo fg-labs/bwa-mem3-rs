@@ -288,25 +288,22 @@ static void legacy_out_sink(void *ctx, uint32_t /*kind*/, size_t origin_idx,
 /* Legacy phase-1 handle: now just an owned ShimRegs. */
 struct ShimSeeds { ShimRegs *regs; };
 
-/* Index handle: owns the loaded FMI_search plus the one-time-unpacked
- * 2*l_pac reference string used by mem_chain2aln_across_reads_V2. The
- * ref_string is built once at load time so every seed_batch borrows it
- * instead of rebuilding (~6GB alloc + full pass over packed ref per call
- * on hs38). Forward declaration of build_ref_string below. */
-static uint8_t *build_ref_string(const bntseq_t *bns, const uint8_t *pac);
-
+/* Index handle: owns the loaded FMI_search (plus the original bns/pac in
+ * --meth mode). The reference is never unpacked: extension reconstructs each
+ * window from the resident `.pac` on demand (bns_get_seq_v2's
+ * `ref_string == NULL` path — the non-meth pac via `fmi`, the meth ORIGINAL pac
+ * via `meth_orig_pac`), matching upstream bwa-mem3 and saving the ~3s startup
+ * unpack + ~6GB array. */
 struct BwaShimIndex {
     FMI_search *fmi;
-    uint8_t    *ref_string;
     /* D3 (--meth) dual-coordinate handles. In meth mode `fmi` is the
      * f/r-doubled CONVERTED seed index (`<ref>.meth.*`) used only for candidate
      * generation, while chaining/extension/output run in ORIGINAL coordinates
-     * loaded here from the un-converted `<ref>.*` prefix. All NULL for a normal
-     * (non-meth) index. `meth_orig_ref_string` is the original 2*l_pac unpacked
-     * reference (analogue of `ref_string` for the original ref). */
+     * loaded here from the un-converted `<ref>.*` prefix. Both NULL for a normal
+     * (non-meth) index; the original reference is pac-fetched from
+     * `meth_orig_pac` on demand, never unpacked. */
     bntseq_t *meth_orig_bns;
     uint8_t  *meth_orig_pac;
-    uint8_t  *meth_orig_ref_string;
 };
 
 /* ------------------ Index ------------------ */
@@ -352,12 +349,15 @@ void *shim_align_idx_load_threads(const char *prefix, int n_threads) {
         return nullptr;
     }
     idx->fmi = fmi;
-    idx->ref_string = build_ref_string(fmi->idx->bns, fmi->idx->pac);
-    if (!idx->ref_string) {
-        delete idx->fmi;
-        free(idx);
-        return nullptr;
-    }
+    /* pac-fetch: do NOT materialize the unpacked 2*l_pac reference. With no
+     * materialized reference, extension reconstructs each window from the
+     * resident `.pac` on demand (bns_get_seq_v2's `ref_string == NULL` path,
+     * per-thread scratch) — byte-identical to the unpacked array it replaces,
+     * and exactly what upstream bwa-mem3's `mem` does (upstream removed the
+     * unpacked `.0123` entirely). This drops the ~3s single-threaded startup
+     * unpack and the ~6 GB resident array; the `pac` stays owned by `fmi`
+     * (loaded with load_pac=true above). The meth path pac-fetches its
+     * ORIGINAL reference the same way (see shim_align_idx_load_meth). */
     return static_cast<void *>(idx);
 }
 
@@ -367,17 +367,15 @@ void *shim_align_idx_load(const char *prefix) {
 
 /* D3 (--meth): load a dual index. `seed_prefix` is the converted seed index
  * (`<ref>.meth`), `orig_prefix` the un-converted original reference (`<ref>`).
- * Both the seed FM-index and the original bns/pac/ref_string stay resident. */
+ * The seed FM-index plus the original bns/pac stay resident; the original
+ * reference is NOT unpacked — extension pac-fetches it from `meth_orig_pac` on
+ * demand (bns_get_seq_v2's `ref_string == NULL` path via mem_kernel2_core's
+ * meth aln_pac routing), matching upstream bwa-mem3. */
 void *shim_align_idx_load_meth(const char *seed_prefix, const char *orig_prefix) {
     void *opaque = shim_align_idx_load(seed_prefix);
     if (!opaque) return nullptr;
     BwaShimIndex *idx = static_cast<BwaShimIndex *>(opaque);
     if (shim_meth_orig_ref_load(orig_prefix, &idx->meth_orig_bns, &idx->meth_orig_pac) != 0) {
-        shim_align_idx_free(opaque);
-        return nullptr;
-    }
-    idx->meth_orig_ref_string = build_ref_string(idx->meth_orig_bns, idx->meth_orig_pac);
-    if (!idx->meth_orig_ref_string) {
         shim_align_idx_free(opaque);
         return nullptr;
     }
@@ -387,8 +385,6 @@ void *shim_align_idx_load_meth(const char *seed_prefix, const char *orig_prefix)
 void shim_align_idx_free(void *opaque) {
     if (!opaque) return;
     BwaShimIndex *idx = static_cast<BwaShimIndex *>(opaque);
-    if (idx->ref_string) _mm_free(idx->ref_string);
-    if (idx->meth_orig_ref_string) _mm_free(idx->meth_orig_ref_string);
     if (idx->meth_orig_pac) free(idx->meth_orig_pac);
     if (idx->meth_orig_bns) bns_destroy(idx->meth_orig_bns);
     delete idx->fmi;
@@ -622,24 +618,6 @@ static void free_seqs(bseq1_t *seqs, int nseqs) {
         free(seqs[i].meth_orig_seq);  /* NULL outside --meth; free() is NULL-safe */
     }
     free(seqs);
-}
-
-/* Unpack 2-bit packed reference into a 1-byte-per-base array with the
- * reverse-complement appended (total = 2 * l_pac). Required by
- * mem_chain2aln_across_reads_V2. */
-static uint8_t *build_ref_string(const bntseq_t *bns, const uint8_t *pac) {
-    int64_t ref_len = bns->l_pac * 2;
-    uint8_t *s = (uint8_t *) _mm_malloc(ref_len, 64);
-    /* ~2*l_pac bytes (~6 GB on hs38): the largest single alloc in the crate and
-     * the one most likely to fail under memory pressure. Return NULL (both
-     * callers check) rather than deref it below. */
-    if (!s) return nullptr;
-    for (int64_t i = 0; i < bns->l_pac; ++i) {
-        uint8_t b = (pac[i >> 2] >> ((~i & 3) << 1)) & 3;
-        s[i] = b;
-        s[ref_len - 1 - i] = (uint8_t)(3 - b);
-    }
-    return s;
 }
 
 /* ------------------ BAM emission (direct from mem_aln_t) ------------------ */
@@ -1260,8 +1238,11 @@ static void seed_extend_range(ShimScratch *sc, ShimRegs *r, BwaShimIndex *idx,
     w.n_processed = 0; w.pes = nullptr; w.nreads = r->n_seqs;
     w.meth_orig_bns = idx->meth_orig_bns;
     w.meth_orig_pac = idx->meth_orig_pac;
-    w.meth_orig_ref_string = idx->meth_orig_ref_string;
-    w.ref_string = idx->meth_orig_ref_string ? idx->meth_orig_ref_string : idx->ref_string;
+    /* No materialized reference on either path: a NULL ref_string selects
+     * bns_get_seq_v2's pac-fetch, which mem_kernel2_core routes to the non-meth
+     * pac (via `fmi`) or the meth ORIGINAL pac (`meth_orig_pac`) as appropriate. */
+    w.meth_orig_ref_string = nullptr;
+    w.ref_string = nullptr;
     for (int seq_id = first; seq_id < first + n; seq_id += BATCH_SIZE) {
         int bs = first + n - seq_id;
         if (bs > BATCH_SIZE) bs = BATCH_SIZE;
