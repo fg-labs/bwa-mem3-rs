@@ -4,6 +4,22 @@
 //! BGZF-compressed BAM stream. Output structure is proper BAM: magic +
 //! header text + contig table + concatenated packed records + BGZF EOF.
 
+/// Route every allocation through mimalloc — Rust's, and (via the `override`
+/// feature) the linked bwa-mem3 C++'s `malloc`/`free`, which otherwise fall to
+/// the system allocator and contend its per-thread arenas under multithreaded
+/// alignment. Upstream bwa-mem3 links mimalloc by default (`USE_MIMALLOC=1`);
+/// this reproduces that `malloc`/`free` interpose only — the other
+/// `USE_MIMALLOC`-gated upstream paths (e.g. the huge-page arena reservation in
+/// `bwa_hugepages.cpp`) are not compiled in here (`bwa-mem3-sys` never defines
+/// `USE_MIMALLOC`) and are unreachable from this CLI regardless.
+///
+/// `bwa-mem3-sys` stays allocator-neutral; the binary that links it owns this
+/// choice, and `MiMalloc` being the global allocator is what pulls mimalloc's
+/// (single-object) `malloc` overrides into the link so the C interpose takes
+/// effect.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
