@@ -89,6 +89,33 @@ for (k, r) in regs.into_iter().enumerate() {
 
 `IdBases` carries the global read ordinal bwa-mem3 uses for tie-breaks; see the type's docs for the `-p` cohort formulas. `AlignScratch` is `Send`, `AlnRegs` is `Send`, `BwaIndex`/`MemOpts`/`MemPeStat` are `Send + Sync`.
 
+### Resident cohorts: no per-sub-batch copies
+
+Each `AlnRegs` above owns its own copy of its reads and alignment regions, allocated by `seed_extend` and freed by `pair_emit`. A `ResidentCohort` keeps a whole cohort's reads and regions resident instead: every sub-batch reserves a range of it, and nothing is copied or freed until the cohort drops. Output is byte-identical to the three-phase API above.
+
+```rust
+use bwa_mem3_rs::*;
+let cohort = ResidentCohort::new(opts.meth())?;       // one per -K cohort, shared via Arc
+// Serially, in input order: reserve one range per sub-batch.
+let mut ranges: Vec<ResidentRange> = cohort_sub_batches.iter()
+    .map(|b| cohort.reserve_pairs(b.len()))
+    .collect::<Result<_>>()?;
+// On any thread: write each range's reads, then seed + extend them.
+for (range, b) in ranges.iter_mut().zip(&cohort_sub_batches) {
+    cohort.write_pairs(range, b)?;
+    cohort.seed_extend(&idx, &opts, &mut scratch, range)?;
+}
+let pestat = cohort.infer_cohort(&idx, &opts)?;        // once every range is extended
+for range in &mut ranges {
+    let pair_base = range.first() / 2;                  // this range's first pair, cohort-local
+    let ids = IdBases { first_single_id: 0, first_pair_id: cohort_first_pair_id + pair_base as u64 };
+    // origin_base = pair_base keeps RecordOrigin::Pair(i) unique across ranges.
+    cohort.pair_emit(&idx, &opts, &mut scratch, range, Some(&pestat), ids, pair_base, &mut my_sink)?;
+}
+```
+
+`ResidentCohort` is `Send + Sync` and every method is safe: a `ResidentRange` is a move-only token (neither `Clone` nor `Copy`), and range calls take it by `&mut`, so two calls can only run at once on different ranges. Lifecycle misuse (writing a slot twice, emitting a range before extending it or twice, a range from another cohort, a different `BwaIndex` than the cohort was aligned against, options whose `--meth` mode differs from the cohort's) returns `Err`. `pair_emit_fields` reports each record as structured `AlignedFields` through an `AlignedFieldsSink` instead of a packed BAM body; a record rebuilt from those fields plus the input read is byte-identical to the packed one.
+
 ## CLI
 
 The `bwa-mem3-rs-cli` crate ships a minimal `bwa-rs` binary that wraps the library:

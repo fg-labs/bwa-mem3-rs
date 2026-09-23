@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 #include "bwa_shim_types.h"  /* mem_opt_t, mem_pestat_t POD layouts */
+#include "bwa_shim_fields.h" /* BwaAlignedFields, BwaFieldSinkFn */
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,6 +29,8 @@ typedef struct BwaSeeds BwaSeeds;
 typedef struct BwaBatch BwaBatch;
 typedef struct BwaScratch BwaScratch;
 typedef struct BwaRegs    BwaRegs;
+typedef struct BwaResidentCohort BwaResidentCohort;
+typedef struct BwaResidentSegment BwaResidentSegment;
 
 typedef struct {
     const char    *r1_name;  size_t r1_name_len;
@@ -201,6 +204,81 @@ int bwa_shim_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
 int bwa_shim_pair_emit(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *sc,
                        BwaRegs *regs, const mem_pestat_t *pestat, BwaIdBases ids,
                        BwaRecordSinkFn sink, void *ctx);
+
+/* ---- Resident-cohort three-phase API ---------------------------------------
+ *
+ * A resident cohort keeps a whole -K cohort's decoded reads + alnreg arrays
+ * resident across seed_extend -> pestat -> pair_emit, and every sub-chunk
+ * borrows one reserved SEGMENT of it instead of owning a self-contained
+ * BwaRegs. Each reserve allocates a new segment whose address is stable for the
+ * cohort's lifetime; the per-segment calls (write/seed_extend/pair_emit) take
+ * the segment directly and never touch the cohort's segment table.
+ *
+ * Thread-safety contract (the bwa-mem3-rs wrapper enforces it; C callers must
+ * uphold it themselves):
+ *   - per-segment calls on DIFFERENT segments may run concurrently with each
+ *     other and with a reserve; two calls on the SAME segment may not;
+ *   - reserve must not run concurrently with another reserve or with
+ *     pestat_cohort;
+ *   - pestat_cohort must not run concurrently with any other call.
+ * Lifecycle errors return -3: writing a slot twice or after seed_extend,
+ * seed-extending an unwritten or already-extended segment, emitting an
+ * unextended or already-emitted segment, and pestat while a pair segment is
+ * unextended or already emitted. Offsets are in READS: a pair occupies two
+ * consecutive reads. */
+
+BwaResidentCohort *bwa_shim_resident_cohort_new(int meth_mode);
+void               bwa_shim_resident_cohort_free(BwaResidentCohort *c);
+
+/* Heap bytes each reserved read costs before anything is written into it (its
+ * read and alignment-region headers). */
+size_t bwa_shim_resident_read_overhead(void);
+
+/* Reserve a new segment of `n_reads` reads in the pair (n_reads even) or single
+ * region. Returns the segment, writing its inclusive-start read offset within
+ * the region to *first_out, or NULL on a bad argument / allocation failure. */
+BwaResidentSegment *bwa_shim_resident_reserve_pairs(BwaResidentCohort *c, size_t n_reads,
+                                                    size_t *first_out);
+BwaResidentSegment *bwa_shim_resident_reserve_singles(BwaResidentCohort *c, size_t n_reads,
+                                                      size_t *first_out);
+
+/* Decode pair `i` (reads 2i, 2i+1) of a pair segment, or single `i` of a single
+ * segment, from borrowed bytes, adding the heap bytes it copies to *added.
+ * Returns 0, -1 on a bad argument / OOM, or -3. */
+int bwa_shim_resident_write_pair(BwaResidentSegment *sg, size_t i, const BwaReadPair *pair,
+                                 size_t *added);
+int bwa_shim_resident_write_single(BwaResidentSegment *sg, size_t i,
+                                   const BwaSingleRead *single, size_t *added);
+
+/* Seed + SE-extend every read of a fully written segment (pairs or singles).
+ * Returns 0, -1, or -3. */
+int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
+                                  BwaScratch *sc, BwaResidentSegment *sg);
+
+/* mem_pestat over the whole cohort's pair region. `out` = mem_pestat_t[4].
+ * Returns 0, -1 on a null arg / allocation failure, or -3. */
+int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
+                                    const BwaResidentCohort *c, mem_pestat_t *out);
+
+/* Pair/mate-rescue/emit a seed-extended pair segment, or SE-emit a single
+ * segment, WITHOUT freeing it; each segment is emitted once.
+ * `ids.first_pair_id`/`first_single_id` is the GLOBAL read ordinal of the
+ * segment's first pair/single; `origin_base` is added to the local index for
+ * the sink's origin_idx. Records stream to `sink` in input order. Returns 0, -1
+ * on a bad argument, -2 when a pair segment has no pestat, or -3. */
+int bwa_shim_resident_pair_emit(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *sc,
+                                BwaResidentSegment *sg, const mem_pestat_t *pestat,
+                                BwaIdBases ids, size_t origin_base, BwaRecordSinkFn sink,
+                                void *ctx);
+
+/* bwa_shim_resident_pair_emit, reporting each record's structured fields
+ * (BwaAlignedFields, defined in the fields header) to `sink` instead of its
+ * packed BAM body. Same records in the same order with the same return codes;
+ * a record built from the reported fields is byte-identical to the packed one. */
+int bwa_shim_resident_pair_emit_fields(const BwaIndex *idx, const mem_opt_t *opts,
+                                       BwaScratch *sc, BwaResidentSegment *sg,
+                                       const mem_pestat_t *pestat, BwaIdBases ids,
+                                       size_t origin_base, BwaFieldSinkFn sink, void *ctx);
 
 size_t         bwa_shim_batch_n_records (const BwaBatch *b);
 size_t         bwa_shim_batch_pair_idx  (const BwaBatch *b, size_t rec);

@@ -26,6 +26,7 @@
 #include "FMI_search.h"
 #include "meth_xm.h"   /* meth_build_xm — D3 (--meth) XM:Z tag */
 #include "kswv.h"      /* kswr_t / SIMD_WIDTH8 — batched mate-rescue path below */
+#include "bwa_shim_fields.h"  /* BwaAlignedFields — the structured-fields sink */
 
 /* sort_classify has external linkage in bwamem.cpp but no header declaration
  * (the CLI's worker_sam calls it from the same TU). The batched mate-rescue
@@ -75,7 +76,7 @@ static void worker_alloc(worker_t &w, int32_t nthreads)
      * indeterminate pointer. */
     w.auxSeedBuf = NULL; w.auxSeedBufSize = 0;
     /* BATCH_SIZE-sized, chunk-local windows. Seeding and extension are fused
-     * per BATCH_SIZE chunk in seed_extend_range, so a chain is dead the moment
+     * per BATCH_SIZE chunk in seed_extend_reads, so a chain is dead the moment
      * its chunk's mem_kernel2_core returns -- exactly upstream's v0.9.0 worker
      * layout, which no longer needs the pre-0.9.0 nreads-sized, seq_id-indexed
      * arrays this crate used to carry across the seed/extend phase barrier. */
@@ -154,7 +155,7 @@ static void worker_free(worker_t &w, int32_t nthreads)
     assert(w.nthreads == nthreads);
 
     free(w.chain_scratch);
-    /* w.regs is NOT freed here: during seed_extend_range it aliases the
+    /* w.regs is NOT freed here: during seed_extend_reads it aliases the
      * caller-owned ShimRegs::regs, which shim_regs_free owns. worker_alloc
      * leaves it NULL and nothing in the scratch ever allocates it. */
     free(w.seed_scratch);
@@ -215,6 +216,10 @@ struct ShimScratch {
     worker_t w;              /* mmc + BATCH_SIZE chain/seed windows; nthreads = 1 */
     uint8_t *rec_buf; size_t rec_cap;   /* one packed record under construction */
     uint8_t *aux_buf; size_t aux_cap;   /* one aux block under construction */
+    /* One record's computed fields (compute_record_fields): the emitted CIGAR
+     * and the MC:Z / SA:Z texts. Grown in place and reused, like aux_buf. */
+    uint32_t *cig_buf; size_t cig_cap;  /* cap in ops */
+    uint8_t  *txt_buf; size_t txt_cap;
 };
 
 /* Phase-1 output (public: BwaRegs). Owns the read copies and the per-read
@@ -239,16 +244,20 @@ struct ShimReadBatch {
 
 typedef void (*ShimRecordSinkFn)(void *ctx, uint32_t origin_kind, size_t origin_idx,
                                  const uint8_t *body, size_t body_len);
+typedef BwaFieldSinkFn ShimFieldSinkFn;
 struct ShimIdBases { uint64_t first_single_id; uint64_t first_pair_id; };
 
 /* Where a record goes once built. Replaces the ShimAlignOutput* that
  * append_bam_record used to write into; the legacy output type is now just
- * one particular sink (legacy_out_sink below). */
+ * one particular sink (legacy_out_sink below). Exactly one of `sink` (packed
+ * BAM body) and `field_sink` (structured fields) is set; `field_sink` is last
+ * so the existing `{ sc, sink, ctx, kind }` initializers leave it NULL. */
 struct ShimEmit {
     ShimScratch      *sc;
     ShimRecordSinkFn  sink;
     void             *ctx;
     uint32_t          origin_kind;
+    ShimFieldSinkFn   field_sink;
 };
 
 /* Legacy sink: append `[u32 block_size][body]` to a ShimAlignOutput and index it. */
@@ -489,6 +498,65 @@ void shim_opts_apply_meth_defaults(mem_opt_t *opt) {
  * allocation failure (free_seqs is NULL-safe on the un-built calloc'd tail). */
 static void free_seqs(bseq1_t *seqs, int nseqs);
 
+/* Decode one read into `s` from borrowed bytes: copy name/seq/qual into owned
+ * buffers and, under --meth, keep the original bases and apply the bisulfite
+ * projection. `role` 0 = R1 or a single (OT, C->T), 1 = R2 (OB, G->A).
+ * Returns 0, or -1 on OOM; every buffer it did allocate is recorded in `s`, so
+ * the caller's free_seqs / segment teardown (NULL-safe on the fields left
+ * unbuilt) releases a partial decode. Shared by every path that copies reads
+ * in, so the legacy and resident paths cannot project differently. */
+static int decode_read(bseq1_t *s, const char *name, size_t name_len,
+                       const uint8_t *seq, size_t seq_len, const uint8_t *qual,
+                       int meth_mode, int role, size_t *heap_bytes) {
+    s->l_seq = (int) seq_len;
+    s->name = (char *) malloc(name_len + 1);
+    if (!s->name) return -1;
+    memcpy(s->name, name, name_len); s->name[name_len] = '\0';
+    s->seq = (char *) malloc(seq_len + 1);
+    if (!s->seq) return -1;
+    memcpy(s->seq, seq, seq_len); s->seq[seq_len] = '\0';
+    if (qual) {
+        s->qual = (char *) malloc(seq_len + 1);
+        if (!s->qual) return -1;
+        memcpy(s->qual, qual, seq_len); s->qual[seq_len] = '\0';
+    } else {
+        s->qual = nullptr;
+    }
+    *heap_bytes += (name_len + 1) + (seq_len + 1) + (qual ? seq_len + 1 : 0);
+    s->sam = nullptr;
+    /* D3 (--meth): retain the ORIGINAL (unconverted) read bases before
+     * projecting seq to match the converted seed index, then apply the
+     * per-strand bisulfite projection in place. R1 is the OT/CT read (C→T), R2
+     * the OB/GA read (G→A) — matching upstream fastmap.cpp's YC assignment; a
+     * single is treated as R1, matching upstream's single-file ingest.
+     * mem_kernel1_core 2-bit-encodes the projected seq; mem_reg2aln /
+     * meth_build_xm use meth_orig_seq for CIGAR/NM/MD and the XM call string,
+     * and serialize_record emits it as SEQ. Same orientation as seq. */
+    if (meth_mode) {
+        s->meth_orig_seq = strdup(s->seq);
+        if (!s->meth_orig_seq) return -1;
+        *heap_bytes += (size_t) s->l_seq + 1;
+        /* v0.9.0: read-number chemistry, consumed by the seed filter in
+         * meth_seed_to_orig (bwamem.cpp:1878-1881), which drops any seed
+         * whose genomic strand does not match the read's. R1 = OT = 1,
+         * R2 = OB = 0, exactly as upstream's ingest sets it
+         * (fastmap.cpp:820).
+         *
+         * Leaving it unset is NOT inert: the field is zero from the
+         * calloc, and 0 is the VALID value for OB, so the filter runs
+         * and silently discards every R1 seed. The filter only
+         * self-disables at < 0. That presented as exactly half the
+         * reads unmapped -- every R1, no R2. */
+        s->meth_base_ot = (role == 0) ? 1 : 0;
+        char from = (role == 0) ? 'C' : 'G';
+        char to   = (role == 0) ? 'T' : 'A';
+        for (int j = 0; j < s->l_seq; ++j)
+            if (s->seq[j] == from || s->seq[j] == (char)(from + 32))
+                s->seq[j] = to;
+    }
+    return 0;
+}
+
 static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
                                    int meth_mode, size_t *heap_bytes) {
     *heap_bytes = 0;
@@ -502,66 +570,15 @@ static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
     if (!seqs) return nullptr;
     for (size_t i = 0; i < n_pairs; ++i) {
         const ShimReadPair *p = &pairs[i];
-        const char    *nm[2] = {p->r1_name,   p->r2_name};
-        size_t         nl[2] = {p->r1_name_len, p->r2_name_len};
-        const uint8_t *sq[2] = {p->r1_seq, p->r2_seq};
-        size_t         sl[2] = {p->r1_seq_len, p->r2_seq_len};
-        const uint8_t *ql[2] = {p->r1_qual, p->r2_qual};
-        for (int k = 0; k < 2; ++k) {
-            bseq1_t *s = &seqs[2*i + k];
-            s->l_seq = (int)sl[k];
-            /* NULL-check every per-read allocation: an OOM here must unwind the
-             * partially-built array and return NULL (the caller's `!pairs_only`
-             * path), not deref NULL. free_seqs() is NULL-safe on the entries not
-             * yet built (calloc leaves them NULL). */
-            s->name = (char *) malloc(nl[k] + 1);
-            if (!s->name) { free_seqs(seqs, nseqs); return nullptr; }
-            memcpy(s->name, nm[k], nl[k]);
-            s->name[nl[k]] = '\0';
-            s->seq = (char *) malloc(sl[k] + 1);
-            if (!s->seq) { free_seqs(seqs, nseqs); return nullptr; }
-            memcpy(s->seq, sq[k], sl[k]);
-            s->seq[sl[k]] = '\0';
-            if (ql[k]) {
-                s->qual = (char *) malloc(sl[k] + 1);
-                if (!s->qual) { free_seqs(seqs, nseqs); return nullptr; }
-                memcpy(s->qual, ql[k], sl[k]);
-                s->qual[sl[k]] = '\0';
-            } else {
-                s->qual = nullptr;
-            }
-            *heap_bytes += (nl[k] + 1) + (sl[k] + 1) + (ql[k] ? sl[k] + 1 : 0);
-            s->sam = nullptr;
-            /* D3 (--meth): retain the ORIGINAL (unconverted) read bases before
-             * projecting seq to match the converted seed index, then apply the
-             * per-strand bisulfite projection in place. R1 (k==0) is the OT/CT
-             * read (C→T), R2 (k==1) is the OB/GA read (G→A) — matching upstream
-             * fastmap.cpp's YC assignment. mem_kernel1_core 2-bit-encodes the
-             * projected seq; mem_reg2aln / meth_build_xm use meth_orig_seq for
-             * CIGAR/NM/MD and the XM call string. Same orientation as seq. */
-            if (meth_mode) {
-                s->meth_orig_seq = strdup(s->seq);
-                if (!s->meth_orig_seq) { free_seqs(seqs, nseqs); return nullptr; }
-                *heap_bytes += (size_t)s->l_seq + 1;
-                /* v0.9.0: read-number chemistry, consumed by the seed filter in
-                 * meth_seed_to_orig (bwamem.cpp:1878-1881), which drops any seed
-                 * whose genomic strand does not match the read's. R1 = OT = 1,
-                 * R2 = OB = 0, exactly as upstream's ingest sets it
-                 * (fastmap.cpp:820).
-                 *
-                 * Leaving it unset is NOT inert: the field is zero from the
-                 * calloc, and 0 is the VALID value for OB, so the filter runs
-                 * and silently discards every R1 seed. The filter only
-                 * self-disables at < 0. That presented as exactly half the
-                 * reads unmapped -- every R1, no R2. */
-                s->meth_base_ot = (k == 0) ? 1 : 0;
-                char from = (k == 0) ? 'C' : 'G';
-                char to   = (k == 0) ? 'T' : 'A';
-                for (int j = 0; j < s->l_seq; ++j) {
-                    if (s->seq[j] == from || s->seq[j] == (char)(from + 32))
-                        s->seq[j] = to;
-                }
-            }
+        /* An OOM unwinds the partially-built array and returns NULL (the
+         * caller's `!pairs_only` path); free_seqs() is NULL-safe on the entries
+         * not yet built (calloc leaves them NULL). */
+        if (decode_read(&seqs[2*i], p->r1_name, p->r1_name_len, p->r1_seq, p->r1_seq_len,
+                        p->r1_qual, meth_mode, 0, heap_bytes) != 0
+            || decode_read(&seqs[2*i + 1], p->r2_name, p->r2_name_len, p->r2_seq,
+                           p->r2_seq_len, p->r2_qual, meth_mode, 1, heap_bytes) != 0) {
+            free_seqs(seqs, nseqs);
+            return nullptr;
         }
     }
     return seqs;
@@ -579,31 +596,9 @@ static int copy_singles_to_seqs(bseq1_t *seqs, size_t base, const ShimSingleRead
 {
     for (size_t i = 0; i < n; ++i) {
         const ShimSingleRead *p = &singles[i];
-        bseq1_t *s = &seqs[base + i];
-        s->l_seq = (int)p->seq_len;
-        s->name = (char *) malloc(p->name_len + 1);
-        if (!s->name) return -1;
-        memcpy(s->name, p->name, p->name_len); s->name[p->name_len] = '\0';
-        s->seq = (char *) malloc(p->seq_len + 1);
-        if (!s->seq) return -1;
-        memcpy(s->seq, p->seq, p->seq_len); s->seq[p->seq_len] = '\0';
-        if (p->qual) {
-            s->qual = (char *) malloc(p->seq_len + 1);
-            if (!s->qual) return -1;
-            memcpy(s->qual, p->qual, p->seq_len); s->qual[p->seq_len] = '\0';
-        } else {
-            s->qual = nullptr;
-        }
-        s->sam = nullptr;
-        *heap_bytes += (p->name_len + 1) + (p->seq_len + 1) + (p->qual ? p->seq_len + 1 : 0);
-        if (meth_mode) {
-            s->meth_orig_seq = strdup(s->seq);
-            if (!s->meth_orig_seq) return -1;
-            s->meth_base_ot = 1;
-            for (int j = 0; j < s->l_seq; ++j)
-                if (s->seq[j] == 'C' || s->seq[j] == 'c') s->seq[j] = 'T';
-            *heap_bytes += (size_t)s->l_seq + 1;
-        }
+        if (decode_read(&seqs[base + i], p->name, p->name_len, p->seq, p->seq_len, p->qual,
+                        meth_mode, 0, heap_bytes) != 0)
+            return -1;
     }
     return 0;
 }
@@ -679,6 +674,31 @@ static inline uint32_t bwa_apply_clip_mode(uint32_t cig, const mem_opt_t *opt,
     if (!(opt->flag & MEM_F_SOFTCLIP) && !is_alt && (o == 3 || o == 4))
         o = which ? 4 : 3;
     return (cig & ~(uint32_t) 0xf) | o;
+}
+
+/* BAM 4-bit code of an ASCII base, as htslib's seq_nt16_table assigns it
+ * (IUPAC ambiguity codes keep their own code; case-insensitive; anything else
+ * is N). */
+static inline uint8_t ascii_to_bam4(unsigned char c) {
+    switch (c & ~0x20) {   /* fold to upper case */
+        case 'A': return 1;  case 'C': return 2;  case 'M': return 3;  case 'G': return 4;
+        case 'R': return 5;  case 'S': return 6;  case 'V': return 7;  case 'T': return 8;
+        case 'U': return 8;  case 'W': return 9;  case 'Y': return 10; case 'H': return 11;
+        case 'K': return 12; case 'D': return 13; case 'B': return 14;
+        default:  return (c == '=') ? 0 : 15;
+    }
+}
+
+/* One emitted --meth SEQ base, as upstream's meth writer (meth_bam.cpp)
+ * builds it from the ORIGINAL (unprojected) read so MethylDackel sees real
+ * C/Ts: the forward strand keeps the base (upper-cased, so an IUPAC code
+ * survives), the reverse strand complements through nst_nt4_table and maps
+ * anything but A/C/G/T to N. */
+static inline uint8_t meth_seq_bam4(unsigned char c, int rev) {
+    if (!rev) return ascii_to_bam4(c);
+    static const uint8_t RC[5] = { 8 /* A->T */, 4 /* C->G */, 2 /* G->C */, 1 /* T->A */, 15 };
+    int bi = nst_nt4_table[c];
+    return RC[bi < 4 ? bi : 4];
 }
 
 /* ASCII base complement (A<->T, C<->G, case-insensitive); anything else -> N.
@@ -759,21 +779,25 @@ static void aux_put_f(uint8_t **buf, size_t *len, size_t *cap,
     buf_append(buf, len, cap, tmp, 7);
 }
 
-/* Emit an SA:Z tag for primary alignments that have supplementary hits. */
-static void emit_sa_tag(uint8_t **buf, size_t *len, size_t *cap,
-                        const bntseq_t *bns,
-                        const mem_aln_t *list, int n, int which) {
+/* Append the SA:Z text (NUL-terminated, no tag header) for a primary alignment
+ * that has supplementary hits. */
+static void build_sa_text(uint8_t **buf, size_t *len, size_t *cap,
+                          const bntseq_t *bns,
+                          const mem_aln_t *list, int n, int which) {
     // Format matches mem_aln2sam:
     //   chrom,pos+1,[+-],CIGAR,mapq,NM;chrom,...
-    uint8_t header[3] = {'S', 'A', 'Z'};
-    buf_append(buf, len, cap, header, 3);
-    char tmp[4096];
+    // The contig name is appended directly: its length is unbounded, so it
+    // must not pass through the fixed `tmp`, whose snprintf results would then
+    // be copied past its end. Every snprintf into `tmp` below has a bounded
+    // numeric length.
+    char tmp[64];
     for (int i = 0; i < n; ++i) {
         if (i == which || (list[i].flag & 0x100)) continue;
         const mem_aln_t *r = &list[i];
-        int m = snprintf(tmp, sizeof(tmp), "%s,%lld,%c,",
-                         bns->anns[r->rid].name, (long long)(r->pos + 1),
-                         r->is_rev ? '-' : '+');
+        const char *chrom = bns->anns[r->rid].name;
+        buf_append(buf, len, cap, chrom, strlen(chrom));
+        int m = snprintf(tmp, sizeof(tmp), ",%lld,%c,",
+                         (long long)(r->pos + 1), r->is_rev ? '-' : '+');
         buf_append(buf, len, cap, tmp, m);
         for (int k = 0; k < r->n_cigar; ++k) {
             m = snprintf(tmp, sizeof(tmp), "%u%c",
@@ -787,7 +811,8 @@ static void emit_sa_tag(uint8_t **buf, size_t *len, size_t *cap,
     buf_append(buf, len, cap, &zero, 1);
 }
 
-/* Emit MC:Z aux (mate CIGAR) from a mate mem_aln_t.
+/* Append the MC:Z text (mate CIGAR; NUL-terminated, no tag header) from a mate
+ * mem_aln_t.
  *
  * `which` is the EMITTING record's index, not the mate's: upstream builds
  * MC:Z through the same `add_cigar` helper and hands it the record's own
@@ -796,10 +821,8 @@ static void emit_sa_tag(uint8_t **buf, size_t *len, size_t *cap,
  * deliberately -- it looks like an upstream quirk, and reproducing it is the
  * point. `m->is_alt` (not the record's) gates it, matching `add_cigar`'s use
  * of the mem_aln_t it was passed. */
-static void emit_mc_tag(uint8_t **buf, size_t *len, size_t *cap,
-                        const mem_opt_t *opt, const mem_aln_t *m, int which) {
-    uint8_t header[3] = {'M', 'C', 'Z'};
-    buf_append(buf, len, cap, header, 3);
+static void build_mc_text(uint8_t **buf, size_t *len, size_t *cap,
+                          const mem_opt_t *opt, const mem_aln_t *m, int which) {
     char tmp[32];
     for (int i = 0; i < m->n_cigar; ++i) {
         uint32_t cig = bwa_apply_clip_mode(m->cigar[i], opt, m->is_alt, which);
@@ -850,16 +873,24 @@ static int32_t compute_tlen(const mem_aln_t *a, int a_ref_len,
     return (int32_t) -(p0 - p1 + nudge);
 }
 
-/* Append one packed BAM record to `out`'s buffer. `opt`/`pac`/`is_r2` are used
- * only for D3 (--meth) tag emission (is_r2: 0 = R1/OT read, 1 = R2/OB read). */
-static void append_bam_record(ShimEmit *e, size_t origin_idx,
-                              const mem_opt_t *opt, const bntseq_t *bns,
-                              const uint8_t *pac, const bseq1_t *s,
-                              const mem_aln_t *p, int n_list,
-                              const mem_aln_t *list, int which,
-                              const mem_aln_t *m, int is_r2)
+/* Compute every field the packed-BAM record for one mem_aln_t carries, into
+ * `f`. This is the single source of truth for record CONTENT: the packed path
+ * (serialize_record) only turns `f` into bytes, and the structured-fields path
+ * hands `f` to the caller as-is, so the two cannot disagree. `f`'s pointers
+ * borrow `sc`'s cig_buf/txt_buf, the mem_aln_t's own buffers (MD, XA), the
+ * global RG id and meth_build_xm's thread-local buffer; all stay valid until
+ * the next record is computed on this scratch/thread.
+ *
+ * `opt`/`pac`/`is_r2` are used only for D3 (--meth) tag emission (is_r2: 0 =
+ * R1/OT read, 1 = R2/OB read). */
+static void compute_record_fields(ShimScratch *sc, BwaAlignedFields *f,
+                                  const mem_opt_t *opt, const bntseq_t *bns,
+                                  const uint8_t *pac, const bseq1_t *s,
+                                  const mem_aln_t *p, int n_list,
+                                  const mem_aln_t *list, int which,
+                                  const mem_aln_t *m, int is_r2)
 {
-    int l_read_name = (int) strlen(s->name) + 1;
+    memset(f, 0, sizeof(*f));
     int l_seq = s->l_seq;
     int n_cigar = p->n_cigar;
     int ref_len = cigar_ref_len(n_cigar, p->cigar);
@@ -872,8 +903,9 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
      * access to bwa_shim.cpp's shim_set_err and these emit helpers return void,
      * so mirror worker_alloc: xassert aborts with a message (survives NDEBUG),
      * matching the surrounding error handling here. Never fires on valid input,
-     * so output stays byte-identical. */
-    xassert(l_read_name <= 255, "read name too long for BAM (>= 255 bytes)");
+     * so output stays byte-identical. Checked here, not in the serializer, so
+     * the structured-fields path enforces the same limits. */
+    xassert((int) strlen(s->name) + 1 <= 255, "read name too long for BAM (>= 255 bytes)");
     xassert(n_cigar <= 0xffff, "too many CIGAR ops for BAM (> 65535)");
 
     /* Upstream's mem_aln2sam prologue (bwamem.cpp:2457-2462), reproduced here
@@ -934,40 +966,116 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     }
     int emit_len = seq_end - seq_start;
     if (emit_len < 0) emit_len = 0;
-
-    /* Build aux first so we know its size. Reuse the scratch's aux buffer: it
-     * is grown in place by buf_append and written back at the end of the record
-     * so the next record reuses the larger allocation. */
-    uint8_t *aux = e->sc->aux_buf;
-    size_t aux_len = 0, aux_cap = e->sc->aux_cap;
-    if (p->n_cigar) {
-        aux_put_i(&aux, &aux_len, &aux_cap, "NM", p->NM);
-        /* MD string is stored right after the CIGAR array in p->cigar. */
-        const char *md = (const char *)(p->cigar + p->n_cigar);
-        aux_put_Z(&aux, &aux_len, &aux_cap, "MD", md);
+    /* A secondary record (raw 0x100: an -a secondary, not a MEM_F_NO_MULTI
+     * split, which carries the internal 0x10000 until the flag remap below)
+     * gets no SEQ/QUAL, exactly as both upstream writers decide it:
+     * `emit_seq = !(p.flag & 0x100)` (bam_writer.cpp:346, meth_bam.cpp). */
+    if (p->flag & 0x100) emit_len = 0;
+    /* Report the window in as-sequenced read coordinates: the forward emitter
+     * reads s->seq[seq_start + i] and the reverse one s->seq[l_seq - 1 -
+     * (seq_start + i)], i.e. [l_seq - seq_start - emit_len, l_seq - seq_start)
+     * read backwards. serialize_record walks exactly this window. */
+    if (eff_is_rev) {
+        f->query_start = l_seq - seq_start - emit_len;
+        f->query_end   = l_seq - seq_start;
+    } else {
+        f->query_start = seq_start;
+        f->query_end   = seq_start + emit_len;
     }
-    if (m && m->n_cigar) emit_mc_tag(&aux, &aux_len, &aux_cap, opt, m, which);
+
+    /* Fixed-width fields. */
+    f->tid  = eff_rid;
+    f->pos  = (int32_t) eff_pos;
+    f->mapq = (uint8_t) p->mapq;
+
+    /* The packed FLAG is 16 bits, but the pair resolve marks MEM_F_NO_MULTI
+     * split hits with upstream's internal 0x10000 (bit 16). Remap it to the BAM
+     * secondary bit 0x100 here, exactly as mem_aln2sam does at write time.
+     * Keeping the marker at 0x10000 internally (not 0x100) is deliberate: it
+     * lets build_sa_text still list NO_MULTI splits in SA:Z (its skip test is
+     * `flag & 0x100`), matching upstream. */
+    /* 0x10/0x20 are recomputed from the POST-copy strands (upstream derives
+     * them after the rewrite above), so an unmapped record placed at its
+     * mate's coordinates inherits that mate's strand. Clearing first matters:
+     * the pair resolve set them from the raw values. */
+    uint32_t flag_raw = (p->flag & ~(uint32_t)(0x10 | 0x20));
+    if (eff_is_rev)       flag_raw |= 0x10;
+    if (m && mate_is_rev) flag_raw |= 0x20;
+    f->flag = (uint16_t)((flag_raw & 0xffff) | ((flag_raw & 0x10000) ? 0x100 : 0));
+
+    /* BAM bin over [pos, pos + rlen), computed as htslib's bam_set1 -- which
+     * both upstream writers build records with -- computes it: rlen is the
+     * CIGAR's reference span for a mapped record and 1 otherwise. So an
+     * unmapped read placed at its mate's coordinates gets reg2bin(pos, pos+1),
+     * not 4680; only an unplaced read (pos == -1) lands on 4680, which
+     * reg2bin(-1, 0) yields through its arithmetic shift. */
+    int bin_rlen = ((f->flag & 0x4) || ref_len == 0) ? 1 : ref_len;
+    f->bin = reg2bin((int)eff_pos, (int)eff_pos + bin_rlen);
+
+    f->next_tid = m ? mate_rid : -1;
+    f->next_pos = m ? (int32_t) mate_pos : -1;
+    f->tlen     = m ? compute_tlen(p, ref_len, m, cigar_ref_len(m->n_cigar, m->cigar)) : 0;
+
+    /* Emitted CIGAR: clip rewrite, then bwa's MIDSH -> BAM opcode remap. */
+    if ((size_t) n_cigar > sc->cig_cap) {
+        size_t cap = sc->cig_cap ? sc->cig_cap : 64;
+        while ((size_t) n_cigar > cap) cap *= 2;
+        uint32_t *tmp = (uint32_t *) realloc(sc->cig_buf, cap * sizeof(uint32_t));
+        xassert(tmp != NULL, "out of memory: cig_buf");
+        sc->cig_buf = tmp; sc->cig_cap = cap;
+    }
+    for (int i = 0; i < n_cigar; ++i)
+        sc->cig_buf[i] = bwa_cigar_to_bam(
+            bwa_apply_clip_mode(p->cigar[i], opt, p->is_alt, which));
+    f->cigar   = sc->cig_buf;
+    f->n_cigar = (uint32_t) n_cigar;
+
+    /* Aux, in the order serialize_record writes it. Every string not owned by
+     * this call's bwa state (MC:Z, SA:Z, RG:Z, XM:Z) is copied into the
+     * scratch's txt_buf, so each borrowed pointer handed to a field sink points
+     * into memory only this exclusively-borrowed scratch owns: nothing the sink
+     * can do (set the global read group, run meth_build_xm on its thread) can
+     * rewrite a field it is still reading. txt_buf may realloc as it grows, so
+     * record offsets and turn them into pointers only after the last append, at
+     * the end of this function. */
+    uint8_t *txt = sc->txt_buf;
+    size_t txt_len = 0, txt_cap = sc->txt_cap;
+    size_t mc_off = SIZE_MAX, sa_off = SIZE_MAX, rg_off = SIZE_MAX, xm_off = SIZE_MAX;
+    if (p->n_cigar) {
+        f->has_nm = 1; f->nm = p->NM;
+        /* MD string is stored right after the CIGAR array in p->cigar. */
+        f->md = (const char *)(p->cigar + p->n_cigar);
+    }
+    if (m && m->n_cigar) {
+        mc_off = txt_len;
+        build_mc_text(&txt, &txt_len, &txt_cap, opt, m, which);
+    }
     /* MQ: the mate's MAPQ. Gated on `m` alone -- NOT `m->n_cigar` like MC:Z
      * above -- so it is emitted even when the mate is unmapped, matching
      * upstream exactly (bwamem.cpp:3484, bam_writer.cpp:395, meth_bam.cpp:585,
-     * which all use `m && opt->compat->emit_mq`). Emitted here, between MC and
-     * AS, because this crate's aux order mirrors upstream's write order.
+     * which all use `m && opt->compat->emit_mq`). Emitted between MC and AS,
+     * because this crate's aux order mirrors upstream's write order.
      *
      * Not a bwa-mem3 invention: bwa emits MQ (bwamem.c:935, lh3/bwa#330) and
      * bwa-mem2 does not, having forked at 0.7.17 before that landed -- hence
      * the compat switch, whose default target (COMPAT_TARGET_OFF) sets
      * emit_mq = 1. */
-    if (m && opt->compat != NULL && opt->compat->emit_mq)
-        aux_put_i(&aux, &aux_len, &aux_cap, "MQ", m->mapq);
-    if (p->score >= 0) aux_put_i(&aux, &aux_len, &aux_cap, "AS", p->score);
-    if (p->sub >= 0)   aux_put_i(&aux, &aux_len, &aux_cap, "XS", p->sub);
-    if (bwa_rg_id[0])  aux_put_Z(&aux, &aux_len, &aux_cap, "RG", bwa_rg_id);
+    if (m && opt->compat != NULL && opt->compat->emit_mq) { f->has_mq = 1; f->mq = m->mapq; }
+    if (p->score >= 0) { f->has_as = 1; f->score = p->score; }
+    if (p->sub >= 0)   { f->has_xs = 1; f->sub = p->sub; }
+    if (bwa_rg_id[0]) {
+        rg_off = txt_len;
+        buf_append(&txt, &txt_len, &txt_cap, bwa_rg_id, strlen(bwa_rg_id) + 1);
+    }
     /* SA: if this is a primary (flag 0x100 not set) and other primary hits exist */
     if (!(p->flag & 0x100) && n_list > 1) {
         int i;
         for (i = 0; i < n_list; ++i)
             if (i != which && !(list[i].flag & 0x100)) break;
-        if (i < n_list) emit_sa_tag(&aux, &aux_len, &aux_cap, bns, list, n_list, which);
+        if (i < n_list) {
+            sa_off = txt_len;
+            build_sa_text(&txt, &txt_len, &txt_cap, bns, list, n_list, which);
+        }
     }
     /* pa:f — mirrors the vendored BAM writer (bam_writer.cpp:468-474) and
      * mem_aln2sam: emitted for a non-secondary record whose read has an ALT
@@ -977,10 +1085,9 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
      * no `.alt` and so never set alt_sc. Value is the shared bwa_pa_tag_value,
      * so the --bam and SAM-text writers agree to the last float bit. */
     if (!(p->flag & 0x100) && p->alt_sc > 0) {
-        float pa_f = bwa_pa_tag_value(p->score, p->alt_sc);
-        aux_put_f(&aux, &aux_len, &aux_cap, "pa", pa_f);
+        f->has_pa = 1; f->pa = bwa_pa_tag_value(p->score, p->alt_sc);
     }
-    if (p->XA) aux_put_Z(&aux, &aux_len, &aux_cap, "XA", p->XA);
+    if (p->XA) f->xa = p->XA;
     /* HN: total # of hits clustered with this primary under XA_drop_ratio
      * (set by mem_gen_alt above). -1 is upstream's "not computed" sentinel
      * (bwamem.h / bwamem.cpp's mem_reg2aln), so guard >= 0.
@@ -996,8 +1103,7 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
      *
      * `compat` is set by mem_opt_init, but it is a pointer on a struct callers
      * can memset, so it is NULL-checked rather than trusted. */
-    if (p->HN >= 0 && opt->compat != NULL && opt->compat->emit_hn)
-        aux_put_i(&aux, &aux_len, &aux_cap, "HN", p->HN);
+    if (p->HN >= 0 && opt->compat != NULL && opt->compat->emit_hn) { f->has_hn = 1; f->hn = p->HN; }
 
     /* D3 (--meth) Bismark tags. XR:Z (read conversion) on every record; XG:Z
      * (genome strand) and XM:Z (per-base methylation call) on mapped records.
@@ -1006,15 +1112,14 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
      * upstream meth_bam.cpp. XM is built from the ORIGINAL (unconverted) read
      * bases in emitted-SEQ orientation. */
     if (opt->meth_mode) {
-        aux_put_Z(&aux, &aux_len, &aux_cap, "XR", is_r2 ? "GA" : "CT");
+        f->xr = is_r2 ? "GA" : "CT";
         if (p->rid >= 0) {
             int is_top = (p->meth_hypothesis >= 0 && (p->meth_hypothesis & 1)) ? 1 : 0;
-            aux_put_Z(&aux, &aux_len, &aux_cap, "XG", is_top ? "CT" : "GA");
+            f->xg = is_top ? "CT" : "GA";
             if (s->meth_orig_seq && emit_len > 0 && n_cigar > 0) {
                 char *seq_text = (char *) malloc((size_t)emit_len + 1);
-                uint32_t *bam_cig = (uint32_t *) malloc((size_t)n_cigar * sizeof(uint32_t));
-                if (seq_text && bam_cig) {
-                    /* `p->is_rev` (not `eff_is_rev`, as the primary SEQ RC above
+                if (seq_text) {
+                    /* `p->is_rev` (not `eff_is_rev`, as the primary SEQ RC
                      * uses) is correct here: this block is `p->rid >= 0`-gated,
                      * and the half-mapped is_rev copy only rewrites an *unmapped*
                      * record (rid < 0), so eff_is_rev == p->is_rev on every path
@@ -1025,73 +1130,77 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
                             : s->meth_orig_seq[seq_start + i];
                     }
                     seq_text[emit_len] = '\0';
-                    /* Same clip rewrite as the emitted CIGAR below: the XM:Z
-                     * builder walks this alongside `seq_text`, which is the
-                     * hard-clipped span, so the two must agree on whether the
-                     * clip consumes query bases. */
-                    for (int i = 0; i < n_cigar; ++i)
-                        bam_cig[i] = bwa_cigar_to_bam(
-                            bwa_apply_clip_mode(p->cigar[i], opt, p->is_alt, which));
-                    /* v0.9.0 added the chemistry selector. It flips only the
+                    /* The XM:Z builder walks the emitted CIGAR (clip rewrite
+                     * applied) alongside `seq_text`, which is the hard-clipped
+                     * span, so the two must agree on whether the clip consumes
+                     * query bases.
+                     *
+                     * v0.9.0 added the chemistry selector. It flips only the
                      * methylated/unmethylated polarity of the call, never the
                      * CpG/CHG/CHH context classification, and comes off
                      * mem_opt_t exactly as upstream's own writer sources it
                      * (meth_bam.cpp:526). mem_opt_init defaults it to
                      * METH_CHEM_EMSEQ, so this is unchanged behavior unless a
-                     * caller sets it. */
-                    char *xm = meth_build_xm(bns, pac, p->rid, (int64_t)p->pos,
-                                             is_top, bam_cig, n_cigar, seq_text, emit_len,
-                                             (meth_chem_t) opt->meth_chem);
-                    if (xm) aux_put_Z(&aux, &aux_len, &aux_cap, "XM", xm);
+                     * caller sets it. The result aliases meth_build_xm's
+                     * thread-local buffer, which the next call on this thread
+                     * overwrites, so it is copied into txt_buf. */
+                    const char *xm = meth_build_xm(bns, pac, p->rid, (int64_t)p->pos,
+                                                   is_top, f->cigar, n_cigar, seq_text,
+                                                   emit_len, (meth_chem_t) opt->meth_chem);
+                    if (xm) {
+                        xm_off = txt_len;
+                        buf_append(&txt, &txt_len, &txt_cap, xm, strlen(xm) + 1);
+                    }
                 }
                 free(seq_text);
-                free(bam_cig);
             }
         }
     }
 
-    /* Reverse-complement the bwa-2bit-encoded query if the EMITTED strand is
-     * reverse; otherwise point at the forward slice. Quality scores mirror the
-     * sequence. Keys off `eff_is_rev`, not `p->is_rev`: for a half-mapped pair
-     * upstream overwrites the unmapped read's `p->is_rev = m->is_rev`
-     * (bwamem.cpp:4575) before mem_aln2sam writes SEQ, so the unmapped mate's
-     * bases come out reverse-complemented to the mapped mate's strand. Keying
-     * off the original `p->is_rev` (0 for an unmapped record) left the unmapped
-     * mate forward while its 0x10 flag said reverse -- a SEQ/QUAL vs FLAG
-     * contradiction, invisible to fixtures whose unmapped mates happen to be
-     * forward. For a mapped read eff_is_rev == p->is_rev, so this is a no-op. */
-    uint8_t *emit_seq_buf = nullptr;
-    char *emit_qual_buf = nullptr;
-    const uint8_t *emit_seq = nullptr;
-    const char *emit_qual = nullptr;
-    if (emit_len > 0) {
-        if (eff_is_rev) {
-            emit_seq_buf = (uint8_t *) malloc(emit_len);
-            xassert(emit_seq_buf != NULL, "out of memory: emit_seq_buf");
-            for (int i = 0; i < emit_len; ++i) {
-                uint8_t b = (uint8_t) s->seq[l_seq - 1 - (seq_start + i)];
-                emit_seq_buf[i] = bwa2_complement(b);
-            }
-            emit_seq = emit_seq_buf;
-            if (s->qual) {
-                emit_qual_buf = (char *) malloc(emit_len);
-                xassert(emit_qual_buf != NULL, "out of memory: emit_qual_buf");
-                for (int i = 0; i < emit_len; ++i)
-                    emit_qual_buf[i] = s->qual[l_seq - 1 - (seq_start + i)];
-                emit_qual = emit_qual_buf;
-            }
-        } else {
-            emit_seq = (const uint8_t *) s->seq + seq_start;
-            if (s->qual) emit_qual = s->qual + seq_start;
-        }
-    }
+    /* The last txt_buf append is done: keep the (possibly grown) buffer for the
+     * next record and turn the recorded offsets into pointers. */
+    sc->txt_buf = txt; sc->txt_cap = txt_cap;
+    if (mc_off != SIZE_MAX) f->mc = (const char *)(txt + mc_off);
+    if (sa_off != SIZE_MAX) f->sa = (const char *)(txt + sa_off);
+    if (rg_off != SIZE_MAX) f->rg = (const char *)(txt + rg_off);
+    if (xm_off != SIZE_MAX) f->xm = (const char *)(txt + xm_off);
+}
+
+/* Serialize `f` into the packed BAM record BODY (no u32 block_size prefix) for
+ * read `s`, in the scratch's reusable record buffer, and hand it to the packed
+ * sink. Pure formatting: every decision was made by compute_record_fields. */
+static void serialize_record(ShimEmit *e, size_t origin_idx, const bseq1_t *s,
+                             const BwaAlignedFields *f)
+{
+    int l_read_name = (int) strlen(s->name) + 1;
+    int n_cigar = (int) f->n_cigar;
+    int emit_len = f->query_end - f->query_start;
+    int is_rev = (f->flag & 0x10) != 0;
+
+    /* Build aux first so we know its size. Reuse the scratch's aux buffer: it
+     * is grown in place by buf_append and written back at the end of the record
+     * so the next record reuses the larger allocation. */
+    uint8_t *aux = e->sc->aux_buf;
+    size_t aux_len = 0, aux_cap = e->sc->aux_cap;
+    if (f->has_nm) aux_put_i(&aux, &aux_len, &aux_cap, "NM", f->nm);
+    if (f->md)     aux_put_Z(&aux, &aux_len, &aux_cap, "MD", f->md);
+    if (f->mc)     aux_put_Z(&aux, &aux_len, &aux_cap, "MC", f->mc);
+    if (f->has_mq) aux_put_i(&aux, &aux_len, &aux_cap, "MQ", f->mq);
+    if (f->has_as) aux_put_i(&aux, &aux_len, &aux_cap, "AS", f->score);
+    if (f->has_xs) aux_put_i(&aux, &aux_len, &aux_cap, "XS", f->sub);
+    if (f->rg)     aux_put_Z(&aux, &aux_len, &aux_cap, "RG", f->rg);
+    if (f->sa)     aux_put_Z(&aux, &aux_len, &aux_cap, "SA", f->sa);
+    if (f->has_pa) aux_put_f(&aux, &aux_len, &aux_cap, "pa", f->pa);
+    if (f->xa)     aux_put_Z(&aux, &aux_len, &aux_cap, "XA", f->xa);
+    if (f->has_hn) aux_put_i(&aux, &aux_len, &aux_cap, "HN", f->hn);
+    if (f->xr)     aux_put_Z(&aux, &aux_len, &aux_cap, "XR", f->xr);
+    if (f->xg)     aux_put_Z(&aux, &aux_len, &aux_cap, "XG", f->xg);
+    if (f->xm)     aux_put_Z(&aux, &aux_len, &aux_cap, "XM", f->xm);
 
     size_t seq_packed = (size_t)(emit_len + 1) / 2;
     size_t block_size = (size_t)32 + l_read_name + 4 * (size_t)n_cigar
                       + seq_packed + (size_t)emit_len + aux_len;
 
-    /* Build the record BODY (no u32 block_size prefix) into the scratch's
-     * reusable record buffer; the sink prepends the prefix if it wants one. */
     if (block_size > e->sc->rec_cap) {
         while (block_size > e->sc->rec_cap) e->sc->rec_cap *= 2;
         uint8_t *tmp = (uint8_t *) realloc(e->sc->rec_buf, e->sc->rec_cap);
@@ -1100,71 +1209,70 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     }
     uint8_t *w = e->sc->rec_buf;
 
-    int32_t ref_id = eff_rid;
-    memcpy(w, &ref_id, 4); w += 4;
-    int32_t pos32 = (int32_t) eff_pos;
-    memcpy(w, &pos32, 4); w += 4;
-
+    memcpy(w, &f->tid, 4); w += 4;
+    memcpy(w, &f->pos, 4); w += 4;
     *w++ = (uint8_t) l_read_name;
-    *w++ = (uint8_t) p->mapq;
-
-    uint16_t bin = (ref_id < 0 || ref_len == 0)
-                       ? 4680
-                       : reg2bin((int)eff_pos, (int)eff_pos + ref_len);
-    memcpy(w, &bin, 2); w += 2;
-
+    *w++ = f->mapq;
+    memcpy(w, &f->bin, 2); w += 2;
     uint16_t nc = (uint16_t) n_cigar;
     memcpy(w, &nc, 2); w += 2;
-
-    /* The packed FLAG is 16 bits, but the pair resolve marks MEM_F_NO_MULTI
-     * split hits with upstream's internal 0x10000 (bit 16). Remap it to the BAM
-     * secondary bit 0x100 here, exactly as mem_aln2sam does at write time.
-     * Keeping the marker at 0x10000 internally (not 0x100) is deliberate: it
-     * lets emit_sa_tag still list NO_MULTI splits in SA:Z (its skip test is
-     * `flag & 0x100`), matching upstream. */
-    /* 0x10/0x20 are recomputed from the POST-copy strands (upstream derives
-     * them after the rewrite above), so an unmapped record placed at its
-     * mate's coordinates inherits that mate's strand. Clearing first matters:
-     * the pair resolve set them from the raw values. */
-    uint32_t flag_raw = (p->flag & ~(uint32_t)(0x10 | 0x20));
-    if (eff_is_rev)       flag_raw |= 0x10;
-    if (m && mate_is_rev) flag_raw |= 0x20;
-    uint16_t flag16 = (uint16_t)((flag_raw & 0xffff) | ((flag_raw & 0x10000) ? 0x100 : 0));
-    memcpy(w, &flag16, 2); w += 2;
-
+    memcpy(w, &f->flag, 2); w += 2;
     int32_t ls = emit_len;
     memcpy(w, &ls, 4); w += 4;
-
-    int32_t mtid = m ? mate_rid : -1;
-    int32_t mpos = m ? (int32_t) mate_pos : -1;
-    int32_t tlen = m ? compute_tlen(p, ref_len, m, cigar_ref_len(m->n_cigar, m->cigar)) : 0;
-    memcpy(w, &mtid, 4); w += 4;
-    memcpy(w, &mpos, 4); w += 4;
-    memcpy(w, &tlen, 4); w += 4;
+    memcpy(w, &f->next_tid, 4); w += 4;
+    memcpy(w, &f->next_pos, 4); w += 4;
+    memcpy(w, &f->tlen, 4); w += 4;
 
     memcpy(w, s->name, l_read_name - 1); w += l_read_name - 1;
     *w++ = 0;
 
-    for (int i = 0; i < n_cigar; ++i) {
-        uint32_t c = bwa_cigar_to_bam(
-            bwa_apply_clip_mode(p->cigar[i], opt, p->is_alt, which));
-        memcpy(w, &c, 4); w += 4;
-    }
+    if (n_cigar) { memcpy(w, f->cigar, 4 * (size_t) n_cigar); w += 4 * (size_t) n_cigar; }
 
-    /* 4-bit packed seq. emit_seq bytes are bwa's 2-bit encoding (0-4); remap
-     * to BAM 4-bit nibbles (1/2/4/8/15). */
-    for (int i = 0; i < emit_len; i += 2) {
-        uint8_t hi = emit_seq ? bwa2_to_bam4[emit_seq[i] & 7] : 15;
+    /* SEQ/QUAL over the window [query_start, query_end) of the read, read
+     * backwards and complemented on the reverse strand. Keys off the emitted
+     * strand (0x10, i.e. `eff_is_rev`), not `p->is_rev`: for a half-mapped pair
+     * upstream overwrites the unmapped read's `p->is_rev = m->is_rev`
+     * (bwamem.cpp:4575) before mem_aln2sam writes SEQ, so the unmapped mate's
+     * bases come out reverse-complemented to the mapped mate's strand. Keying
+     * off the original `p->is_rev` (0 for an unmapped record) left the unmapped
+     * mate forward while its 0x10 flag said reverse -- a SEQ/QUAL vs FLAG
+     * contradiction, invisible to fixtures whose unmapped mates happen to be
+     * forward. For a mapped read eff_is_rev == p->is_rev, so this is a no-op.
+     *
+     * s->seq holds bwa's 2-bit encoding (0-4); remap to BAM 4-bit nibbles
+     * (1/2/4/8/15). Under --meth s->seq is the bisulfite-PROJECTED read the
+     * seeds matched, so SEQ comes from the original bases instead, as the
+     * upstream meth writer emits it (meth_seq_bam4). */
+    if (s->meth_orig_seq) {
+        const unsigned char *orig = (const unsigned char *) s->meth_orig_seq;
+        for (int i = 0; i < emit_len; i += 2) {
+            uint8_t hi = meth_seq_bam4(is_rev ? orig[f->query_end - 1 - i]
+                                              : orig[f->query_start + i], is_rev);
+            uint8_t lo = 0;
+            if (i + 1 < emit_len)
+                lo = meth_seq_bam4(is_rev ? orig[f->query_end - 2 - i]
+                                          : orig[f->query_start + i + 1], is_rev);
+            *w++ = (uint8_t)((hi << 4) | lo);
+        }
+    } else for (int i = 0; i < emit_len; i += 2) {
+        uint8_t b0 = is_rev ? bwa2_complement((uint8_t) s->seq[f->query_end - 1 - i])
+                            : (uint8_t) s->seq[f->query_start + i];
+        uint8_t hi = bwa2_to_bam4[b0 & 7];
         uint8_t lo = 0;
         if (i + 1 < emit_len) {
-            lo = emit_seq ? bwa2_to_bam4[emit_seq[i + 1] & 7] : 15;
+            uint8_t b1 = is_rev ? bwa2_complement((uint8_t) s->seq[f->query_end - 2 - i])
+                                : (uint8_t) s->seq[f->query_start + i + 1];
+            lo = bwa2_to_bam4[b1 & 7];
         }
         *w++ = (uint8_t)((hi << 4) | lo);
     }
 
     /* qual: ASCII - 33, or 0xFF if missing. */
-    if (emit_qual) {
-        for (int i = 0; i < emit_len; ++i) *w++ = (uint8_t)(emit_qual[i] - 33);
+    if (s->qual) {
+        for (int i = 0; i < emit_len; ++i) {
+            char q = is_rev ? s->qual[f->query_end - 1 - i] : s->qual[f->query_start + i];
+            *w++ = (uint8_t)(q - 33);
+        }
     } else if (emit_len > 0) {
         memset(w, 0xFF, emit_len); w += emit_len;
     }
@@ -1174,10 +1282,28 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
      * freeing it -- buf_append reallocs in place. */
     e->sc->aux_buf = aux; e->sc->aux_cap = aux_cap;
 
-    free(emit_seq_buf);
-    free(emit_qual_buf);
     assert((size_t)(w - e->sc->rec_buf) == block_size);
     e->sink(e->ctx, e->origin_kind, origin_idx, e->sc->rec_buf, block_size);
+}
+
+/* Emit one record for mem_aln_t `p` (the `which`-th of `list`, with mate
+ * anchor `m`) of read `s` to `e`'s sink: its structured fields to a field
+ * sink, or its packed BAM body to a packed sink. `is_r2` doubles as the field
+ * sink's `mate` discriminant, and `which == 0` marks the read's first
+ * (primary) record -- every caller emits a read's records in list order. */
+static void append_bam_record(ShimEmit *e, size_t origin_idx,
+                              const mem_opt_t *opt, const bntseq_t *bns,
+                              const uint8_t *pac, const bseq1_t *s,
+                              const mem_aln_t *p, int n_list,
+                              const mem_aln_t *list, int which,
+                              const mem_aln_t *m, int is_r2)
+{
+    BwaAlignedFields f;
+    compute_record_fields(e->sc, &f, opt, bns, pac, s, p, n_list, list, which, m, is_r2);
+    if (e->field_sink)
+        e->field_sink(e->ctx, e->origin_kind, origin_idx, (uint8_t) is_r2, which == 0, &f);
+    else
+        serialize_record(e, origin_idx, s, &f);
 }
 
 /* ------------------ Phase 1: scratch + fused seed+extend ------------------ */
@@ -1204,6 +1330,7 @@ void shim_scratch_free(ShimScratch *sc) {
     if (!sc) return;
     worker_free(sc->w, 1);
     free(sc->rec_buf); free(sc->aux_buf);
+    free(sc->cig_buf); free(sc->txt_buf);   /* lazily grown; NULL until first use */
     free(sc);
 }
 
@@ -1224,18 +1351,20 @@ void shim_regs_free(ShimRegs *r) {
     free(r);
 }
 
-/* Fused seed + SE-extend over seqs[first, first+n) in BATCH_SIZE chunks, the
- * shape of upstream's worker_bwt_aln (bwamem.cpp:2782-2786). `opt` is the
- * per-group copy (MEM_F_PE set for pairs). Chain/seed windows are chunk-local
- * so the BATCH_SIZE scratch suffices; the pre-0.9.0 tail `seedBufSz` shrink is
- * dropped as upstream did ("output-dead either way", worker_bwt). */
-static void seed_extend_range(ShimScratch *sc, ShimRegs *r, BwaShimIndex *idx,
-                              const mem_opt_t *opt, int first, int n)
+/* Fused seed + SE-extend over reads `seqs[0, n)` / `regs[0, n)` in BATCH_SIZE
+ * chunks, the shape of upstream's worker_bwt_aln (bwamem.cpp:2782-2786). `opt`
+ * is the per-group copy (MEM_F_PE set for pairs, cleared for singles).
+ * Chain/seed windows are chunk-local so the BATCH_SIZE scratch suffices; the
+ * pre-0.9.0 tail `seedBufSz` shrink is dropped as upstream did ("output-dead
+ * either way", worker_bwt). Shared by the legacy ShimRegs path and the resident
+ * segments. */
+static void seed_extend_reads(ShimScratch *sc, BwaShimIndex *idx, const mem_opt_t *opt,
+                              bseq1_t *seqs, mem_alnreg_v *regs, int n)
 {
     worker_t &w = sc->w;
     FMI_search *fmi = idx->fmi;
-    w.opt = opt; w.fmi = fmi; w.seqs = r->seqs; w.regs = r->regs;
-    w.n_processed = 0; w.pes = nullptr; w.nreads = r->n_seqs;
+    w.opt = opt; w.fmi = fmi; w.seqs = seqs; w.regs = regs;
+    w.n_processed = 0; w.pes = nullptr; w.nreads = n;
     w.meth_orig_bns = idx->meth_orig_bns;
     w.meth_orig_pac = idx->meth_orig_pac;
     /* No materialized reference on either path: a NULL ref_string selects
@@ -1243,13 +1372,13 @@ static void seed_extend_range(ShimScratch *sc, ShimRegs *r, BwaShimIndex *idx,
      * pac (via `fmi`) or the meth ORIGINAL pac (`meth_orig_pac`) as appropriate. */
     w.meth_orig_ref_string = nullptr;
     w.ref_string = nullptr;
-    for (int seq_id = first; seq_id < first + n; seq_id += BATCH_SIZE) {
-        int bs = first + n - seq_id;
+    for (int seq_id = 0; seq_id < n; seq_id += BATCH_SIZE) {
+        int bs = n - seq_id;
         if (bs > BATCH_SIZE) bs = BATCH_SIZE;
-        mem_kernel1_core(fmi, opt, r->seqs + seq_id, bs,
+        mem_kernel1_core(fmi, opt, seqs + seq_id, bs,
                          w.chain_scratch, w.seed_scratch, w.seed_scratch_size,
                          &w.mmc, 0 /* tid */, idx->meth_orig_bns, idx->meth_orig_pac);
-        mem_kernel2_core(fmi, opt, r->seqs + seq_id, r->regs + seq_id, bs,
+        mem_kernel2_core(fmi, opt, seqs + seq_id, regs + seq_id, bs,
                          w.chain_scratch, &w.mmc, w.ref_string, 0 /* tid */,
                          idx->meth_orig_bns, idx->meth_orig_pac);
     }
@@ -1295,8 +1424,9 @@ ShimRegs *shim_seed_extend(void *idx_opaque, const mem_opt_t *opts, ShimScratch 
      * (fastmap.cpp:912-921): pairs with the flag SET, singles with it CLEARED. */
     mem_opt_t opt_pe = *opts; opt_pe.n_threads = 1; opt_pe.flag |=  MEM_F_PE;
     mem_opt_t opt_se = *opts; opt_se.n_threads = 1; opt_se.flag &= ~MEM_F_PE;
-    if (r->n_pairs > 0)   seed_extend_range(sc, r, idx, &opt_pe, 0, (int)(2 * r->n_pairs));
-    if (r->n_singles > 0) seed_extend_range(sc, r, idx, &opt_se, (int)(2 * r->n_pairs), (int)r->n_singles);
+    if (r->n_pairs > 0)   seed_extend_reads(sc, idx, &opt_pe, r->seqs, r->regs, (int)(2 * r->n_pairs));
+    if (r->n_singles > 0) seed_extend_reads(sc, idx, &opt_se, r->seqs + 2 * r->n_pairs,
+                                            r->regs + 2 * r->n_pairs, (int)r->n_singles);
     return r;
 }
 
@@ -1353,12 +1483,22 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
  * touches pestat (fastmap.cpp:919-946). Singles have no mate and so contribute
  * nothing to the insert-size distribution either way. Verified against
  * `bwa-mem3 mem -p` on a mixed interleaved input (three_phase_cli_parity.rs). */
+/* mem_pestat over `total` gathered PE-read alnreg headers (R1/R2 interleaved),
+ * with the per-call PE opt copy. Shared by the legacy cohort gather below and
+ * the resident cohort's. */
+static void pestat_over_headers(BwaShimIndex *idx, const mem_opt_t *opts,
+                                const mem_alnreg_v *cat, size_t total, mem_pestat_t *out)
+{
+    const bntseq_t *bns = idx->meth_orig_bns ? idx->meth_orig_bns : idx->fmi->idx->bns;
+    mem_opt_t opt_pe = *opts; opt_pe.n_threads = 1; opt_pe.flag |= MEM_F_PE;
+    mem_pestat(&opt_pe, bns->l_pac, (int)total, cat, out);
+}
+
 int shim_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
                        const ShimRegs *const *regs, size_t n_regs, mem_pestat_t *out)
 {
     if (!idx_opaque || !opts || (n_regs > 0 && !regs) || !out) return -1;
     BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
-    const bntseq_t *bns = idx->meth_orig_bns ? idx->meth_orig_bns : idx->fmi->idx->bns;
     size_t total = 0;
     for (size_t k = 0; k < n_regs; ++k) total += 2 * regs[k]->n_pairs;
     mem_alnreg_v *cat = total ? (mem_alnreg_v *) malloc(total * sizeof(mem_alnreg_v)) : nullptr;
@@ -1369,10 +1509,89 @@ int shim_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
         if (n) memcpy(cat + at, regs[k]->regs, n * sizeof(mem_alnreg_v));
         at += n;
     }
-    mem_opt_t opt_pe = *opts; opt_pe.n_threads = 1; opt_pe.flag |= MEM_F_PE;
-    mem_pestat(&opt_pe, bns->l_pac, (int)total, cat, out);
+    pestat_over_headers(idx, opts, cat, total, out);
     free(cat);
     return 0;
+}
+
+/* Pair, mate-rescue and emit `n_pairs` pairs (reads `seqs[0, 2*n_pairs)`, R1/R2
+ * interleaved) — the CLI's worker_sam path on AVX2/AVX-512/NEON
+ * (bwamem.cpp:2826-2879): gather every pair's rescue jobs, run them through the
+ * SIMD kswv kernel once, then resolve + emit per pair. Pair `i` gets read
+ * ordinal `first_pair_id + i` and sink origin `origin_base + i`. `opt_pe` is the
+ * per-call PE copy. tid = 0: one ShimScratch per thread. Shared by the legacy
+ * and resident paths.
+ *
+ * Batched mate rescue is the only mate-rescue path upstream ships: the scalar
+ * mem_sam_pe / mem_pair_resolve pairing path (and the BWAMEM_BATCHED_MATESW /
+ * DISABLE_BATCHED_MATESW gate) were removed in fg-labs/bwa-mem3#513, which
+ * requires AVX2+ on x86 (NEON on arm).
+ *
+ * Chunk the batched mate-rescue exactly as the CLI's kt_for dispatches
+ * worker_sam: BATCH_SIZE reads (= BATCH_SIZE/2 pairs) per work item
+ * (kthread.cpp:109-118, bwamem.cpp worker_sam ~L2788). The pre-loop's running
+ * pcnt/gcnt/maxRefLen/maxQerLen and, with them, the kswv seqBuf ref-window
+ * offset (SeqPair.idr, an int32 derived from the monotonic pcnt) reset at every
+ * chunk boundary, so the offset can never exceed int32 no matter how large the
+ * -K cohort or how long the reads (seqbuf_grow_capacity's
+ * SEQBUF_CAPACITY_OVERFLOW → seqbuf_capacity_fatal exit(), which would abort
+ * across the FFI boundary). Without the chunk loop a single running pcnt
+ * spanned all the pairs, exactly the unbounded-offset the CLI avoids by
+ * resetting per BATCH_SIZE.
+ *
+ * Chunking is purely internal kswv/seqBuf batch bookkeeping. The per-pair
+ * rescue result is independent of how pairs are grouped, and the GLOBAL
+ * read-ordinal id and the emit order (index i, ascending) are unchanged — only
+ * pcnt/gcnt/maxRefLen/maxQerLen/aln/myaln reset per chunk. So output is
+ * byte-identical to a single batch and to `bwa-mem3 mem -t 1 -p`, however the
+ * caller splits the pairs. For n_pairs <= BATCH_SIZE/2 this is a single
+ * iteration. */
+static void pair_emit_pairs_chunked(ShimEmit *e, const mem_opt_t *opt_pe,
+                                    const bntseq_t *bns, const uint8_t *pac,
+                                    const mem_pestat_t *pestat, uint64_t first_pair_id,
+                                    bseq1_t *seqs, mem_alnreg_v *regs, size_t n_pairs,
+                                    size_t origin_base)
+{
+    worker_t &w = e->sc->w;
+    const size_t pairs_per_chunk = (size_t)BATCH_SIZE / 2;
+    for (size_t chunk_start = 0; chunk_start < n_pairs; chunk_start += pairs_per_chunk) {
+        size_t chunk_end = chunk_start + pairs_per_chunk;
+        if (chunk_end > n_pairs) chunk_end = n_pairs;
+
+        int32_t maxRefLen = 0, maxQerLen = 0, gcnt = 0;
+        int64_t pcnt = 0;
+        for (size_t i = chunk_start; i < chunk_end; ++i)
+            mem_sam_pe_batch_pre(opt_pe, bns, pac, pestat, first_pair_id + (uint64_t)i,
+                                 seqs + 2*i, regs + 2*i, &w.mmc, pcnt, gcnt,
+                                 maxRefLen, maxQerLen, 0);
+        int64_t pcnt8 = sort_classify(&w.mmc, pcnt, 0);
+        kswr_t *aln = (kswr_t *) _mm_malloc((pcnt + SIMD_WIDTH8) * sizeof(kswr_t), 64);
+        xassert(aln != NULL, "out of memory: aln");
+        mem_sam_pe_batch(opt_pe, &w.mmc, pcnt, pcnt8, aln, maxRefLen, maxQerLen, 0);
+        gcnt = 0;
+        kswr_t *myaln = aln;
+        for (size_t i = chunk_start; i < chunk_end; ++i) {
+            int n_pri[2], z[2], q_se[2], extra_flag, paired;
+            mem_pair_resolve_batch_post(opt_pe, bns, pac, pestat, first_pair_id + (uint64_t)i,
+                                        seqs + 2*i, regs + 2*i, &myaln, &w.mmc, gcnt, 0,
+                                        n_pri, z, q_se, &extra_flag, &paired);
+            emit_resolved_pair(e, origin_base + i, opt_pe, bns, pac, seqs + 2*i, regs + 2*i,
+                               pestat, n_pri, z, q_se, extra_flag, paired);
+        }
+        _mm_free(aln);
+    }
+}
+
+/* SE resolve + emit of `n` singles: single `i` gets read ordinal
+ * `first_single_id + i` and sink origin `origin_base + i`, under the per-call
+ * SE opt copy `opt_se`. Shared by the legacy and resident paths. */
+static void emit_singles(ShimEmit *e, const mem_opt_t *opt_se, const bntseq_t *bns,
+                         const uint8_t *pac, uint64_t first_single_id, bseq1_t *seqs,
+                         mem_alnreg_v *regs, size_t n, size_t origin_base)
+{
+    for (size_t i = 0; i < n; ++i)
+        single_and_emit(e, origin_base + i, first_single_id + (uint64_t)i,
+                        opt_se, bns, pac, seqs + i, regs + i);
 }
 
 /* Phase 3: pairing + mate rescue + primary marking + emission for one batch.
@@ -1391,75 +1610,17 @@ int shim_pair_emit(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc, Shi
     const uint8_t  *pac = idx->meth_orig_pac ? idx->meth_orig_pac : idx->fmi->idx->pac;
 
     mem_opt_t opt_pe = *opts; opt_pe.n_threads = 1; opt_pe.flag |= MEM_F_PE;
-    ShimEmit e = { sc, sink, ctx, 0u /* BWA_ORIGIN_PAIR */ };
-    /* Batched mate rescue is the only mate-rescue path upstream ships: the
-     * scalar mem_sam_pe / mem_pair_resolve pairing path (and the
-     * BWAMEM_BATCHED_MATESW / DISABLE_BATCHED_MATESW gate) were removed in
-     * fg-labs/bwa-mem3#513, which requires AVX2+ on x86 (NEON on arm).
-     *
-     * The CLI's worker_sam path on AVX2/AVX-512/NEON (bwamem.cpp:2826-2879):
-     * gather every pair's rescue jobs, run them through the SIMD kswv kernel
-     * once, then resolve + emit per pair. tid = 0: one ShimScratch per thread. */
-    if (r->n_pairs > 0) {
-        worker_t &w = sc->w;
-        /* Chunk the batched mate-rescue exactly as the CLI's kt_for dispatches
-         * worker_sam: BATCH_SIZE reads (= BATCH_SIZE/2 pairs) per work item
-         * (kthread.cpp:109-118, bwamem.cpp worker_sam ~L2788). The pre-loop's
-         * running pcnt/gcnt/maxRefLen/maxQerLen and, with them, the kswv seqBuf
-         * ref-window offset (SeqPair.idr, an int32 derived from the monotonic
-         * pcnt) reset at every chunk boundary, so the offset can never exceed
-         * int32 no matter how large the -K cohort or how long the reads
-         * (seqbuf_grow_capacity's SEQBUF_CAPACITY_OVERFLOW → seqbuf_capacity_fatal
-         * exit(), which would abort across the FFI boundary). Without the chunk
-         * loop a single running pcnt spanned all r->n_pairs, exactly the
-         * unbounded-offset the CLI avoids by resetting per BATCH_SIZE.
-         *
-         * Chunking is purely internal kswv/seqBuf batch bookkeeping. The
-         * per-pair rescue result is independent of how pairs are grouped, and
-         * the GLOBAL read-ordinal id (ids.first_pair_id + global pair index) and
-         * the emit order (global index i, ascending) are unchanged — only
-         * pcnt/gcnt/maxRefLen/maxQerLen/aln/myaln reset per chunk. So output
-         * stays byte-identical to the former single-batch path and to
-         * `bwa-mem3 mem -t 1 -p`. For n_pairs <= BATCH_SIZE/2 this is a single
-         * iteration, identical to before. */
-        const size_t pairs_per_chunk = (size_t)BATCH_SIZE / 2;
-        for (size_t chunk_start = 0; chunk_start < r->n_pairs; chunk_start += pairs_per_chunk) {
-            size_t chunk_end = chunk_start + pairs_per_chunk;
-            if (chunk_end > r->n_pairs) chunk_end = r->n_pairs;
-
-            int32_t maxRefLen = 0, maxQerLen = 0, gcnt = 0;
-            int64_t pcnt = 0;
-            for (size_t i = chunk_start; i < chunk_end; ++i)
-                mem_sam_pe_batch_pre(&opt_pe, bns, pac, pestat, ids.first_pair_id + (uint64_t)i,
-                                     r->seqs + 2*i, r->regs + 2*i, &w.mmc, pcnt, gcnt,
-                                     maxRefLen, maxQerLen, 0);
-            int64_t pcnt8 = sort_classify(&w.mmc, pcnt, 0);
-            kswr_t *aln = (kswr_t *) _mm_malloc((pcnt + SIMD_WIDTH8) * sizeof(kswr_t), 64);
-            xassert(aln != NULL, "out of memory: aln");
-            mem_sam_pe_batch(&opt_pe, &w.mmc, pcnt, pcnt8, aln, maxRefLen, maxQerLen, 0);
-            gcnt = 0;
-            kswr_t *myaln = aln;
-            for (size_t i = chunk_start; i < chunk_end; ++i) {
-                int n_pri[2], z[2], q_se[2], extra_flag, paired;
-                mem_pair_resolve_batch_post(&opt_pe, bns, pac, pestat, ids.first_pair_id + (uint64_t)i,
-                                            r->seqs + 2*i, r->regs + 2*i, &myaln, &w.mmc, gcnt, 0,
-                                            n_pri, z, q_se, &extra_flag, &paired);
-                emit_resolved_pair(&e, i, &opt_pe, bns, pac, r->seqs + 2*i, r->regs + 2*i, pestat,
-                                   n_pri, z, q_se, extra_flag, paired);
-            }
-            _mm_free(aln);
-        }
-    }
+    ShimEmit e = { sc, sink, ctx, 0u /* BWA_ORIGIN_PAIR */, nullptr };
+    pair_emit_pairs_chunked(&e, &opt_pe, bns, pac, pestat, ids.first_pair_id,
+                            r->seqs, r->regs, r->n_pairs, 0);
     /* Singles after pairs: SE group emitted with MEM_F_PE cleared, ids from
      * first_single_id, one origin_idx per single (index into batch->singles).
      * BWA_ORIGIN_SINGLE (1) distinguishes them from pairs at the sink. */
     mem_opt_t opt_se = *opts; opt_se.n_threads = 1; opt_se.flag &= ~MEM_F_PE;
     e.origin_kind = 1u /* BWA_ORIGIN_SINGLE */;
-    for (size_t i = 0; i < r->n_singles; ++i) {
-        size_t k = 2 * r->n_pairs + i;
-        single_and_emit(&e, i, ids.first_single_id + (uint64_t)i,
-                        &opt_se, bns, pac, r->seqs + k, r->regs + k);
-    }
+    size_t k = 2 * r->n_pairs;
+    emit_singles(&e, &opt_se, bns, pac, ids.first_single_id, r->seqs + k, r->regs + k,
+                 r->n_singles, 0);
     shim_regs_free(r);
     return 0;
 }
@@ -2014,6 +2175,269 @@ void shim_align_out_free(ShimAlignOutput *out) {
     if (!out) return;
     free(out->buf); free(out->rec_off); free(out->rec_len); free(out->pair_idx);
     free(out);
+}
+
+/* ==================================================================
+ * Resident-cohort aligner
+ *
+ * Keeps a -K cohort's decoded reads (bseq1_t[]) and their alignment
+ * regions (mem_alnreg_v[]) RESIDENT across the seed_extend -> pestat ->
+ * pair_emit phases, instead of the self-contained-per-sub-batch ShimRegs
+ * that shim_seed_extend/shim_pair_emit allocate and free on every call.
+ * Each sub-chunk owns one reserved SEGMENT of the resident cohort; no
+ * sub-chunk allocates or frees the arrays. A segment is a separate
+ * allocation, so a later reserve() -- which only grows the table of segment
+ * pointers -- never moves it.
+ *
+ * The per-segment calls run the same helpers as the legacy path
+ * (decode_read, seed_extend_reads, pestat_over_headers,
+ * pair_emit_pairs_chunked, emit_singles), so the two paths cannot diverge.
+ * The safe wrapper is bwa-mem3-rs's `ResidentCohort`.
+ * ================================================================== */
+
+/* One reserved sub-chunk of a resident region: its reads, their alnreg
+ * headers, and its lifecycle state. Allocated separately (one per reserve) so
+ * its address is stable for the cohort's whole lifetime -- a later reserve only
+ * grows the region's table of segment POINTERS, never moves a segment. Every
+ * per-segment call takes the segment directly and never consults the table,
+ * which is what lets those calls run concurrently with a reserve.
+ *
+ * Only the one caller holding a segment's range touches it (the bwa-mem3-rs
+ * wrapper enforces that with a move-only range token); the whole-cohort call
+ * (pestat) reads every segment and must exclude per-segment calls. */
+struct ShimResidentSegment {
+    bseq1_t      *seqs;       /* n reads; pairs R1/R2 interleaved */
+    mem_alnreg_v *regs;       /* parallel per-read alnreg headers */
+    size_t        n;          /* reads */
+    size_t        base;       /* inclusive-start read offset within its region */
+    int           is_pairs;
+    int           meth_mode;
+    int           extended;   /* seed_extend has run; the reads are 2-bit encoded */
+    int           emitted;    /* pair_emit has run; mate rescue has grown its regs */
+};
+
+/* One resident region (pairs or singles) for one bwa-mem3 -p group: a growable
+ * table of segment pointers, in reserve order. */
+struct ShimResidentRegion {
+    ShimResidentSegment **segs;
+    size_t                n_segments;
+    size_t                cap_segments;
+    size_t                len;        /* total reserved reads */
+};
+
+struct ShimResidentCohort {
+    ShimResidentRegion pairs;    /* 2*n_pairs reads, R1/R2 interleaved */
+    ShimResidentRegion singles;
+    int meth_mode;
+};
+
+static void resident_segment_free(ShimResidentSegment *sg) {
+    for (size_t i = 0; i < sg->n; ++i) {
+        /* Same per-read teardown as free_seqs + shim_regs_free's regs loop:
+         * free() is NULL-safe on the fields a partial write left unbuilt. */
+        free(sg->seqs[i].name); free(sg->seqs[i].seq); free(sg->seqs[i].qual);
+        free(sg->seqs[i].sam);  free(sg->seqs[i].meth_orig_seq);
+        free(sg->regs[i].a);
+    }
+    free(sg->seqs); free(sg->regs); free(sg);
+}
+
+static void resident_region_free(ShimResidentRegion *rg) {
+    for (size_t s = 0; s < rg->n_segments; ++s) resident_segment_free(rg->segs[s]);
+    free(rg->segs);
+    memset(rg, 0, sizeof(*rg));
+}
+
+/* Append a new segment of `n_reads` reads and return it (NULL on allocation
+ * failure, leaving the region unchanged). Single-writer: must not run
+ * concurrently with another reserve or with pestat on this cohort, but MAY run
+ * concurrently with per-segment calls on already-returned segments. */
+static ShimResidentSegment *resident_region_reserve(ShimResidentRegion *rg, size_t n_reads,
+                                                    int is_pairs, int meth_mode) {
+    if (rg->n_segments == rg->cap_segments) {
+        size_t newcap = rg->cap_segments ? rg->cap_segments * 2 : 8;
+        ShimResidentSegment **ns =
+            (ShimResidentSegment **) realloc(rg->segs, newcap * sizeof(*ns));
+        if (!ns) return nullptr;
+        rg->segs = ns;
+        rg->cap_segments = newcap;
+    }
+    ShimResidentSegment *sg = (ShimResidentSegment *) calloc(1, sizeof(ShimResidentSegment));
+    if (!sg) return nullptr;
+    /* calloc(0,...) may legally return NULL; guard n_reads==0 so that is not
+     * mistaken for OOM (matches copy_pairs_to_seqs's empty-batch handling). */
+    sg->seqs = (bseq1_t *) calloc(n_reads ? n_reads : 1, sizeof(bseq1_t));
+    sg->regs = (mem_alnreg_v *) calloc(n_reads ? n_reads : 1, sizeof(mem_alnreg_v));
+    if (!sg->seqs || !sg->regs) { free(sg->seqs); free(sg->regs); free(sg); return nullptr; }
+    sg->n = n_reads;
+    sg->base = rg->len;
+    sg->is_pairs = is_pairs;
+    sg->meth_mode = meth_mode;
+    rg->segs[rg->n_segments++] = sg;
+    rg->len += n_reads;
+    return sg;
+}
+
+ShimResidentCohort *shim_resident_cohort_new(int meth_mode) {
+    ShimResidentCohort *c = (ShimResidentCohort *) calloc(1, sizeof(ShimResidentCohort));
+    if (!c) return nullptr;
+    c->meth_mode = meth_mode;   /* pairs/singles are zeroed by calloc */
+    return c;
+}
+
+void shim_resident_cohort_free(ShimResidentCohort *c) {
+    if (!c) return;
+    resident_region_free(&c->pairs);
+    resident_region_free(&c->singles);
+    free(c);
+}
+
+/* Heap bytes a reserved read costs before anything is written into it: its
+ * bseq1_t and mem_alnreg_v headers. */
+size_t shim_resident_read_overhead(void) {
+    return sizeof(bseq1_t) + sizeof(mem_alnreg_v);
+}
+
+ShimResidentSegment *shim_resident_reserve_pairs(ShimResidentCohort *c, size_t n_reads,
+                                                 size_t *first_out) {
+    if (!c || !first_out || n_reads % 2 != 0) return nullptr;
+    ShimResidentSegment *sg = resident_region_reserve(&c->pairs, n_reads, 1, c->meth_mode);
+    if (sg) *first_out = sg->base;
+    return sg;
+}
+ShimResidentSegment *shim_resident_reserve_singles(ShimResidentCohort *c, size_t n_reads,
+                                                   size_t *first_out) {
+    if (!c || !first_out) return nullptr;
+    ShimResidentSegment *sg = resident_region_reserve(&c->singles, n_reads, 0, c->meth_mode);
+    if (sg) *first_out = sg->base;
+    return sg;
+}
+
+/* Write pair `i` of a pair segment (reads 2i, 2i+1), adding the bytes it
+ * copies to *added. Returns 0, -1 on a null arg / bad index / wrong region /
+ * OOM, or -3 when the segment was already seed-extended or the slot already
+ * written (rewriting would leak the old buffers, and an ASCII read under 2-bit
+ * regs would feed the kernels garbage). */
+int shim_resident_write_pair(ShimResidentSegment *sg, size_t i, const ShimReadPair *pair,
+                             size_t *added) {
+    if (!sg || !pair || !added || !sg->is_pairs || i >= sg->n / 2) return -1;
+    bseq1_t *r1 = &sg->seqs[2 * i], *r2 = &sg->seqs[2 * i + 1];
+    if (sg->extended || r1->name || r2->name) return -3;
+    if (decode_read(r1, pair->r1_name, pair->r1_name_len, pair->r1_seq, pair->r1_seq_len,
+                    pair->r1_qual, sg->meth_mode, 0, added) != 0) return -1;
+    if (decode_read(r2, pair->r2_name, pair->r2_name_len, pair->r2_seq, pair->r2_seq_len,
+                    pair->r2_qual, sg->meth_mode, 1, added) != 0) return -1;
+    return 0;
+}
+int shim_resident_write_single(ShimResidentSegment *sg, size_t i, const ShimSingleRead *single,
+                               size_t *added) {
+    if (!sg || !single || !added || sg->is_pairs || i >= sg->n) return -1;
+    bseq1_t *s = &sg->seqs[i];
+    if (sg->extended || s->name) return -3;
+    return decode_read(s, single->name, single->name_len, single->seq, single->seq_len,
+                       single->qual, sg->meth_mode, 0, added);
+}
+
+/* Seed + SE-extend a whole segment (pairs or singles). Returns 0, -1 on a null
+ * arg, or -3 when it was already extended or any slot is unwritten (a NULL seq
+ * would crash the seeding kernel). */
+int shim_resident_seed_extend(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
+                              ShimResidentSegment *sg) {
+    if (!idx_opaque || !opts || !sc || !sg) return -1;
+    if (sg->extended) return -3;
+    for (size_t i = 0; i < sg->n; ++i)
+        if (!sg->seqs[i].seq) return -3;
+    BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
+    /* The per-group opt copy shim_seed_extend makes (MEM_F_PE on for pairs, off
+     * for singles). */
+    mem_opt_t opt = *opts; opt.n_threads = 1;
+    if (sg->is_pairs) opt.flag |= MEM_F_PE; else opt.flag &= ~MEM_F_PE;
+    seed_extend_reads(sc, idx, &opt, sg->seqs, sg->regs, (int) sg->n);
+    sg->extended = 1;
+    return 0;
+}
+
+/* mem_pestat over the WHOLE resident pair region (every read there is a PE
+ * read). Gathers the 24-byte alnreg headers across segments into one contiguous
+ * array, like shim_pestat_cohort's gather, but off the resident segments, so a
+ * caller no longer has to collect every sub-batch's regs to call it. A
+ * whole-cohort call: must not run concurrently with any per-segment call or
+ * reserve. Returns 0, -1 on a null arg / OOM, or -3 when some pair segment is
+ * not seed-extended yet (the model would silently omit its reads) or has
+ * already been emitted (mate rescue has appended to its regs, so the model
+ * would no longer be the one the CLI computes before pairing). */
+int shim_resident_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
+                                const ShimResidentCohort *c, mem_pestat_t *out) {
+    if (!idx_opaque || !opts || !c || !out) return -1;
+    for (size_t s = 0; s < c->pairs.n_segments; ++s)
+        if (!c->pairs.segs[s]->extended || c->pairs.segs[s]->emitted) return -3;
+    size_t total = c->pairs.len;
+    mem_alnreg_v *cat = total ? (mem_alnreg_v *) malloc(total * sizeof(mem_alnreg_v)) : nullptr;
+    if (total && !cat) return -1;
+    size_t at = 0;
+    for (size_t s = 0; s < c->pairs.n_segments; ++s) {
+        const ShimResidentSegment *sg = c->pairs.segs[s];
+        if (sg->n) memcpy(cat + at, sg->regs, sg->n * sizeof(mem_alnreg_v));
+        at += sg->n;
+    }
+    pestat_over_headers(static_cast<BwaShimIndex *>(idx_opaque), opts, cat, total, out);
+    free(cat);
+    return 0;
+}
+
+/* Pair + mate-rescue + emit a pair segment, or SE-emit a single segment,
+ * WITHOUT freeing it. `ids.first_pair_id` / `first_single_id` is the GLOBAL
+ * read ordinal of the segment's first pair/single; `origin_base` is added to
+ * the local index for the sink's origin_idx. Exactly one of `sink` /
+ * `field_sink` is set. Returns 0, -1 on a null arg, -2 when a pair segment has
+ * pairs and no pestat, or -3 when it was not seed-extended or was already
+ * emitted (mate rescue appended to its regs on the first emission, so a second
+ * would not reproduce it). */
+static int resident_pair_emit(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
+                              ShimResidentSegment *sg, const mem_pestat_t *pestat,
+                              ShimIdBases ids, size_t origin_base, ShimRecordSinkFn sink,
+                              ShimFieldSinkFn field_sink, void *ctx) {
+    if (!idx_opaque || !opts || !sc || !sg || (!sink && !field_sink)) return -1;
+    if (sg->is_pairs && sg->n > 0 && !pestat) return -2;
+    if (!sg->extended || sg->emitted) return -3;
+    BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
+    const bntseq_t *bns = idx->meth_orig_bns ? idx->meth_orig_bns : idx->fmi->idx->bns;
+    const uint8_t  *pac = idx->meth_orig_pac ? idx->meth_orig_pac : idx->fmi->idx->pac;
+    sg->emitted = 1;
+    if (sg->is_pairs) {
+        mem_opt_t opt_pe = *opts; opt_pe.n_threads = 1; opt_pe.flag |= MEM_F_PE;
+        ShimEmit e = { sc, sink, ctx, 0u /* BWA_ORIGIN_PAIR */, field_sink };
+        pair_emit_pairs_chunked(&e, &opt_pe, bns, pac, pestat, ids.first_pair_id,
+                                sg->seqs, sg->regs, sg->n / 2, origin_base);
+    } else {
+        mem_opt_t opt_se = *opts; opt_se.n_threads = 1; opt_se.flag &= ~MEM_F_PE;
+        ShimEmit e = { sc, sink, ctx, 1u /* BWA_ORIGIN_SINGLE */, field_sink };
+        emit_singles(&e, &opt_se, bns, pac, ids.first_single_id, sg->seqs, sg->regs, sg->n,
+                     origin_base);
+    }
+    return 0;
+}
+
+int shim_resident_pair_emit(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
+                            ShimResidentSegment *sg, const mem_pestat_t *pestat,
+                            ShimIdBases ids, size_t origin_base,
+                            ShimRecordSinkFn sink, void *ctx) {
+    if (!sink) return -1;
+    return resident_pair_emit(idx_opaque, opts, sc, sg, pestat, ids, origin_base,
+                              sink, nullptr, ctx);
+}
+
+/* shim_resident_pair_emit, reporting each record's structured fields to
+ * `field_sink` instead of its packed BAM body. Same resolution, same records,
+ * same order: both variants share resident_pair_emit and differ only in
+ * append_bam_record's last step. */
+int shim_resident_pair_emit_fields(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
+                                   ShimResidentSegment *sg, const mem_pestat_t *pestat,
+                                   ShimIdBases ids, size_t origin_base,
+                                   ShimFieldSinkFn field_sink, void *ctx) {
+    if (!field_sink) return -1;
+    return resident_pair_emit(idx_opaque, opts, sc, sg, pestat, ids, origin_base,
+                              nullptr, field_sink, ctx);
 }
 
 } /* extern "C" */

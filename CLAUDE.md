@@ -168,7 +168,7 @@ any seed whose genomic strand disagrees with the read's. Leaving it zero is not
 inert — `0` is the *valid* encoding for OB, so the filter runs and silently
 discards every R1 seed (it only self-disables at `< 0`). `mem_reg2aln` and
 `mem_gen_alt` both take `meth_orig_seq` so NM/MD/CIGAR — and every `XA:Z`
-sub-entry's NM — reflect the original read rather than the projected one, and `append_bam_record` emits Bismark `XR:Z` (read conversion,
+sub-entry's NM — reflect the original read rather than the projected one, and `compute_record_fields` (called by `append_bam_record` for both the packed-BAM and structured-fields sinks) emits Bismark `XR:Z` (read conversion,
 from R1/R2), `XG:Z` (genome strand, from `mem_aln_t.meth_hypothesis`), and
 `XM:Z` (via upstream `meth_build_xm`, which is compiled — only `meth_bam.cpp`,
 the htslib writer, is excluded; it takes a `meth_chem_t` chemistry argument as
@@ -185,6 +185,17 @@ non-NULL `meth_orig_*`, so the non-meth path is unchanged. Output matches the
 CLI byte-for-byte on every record including secondaries/`XA:Z`
 (`bwa-mem3-rs-cli/tests/meth_e2e.rs` pins this), because `emit_resolved_pair`
 replicates `mem_reg2sam`'s XA folding (see gotcha #12).
+
+**SEQ under `--meth` is the ORIGINAL read, not `s->seq`.** `s->seq` holds the
+bisulfite-projected read the seeds matched; upstream's meth writer restores the
+original bases for MethylDackel, upper-casing the forward strand (IUPAC codes
+kept) and complementing the reverse through `nst_nt4_table` (anything but ACGT
+becomes N). `serialize_record` does the same from `meth_orig_seq`. This was
+wrong until the parity comparator (`record_key_fields`) started comparing SEQ
+and QUAL: before that, projected bases matched every compared field. Two
+related rules both writers share and the shim follows: a raw-`0x100`
+(`-a` secondary) record carries no SEQ/QUAL, and `bin` is htslib `bam_set1`'s
+(`reg2bin(pos, pos + max(rlen, 1))`, so a placed-unmapped read is not 4680).
 
 ### 12. `emit_resolved_pair` folds secondaries into `XA:Z` like `mem_reg2sam`
 
@@ -309,8 +320,8 @@ selector, so the only reachable row is `COMPAT_TARGET_OFF` — which turns
 | field | honored | where |
 |---|---|---|
 | `emit_hd` / `hd_line` | yes | `MemOpts::compat_hd_line` → `write_bam_header` |
-| `emit_mq` | yes | `append_bam_record` |
-| `emit_hn` | yes | `append_bam_record` |
+| `emit_mq` | yes | `compute_record_fields` |
+| `emit_hn` | yes | `compute_record_fields` |
 | `read_sidecar` | **no — deliberate** | see below |
 
 `emit_hd` was a live bug until it was wired up: `write_bam_header` hardcoded

@@ -66,6 +66,17 @@ fn prefix_to_cstring(prefix: &Path, what: &str) -> Result<CString> {
 /// `BwaIndex` via `&BwaIndex` or `Arc<BwaIndex>` for concurrent alignment.
 pub struct BwaIndex {
     handle: *mut bwa_mem3_sys::BwaIndex,
+    /// Unique per loaded index for the process lifetime (never reused, unlike
+    /// the handle's address), so state built against one index can recognize
+    /// a different one.
+    id: u64,
+}
+
+/// Source of [`BwaIndex`] identities; starts at 1 so 0 can mean "none".
+static NEXT_INDEX_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_index_id() -> u64 {
+    NEXT_INDEX_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl BwaIndex {
@@ -112,7 +123,10 @@ impl BwaIndex {
                 msg: shim_err("idx load").to_string(),
             });
         }
-        Ok(BwaIndex { handle })
+        Ok(BwaIndex {
+            handle,
+            id: next_index_id(),
+        })
     }
 
     /// As [`load`](Self::load), but loads the FM-index with `n_threads`
@@ -139,7 +153,10 @@ impl BwaIndex {
                 msg: shim_err("idx load").to_string(),
             });
         }
-        Ok(BwaIndex { handle })
+        Ok(BwaIndex {
+            handle,
+            id: next_index_id(),
+        })
     }
 
     /// Load a bisulfite (BS-seq) **dual index** for `--meth` alignment.
@@ -171,7 +188,10 @@ impl BwaIndex {
                 msg: shim_err("meth idx load").to_string(),
             });
         }
-        Ok(BwaIndex { handle })
+        Ok(BwaIndex {
+            handle,
+            id: next_index_id(),
+        })
     }
 
     /// Whether this index was loaded as a bisulfite dual index via
@@ -206,6 +226,11 @@ impl BwaIndex {
 
     pub fn contigs(&self) -> impl Iterator<Item = (&str, i64)> + '_ {
         (0..self.n_contigs()).map(move |i| (self.contig_name(i), self.contig_len(i)))
+    }
+
+    /// This index's process-unique identity (see the field doc).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     pub(crate) fn raw(&self) -> *mut bwa_mem3_sys::BwaIndex {

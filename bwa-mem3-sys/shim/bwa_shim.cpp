@@ -120,6 +120,34 @@ extern "C" {
     int shim_pair_emit(void *fmi, const mem_opt_t *opts, ShimScratch *sc, ShimRegs *regs,
                        const mem_pestat_t *pestat, ShimIdBases ids, ShimRecordSinkFn sink, void *ctx);
 
+    /* Resident-cohort three-phase primitives. */
+    struct ShimResidentCohort; struct ShimResidentSegment;
+    ShimResidentCohort *shim_resident_cohort_new(int meth_mode);
+    void   shim_resident_cohort_free(ShimResidentCohort *c);
+    size_t shim_resident_read_overhead(void);
+    ShimResidentSegment *shim_resident_reserve_pairs(ShimResidentCohort *c, size_t n_reads,
+                                                     size_t *first_out);
+    ShimResidentSegment *shim_resident_reserve_singles(ShimResidentCohort *c, size_t n_reads,
+                                                       size_t *first_out);
+    int    shim_resident_write_pair(ShimResidentSegment *sg, size_t i, const ShimReadPair *pair,
+                                    size_t *added);
+    int    shim_resident_write_single(ShimResidentSegment *sg, size_t i,
+                                      const ShimSingleRead *single, size_t *added);
+    int    shim_resident_seed_extend(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
+                                     ShimResidentSegment *sg);
+    int    shim_resident_pestat_cohort(void *fmi, const mem_opt_t *opts,
+                                       const ShimResidentCohort *c, mem_pestat_t *out);
+    int    shim_resident_pair_emit(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
+                                   ShimResidentSegment *sg, const mem_pestat_t *pestat,
+                                   ShimIdBases ids, size_t origin_base,
+                                   ShimRecordSinkFn sink, void *ctx);
+    /* Structured-fields variant; BwaFieldSinkFn comes from bwa_shim_fields.h,
+     * which bwa_shim_align.cpp includes too, so there is no mirrored layout. */
+    int    shim_resident_pair_emit_fields(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
+                                          ShimResidentSegment *sg, const mem_pestat_t *pestat,
+                                          ShimIdBases ids, size_t origin_base,
+                                          BwaFieldSinkFn sink, void *ctx);
+
     size_t         shim_align_out_n_recs(ShimAlignOutput *out);
     size_t         shim_align_out_pair_idx(ShimAlignOutput *out, size_t i);
     const uint8_t *shim_align_out_rec_ptr(ShimAlignOutput *out, size_t i);
@@ -593,6 +621,118 @@ extern "C" int bwa_shim_pair_emit(const BwaIndex *idx, const mem_opt_t *opts, Bw
     if (rc == -2) { shim_set_err("pair_emit: a batch with pairs requires a cohort pestat (pass bwa_shim_pestat_cohort's output)"); return -1; }
     if (rc != 0)  { shim_set_err("pair_emit failed"); return -1; }
     return 0;
+}
+
+/* ---- resident-cohort three-phase API ---------------------------- */
+
+struct BwaResidentCohort { struct ShimResidentCohort *inner; };
+/* BwaResidentSegment is never defined: a BwaResidentSegment* IS the shim's
+ * ShimResidentSegment*, cast at this boundary. */
+static ShimResidentSegment *shim_seg(BwaResidentSegment *sg) {
+    return reinterpret_cast<ShimResidentSegment *>(sg);
+}
+
+extern "C" BwaResidentCohort *bwa_shim_resident_cohort_new(int meth_mode) {
+    shim_clear_err();
+    ShimResidentCohort *inner = shim_resident_cohort_new(meth_mode);
+    if (!inner) { shim_set_err("resident_cohort_new failed"); return NULL; }
+    BwaResidentCohort *c = (BwaResidentCohort *) calloc(1, sizeof(BwaResidentCohort));
+    if (!c) { shim_resident_cohort_free(inner); shim_set_err("calloc failed"); return NULL; }
+    c->inner = inner;
+    return c;
+}
+extern "C" void bwa_shim_resident_cohort_free(BwaResidentCohort *c) {
+    if (!c) return;
+    shim_resident_cohort_free(c->inner);
+    free(c);
+}
+extern "C" size_t bwa_shim_resident_read_overhead(void) {
+    return shim_resident_read_overhead();
+}
+
+/* Map a shim status to the public contract, recording why it failed. The -3
+ * message is complete on its own: the Rust wrapper surfaces it verbatim. */
+static int resident_status(int rc, const char *what) {
+    if (rc == 0) return 0;
+    if (rc == -2) { shim_set_err("%s: pairs require a cohort pestat", what); return -2; }
+    if (rc == -3) { shim_set_err("%s: resident range lifecycle violated", what); return -3; }
+    shim_set_err("%s failed", what);
+    return -1;
+}
+
+extern "C" BwaResidentSegment *bwa_shim_resident_reserve_pairs(BwaResidentCohort *c,
+                                                               size_t n_reads,
+                                                               size_t *first_out) {
+    shim_clear_err();
+    if (!c || !first_out) { shim_set_err("null arg"); return NULL; }
+    ShimResidentSegment *sg = shim_resident_reserve_pairs(c->inner, n_reads, first_out);
+    if (!sg) shim_set_err("resident_reserve_pairs failed (odd n_reads or OOM)");
+    return reinterpret_cast<BwaResidentSegment *>(sg);
+}
+extern "C" BwaResidentSegment *bwa_shim_resident_reserve_singles(BwaResidentCohort *c,
+                                                                 size_t n_reads,
+                                                                 size_t *first_out) {
+    shim_clear_err();
+    if (!c || !first_out) { shim_set_err("null arg"); return NULL; }
+    ShimResidentSegment *sg = shim_resident_reserve_singles(c->inner, n_reads, first_out);
+    if (!sg) shim_set_err("resident_reserve_singles failed (OOM)");
+    return reinterpret_cast<BwaResidentSegment *>(sg);
+}
+extern "C" int bwa_shim_resident_write_pair(BwaResidentSegment *sg, size_t i,
+                                            const BwaReadPair *pair, size_t *added) {
+    shim_clear_err();
+    return resident_status(
+        shim_resident_write_pair(shim_seg(sg), i, reinterpret_cast<const ShimReadPair *>(pair),
+                                 added),
+        "resident_write_pair");
+}
+extern "C" int bwa_shim_resident_write_single(BwaResidentSegment *sg, size_t i,
+                                              const BwaSingleRead *single, size_t *added) {
+    shim_clear_err();
+    return resident_status(
+        shim_resident_write_single(shim_seg(sg), i,
+                                   reinterpret_cast<const ShimSingleRead *>(single), added),
+        "resident_write_single");
+}
+extern "C" int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
+                                             BwaScratch *sc, BwaResidentSegment *sg) {
+    shim_clear_err();
+    if (!idx || !opts || !sc || !sg) { shim_set_err("null arg"); return -1; }
+    return resident_status(shim_resident_seed_extend(idx->fmi, opts, sc->inner, shim_seg(sg)),
+                           "resident_seed_extend");
+}
+extern "C" int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
+                                               const BwaResidentCohort *c, mem_pestat_t *out) {
+    shim_clear_err();
+    if (!idx || !opts || !c || !out) { shim_set_err("null arg"); return -1; }
+    return resident_status(shim_resident_pestat_cohort(idx->fmi, opts, c->inner, out),
+                           "resident_pestat_cohort");
+}
+extern "C" int bwa_shim_resident_pair_emit(const BwaIndex *idx, const mem_opt_t *opts,
+                                           BwaScratch *sc, BwaResidentSegment *sg,
+                                           const mem_pestat_t *pestat, BwaIdBases ids,
+                                           size_t origin_base, BwaRecordSinkFn sink,
+                                           void *ctx) {
+    shim_clear_err();
+    if (!idx || !opts || !sc || !sg || !sink) { shim_set_err("null arg"); return -1; }
+    ShimIdBases sids = { ids.first_single_id, ids.first_pair_id };
+    return resident_status(
+        shim_resident_pair_emit(idx->fmi, opts, sc->inner, shim_seg(sg), pestat, sids,
+                                origin_base, reinterpret_cast<ShimRecordSinkFn>(sink), ctx),
+        "resident_pair_emit");
+}
+extern "C" int bwa_shim_resident_pair_emit_fields(const BwaIndex *idx, const mem_opt_t *opts,
+                                                  BwaScratch *sc, BwaResidentSegment *sg,
+                                                  const mem_pestat_t *pestat, BwaIdBases ids,
+                                                  size_t origin_base, BwaFieldSinkFn sink,
+                                                  void *ctx) {
+    shim_clear_err();
+    if (!idx || !opts || !sc || !sg || !sink) { shim_set_err("null arg"); return -1; }
+    ShimIdBases sids = { ids.first_single_id, ids.first_pair_id };
+    return resident_status(
+        shim_resident_pair_emit_fields(idx->fmi, opts, sc->inner, shim_seg(sg), pestat, sids,
+                                       origin_base, sink, ctx),
+        "resident_pair_emit_fields");
 }
 
 extern "C" size_t bwa_shim_batch_n_records(const BwaBatch *b) {

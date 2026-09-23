@@ -133,6 +133,7 @@ dependencies = [
  "bwa-mem3-sys",
  "libc",
  "rayon",
+ "rstest",
  "tempfile",
  "thiserror",
 ]

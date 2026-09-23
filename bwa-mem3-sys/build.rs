@@ -59,6 +59,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/bwa_shim_layout_assert.cpp");
     println!("cargo:rerun-if-changed=shim/bwa_shim.h");
     println!("cargo:rerun-if-changed=shim/bwa_shim_types.h");
+    println!("cargo:rerun-if-changed=shim/bwa_shim_fields.h");
     println!("cargo:rerun-if-changed=vendor/COMMIT");
     println!("cargo:rerun-if-changed=patches");
 
@@ -686,6 +687,8 @@ fn check_or_regenerate_bindings(manifest: &Path, out: &Path) {
             .allowlist_type("BwaSingleRead")
             .allowlist_type("BwaIdBases")
             .allowlist_type("BwaRecordSinkFn")
+            .allowlist_type("BwaAlignedFields")
+            .allowlist_type("BwaFieldSinkFn")
             .allowlist_type("mem_opt_t")
             .allowlist_type("mem_pestat_t")
             .allowlist_function("bwa_shim_.*")
