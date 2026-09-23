@@ -832,6 +832,396 @@ fn bindgen_test_layout_mem_pestat_t() {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct BwaAlignedFields {
+    pub tid: i32,
+    pub pos: i32,
+    pub next_tid: i32,
+    pub next_pos: i32,
+    pub tlen: i32,
+    pub flag: u16,
+    pub bin: u16,
+    pub mapq: u8,
+    pub query_start: i32,
+    pub query_end: i32,
+    pub cigar: *const u32,
+    pub n_cigar: u32,
+    pub has_nm: u8,
+    pub nm: i32,
+    pub md: *const ::std::os::raw::c_char,
+    pub mc: *const ::std::os::raw::c_char,
+    pub has_mq: u8,
+    pub mq: i32,
+    pub has_as: u8,
+    pub score: i32,
+    pub has_xs: u8,
+    pub sub: i32,
+    pub rg: *const ::std::os::raw::c_char,
+    pub sa: *const ::std::os::raw::c_char,
+    pub has_pa: u8,
+    pub pa: f32,
+    pub xa: *const ::std::os::raw::c_char,
+    pub has_hn: u8,
+    pub hn: i32,
+    pub xr: *const ::std::os::raw::c_char,
+    pub xg: *const ::std::os::raw::c_char,
+    pub xm: *const ::std::os::raw::c_char,
+}
+#[test]
+fn bindgen_test_layout_BwaAlignedFields() {
+    const UNINIT: ::std::mem::MaybeUninit<BwaAlignedFields> = ::std::mem::MaybeUninit::uninit();
+    let ptr = UNINIT.as_ptr();
+    assert_eq!(
+        ::std::mem::size_of::<BwaAlignedFields>(),
+        168usize,
+        concat!("Size of: ", stringify!(BwaAlignedFields))
+    );
+    assert_eq!(
+        ::std::mem::align_of::<BwaAlignedFields>(),
+        8usize,
+        concat!("Alignment of ", stringify!(BwaAlignedFields))
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).tid) as usize - ptr as usize },
+        0usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(tid)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).pos) as usize - ptr as usize },
+        4usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(pos)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).next_tid) as usize - ptr as usize },
+        8usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(next_tid)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).next_pos) as usize - ptr as usize },
+        12usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(next_pos)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).tlen) as usize - ptr as usize },
+        16usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(tlen)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).flag) as usize - ptr as usize },
+        20usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(flag)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).bin) as usize - ptr as usize },
+        22usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(bin)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).mapq) as usize - ptr as usize },
+        24usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(mapq)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).query_start) as usize - ptr as usize },
+        28usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(query_start)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).query_end) as usize - ptr as usize },
+        32usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(query_end)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).cigar) as usize - ptr as usize },
+        40usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(cigar)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).n_cigar) as usize - ptr as usize },
+        48usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(n_cigar)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).has_nm) as usize - ptr as usize },
+        52usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(has_nm)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).nm) as usize - ptr as usize },
+        56usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(nm)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).md) as usize - ptr as usize },
+        64usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(md)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).mc) as usize - ptr as usize },
+        72usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(mc)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).has_mq) as usize - ptr as usize },
+        80usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(has_mq)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).mq) as usize - ptr as usize },
+        84usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(mq)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).has_as) as usize - ptr as usize },
+        88usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(has_as)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).score) as usize - ptr as usize },
+        92usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(score)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).has_xs) as usize - ptr as usize },
+        96usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(has_xs)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).sub) as usize - ptr as usize },
+        100usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(sub)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).rg) as usize - ptr as usize },
+        104usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(rg)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).sa) as usize - ptr as usize },
+        112usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(sa)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).has_pa) as usize - ptr as usize },
+        120usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(has_pa)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).pa) as usize - ptr as usize },
+        124usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(pa)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).xa) as usize - ptr as usize },
+        128usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(xa)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).has_hn) as usize - ptr as usize },
+        136usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(has_hn)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).hn) as usize - ptr as usize },
+        140usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(hn)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).xr) as usize - ptr as usize },
+        144usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(xr)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).xg) as usize - ptr as usize },
+        152usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(xg)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).xm) as usize - ptr as usize },
+        160usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(xm)
+        )
+    );
+}
+impl Default for BwaAlignedFields {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type BwaFieldSinkFn = ::std::option::Option<
+    unsafe extern "C" fn(
+        ctx: *mut ::std::os::raw::c_void,
+        origin_kind: u32,
+        origin_idx: usize,
+        mate: u8,
+        is_primary: ::std::os::raw::c_int,
+        f: *const BwaAlignedFields,
+    ),
+>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct BwaIndex {
     _unused: [u8; 0],
 }
@@ -853,6 +1243,16 @@ pub struct BwaScratch {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BwaRegs {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct BwaResidentCohort {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct BwaResidentSegment {
     _unused: [u8; 0],
 }
 #[repr(C)]
@@ -1347,6 +1747,88 @@ extern "C" {
         pestat: *const mem_pestat_t,
         ids: BwaIdBases,
         sink: BwaRecordSinkFn,
+        ctx: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_resident_cohort_new(meth_mode: ::std::os::raw::c_int)
+        -> *mut BwaResidentCohort;
+}
+extern "C" {
+    pub fn bwa_shim_resident_cohort_free(c: *mut BwaResidentCohort);
+}
+extern "C" {
+    pub fn bwa_shim_resident_read_overhead() -> usize;
+}
+extern "C" {
+    pub fn bwa_shim_resident_reserve_pairs(
+        c: *mut BwaResidentCohort,
+        n_reads: usize,
+        first_out: *mut usize,
+    ) -> *mut BwaResidentSegment;
+}
+extern "C" {
+    pub fn bwa_shim_resident_reserve_singles(
+        c: *mut BwaResidentCohort,
+        n_reads: usize,
+        first_out: *mut usize,
+    ) -> *mut BwaResidentSegment;
+}
+extern "C" {
+    pub fn bwa_shim_resident_write_pair(
+        sg: *mut BwaResidentSegment,
+        i: usize,
+        pair: *const BwaReadPair,
+        added: *mut usize,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_resident_write_single(
+        sg: *mut BwaResidentSegment,
+        i: usize,
+        single: *const BwaSingleRead,
+        added: *mut usize,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_resident_seed_extend(
+        idx: *const BwaIndex,
+        opts: *const mem_opt_t,
+        sc: *mut BwaScratch,
+        sg: *mut BwaResidentSegment,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_resident_pestat_cohort(
+        idx: *const BwaIndex,
+        opts: *const mem_opt_t,
+        c: *const BwaResidentCohort,
+        out: *mut mem_pestat_t,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_resident_pair_emit(
+        idx: *const BwaIndex,
+        opts: *const mem_opt_t,
+        sc: *mut BwaScratch,
+        sg: *mut BwaResidentSegment,
+        pestat: *const mem_pestat_t,
+        ids: BwaIdBases,
+        origin_base: usize,
+        sink: BwaRecordSinkFn,
+        ctx: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_resident_pair_emit_fields(
+        idx: *const BwaIndex,
+        opts: *const mem_opt_t,
+        sc: *mut BwaScratch,
+        sg: *mut BwaResidentSegment,
+        pestat: *const mem_pestat_t,
+        ids: BwaIdBases,
+        origin_base: usize,
+        sink: BwaFieldSinkFn,
         ctx: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }
