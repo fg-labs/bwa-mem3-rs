@@ -37,6 +37,22 @@ impl From<std::ffi::NulError> for Error {
 }
 
 /// Fetch the shim's thread-local last-error string and wrap it into [`Error::Shim`].
+/// The shim's last error message on this thread, verbatim (for messages that
+/// are already complete, like the resident lifecycle errors).
+pub(crate) fn shim_last_message() -> String {
+    // SAFETY: `bwa_shim_last_error` returns NULL or a pointer to this thread's
+    // NUL-terminated error buffer, which stays valid until the next shim call
+    // on this thread; it is copied out before returning.
+    unsafe {
+        let ptr = bwa_mem3_sys::bwa_shim_last_error();
+        if ptr.is_null() {
+            "unknown shim error".to_string()
+        } else {
+            std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
+    }
+}
+
 pub(crate) fn shim_err(context: &str) -> Error {
     let msg = unsafe {
         let ptr = bwa_mem3_sys::bwa_shim_last_error();

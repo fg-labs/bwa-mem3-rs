@@ -16,11 +16,30 @@ pub struct ReadPair<'a> {
     pub qual_r2: Option<&'a [u8]>,
 }
 
+/// Longest read name a BAM record can carry: `l_read_name` is a `u8` that
+/// counts the trailing NUL, so the name itself tops out at 254 bytes. The shim
+/// aborts the process on a longer one when it builds the record, so the name is
+/// rejected up front instead.
+const MAX_READ_NAME_LEN: usize = 254;
+
+/// Reject a read name too long for a BAM record (see [`MAX_READ_NAME_LEN`]).
+fn validate_read_name(name: &[u8]) -> Result<()> {
+    if name.len() > MAX_READ_NAME_LEN {
+        return Err(Error::InvalidInput(format!(
+            "read name is {} bytes; BAM allows at most {MAX_READ_NAME_LEN}",
+            name.len()
+        )));
+    }
+    Ok(())
+}
+
 impl<'a> ReadPair<'a> {
     pub fn validate(&self) -> Result<()> {
         if self.seq_r1.is_empty() || self.seq_r2.is_empty() {
             return Err(Error::InvalidInput("empty sequence".into()));
         }
+        validate_read_name(self.name_r1)?;
+        validate_read_name(self.name_r2)?;
         if let Some(q) = self.qual_r1 {
             if q.len() != self.seq_r1.len() {
                 return Err(Error::InvalidInput(format!(
@@ -59,7 +78,7 @@ fn validate_all(pairs: &[ReadPair<'_>]) -> Result<()> {
 /// (or vice versa) would silently produce wrong output — projected reads
 /// against an unconverted index, or spurious `XR`/`XG`/`XM` tags — so we fail
 /// fast instead.
-fn check_meth_consistency(idx: &BwaIndex, opts: &MemOpts) -> Result<()> {
+pub(crate) fn check_meth_consistency(idx: &BwaIndex, opts: &MemOpts) -> Result<()> {
     match (opts.meth(), idx.is_meth()) {
         (true, false) => Err(Error::InvalidInput(
             "opts have --meth enabled but the index is not a meth dual index \
@@ -75,22 +94,24 @@ fn check_meth_consistency(idx: &BwaIndex, opts: &MemOpts) -> Result<()> {
     }
 }
 
+/// The C view of one pair, borrowing `p`'s bytes (no copy).
+pub(crate) fn c_pair(p: &ReadPair<'_>) -> bwa_mem3_sys::BwaReadPair {
+    bwa_mem3_sys::BwaReadPair {
+        r1_name: p.name_r1.as_ptr().cast::<std::ffi::c_char>(),
+        r1_name_len: p.name_r1.len(),
+        r1_seq: p.seq_r1.as_ptr(),
+        r1_seq_len: p.seq_r1.len(),
+        r1_qual: p.qual_r1.map_or(std::ptr::null(), <[u8]>::as_ptr),
+        r2_name: p.name_r2.as_ptr().cast::<std::ffi::c_char>(),
+        r2_name_len: p.name_r2.len(),
+        r2_seq: p.seq_r2.as_ptr(),
+        r2_seq_len: p.seq_r2.len(),
+        r2_qual: p.qual_r2.map_or(std::ptr::null(), <[u8]>::as_ptr),
+    }
+}
+
 fn to_c_pairs(pairs: &[ReadPair<'_>]) -> Vec<bwa_mem3_sys::BwaReadPair> {
-    pairs
-        .iter()
-        .map(|p| bwa_mem3_sys::BwaReadPair {
-            r1_name: p.name_r1.as_ptr().cast::<std::ffi::c_char>(),
-            r1_name_len: p.name_r1.len(),
-            r1_seq: p.seq_r1.as_ptr(),
-            r1_seq_len: p.seq_r1.len(),
-            r1_qual: p.qual_r1.map_or(std::ptr::null(), <[u8]>::as_ptr),
-            r2_name: p.name_r2.as_ptr().cast::<std::ffi::c_char>(),
-            r2_name_len: p.name_r2.len(),
-            r2_seq: p.seq_r2.as_ptr(),
-            r2_seq_len: p.seq_r2.len(),
-            r2_qual: p.qual_r2.map_or(std::ptr::null(), <[u8]>::as_ptr),
-        })
-        .collect()
+    pairs.iter().map(c_pair).collect()
 }
 
 /// Phase-1 opaque handle: the seeds (chains) for a batch of read pairs.
@@ -317,6 +338,7 @@ impl SingleRead<'_> {
         if self.seq.is_empty() {
             return Err(Error::InvalidInput("empty sequence".into()));
         }
+        validate_read_name(self.name)?;
         if let Some(q) = self.qual {
             if q.len() != self.seq.len() {
                 return Err(Error::InvalidInput(format!(
@@ -353,24 +375,26 @@ impl ReadBatch<'_> {
     }
 }
 
+/// The C view of one single-end read, borrowing `s`'s bytes (no copy).
+pub(crate) fn c_single(s: &SingleRead<'_>) -> bwa_mem3_sys::BwaSingleRead {
+    bwa_mem3_sys::BwaSingleRead {
+        name: s.name.as_ptr().cast::<std::ffi::c_char>(),
+        name_len: s.name.len(),
+        seq: s.seq.as_ptr(),
+        seq_len: s.seq.len(),
+        qual: s.qual.map_or(std::ptr::null(), <[u8]>::as_ptr),
+    }
+}
+
 fn to_c_singles(singles: &[SingleRead<'_>]) -> Vec<bwa_mem3_sys::BwaSingleRead> {
-    singles
-        .iter()
-        .map(|s| bwa_mem3_sys::BwaSingleRead {
-            name: s.name.as_ptr().cast::<std::ffi::c_char>(),
-            name_len: s.name.len(),
-            seq: s.seq.as_ptr(),
-            seq_len: s.seq.len(),
-            qual: s.qual.map_or(std::ptr::null(), <[u8]>::as_ptr),
-        })
-        .collect()
+    singles.iter().map(c_single).collect()
 }
 
 /// Per-thread reusable scratch (~24 MB of SIMD buffers after first use). Create
 /// one per worker thread and pass it to every [`seed_extend`] / [`pair_emit`]
 /// on that thread. `Send` so a pool can migrate it; not `Sync`.
 pub struct AlignScratch {
-    handle: *mut bwa_mem3_sys::BwaScratch,
+    pub(crate) handle: *mut bwa_mem3_sys::BwaScratch,
 }
 
 impl AlignScratch {
@@ -543,9 +567,40 @@ impl RecordSink for RecordVec {
 
 /// Trampoline state: the caller's sink plus, if `emit` unwound, the caught
 /// panic payload to resume after the C call stack has unwound normally.
-struct SinkCtx<'a> {
-    sink: &'a mut dyn RecordSink,
-    panic: Option<Box<dyn std::any::Any + Send + 'static>>,
+/// Shared by the packed ([`RecordSink`]) and structured
+/// ([`AlignedFieldsSink`](crate::AlignedFieldsSink)) trampolines.
+pub(crate) struct SinkCtx<'a, S: ?Sized> {
+    pub(crate) sink: &'a mut S,
+    pub(crate) panic: Option<Box<dyn std::any::Any + Send + 'static>>,
+}
+
+impl<S: ?Sized> SinkCtx<'_, S> {
+    /// Run `f` against the sink unless an earlier call already panicked,
+    /// catching (and stashing) any panic so it never unwinds across the
+    /// calling `extern "C"` frame. The C call stack cannot unwind, so after a
+    /// panic the trampoline keeps returning normally for the remaining records
+    /// and the caller resumes the panic once the shim call itself returns.
+    /// `AssertUnwindSafe` is fine because after a caught panic the sink is
+    /// never touched again.
+    pub(crate) fn emit_catching(&mut self, f: impl FnOnce(&mut S)) {
+        if self.panic.is_some() {
+            return;
+        }
+        let sink = &mut *self.sink;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(sink)));
+        if let Err(payload) = outcome {
+            self.panic = Some(payload);
+        }
+    }
+}
+
+/// Map the shim's `origin_kind`/`origin_idx` pair to a [`RecordOrigin`].
+pub(crate) fn record_origin(origin_kind: u32, origin_idx: usize) -> RecordOrigin {
+    if origin_kind == bwa_mem3_sys::BWA_ORIGIN_SINGLE {
+        RecordOrigin::Single(origin_idx)
+    } else {
+        RecordOrigin::Pair(origin_idx)
+    }
 }
 
 /// C -> Rust trampoline for [`RecordSink`], passed to `bwa_shim_pair_emit` as
@@ -558,7 +613,7 @@ struct SinkCtx<'a> {
 /// not alias it elsewhere during that call. `body` must point at `body_len`
 /// initialized, readable bytes that stay valid for the duration of this call
 /// only (the shim's own contract for `BwaRecordSinkFn`).
-unsafe extern "C" fn sink_trampoline(
+pub(crate) unsafe extern "C" fn sink_trampoline(
     ctx: *mut std::ffi::c_void,
     origin_kind: u32,
     origin_idx: usize,
@@ -567,36 +622,15 @@ unsafe extern "C" fn sink_trampoline(
 ) {
     // SAFETY: see the function's `# Safety` section -- `ctx` is a live
     // `&mut SinkCtx` for the duration of this call.
-    let ctx = unsafe { &mut *ctx.cast::<SinkCtx<'_>>() };
-    if ctx.panic.is_some() {
-        // A previous record's `emit` already panicked. The C call stack
-        // cannot unwind (this frame is `extern "C"`), so we keep returning
-        // normally for any remaining records and resume the panic in
-        // `pair_emit` once `bwa_shim_pair_emit` itself returns.
-        return;
-    }
+    let ctx = unsafe { &mut *ctx.cast::<SinkCtx<'_, dyn RecordSink>>() };
     // SAFETY: see the function's `# Safety` section -- `body`/`body_len`
     // describe a valid slice for the duration of this call.
     let bytes = unsafe { std::slice::from_raw_parts(body, body_len) };
-    let origin = if origin_kind == bwa_mem3_sys::BWA_ORIGIN_SINGLE {
-        RecordOrigin::Single(origin_idx)
-    } else {
-        RecordOrigin::Pair(origin_idx)
-    };
+    let origin = record_origin(origin_kind, origin_idx);
     // Panics must not unwind across this `extern "C"` frame: with
     // `panic = "unwind"` that is UB, and with `panic = "abort"` it would take
     // down the process before the caller ever sees `pair_emit`'s `Result`.
-    // Catch it here; `AssertUnwindSafe` is fine because on a caught panic we
-    // never touch `ctx.sink` again (guarded by the check above).
-    let outcome = {
-        let sink = &mut ctx.sink;
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            sink.emit(origin, bytes);
-        }))
-    };
-    if let Err(payload) = outcome {
-        ctx.panic = Some(payload);
-    }
+    ctx.emit_catching(|sink| sink.emit(origin, bytes));
 }
 
 /// Phase 3: pairing + mate rescue + primary marking + emission (bwa-mem3's
