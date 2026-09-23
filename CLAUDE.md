@@ -186,6 +186,17 @@ CLI byte-for-byte on every record including secondaries/`XA:Z`
 (`bwa-mem3-rs-cli/tests/meth_e2e.rs` pins this), because `emit_resolved_pair`
 replicates `mem_reg2sam`'s XA folding (see gotcha #12).
 
+**SEQ under `--meth` is the ORIGINAL read, not `s->seq`.** `s->seq` holds the
+bisulfite-projected read the seeds matched; upstream's meth writer restores the
+original bases for MethylDackel, upper-casing the forward strand (IUPAC codes
+kept) and complementing the reverse through `nst_nt4_table` (anything but ACGT
+becomes N). `append_bam_record` does the same from `meth_orig_seq`. This was
+wrong until the parity comparator (`record_key_fields`) started comparing SEQ
+and QUAL: before that, projected bases matched every compared field. Two
+related rules both writers share and the shim follows: a raw-`0x100`
+(`-a` secondary) record carries no SEQ/QUAL, and `bin` is htslib `bam_set1`'s
+(`reg2bin(pos, pos + max(rlen, 1))`, so a placed-unmapped read is not 4680).
+
 ### 12. `emit_resolved_pair` folds secondaries into `XA:Z` like `mem_reg2sam`
 
 The shim emits records from the per-read alnreg list itself rather than calling

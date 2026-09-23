@@ -653,6 +653,31 @@ static inline uint8_t bwa2_complement(uint8_t b) {
     return (b < 4) ? (uint8_t)(3 - b) : (uint8_t)4;
 }
 
+/* BAM 4-bit code of an ASCII base, as htslib's seq_nt16_table assigns it
+ * (IUPAC ambiguity codes keep their own code; case-insensitive; anything else
+ * is N). */
+static inline uint8_t ascii_to_bam4(unsigned char c) {
+    switch (c & ~0x20) {   /* fold to upper case */
+        case 'A': return 1;  case 'C': return 2;  case 'M': return 3;  case 'G': return 4;
+        case 'R': return 5;  case 'S': return 6;  case 'V': return 7;  case 'T': return 8;
+        case 'U': return 8;  case 'W': return 9;  case 'Y': return 10; case 'H': return 11;
+        case 'K': return 12; case 'D': return 13; case 'B': return 14;
+        default:  return (c == '=') ? 0 : 15;
+    }
+}
+
+/* One emitted --meth SEQ base, as upstream's meth writer (meth_bam.cpp)
+ * builds it from the ORIGINAL (unprojected) read so MethylDackel sees real
+ * C/Ts: the forward strand keeps the base (upper-cased, so an IUPAC code
+ * survives), the reverse strand complements through nst_nt4_table and maps
+ * anything but A/C/G/T to N. */
+static inline uint8_t meth_seq_bam4(unsigned char c, int rev) {
+    if (!rev) return ascii_to_bam4(c);
+    static const uint8_t RC[5] = { 8 /* A->T */, 4 /* C->G */, 2 /* G->C */, 1 /* T->A */, 15 };
+    int bi = nst_nt4_table[c];
+    return RC[bi < 4 ? bi : 4];
+}
+
 /* bwa-mem3 uses a 5-char CIGAR opcode table "MIDSH" (S=3, H=4), incompatible
  * with the BAM spec's "MIDNSHP=X" (S=4, H=5). Remap when emitting to BAM. */
 static inline uint32_t bwa_cigar_to_bam(uint32_t op) {
@@ -934,6 +959,11 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     }
     int emit_len = seq_end - seq_start;
     if (emit_len < 0) emit_len = 0;
+    /* A secondary record (raw 0x100: an -a secondary, not a MEM_F_NO_MULTI
+     * split, which carries the internal 0x10000 until the flag remap below)
+     * gets no SEQ/QUAL, exactly as both upstream writers decide it:
+     * `emit_seq = !(p.flag & 0x100)` (bam_writer.cpp:346, meth_bam.cpp). */
+    if (p->flag & 0x100) emit_len = 0;
 
     /* Build aux first so we know its size. Reuse the scratch's aux buffer: it
      * is grown in place by buf_append and written back at the end of the record
@@ -1108,9 +1138,15 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     *w++ = (uint8_t) l_read_name;
     *w++ = (uint8_t) p->mapq;
 
-    uint16_t bin = (ref_id < 0 || ref_len == 0)
-                       ? 4680
-                       : reg2bin((int)eff_pos, (int)eff_pos + ref_len);
+    /* BAM bin over [pos, pos + rlen), computed as htslib's bam_set1 -- which
+     * both upstream writers build records with -- computes it: rlen is the
+     * CIGAR's reference span for a mapped record and 1 otherwise. So an
+     * unmapped read placed at its mate's coordinates gets reg2bin(pos, pos+1),
+     * not 4680; only an unplaced read (pos == -1) lands on 4680, which
+     * reg2bin(-1, 0) yields through its arithmetic shift. 0x4 is set by the
+     * pair resolve and never rewritten below. */
+    int bin_rlen = ((p->flag & 0x4) || ref_len == 0) ? 1 : ref_len;
+    uint16_t bin = reg2bin((int)eff_pos, (int)eff_pos + bin_rlen);
     memcpy(w, &bin, 2); w += 2;
 
     uint16_t nc = (uint16_t) n_cigar;
@@ -1152,8 +1188,21 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     }
 
     /* 4-bit packed seq. emit_seq bytes are bwa's 2-bit encoding (0-4); remap
-     * to BAM 4-bit nibbles (1/2/4/8/15). */
-    for (int i = 0; i < emit_len; i += 2) {
+     * to BAM 4-bit nibbles (1/2/4/8/15). Under --meth s->seq is the
+     * bisulfite-PROJECTED read the seeds matched, so SEQ comes from the
+     * original bases instead, as the upstream meth writer emits it
+     * (meth_seq_bam4), over the same window and orientation. */
+    if (s->meth_orig_seq) {
+        const unsigned char *orig = (const unsigned char *) s->meth_orig_seq;
+        for (int i = 0; i < emit_len; i += 2) {
+            int j = seq_start + i;
+            uint8_t hi = meth_seq_bam4(eff_is_rev ? orig[l_seq - 1 - j] : orig[j], eff_is_rev);
+            uint8_t lo = 0;
+            if (i + 1 < emit_len)
+                lo = meth_seq_bam4(eff_is_rev ? orig[l_seq - 2 - j] : orig[j + 1], eff_is_rev);
+            *w++ = (uint8_t)((hi << 4) | lo);
+        }
+    } else for (int i = 0; i < emit_len; i += 2) {
         uint8_t hi = emit_seq ? bwa2_to_bam4[emit_seq[i] & 7] : 15;
         uint8_t lo = 0;
         if (i + 1 < emit_len) {

@@ -191,11 +191,11 @@ fn aux_tag_key<'a>(field: &'a str, sam_line: &str) -> &'a str {
 }
 
 /// Reduce a SAM line to the fields that must match the reference aligner:
-/// qname, flag, rname, pos, mapq, cigar, and the `NM`/`MD`/`XG`/`XR`/`XM`/`XA`
-/// tags. These are the semantically meaningful fields the shim reproduces
-/// byte-for-byte; SEQ/QUAL/RNEXT/PNEXT/TLEN and the shim's own aux ordering
-/// (which places the Bismark tags differently from upstream's SAM writer) are
-/// excluded on purpose.
+/// qname, flag, rname, pos, mapq, cigar, SEQ, QUAL, and the
+/// `NM`/`MD`/`XG`/`XR`/`XM`/`XA` tags. These are the semantically meaningful
+/// fields the shim reproduces byte-for-byte; RNEXT/PNEXT/TLEN and the shim's
+/// own aux ordering (which places the Bismark tags differently from upstream's
+/// SAM writer) are excluded on purpose.
 ///
 /// The key also appends a sorted `TAGS:<key,key,...>` component listing every
 /// aux tag *key* present on the record, not just the six compared above,
@@ -252,14 +252,20 @@ pub fn record_key_fields(sam_line: &str) -> String {
         .filter(|k| !DELIBERATELY_ASYMMETRIC_TAG_KEYS.contains(k))
         .collect();
     tag_keys.sort_unstable();
+    // SEQ and QUAL (columns 10-11) are compared too: without them a record
+    // emitting the wrong bases -- the --meth projection instead of the original
+    // read, or a SEQ on a secondary the CLI leaves as `*` -- matched every other
+    // key field and passed.
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\tNM:{nm}\tMD:{md}\tXG:{xg}\tXR:{xr}\tXM:{xm}\tXA:{xa}\tTAGS:{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tNM:{nm}\tMD:{md}\tXG:{xg}\tXR:{xr}\tXM:{xm}\tXA:{xa}\tTAGS:{}",
         f[0],
         f[1],
         f[2],
         f[3],
         f[4],
         f[5],
+        f[9],
+        f[10],
         tag_keys.join(",")
     )
 }
