@@ -133,6 +133,10 @@ extern "C" {
                                     size_t *added);
     int    shim_resident_write_single(ShimResidentSegment *sg, size_t i,
                                       const ShimSingleRead *single, size_t *added);
+    int    shim_resident_write_pairs(ShimResidentSegment *sg, const ShimReadPair *pairs,
+                                     size_t n, size_t *added);
+    int    shim_resident_write_singles(ShimResidentSegment *sg, const ShimSingleRead *reads,
+                                       size_t n, size_t *added);
     int    shim_resident_seed_extend(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
                                      ShimResidentSegment *sg);
     int    shim_resident_pestat_cohort(void *fmi, const mem_opt_t *opts,
@@ -693,6 +697,22 @@ extern "C" int bwa_shim_resident_write_single(BwaResidentSegment *sg, size_t i,
         shim_resident_write_single(shim_seg(sg), i,
                                    reinterpret_cast<const ShimSingleRead *>(single), added),
         "resident_write_single");
+}
+extern "C" int bwa_shim_resident_write_pairs(BwaResidentSegment *sg, const BwaReadPair *pairs,
+                                             size_t n, size_t *added) {
+    shim_clear_err();
+    return resident_status(
+        shim_resident_write_pairs(shim_seg(sg), reinterpret_cast<const ShimReadPair *>(pairs), n,
+                                  added),
+        "resident_write_pairs");
+}
+extern "C" int bwa_shim_resident_write_singles(BwaResidentSegment *sg, const BwaSingleRead *reads,
+                                               size_t n, size_t *added) {
+    shim_clear_err();
+    return resident_status(
+        shim_resident_write_singles(shim_seg(sg), reinterpret_cast<const ShimSingleRead *>(reads),
+                                    n, added),
+        "resident_write_singles");
 }
 extern "C" int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
                                              BwaScratch *sc, BwaResidentSegment *sg) {

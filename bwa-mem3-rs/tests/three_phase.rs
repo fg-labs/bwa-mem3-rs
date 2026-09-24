@@ -703,6 +703,9 @@ enum Misuse {
     InferBeforeSeedExtend,
     InferOtherMeth,
     InferAfterPairEmit,
+    WritePairsPartial,
+    WriteSinglesPartial,
+    WritePairsAfterSlotWrite,
 }
 
 /// A structured sink that discards every record.
@@ -739,6 +742,9 @@ impl AlignedFieldsSink for NullFieldSink {
 #[case::infer_before_seed_extend(Misuse::InferBeforeSeedExtend, LIFECYCLE)]
 #[case::infer_other_meth(Misuse::InferOtherMeth, "meth=")]
 #[case::infer_after_pair_emit(Misuse::InferAfterPairEmit, LIFECYCLE)]
+#[case::write_pairs_partial(Misuse::WritePairsPartial, "for a range of")]
+#[case::write_singles_partial(Misuse::WriteSinglesPartial, "for a range of")]
+#[case::write_pairs_after_slot_write(Misuse::WritePairsAfterSlotWrite, LIFECYCLE)]
 fn resident_misuse_is_rejected(#[case] misuse: Misuse, #[case] needle: &str) {
     let Some(idx) = shared_idx() else {
         eprintln!("skip: bwa-mem3 not available to build a PhiX index");
@@ -772,6 +778,17 @@ fn resident_misuse_is_rejected(#[case] misuse: Misuse, #[case] needle: &str) {
     };
 
     let result: bwa_mem3_rs::Result<()> = match misuse {
+        Misuse::WritePairsPartial => {
+            cohort.write_pairs(&mut cohort.reserve_pairs(2).unwrap(), &[pair])
+        }
+        Misuse::WriteSinglesPartial => {
+            cohort.write_singles(&mut cohort.reserve_singles(2).unwrap(), &[single])
+        }
+        Misuse::WritePairsAfterSlotWrite => {
+            let mut r = cohort.reserve_pairs(2).unwrap();
+            cohort.write_pair(&mut r, 1, pair).unwrap();
+            cohort.write_pairs(&mut r, &[pair, pair])
+        }
         Misuse::ForeignWritePair => cohort.write_pair(&mut foreign(), 0, pair),
         Misuse::ForeignWriteSingle => {
             let mut r = ResidentCohort::new(false)
@@ -1172,4 +1189,89 @@ fn panicking_sink_leaves_the_cohort_usable() {
         got == expected,
         "the other range's output changed after a panic"
     );
+}
+
+/// A range written in one batch (one arena) aligns byte-identically to the same
+/// range written slot by slot, with and without `--meth`.
+#[rstest]
+#[case::plain(false)]
+#[case::meth(true)]
+fn batch_write_matches_per_slot_write(#[case] meth: bool) {
+    let idx = if meth {
+        phix_meth().map(|r| r.idx.clone())
+    } else {
+        shared_idx()
+    };
+    let Some(idx) = idx else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let mut opts = MemOpts::new().unwrap();
+    if meth {
+        opts.set_meth(true);
+    }
+    let pairs: Vec<ReadPair<'_>> = fixture.pairs.iter().map(as_read_pair).collect();
+    let run = |batch: bool| -> Records {
+        let cohort = ResidentCohort::new(meth).unwrap();
+        let mut scratch = AlignScratch::new().unwrap();
+        let mut range = cohort.reserve_pairs(pairs.len()).unwrap();
+        if batch {
+            cohort.write_pairs(&mut range, &pairs).unwrap();
+        } else {
+            for (i, p) in pairs.iter().enumerate() {
+                cohort.write_pair(&mut range, i, *p).unwrap();
+            }
+        }
+        cohort
+            .seed_extend(&idx, &opts, &mut scratch, &mut range)
+            .unwrap();
+        let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+        emit_range(&cohort, &idx, &opts, &mut scratch, &mut range, &pestat, 0)
+    };
+    let (batched, per_slot) = (run(true), run(false));
+    assert!(!batched.is_empty(), "the fixture must emit records");
+    assert_eq!(batched, per_slot);
+}
+
+/// A batch write accounts exactly the bytes the per-slot writes do.
+#[rstest]
+#[case::pairs(true)]
+#[case::singles(false)]
+fn batch_write_counts_the_same_heap_bytes(#[case] pairs_region: bool) {
+    let fixture = field_fixture();
+    let pairs: Vec<ReadPair<'_>> = fixture.pairs.iter().map(as_read_pair).collect();
+    let singles: Vec<SingleRead<'_>> = fixture
+        .singles
+        .iter()
+        .map(|r| SingleRead {
+            name: &r.name,
+            seq: &r.seq,
+            qual: r.qual.as_deref(),
+        })
+        .collect();
+    let bytes = |batch: bool| {
+        let cohort = ResidentCohort::new(false).unwrap();
+        if pairs_region {
+            let mut range = cohort.reserve_pairs(pairs.len()).unwrap();
+            if batch {
+                cohort.write_pairs(&mut range, &pairs).unwrap();
+            } else {
+                for (i, p) in pairs.iter().enumerate() {
+                    cohort.write_pair(&mut range, i, *p).unwrap();
+                }
+            }
+        } else {
+            let mut range = cohort.reserve_singles(singles.len()).unwrap();
+            if batch {
+                cohort.write_singles(&mut range, &singles).unwrap();
+            } else {
+                for (i, r) in singles.iter().enumerate() {
+                    cohort.write_single(&mut range, i, *r).unwrap();
+                }
+            }
+        }
+        cohort.heap_bytes()
+    };
+    assert_eq!(bytes(true), bytes(false));
 }

@@ -532,6 +532,32 @@ impl ResidentCohort {
         Ok(())
     }
 
+    /// Validate a whole-range batch write: owned range of `region` and exactly
+    /// `expected` items.
+    fn check_batch(
+        &self,
+        range: &ResidentRange,
+        region: Region,
+        n: usize,
+        expected: usize,
+        what: &str,
+    ) -> Result<()> {
+        self.check_owned(range, what)?;
+        if range.region != region {
+            let kind = match region {
+                Region::Pairs => "pair",
+                Region::Singles => "single",
+            };
+            return Err(Error::InvalidInput(format!("{what}: not a {kind} range")));
+        }
+        if n != expected {
+            return Err(Error::InvalidInput(format!(
+                "{what}: {n} items for a range of {expected}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Decode pair `i` of a pair `range` from borrowed bytes into its resident
     /// slot. Each slot may be written once, before the range's `seed_extend`.
     pub fn write_pair(
@@ -543,10 +569,39 @@ impl ResidentCohort {
         self.write_pairs_from(range, i, std::slice::from_ref(&pair))
     }
 
-    /// Decode `pairs` into pair `range` starting at pair 0, taking the range
-    /// lock once for the whole batch rather than once per pair.
+    /// Decode every pair of pair `range` at once: `pairs.len()` must equal
+    /// [`ResidentRange::n_pairs`], and no slot may have been written yet. All
+    /// the reads' bytes go into one allocation (the CLI reader's per-chunk
+    /// arena) instead of three per read, in one FFI call under one lock.
     pub fn write_pairs(&self, range: &mut ResidentRange, pairs: &[ReadPair<'_>]) -> Result<()> {
-        self.write_pairs_from(range, 0, pairs)
+        self.check_batch(
+            range,
+            Region::Pairs,
+            pairs.len(),
+            range.n_pairs(),
+            "write_pairs",
+        )?;
+        for pair in pairs {
+            pair.validate()?;
+        }
+        let cs: Vec<bwa_mem3_sys::BwaReadPair> = pairs.iter().map(c_pair).collect();
+        let _ranges = self.lock_ranges_shared();
+        let mut added = 0usize;
+        // SAFETY: `range.segment` is a live segment of this cohort (checked
+        // id; segments live until the cohort drops) that no other call is
+        // touching (`&mut range`); `cs` and the bytes it borrows outlive the
+        // call, and the shim copies every byte before returning; `added` is a
+        // live `usize`.
+        let rc = unsafe {
+            bwa_mem3_sys::bwa_shim_resident_write_pairs(
+                range.segment,
+                cs.as_ptr(),
+                cs.len(),
+                &mut added,
+            )
+        };
+        self.heap_bytes.fetch_add(added, Ordering::Relaxed);
+        resident_status(rc, "resident_write_pairs")
     }
 
     fn write_pairs_from(
@@ -597,10 +652,34 @@ impl ResidentCohort {
         self.write_singles_from(range, i, std::slice::from_ref(&read))
     }
 
-    /// Decode `reads` into single `range` starting at read 0, taking the range
-    /// lock once for the whole batch rather than once per read.
+    /// Decode every read of single `range` at once: `reads.len()` must equal
+    /// [`ResidentRange::n_reads`], and no slot may have been written yet. See
+    /// [`write_pairs`](Self::write_pairs).
     pub fn write_singles(&self, range: &mut ResidentRange, reads: &[SingleRead<'_>]) -> Result<()> {
-        self.write_singles_from(range, 0, reads)
+        self.check_batch(
+            range,
+            Region::Singles,
+            reads.len(),
+            range.n_reads,
+            "write_singles",
+        )?;
+        for read in reads {
+            read.validate()?;
+        }
+        let cs: Vec<bwa_mem3_sys::BwaSingleRead> = reads.iter().map(c_single).collect();
+        let _ranges = self.lock_ranges_shared();
+        let mut added = 0usize;
+        // SAFETY: as `write_pairs`.
+        let rc = unsafe {
+            bwa_mem3_sys::bwa_shim_resident_write_singles(
+                range.segment,
+                cs.as_ptr(),
+                cs.len(),
+                &mut added,
+            )
+        };
+        self.heap_bytes.fetch_add(added, Ordering::Relaxed);
+        resident_status(rc, "resident_write_singles")
     }
 
     fn write_singles_from(

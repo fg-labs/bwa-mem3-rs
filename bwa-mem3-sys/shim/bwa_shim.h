@@ -250,6 +250,16 @@ int bwa_shim_resident_write_pair(BwaResidentSegment *sg, size_t i, const BwaRead
 int bwa_shim_resident_write_single(BwaResidentSegment *sg, size_t i,
                                    const BwaSingleRead *single, size_t *added);
 
+/* Decode EVERY pair (resp. single) of an unwritten segment in one call, all
+ * strings in one allocation. `n` must equal the segment's pair (resp. read)
+ * count. Adds the same bytes the per-slot writes would to *added. Returns 0,
+ * -1 on a bad argument / count mismatch / OOM, or -3 when any slot was already
+ * written or the segment was extended. */
+int bwa_shim_resident_write_pairs(BwaResidentSegment *sg, const BwaReadPair *pairs, size_t n,
+                                  size_t *added);
+int bwa_shim_resident_write_singles(BwaResidentSegment *sg, const BwaSingleRead *reads,
+                                    size_t n, size_t *added);
+
 /* Seed + SE-extend every read of a fully written segment (pairs or singles).
  * Returns 0, -1, or -3. */
 int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,

@@ -1791,6 +1791,22 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn bwa_shim_resident_write_pairs(
+        sg: *mut BwaResidentSegment,
+        pairs: *const BwaReadPair,
+        n: usize,
+        added: *mut usize,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_resident_write_singles(
+        sg: *mut BwaResidentSegment,
+        reads: *const BwaSingleRead,
+        n: usize,
+        added: *mut usize,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn bwa_shim_resident_seed_extend(
         idx: *const BwaIndex,
         opts: *const mem_opt_t,

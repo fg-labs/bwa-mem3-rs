@@ -505,6 +505,30 @@ static void free_seqs(bseq1_t *seqs, int nseqs);
  * the caller's free_seqs / segment teardown (NULL-safe on the fields left
  * unbuilt) releases a partial decode. Shared by every path that copies reads
  * in, so the legacy and resident paths cannot project differently. */
+/* The --meth read setup shared by every path that copies reads in, applied
+ * after the original bases were saved to s->meth_orig_seq: record the read's
+ * chemistry and project s->seq in place. `role` 0 = R1 or a single (OT, C->T),
+ * 1 = R2 (OB, G->A). */
+static void meth_project_in_place(bseq1_t *s, int role) {
+    /* v0.9.0: read-number chemistry, consumed by the seed filter in
+     * meth_seed_to_orig (bwamem.cpp:1878-1881), which drops any seed
+     * whose genomic strand does not match the read's. R1 = OT = 1,
+     * R2 = OB = 0, exactly as upstream's ingest sets it
+     * (fastmap.cpp:820).
+     *
+     * Leaving it unset is NOT inert: the field is zero from the
+     * calloc, and 0 is the VALID value for OB, so the filter runs
+     * and silently discards every R1 seed. The filter only
+     * self-disables at < 0. That presented as exactly half the
+     * reads unmapped -- every R1, no R2. */
+    s->meth_base_ot = (role == 0) ? 1 : 0;
+    char from = (role == 0) ? 'C' : 'G';
+    char to   = (role == 0) ? 'T' : 'A';
+    for (int j = 0; j < s->l_seq; ++j)
+        if (s->seq[j] == from || s->seq[j] == (char)(from + 32))
+            s->seq[j] = to;
+}
+
 static int decode_read(bseq1_t *s, const char *name, size_t name_len,
                        const uint8_t *seq, size_t seq_len, const uint8_t *qual,
                        int meth_mode, int role, size_t *heap_bytes) {
@@ -536,25 +560,46 @@ static int decode_read(bseq1_t *s, const char *name, size_t name_len,
         s->meth_orig_seq = strdup(s->seq);
         if (!s->meth_orig_seq) return -1;
         *heap_bytes += (size_t) s->l_seq + 1;
-        /* v0.9.0: read-number chemistry, consumed by the seed filter in
-         * meth_seed_to_orig (bwamem.cpp:1878-1881), which drops any seed
-         * whose genomic strand does not match the read's. R1 = OT = 1,
-         * R2 = OB = 0, exactly as upstream's ingest sets it
-         * (fastmap.cpp:820).
-         *
-         * Leaving it unset is NOT inert: the field is zero from the
-         * calloc, and 0 is the VALID value for OB, so the filter runs
-         * and silently discards every R1 seed. The filter only
-         * self-disables at < 0. That presented as exactly half the
-         * reads unmapped -- every R1, no R2. */
-        s->meth_base_ot = (role == 0) ? 1 : 0;
-        char from = (role == 0) ? 'C' : 'G';
-        char to   = (role == 0) ? 'T' : 'A';
-        for (int j = 0; j < s->l_seq; ++j)
-            if (s->seq[j] == from || s->seq[j] == (char)(from + 32))
-                s->seq[j] = to;
+        meth_project_in_place(s, role);
     }
     return 0;
+}
+
+/* Bump cursor over one resident segment's read arena. */
+struct ArenaCursor { uint8_t *p; };
+
+/* Place `len` bytes plus a NUL at the cursor and advance it. */
+static char *arena_put(ArenaCursor *cur, const void *src, size_t len) {
+    char *dst = (char *) cur->p;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    cur->p += len + 1;
+    return dst;
+}
+
+/* Bytes decode_read_arena places for one read: the same total decode_read
+ * adds to its heap_bytes, so the two paths account identically. */
+static size_t read_arena_bytes(size_t name_len, size_t seq_len, const uint8_t *qual,
+                               int meth_mode) {
+    return (name_len + 1) + (seq_len + 1) + (qual ? seq_len + 1 : 0)
+         + (meth_mode ? seq_len + 1 : 0);
+}
+
+/* decode_read, placing every string at `cur` instead of in its own malloc:
+ * the same bytes and terminators, and under --meth the same original-base copy
+ * (taken before the projection) and the same projection. */
+static void decode_read_arena(bseq1_t *s, ArenaCursor *cur, const char *name, size_t name_len,
+                              const uint8_t *seq, size_t seq_len, const uint8_t *qual,
+                              int meth_mode, int role) {
+    s->l_seq = (int) seq_len;
+    s->name = arena_put(cur, name, name_len);
+    s->seq = arena_put(cur, seq, seq_len);
+    s->qual = qual ? arena_put(cur, qual, seq_len) : nullptr;
+    s->sam = nullptr;
+    if (meth_mode) {
+        s->meth_orig_seq = arena_put(cur, s->seq, seq_len);
+        meth_project_in_place(s, role);
+    }
 }
 
 static bseq1_t *copy_pairs_to_seqs(const ShimReadPair *pairs, size_t n_pairs,
@@ -2220,6 +2265,7 @@ void shim_align_out_free(ShimAlignOutput *out) {
 struct ShimResidentSegment {
     bseq1_t      *seqs;       /* n reads; pairs R1/R2 interleaved */
     mem_alnreg_v *regs;       /* parallel per-read alnreg headers */
+    uint8_t      *arena;      /* every read's strings, when batch-written; else NULL */
     size_t        n;          /* reads */
     size_t        base;       /* inclusive-start read offset within its region */
     int           is_pairs;
@@ -2246,11 +2292,16 @@ struct ShimResidentCohort {
 static void resident_segment_free(ShimResidentSegment *sg) {
     for (size_t i = 0; i < sg->n; ++i) {
         /* Same per-read teardown as free_seqs + shim_regs_free's regs loop:
-         * free() is NULL-safe on the fields a partial write left unbuilt. */
-        free(sg->seqs[i].name); free(sg->seqs[i].seq); free(sg->seqs[i].qual);
-        free(sg->seqs[i].sam);  free(sg->seqs[i].meth_orig_seq);
+         * free() is NULL-safe on the fields a partial write left unbuilt. A
+         * batch-written segment's strings live in its arena instead. */
+        if (!sg->arena) {
+            free(sg->seqs[i].name); free(sg->seqs[i].seq); free(sg->seqs[i].qual);
+            free(sg->seqs[i].meth_orig_seq);
+        }
+        free(sg->seqs[i].sam);
         free(sg->regs[i].a);
     }
+    free(sg->arena);
     free(sg->seqs); free(sg->regs); free(sg);
 }
 
@@ -2334,7 +2385,7 @@ int shim_resident_write_pair(ShimResidentSegment *sg, size_t i, const ShimReadPa
                              size_t *added) {
     if (!sg || !pair || !added || !sg->is_pairs || i >= sg->n / 2) return -1;
     bseq1_t *r1 = &sg->seqs[2 * i], *r2 = &sg->seqs[2 * i + 1];
-    if (sg->extended || r1->name || r2->name) return -3;
+    if (sg->extended || sg->arena || r1->name || r2->name) return -3;
     if (decode_read(r1, pair->r1_name, pair->r1_name_len, pair->r1_seq, pair->r1_seq_len,
                     pair->r1_qual, sg->meth_mode, 0, added) != 0) return -1;
     if (decode_read(r2, pair->r2_name, pair->r2_name_len, pair->r2_seq, pair->r2_seq_len,
@@ -2345,9 +2396,73 @@ int shim_resident_write_single(ShimResidentSegment *sg, size_t i, const ShimSing
                                size_t *added) {
     if (!sg || !single || !added || sg->is_pairs || i >= sg->n) return -1;
     bseq1_t *s = &sg->seqs[i];
-    if (sg->extended || s->name) return -3;
+    if (sg->extended || sg->arena || s->name) return -3;
     return decode_read(s, single->name, single->name_len, single->seq, single->seq_len,
                        single->qual, sg->meth_mode, 0, added);
+}
+
+/* Over-allocation past a segment arena's last string, so a vectorized read
+ * that runs past the final read's bytes stays inside the allocation. */
+#define RESIDENT_ARENA_SLACK 64
+
+/* 0 when `sg` can take a batch write (nothing written, not extended), else -3. */
+static int resident_batch_writable(const ShimResidentSegment *sg) {
+    if (sg->extended || sg->arena) return -3;
+    for (size_t i = 0; i < sg->n; ++i)
+        if (sg->seqs[i].name) return -3;
+    return 0;
+}
+
+/* Write every pair of an unwritten pair segment in one call, placing all the
+ * reads' strings in ONE allocation (the segment arena), as the CLI's reader
+ * does per chunk, instead of three per read. `n` must be the segment's pair
+ * count. Adds the bytes copied to *added -- the same total the per-slot
+ * writes would add. Returns 0, -1 on a null arg / wrong region / count
+ * mismatch / OOM, or -3 when any slot was already written or the segment was
+ * extended. */
+int shim_resident_write_pairs(ShimResidentSegment *sg, const ShimReadPair *pairs, size_t n,
+                              size_t *added) {
+    if (!sg || !added || !sg->is_pairs || (n > 0 && !pairs) || n != sg->n / 2) return -1;
+    int rc = resident_batch_writable(sg);
+    if (rc != 0) return rc;
+    size_t total = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const ShimReadPair *p = &pairs[i];
+        total += read_arena_bytes(p->r1_name_len, p->r1_seq_len, p->r1_qual, sg->meth_mode)
+               + read_arena_bytes(p->r2_name_len, p->r2_seq_len, p->r2_qual, sg->meth_mode);
+    }
+    sg->arena = (uint8_t *) malloc(total + RESIDENT_ARENA_SLACK);
+    if (!sg->arena) return -1;
+    ArenaCursor cur = { sg->arena };
+    for (size_t i = 0; i < n; ++i) {
+        const ShimReadPair *p = &pairs[i];
+        decode_read_arena(&sg->seqs[2 * i], &cur, p->r1_name, p->r1_name_len, p->r1_seq,
+                          p->r1_seq_len, p->r1_qual, sg->meth_mode, 0);
+        decode_read_arena(&sg->seqs[2 * i + 1], &cur, p->r2_name, p->r2_name_len, p->r2_seq,
+                          p->r2_seq_len, p->r2_qual, sg->meth_mode, 1);
+    }
+    *added += total;
+    return 0;
+}
+
+/* shim_resident_write_pairs for a single segment: `n` must be its read count. */
+int shim_resident_write_singles(ShimResidentSegment *sg, const ShimSingleRead *reads, size_t n,
+                                size_t *added) {
+    if (!sg || !added || sg->is_pairs || (n > 0 && !reads) || n != sg->n) return -1;
+    int rc = resident_batch_writable(sg);
+    if (rc != 0) return rc;
+    size_t total = 0;
+    for (size_t i = 0; i < n; ++i)
+        total += read_arena_bytes(reads[i].name_len, reads[i].seq_len, reads[i].qual,
+                                  sg->meth_mode);
+    sg->arena = (uint8_t *) malloc(total + RESIDENT_ARENA_SLACK);
+    if (!sg->arena) return -1;
+    ArenaCursor cur = { sg->arena };
+    for (size_t i = 0; i < n; ++i)
+        decode_read_arena(&sg->seqs[i], &cur, reads[i].name, reads[i].name_len, reads[i].seq,
+                          reads[i].seq_len, reads[i].qual, sg->meth_mode, 0);
+    *added += total;
+    return 0;
 }
 
 /* Seed + SE-extend a whole segment (pairs or singles). Returns 0, -1 on a null
