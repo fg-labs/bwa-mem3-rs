@@ -1431,3 +1431,15 @@ fn released_range_rejects_every_later_call(#[case] call: &str) {
     let err = result.unwrap_err();
     assert!(err.to_string().contains(LIFECYCLE), "{call}: {err}");
 }
+
+/// `batch_size` reports the kernel batch the vendored `macro.h` selects for
+/// this build's architecture.
+#[test]
+fn batch_size_matches_the_build_target() {
+    let expected = if cfg!(target_arch = "aarch64") {
+        1024
+    } else {
+        512
+    };
+    assert_eq!(bwa_mem3_rs::batch_size(), expected);
+}

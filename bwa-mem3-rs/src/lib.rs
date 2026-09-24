@@ -40,7 +40,7 @@ pub use align::{
     AlignmentBatch, AlnRegs, IdBases, ReadBatch, ReadPair, Record, RecordOrigin, RecordSink,
     RecordVec, Seeds, SingleRead,
 };
-pub use build_info::{build_info, version, BuildInfo};
+pub use build_info::{batch_size, build_info, version, BuildInfo};
 pub use error::{Error, Result};
 pub use index::BwaIndex;
 pub use opts::{MemOpts, MemPeStat, MethScoring, Mode, PeOrient, PeOrientation, SeedOrder};

@@ -2414,6 +2414,13 @@ void shim_resident_cohort_free(ShimResidentCohort *c) {
     free(c);
 }
 
+/* Reads per bwa-mem3 kernel batch (macro.h's BATCH_SIZE: 1024 on aarch64, 512
+ * elsewhere): the chunk seed_extend_reads and pair_emit_pairs_chunked run each
+ * kernel call on, and the work item the CLI's kt_for hands a worker. */
+size_t shim_batch_size(void) {
+    return (size_t) BATCH_SIZE;
+}
+
 /* Heap bytes a reserved read costs before anything is written into it: its
  * bseq1_t and mem_alnreg_v headers. */
 size_t shim_resident_read_overhead(void) {

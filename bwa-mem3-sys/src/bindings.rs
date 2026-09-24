@@ -1761,6 +1761,9 @@ extern "C" {
     pub fn bwa_shim_resident_read_overhead() -> usize;
 }
 extern "C" {
+    pub fn bwa_shim_batch_size() -> usize;
+}
+extern "C" {
     pub fn bwa_shim_resident_reserve_pairs(
         c: *mut BwaResidentCohort,
         n_reads: usize,

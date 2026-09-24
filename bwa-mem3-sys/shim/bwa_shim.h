@@ -234,6 +234,11 @@ void               bwa_shim_resident_cohort_free(BwaResidentCohort *c);
  * read and alignment-region headers). */
 size_t bwa_shim_resident_read_overhead(void);
 
+/* Reads per kernel batch the linked bwa-mem3 was built with (1024 on aarch64,
+ * 512 elsewhere). Filling a sub-batch to a multiple of it runs every seed,
+ * extension and mate-rescue kernel call on a full batch. */
+size_t bwa_shim_batch_size(void);
+
 /* Reserve a new segment of `n_reads` reads in the pair (n_reads even) or single
  * region. Returns the segment, writing its inclusive-start read offset within
  * the region to *first_out, or NULL on a bad argument / allocation failure. */

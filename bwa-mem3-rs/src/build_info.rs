@@ -6,6 +6,16 @@ pub fn version() -> &'static str {
     bwa_mem3_sys::build_info::VERSION
 }
 
+/// Reads per bwa-mem3 kernel batch (`BATCH_SIZE` in the vendored `macro.h`:
+/// 1024 on aarch64, 512 elsewhere). The shim runs each seed, extension and
+/// mate-rescue kernel call on one such batch, as the CLI's workers do, so a
+/// caller splitting a `-K` chunk should size its pieces in multiples of it.
+#[must_use]
+pub fn batch_size() -> usize {
+    // SAFETY: a pure query with no preconditions.
+    unsafe { bwa_mem3_sys::bwa_shim_batch_size() }
+}
+
 /// Snapshot of what `bwa-mem3-sys` compiled against. See [`build_info`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildInfo {
