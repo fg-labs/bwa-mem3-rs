@@ -263,6 +263,9 @@ pub struct ResidentRange {
     region: Region,
     first: usize,
     n_reads: usize,
+    /// Read bytes this range's writes copied into the cohort; handed back to
+    /// the cohort's `heap_bytes` when the range is emitted.
+    bytes: usize,
 }
 
 // SAFETY: the token is plain data plus a pointer that is only dereferenced
@@ -504,6 +507,7 @@ impl ResidentCohort {
             region,
             first,
             n_reads,
+            bytes: 0,
         })
     }
 
@@ -601,6 +605,7 @@ impl ResidentCohort {
             )
         };
         self.heap_bytes.fetch_add(added, Ordering::Relaxed);
+        range.bytes += added;
         resident_status(rc, "resident_write_pairs")
     }
 
@@ -638,6 +643,7 @@ impl ResidentCohort {
         // Bytes copied before a failure are held by the segment until the
         // cohort drops, so they count either way.
         self.heap_bytes.fetch_add(added, Ordering::Relaxed);
+        range.bytes += added;
         result
     }
 
@@ -679,6 +685,7 @@ impl ResidentCohort {
             )
         };
         self.heap_bytes.fetch_add(added, Ordering::Relaxed);
+        range.bytes += added;
         resident_status(rc, "resident_write_singles")
     }
 
@@ -716,6 +723,7 @@ impl ResidentCohort {
             }
         }
         self.heap_bytes.fetch_add(added, Ordering::Relaxed);
+        range.bytes += added;
         result
     }
 
@@ -775,13 +783,22 @@ impl ResidentCohort {
 
     /// Bytes this cohort holds on the C heap for its reads: each reserved
     /// read's headers plus the name, bases and qualities copied into it (and,
-    /// under `--meth`, its original bases). It does not count the alignment
+    /// under `--meth`, its original bases). A range's copied bytes are held
+    /// until it is emitted, when the shim releases its reads and regions and
+    /// only the headers remain. It does not count the alignment
     /// regions, which `seed_extend` and mate rescue grow in place; that is the
     /// difference from [`AlnRegs::heap_bytes`](crate::AlnRegs::heap_bytes),
     /// which counts them. Lock-free: it never waits on in-flight range calls.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
         self.heap_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Hand an emitted range's read bytes back: the shim released them at the
+    /// end of the emit, even when the sink panicked partway.
+    fn release_bytes(&self, range: &mut ResidentRange) {
+        self.heap_bytes.fetch_sub(range.bytes, Ordering::Relaxed);
+        range.bytes = 0;
     }
 
     /// Validate an emit call and take the shared range lock for it.
@@ -851,6 +868,9 @@ impl ResidentCohort {
                 ctx_ptr,
             )
         };
+        if rc == 0 {
+            self.release_bytes(range);
+        }
         if let Some(payload) = sink_ctx.panic {
             std::panic::resume_unwind(payload);
         }
@@ -891,6 +911,9 @@ impl ResidentCohort {
                 ctx_ptr,
             )
         };
+        if rc == 0 {
+            self.release_bytes(range);
+        }
         if let Some(payload) = sink_ctx.panic {
             std::panic::resume_unwind(payload);
         }

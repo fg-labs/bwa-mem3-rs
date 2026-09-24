@@ -1275,3 +1275,159 @@ fn batch_write_counts_the_same_heap_bytes(#[case] pairs_region: bool) {
     };
     assert_eq!(bytes(true), bytes(false));
 }
+
+/// How a release test emits its range.
+#[derive(Clone, Copy, Debug)]
+enum EmitVia {
+    Packed,
+    Fields,
+    PanickingSink,
+}
+
+/// Emitting a range hands its copied read bytes back: `heap_bytes` falls to the
+/// headers-only figure, whichever emit call ran and even when the sink panics
+/// (the shim has already released the reads by then).
+#[rstest]
+#[case::packed(EmitVia::Packed)]
+#[case::fields(EmitVia::Fields)]
+#[case::panicking_sink(EmitVia::PanickingSink)]
+fn emit_releases_the_ranges_read_bytes(#[case] via: EmitVia) {
+    struct Boom;
+    impl RecordSink for Boom {
+        fn emit(&mut self, _: RecordOrigin, _: &[u8]) {
+            panic!("boom mid-emission");
+        }
+    }
+    let Some(idx) = shared_idx() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let opts = MemOpts::new().unwrap();
+    // SAFETY: a pure query with no preconditions.
+    let overhead = unsafe { bwa_mem3_sys::bwa_shim_resident_read_overhead() };
+    let pairs: Vec<ReadPair<'_>> = fixture.pairs.iter().map(as_read_pair).collect();
+    let cohort = ResidentCohort::new(false).unwrap();
+    let mut scratch = AlignScratch::new().unwrap();
+    let mut range = cohort.reserve_pairs(pairs.len()).unwrap();
+    cohort.write_pairs(&mut range, &pairs).unwrap();
+    cohort
+        .seed_extend(&idx, &opts, &mut scratch, &mut range)
+        .unwrap();
+    let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+    let headers_only = 2 * pairs.len() * overhead;
+    assert!(
+        cohort.heap_bytes() > headers_only,
+        "the reads are held before emit"
+    );
+    let ids = IdBases::default();
+    match via {
+        EmitVia::Packed => cohort
+            .pair_emit(
+                &idx,
+                &opts,
+                &mut scratch,
+                &mut range,
+                Some(&pestat),
+                ids,
+                0,
+                &mut RecordVec::default(),
+            )
+            .unwrap(),
+        EmitVia::Fields => cohort
+            .pair_emit_fields(
+                &idx,
+                &opts,
+                &mut scratch,
+                &mut range,
+                Some(&pestat),
+                ids,
+                0,
+                &mut NullFieldSink,
+            )
+            .unwrap(),
+        EmitVia::PanickingSink => {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cohort.pair_emit(
+                    &idx,
+                    &opts,
+                    &mut scratch,
+                    &mut range,
+                    Some(&pestat),
+                    ids,
+                    0,
+                    &mut Boom,
+                )
+            }));
+            assert!(outcome.is_err(), "the sink's panic propagates");
+        }
+    }
+    assert_eq!(cohort.heap_bytes(), headers_only);
+}
+
+/// After a range is emitted (and its reads released), every later call on it,
+/// and the cohort pestat, is a lifecycle error rather than a read of freed
+/// memory.
+#[rstest]
+#[case::emit_again("emit")]
+#[case::emit_fields_again("emit_fields")]
+#[case::extend_again("extend")]
+#[case::infer_after_emit("infer")]
+fn released_range_rejects_every_later_call(#[case] call: &str) {
+    let Some(idx) = shared_idx() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let opts = MemOpts::new().unwrap();
+    let pairs: Vec<ReadPair<'_>> = fixture.pairs.iter().map(as_read_pair).collect();
+    let cohort = ResidentCohort::new(false).unwrap();
+    let mut scratch = AlignScratch::new().unwrap();
+    let mut range = cohort.reserve_pairs(pairs.len()).unwrap();
+    cohort.write_pairs(&mut range, &pairs).unwrap();
+    cohort
+        .seed_extend(&idx, &opts, &mut scratch, &mut range)
+        .unwrap();
+    let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+    let ids = IdBases::default();
+    let mut sink = RecordVec::default();
+    cohort
+        .pair_emit(
+            &idx,
+            &opts,
+            &mut scratch,
+            &mut range,
+            Some(&pestat),
+            ids,
+            0,
+            &mut sink,
+        )
+        .unwrap();
+    let result: bwa_mem3_rs::Result<()> = match call {
+        "emit" => cohort.pair_emit(
+            &idx,
+            &opts,
+            &mut scratch,
+            &mut range,
+            Some(&pestat),
+            ids,
+            0,
+            &mut sink,
+        ),
+        "emit_fields" => cohort.pair_emit_fields(
+            &idx,
+            &opts,
+            &mut scratch,
+            &mut range,
+            Some(&pestat),
+            ids,
+            0,
+            &mut NullFieldSink,
+        ),
+        "extend" => cohort.seed_extend(&idx, &opts, &mut scratch, &mut range),
+        "infer" => cohort.infer_cohort(&idx, &opts).map(drop),
+        other => unreachable!("unknown case {other}"),
+    };
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains(LIFECYCLE), "{call}: {err}");
+}

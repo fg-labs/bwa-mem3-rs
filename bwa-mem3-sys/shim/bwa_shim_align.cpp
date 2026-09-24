@@ -1591,6 +1591,15 @@ int shim_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
  * byte-identical to a single batch and to `bwa-mem3 mem -t 1 -p`, however the
  * caller splits the pairs. For n_pairs <= BATCH_SIZE/2 this is a single
  * iteration. */
+/* Free one read's alignment regions and leave an empty vector behind, so
+ * every later free (the legacy shim_regs_free, a resident segment's teardown)
+ * is a no-op on it. */
+static void release_regs(mem_alnreg_v *v) {
+    free(v->a);
+    v->a = nullptr;
+    v->n = v->m = 0;
+}
+
 static void pair_emit_pairs_chunked(ShimEmit *e, const mem_opt_t *opt_pe,
                                     const bntseq_t *bns, const uint8_t *pac,
                                     const mem_pestat_t *pestat, uint64_t first_pair_id,
@@ -1622,6 +1631,11 @@ static void pair_emit_pairs_chunked(ShimEmit *e, const mem_opt_t *opt_pe,
                                         n_pri, z, q_se, &extra_flag, &paired);
             emit_resolved_pair(e, origin_base + i, opt_pe, bns, pac, seqs + 2*i, regs + 2*i,
                                pestat, n_pri, z, q_se, extra_flag, paired);
+            /* Nothing reads a pair's regions once it is emitted: release them
+             * now, while they are still hot, as worker_sam does right after
+             * mem_sam_pe_batch_post (bwamem.cpp:3970-3971). */
+            release_regs(&regs[2*i]);
+            release_regs(&regs[2*i + 1]);
         }
         _mm_free(aln);
     }
@@ -1634,9 +1648,11 @@ static void emit_singles(ShimEmit *e, const mem_opt_t *opt_se, const bntseq_t *b
                          const uint8_t *pac, uint64_t first_single_id, bseq1_t *seqs,
                          mem_alnreg_v *regs, size_t n, size_t origin_base)
 {
-    for (size_t i = 0; i < n; ++i)
+    for (size_t i = 0; i < n; ++i) {
         single_and_emit(e, origin_base + i, first_single_id + (uint64_t)i,
                         opt_se, bns, pac, seqs + i, regs + i);
+        release_regs(&regs[i]);
+    }
 }
 
 /* Phase 3: pairing + mate rescue + primary marking + emission for one batch.
@@ -2305,6 +2321,28 @@ static void resident_segment_free(ShimResidentSegment *sg) {
     free(sg->seqs); free(sg->regs); free(sg);
 }
 
+/* Release an emitted segment's reads: its arena (or per-read strings) and any
+ * regions left, zeroing the headers so resident_segment_free has nothing more
+ * to free. Safe because `emitted` makes every later call on the segment a
+ * lifecycle error and pestat refuses a cohort with an emitted segment. The
+ * cohort then holds only this segment's zeroed headers until it drops. */
+static void resident_segment_release_reads(ShimResidentSegment *sg) {
+    for (size_t i = 0; i < sg->n; ++i) {
+        if (!sg->arena) {
+            free(sg->seqs[i].name); free(sg->seqs[i].seq); free(sg->seqs[i].qual);
+            free(sg->seqs[i].meth_orig_seq);
+        }
+        free(sg->seqs[i].sam);
+        free(sg->regs[i].a);
+    }
+    free(sg->arena);
+    sg->arena = nullptr;
+    if (sg->n) {
+        memset(sg->seqs, 0, sg->n * sizeof(bseq1_t));
+        memset(sg->regs, 0, sg->n * sizeof(mem_alnreg_v));
+    }
+}
+
 static void resident_region_free(ShimResidentRegion *rg) {
     for (size_t s = 0; s < rg->n_segments; ++s) resident_segment_free(rg->segs[s]);
     free(rg->segs);
@@ -2542,6 +2580,7 @@ static int resident_pair_emit(void *idx_opaque, const mem_opt_t *opts, ShimScrat
         emit_singles(&e, &opt_se, bns, pac, ids.first_single_id, sg->seqs, sg->regs, sg->n,
                      origin_base);
     }
+    resident_segment_release_reads(sg);
     return 0;
 }
 
