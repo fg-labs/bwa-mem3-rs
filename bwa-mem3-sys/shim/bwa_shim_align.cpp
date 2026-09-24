@@ -609,8 +609,12 @@ static int decode_read(bseq1_t *s, const char *name, size_t name_len,
      * meth_build_xm use meth_orig_seq for CIGAR/NM/MD and the XM call string,
      * and serialize_record emits it as SEQ. Same orientation as seq. */
     if (meth_mode) {
-        s->meth_orig_seq = strdup(s->seq);
+        /* Copy exactly l_seq bytes, not strdup: a base byte of 0 would make
+         * strdup stop short and every later reader of the l_seq original bases
+         * run off the end -- and diverge from decode_read_arena's copy. */
+        s->meth_orig_seq = (char *) malloc(seq_len + 1);
         if (!s->meth_orig_seq) return -1;
+        memcpy(s->meth_orig_seq, s->seq, seq_len); s->meth_orig_seq[seq_len] = '\0';
         *heap_bytes += (size_t) s->l_seq + 1;
         meth_project_in_place(s, role);
     }
