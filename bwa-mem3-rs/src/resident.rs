@@ -263,6 +263,9 @@ pub struct ResidentRange {
     region: Region,
     first: usize,
     n_reads: usize,
+    /// Read bytes this range's writes copied into the cohort; handed back to
+    /// the cohort's `heap_bytes` when the range is emitted.
+    bytes: usize,
 }
 
 // SAFETY: the token is plain data plus a pointer that is only dereferenced
@@ -309,8 +312,9 @@ impl ResidentRange {
 /// A whole `-K` cohort's decoded reads + alnreg arrays, kept resident on the C
 /// heap across `seed_extend -> infer_cohort -> pair_emit`. Every sub-batch
 /// works on its own [`ResidentRange`] instead of owning a self-contained
-/// [`AlnRegs`](crate::AlnRegs); nothing is copied or freed per sub-batch, and
-/// the whole cohort is freed once, on drop.
+/// [`AlnRegs`](crate::AlnRegs). Reads are copied in once, by the `write_*`
+/// calls; each range's reads and alignment regions are released as soon as it
+/// is emitted, and only the per-read headers stay until the cohort drops.
 ///
 /// # Concurrency
 ///
@@ -354,7 +358,8 @@ pub struct ResidentCohort {
     /// regions hold that index's coordinates.
     index_id: AtomicU64,
     /// C-heap bytes this cohort holds for its reads (see
-    /// [`heap_bytes`](Self::heap_bytes)); maintained by `reserve_*`/`write_*`.
+    /// [`heap_bytes`](Self::heap_bytes)); raised by `reserve_*`/`write_*` and
+    /// lowered when a range is emitted.
     heap_bytes: AtomicUsize,
     /// Serializes calls that read or grow the C segment table: `reserve_*`
     /// (writes it) and `infer_cohort` (walks it).
@@ -504,7 +509,21 @@ impl ResidentCohort {
             region,
             first,
             n_reads,
+            bytes: 0,
         })
+    }
+
+    /// Check that `range` is this cohort's and holds `region` reads.
+    fn check_region(&self, range: &ResidentRange, region: Region, what: &str) -> Result<()> {
+        self.check_owned(range, what)?;
+        if range.region != region {
+            let kind = match region {
+                Region::Pairs => "pair",
+                Region::Singles => "single",
+            };
+            return Err(Error::InvalidInput(format!("{what}: not a {kind} range")));
+        }
+        Ok(())
     }
 
     /// Validate a write to `range` of an item at local index `i` of `n_items`.
@@ -516,14 +535,7 @@ impl ResidentCohort {
         n_items: usize,
         what: &str,
     ) -> Result<()> {
-        self.check_owned(range, what)?;
-        if range.region != region {
-            let kind = match region {
-                Region::Pairs => "pair",
-                Region::Singles => "single",
-            };
-            return Err(Error::InvalidInput(format!("{what}: not a {kind} range")));
-        }
+        self.check_region(range, region, what)?;
         if i >= n_items {
             return Err(Error::InvalidInput(format!(
                 "{what}: index {i} out of range ({n_items} in the range)"
@@ -532,112 +544,142 @@ impl ResidentCohort {
         Ok(())
     }
 
+    /// Validate a whole-range batch write: owned range of `region` and exactly
+    /// `expected` items.
+    fn check_batch(
+        &self,
+        range: &ResidentRange,
+        region: Region,
+        n: usize,
+        expected: usize,
+        what: &str,
+    ) -> Result<()> {
+        self.check_region(range, region, what)?;
+        if n != expected {
+            return Err(Error::InvalidInput(format!(
+                "{what}: a batch of {n} for a range of {expected}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record `added` bytes a write to `range` copied into the cohort. Bytes
+    /// copied before a failure are held by the segment (a partly written range
+    /// is never emitted), so they count either way.
+    fn account_write(&self, range: &mut ResidentRange, added: usize) {
+        self.heap_bytes.fetch_add(added, Ordering::Relaxed);
+        range.bytes += added;
+    }
+
     /// Decode pair `i` of a pair `range` from borrowed bytes into its resident
-    /// slot. Each slot may be written once, before the range's `seed_extend`.
+    /// slot. Each slot may be written once, before the range's `seed_extend`,
+    /// and not at all in a range written with [`write_pairs`](Self::write_pairs).
     pub fn write_pair(
         &self,
         range: &mut ResidentRange,
         i: usize,
         pair: ReadPair<'_>,
     ) -> Result<()> {
-        self.write_pairs_from(range, i, std::slice::from_ref(&pair))
-    }
-
-    /// Decode `pairs` into pair `range` starting at pair 0, taking the range
-    /// lock once for the whole batch rather than once per pair.
-    pub fn write_pairs(&self, range: &mut ResidentRange, pairs: &[ReadPair<'_>]) -> Result<()> {
-        self.write_pairs_from(range, 0, pairs)
-    }
-
-    fn write_pairs_from(
-        &self,
-        range: &mut ResidentRange,
-        first: usize,
-        pairs: &[ReadPair<'_>],
-    ) -> Result<()> {
-        if pairs.is_empty() {
-            return Ok(());
-        }
-        let last = first + pairs.len() - 1;
-        self.check_write(range, Region::Pairs, last, range.n_pairs(), "write_pair")?;
-        for pair in pairs {
-            pair.validate()?;
-        }
+        self.check_write(range, Region::Pairs, i, range.n_pairs(), "write_pair")?;
+        pair.validate()?;
+        let c = c_pair(&pair);
         let _ranges = self.lock_ranges_shared();
         let mut added = 0usize;
-        let mut result = Ok(());
-        for (k, pair) in pairs.iter().enumerate() {
-            let c = c_pair(pair);
-            // SAFETY: `range.segment` is a live segment of this cohort (checked
-            // id; segments live until the cohort drops) that no other call is
-            // touching (`&mut range`); `c` borrows `pair`'s bytes for the call
-            // only; `added` is a live `usize`.
-            let rc = unsafe {
-                bwa_mem3_sys::bwa_shim_resident_write_pair(range.segment, first + k, &c, &mut added)
-            };
-            result = resident_status(rc, "resident_write_pair");
-            if result.is_err() {
-                break;
-            }
-        }
-        // Bytes copied before a failure are held by the segment until the
-        // cohort drops, so they count either way.
-        self.heap_bytes.fetch_add(added, Ordering::Relaxed);
-        result
+        // SAFETY: `range.segment` is a live segment of this cohort (checked
+        // id; segments live until the cohort drops) that no other call is
+        // touching (`&mut range`); `c` borrows `pair`'s bytes for the call
+        // only; `added` is a live `usize`.
+        let rc =
+            unsafe { bwa_mem3_sys::bwa_shim_resident_write_pair(range.segment, i, &c, &mut added) };
+        self.account_write(range, added);
+        resident_status(rc, "resident_write_pair")
+    }
+
+    /// Decode every pair of pair `range` at once: `pairs.len()` must equal
+    /// [`ResidentRange::n_pairs`], and no slot may have been written yet. All
+    /// the reads' bytes go into one allocation (the CLI reader's per-chunk
+    /// arena) instead of three per read, in one FFI call under one lock.
+    pub fn write_pairs(&self, range: &mut ResidentRange, pairs: &[ReadPair<'_>]) -> Result<()> {
+        self.check_batch(
+            range,
+            Region::Pairs,
+            pairs.len(),
+            range.n_pairs(),
+            "write_pairs",
+        )?;
+        let cs = pairs
+            .iter()
+            .map(|pair| pair.validate().map(|()| c_pair(pair)))
+            .collect::<Result<Vec<bwa_mem3_sys::BwaReadPair>>>()?;
+        let _ranges = self.lock_ranges_shared();
+        let mut added = 0usize;
+        // SAFETY: `range.segment` is a live segment of this cohort (checked
+        // id; segments live until the cohort drops) that no other call is
+        // touching (`&mut range`); `cs` and the bytes it borrows outlive the
+        // call, and the shim copies every byte before returning; `added` is a
+        // live `usize`.
+        let rc = unsafe {
+            bwa_mem3_sys::bwa_shim_resident_write_pairs(
+                range.segment,
+                cs.as_ptr(),
+                cs.len(),
+                &mut added,
+            )
+        };
+        self.account_write(range, added);
+        resident_status(rc, "resident_write_pairs")
     }
 
     /// Decode single `i` of a single `range` from borrowed bytes. Each slot may
-    /// be written once, before the range's `seed_extend`.
+    /// be written once, before the range's `seed_extend`, and not at all in a
+    /// range written with [`write_singles`](Self::write_singles).
     pub fn write_single(
         &self,
         range: &mut ResidentRange,
         i: usize,
         read: SingleRead<'_>,
     ) -> Result<()> {
-        self.write_singles_from(range, i, std::slice::from_ref(&read))
-    }
-
-    /// Decode `reads` into single `range` starting at read 0, taking the range
-    /// lock once for the whole batch rather than once per read.
-    pub fn write_singles(&self, range: &mut ResidentRange, reads: &[SingleRead<'_>]) -> Result<()> {
-        self.write_singles_from(range, 0, reads)
-    }
-
-    fn write_singles_from(
-        &self,
-        range: &mut ResidentRange,
-        first: usize,
-        reads: &[SingleRead<'_>],
-    ) -> Result<()> {
-        if reads.is_empty() {
-            return Ok(());
-        }
-        let last = first + reads.len() - 1;
-        self.check_write(range, Region::Singles, last, range.n_reads, "write_single")?;
-        for read in reads {
-            read.validate()?;
-        }
+        self.check_write(range, Region::Singles, i, range.n_reads, "write_single")?;
+        read.validate()?;
+        let c = c_single(&read);
         let _ranges = self.lock_ranges_shared();
         let mut added = 0usize;
-        let mut result = Ok(());
-        for (k, read) in reads.iter().enumerate() {
-            let c = c_single(read);
-            // SAFETY: as `write_pairs_from`.
-            let rc = unsafe {
-                bwa_mem3_sys::bwa_shim_resident_write_single(
-                    range.segment,
-                    first + k,
-                    &c,
-                    &mut added,
-                )
-            };
-            result = resident_status(rc, "resident_write_single");
-            if result.is_err() {
-                break;
-            }
-        }
-        self.heap_bytes.fetch_add(added, Ordering::Relaxed);
-        result
+        // SAFETY: as `write_pair`.
+        let rc = unsafe {
+            bwa_mem3_sys::bwa_shim_resident_write_single(range.segment, i, &c, &mut added)
+        };
+        self.account_write(range, added);
+        resident_status(rc, "resident_write_single")
+    }
+
+    /// Decode every read of single `range` at once: `reads.len()` must equal
+    /// [`ResidentRange::n_reads`], and no slot may have been written yet. See
+    /// [`write_pairs`](Self::write_pairs).
+    pub fn write_singles(&self, range: &mut ResidentRange, reads: &[SingleRead<'_>]) -> Result<()> {
+        self.check_batch(
+            range,
+            Region::Singles,
+            reads.len(),
+            range.n_reads,
+            "write_singles",
+        )?;
+        let cs = reads
+            .iter()
+            .map(|read| read.validate().map(|()| c_single(read)))
+            .collect::<Result<Vec<bwa_mem3_sys::BwaSingleRead>>>()?;
+        let _ranges = self.lock_ranges_shared();
+        let mut added = 0usize;
+        // SAFETY: as `write_pairs`.
+        let rc = unsafe {
+            bwa_mem3_sys::bwa_shim_resident_write_singles(
+                range.segment,
+                cs.as_ptr(),
+                cs.len(),
+                &mut added,
+            )
+        };
+        self.account_write(range, added);
+        resident_status(rc, "resident_write_singles")
     }
 
     /// Seed + SE-extend the reads of `range`. Every slot must be written, and a
@@ -696,13 +738,39 @@ impl ResidentCohort {
 
     /// Bytes this cohort holds on the C heap for its reads: each reserved
     /// read's headers plus the name, bases and qualities copied into it (and,
-    /// under `--meth`, its original bases). It does not count the alignment
+    /// under `--meth`, its original bases). A range's copied bytes are held
+    /// until it is emitted, when the shim releases its reads and regions and
+    /// only the headers remain. It does not count the alignment
     /// regions, which `seed_extend` and mate rescue grow in place; that is the
     /// difference from [`AlnRegs::heap_bytes`](crate::AlnRegs::heap_bytes),
     /// which counts them. Lock-free: it never waits on in-flight range calls.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
         self.heap_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Whether `range`'s segment still holds any read string or alignment
+    /// region on the C heap: `true` once written, `false` after it has been
+    /// emitted. A test hook for the release-at-emit contract.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn range_holds_reads(&self, range: &ResidentRange) -> bool {
+        if self.check_owned(range, "range_holds_reads").is_err() {
+            return false;
+        }
+        let _ranges = self.lock_ranges_shared();
+        // SAFETY: `range.segment` is a live segment of this cohort (checked id;
+        // segments live until the cohort drops); the query only reads it, and
+        // no call can mutate it concurrently because every mutating call needs
+        // the range by `&mut`.
+        unsafe { bwa_mem3_sys::bwa_shim_resident_segment_holds_reads(range.segment) != 0 }
+    }
+
+    /// Hand an emitted range's read bytes back: the shim released them at the
+    /// end of the emit, even when the sink panicked partway.
+    fn release_bytes(&self, range: &mut ResidentRange) {
+        self.heap_bytes.fetch_sub(range.bytes, Ordering::Relaxed);
+        range.bytes = 0;
     }
 
     /// Validate an emit call and take the shared range lock for it.
@@ -725,9 +793,10 @@ impl ResidentCohort {
         Ok(self.lock_ranges_shared())
     }
 
-    /// Pair / mate-rescue / emit the reads of a seed-extended `range` **without**
-    /// freeing them; each range is emitted once. `ids` gives the global read
-    /// ordinal of the range's first pair/single; `origin_base` is added to the
+    /// Pair / mate-rescue / emit the reads of a seed-extended `range`, then
+    /// release its reads and alignment regions; each range is emitted once.
+    /// `ids` gives the global read ordinal of the range's first pair/single;
+    /// `origin_base` is added to the
     /// local index for each record's [`RecordOrigin`]. `pestat` is the cohort
     /// model from [`infer_cohort`](Self::infer_cohort); it may be `None` only
     /// for a single-end range.
@@ -772,6 +841,9 @@ impl ResidentCohort {
                 ctx_ptr,
             )
         };
+        if rc == 0 {
+            self.release_bytes(range);
+        }
         if let Some(payload) = sink_ctx.panic {
             std::panic::resume_unwind(payload);
         }
@@ -812,6 +884,9 @@ impl ResidentCohort {
                 ctx_ptr,
             )
         };
+        if rc == 0 {
+            self.release_bytes(range);
+        }
         if let Some(payload) = sink_ctx.panic {
             std::panic::resume_unwind(payload);
         }

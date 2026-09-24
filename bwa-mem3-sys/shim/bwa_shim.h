@@ -158,6 +158,17 @@ int bwa_shim_estimate_pestat(
 BwaScratch *bwa_shim_scratch_new(void);
 void        bwa_shim_scratch_free(BwaScratch *sc);
 
+/* The kernel thread slot a scratch runs bwa-mem3's kernels in (its own
+ * mem_cache entry and profiling-counter column), or -1 for NULL. Distinct for
+ * up to 256 scratches alive together; beyond that, slots are shared. Exposed
+ * for tests. */
+int bwa_shim_scratch_tid(const BwaScratch *sc);
+
+/* Reads per kernel batch the linked bwa-mem3 was built with (1024 on aarch64,
+ * 512 elsewhere). Filling a sub-batch to a multiple of it runs every seed,
+ * extension and mate-rescue kernel call on a full batch. */
+size_t bwa_shim_kernel_batch_size(void);
+
 /* Phase 1: seed + single-end-extend every read of `batch` (the fused
  * `worker_bwt_aln` work). Per-read independent: safe to split a cohort into
  * any number of batches on any number of threads. Returns NULL + last_error
@@ -250,6 +261,20 @@ int bwa_shim_resident_write_pair(BwaResidentSegment *sg, size_t i, const BwaRead
 int bwa_shim_resident_write_single(BwaResidentSegment *sg, size_t i,
                                    const BwaSingleRead *single, size_t *added);
 
+/* Decode EVERY pair (resp. single) of an unwritten segment in one call, all
+ * strings in one allocation. `n` must equal the segment's pair (resp. read)
+ * count. Adds the same bytes the per-slot writes would to *added. Returns 0,
+ * -1 on a bad argument / count mismatch / OOM, or -3 when any slot was already
+ * written or the segment was extended. */
+int bwa_shim_resident_write_pairs(BwaResidentSegment *sg, const BwaReadPair *pairs, size_t n,
+                                  size_t *added);
+int bwa_shim_resident_write_singles(BwaResidentSegment *sg, const BwaSingleRead *reads,
+                                    size_t n, size_t *added);
+
+/* 1 while a segment still holds any read string or alignment region, 0 once it
+ * has been emitted (which releases them) or for NULL. Exposed for tests. */
+int bwa_shim_resident_segment_holds_reads(const BwaResidentSegment *sg);
+
 /* Seed + SE-extend every read of a fully written segment (pairs or singles).
  * Returns 0, -1, or -3. */
 int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
@@ -261,7 +286,8 @@ int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
                                     const BwaResidentCohort *c, mem_pestat_t *out);
 
 /* Pair/mate-rescue/emit a seed-extended pair segment, or SE-emit a single
- * segment, WITHOUT freeing it; each segment is emitted once.
+ * segment, then release its reads and regions (the segment's headers stay
+ * until the cohort is freed); each segment is emitted once.
  * `ids.first_pair_id`/`first_single_id` is the GLOBAL read ordinal of the
  * segment's first pair/single; `origin_base` is added to the local index for
  * the sink's origin_idx. Records stream to `sink` in input order. Returns 0, -1

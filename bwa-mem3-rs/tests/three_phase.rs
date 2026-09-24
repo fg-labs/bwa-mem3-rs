@@ -703,6 +703,16 @@ enum Misuse {
     InferBeforeSeedExtend,
     InferOtherMeth,
     InferAfterPairEmit,
+    WritePairsPartial,
+    WriteSinglesPartial,
+    WritePairsAfterSlotWrite,
+    PairsIntoSingleRange,
+    SinglesIntoPairRange,
+    WritePairAfterWritePairs,
+    WriteSingleAfterWriteSingles,
+    WritePairsTwice,
+    PairEmitFieldsAfterPairEmit,
+    SeedExtendAfterPairEmit,
 }
 
 /// A structured sink that discards every record.
@@ -739,6 +749,16 @@ impl AlignedFieldsSink for NullFieldSink {
 #[case::infer_before_seed_extend(Misuse::InferBeforeSeedExtend, LIFECYCLE)]
 #[case::infer_other_meth(Misuse::InferOtherMeth, "meth=")]
 #[case::infer_after_pair_emit(Misuse::InferAfterPairEmit, LIFECYCLE)]
+#[case::write_pairs_partial(Misuse::WritePairsPartial, "for a range of")]
+#[case::write_singles_partial(Misuse::WriteSinglesPartial, "for a range of")]
+#[case::write_pairs_after_slot_write(Misuse::WritePairsAfterSlotWrite, LIFECYCLE)]
+#[case::pairs_into_single_range(Misuse::PairsIntoSingleRange, "not a pair range")]
+#[case::singles_into_pair_range(Misuse::SinglesIntoPairRange, "not a single range")]
+#[case::write_pair_after_write_pairs(Misuse::WritePairAfterWritePairs, LIFECYCLE)]
+#[case::write_single_after_write_singles(Misuse::WriteSingleAfterWriteSingles, LIFECYCLE)]
+#[case::write_pairs_twice(Misuse::WritePairsTwice, LIFECYCLE)]
+#[case::pair_emit_fields_after_pair_emit(Misuse::PairEmitFieldsAfterPairEmit, LIFECYCLE)]
+#[case::seed_extend_after_pair_emit(Misuse::SeedExtendAfterPairEmit, LIFECYCLE)]
 fn resident_misuse_is_rejected(#[case] misuse: Misuse, #[case] needle: &str) {
     let Some(idx) = shared_idx() else {
         eprintln!("skip: bwa-mem3 not available to build a PhiX index");
@@ -772,6 +792,70 @@ fn resident_misuse_is_rejected(#[case] misuse: Misuse, #[case] needle: &str) {
     };
 
     let result: bwa_mem3_rs::Result<()> = match misuse {
+        Misuse::WritePairsPartial => {
+            cohort.write_pairs(&mut cohort.reserve_pairs(2).unwrap(), &[pair])
+        }
+        Misuse::WriteSinglesPartial => {
+            cohort.write_singles(&mut cohort.reserve_singles(2).unwrap(), &[single])
+        }
+        Misuse::PairsIntoSingleRange => {
+            cohort.write_pairs(&mut cohort.reserve_singles(1).unwrap(), &[pair])
+        }
+        Misuse::SinglesIntoPairRange => {
+            cohort.write_singles(&mut cohort.reserve_pairs(1).unwrap(), &[single])
+        }
+        Misuse::WritePairAfterWritePairs => {
+            let mut r = cohort.reserve_pairs(2).unwrap();
+            cohort.write_pairs(&mut r, &[pair, pair]).unwrap();
+            cohort.write_pair(&mut r, 0, pair)
+        }
+        Misuse::WriteSingleAfterWriteSingles => {
+            let mut r = cohort.reserve_singles(1).unwrap();
+            cohort.write_singles(&mut r, &[single]).unwrap();
+            cohort.write_single(&mut r, 0, single)
+        }
+        Misuse::WritePairsTwice => {
+            let mut r = written();
+            cohort.write_pairs(&mut r, &[pair, pair])
+        }
+        Misuse::PairEmitFieldsAfterPairEmit | Misuse::SeedExtendAfterPairEmit => {
+            let mut r = written();
+            cohort
+                .seed_extend(&idx, &opts, &mut scratch, &mut r)
+                .unwrap();
+            let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+            cohort
+                .pair_emit(
+                    &idx,
+                    &opts,
+                    &mut scratch,
+                    &mut r,
+                    Some(&pestat),
+                    ids,
+                    0,
+                    &mut sink,
+                )
+                .unwrap();
+            if matches!(misuse, Misuse::SeedExtendAfterPairEmit) {
+                cohort.seed_extend(&idx, &opts, &mut scratch, &mut r)
+            } else {
+                cohort.pair_emit_fields(
+                    &idx,
+                    &opts,
+                    &mut scratch,
+                    &mut r,
+                    Some(&pestat),
+                    ids,
+                    0,
+                    &mut NullFieldSink,
+                )
+            }
+        }
+        Misuse::WritePairsAfterSlotWrite => {
+            let mut r = cohort.reserve_pairs(2).unwrap();
+            cohort.write_pair(&mut r, 1, pair).unwrap();
+            cohort.write_pairs(&mut r, &[pair, pair])
+        }
         Misuse::ForeignWritePair => cohort.write_pair(&mut foreign(), 0, pair),
         Misuse::ForeignWriteSingle => {
             let mut r = ResidentCohort::new(false)
@@ -933,7 +1017,13 @@ fn resident_misuse_is_rejected(#[case] misuse: Misuse, #[case] needle: &str) {
     };
     assert_invalid(result, needle, &format!("{misuse:?}"));
     // A rejected pre-emit call must not have produced records.
-    if !matches!(misuse, Misuse::PairEmitTwice | Misuse::InferAfterPairEmit) {
+    if !matches!(
+        misuse,
+        Misuse::PairEmitTwice
+            | Misuse::InferAfterPairEmit
+            | Misuse::PairEmitFieldsAfterPairEmit
+            | Misuse::SeedExtendAfterPairEmit
+    ) {
         assert!(
             sink.records.is_empty(),
             "{misuse:?}: a rejected call produced records"
@@ -1172,4 +1262,362 @@ fn panicking_sink_leaves_the_cohort_usable() {
         got == expected,
         "the other range's output changed after a panic"
     );
+}
+
+/// Which region a batch-write test writes.
+#[derive(Clone, Copy, Debug)]
+enum WriteRegion {
+    Pairs,
+    Singles,
+}
+
+/// How a test writes a range: one batch into the arena, or slot by slot.
+#[derive(Clone, Copy, Debug)]
+enum WriteMode {
+    Batch,
+    PerSlot,
+}
+
+/// The fixture's singles as borrowed reads.
+fn fixture_singles(fixture: &Fixture) -> Vec<SingleRead<'_>> {
+    fixture
+        .singles
+        .iter()
+        .map(|r| SingleRead {
+            name: &r.name,
+            seq: &r.seq,
+            qual: r.qual.as_deref(),
+        })
+        .collect()
+}
+
+/// Reserve and write a pair range holding `pairs`.
+fn write_pair_range(
+    cohort: &ResidentCohort,
+    pairs: &[ReadPair<'_>],
+    mode: WriteMode,
+) -> ResidentRange {
+    let mut range = cohort.reserve_pairs(pairs.len()).unwrap();
+    match mode {
+        WriteMode::Batch => cohort.write_pairs(&mut range, pairs).unwrap(),
+        WriteMode::PerSlot => {
+            for (i, p) in pairs.iter().enumerate() {
+                cohort.write_pair(&mut range, i, *p).unwrap();
+            }
+        }
+    }
+    range
+}
+
+/// Reserve and write a single range holding `reads`.
+fn write_single_range(
+    cohort: &ResidentCohort,
+    reads: &[SingleRead<'_>],
+    mode: WriteMode,
+) -> ResidentRange {
+    let mut range = cohort.reserve_singles(reads.len()).unwrap();
+    match mode {
+        WriteMode::Batch => cohort.write_singles(&mut range, reads).unwrap(),
+        WriteMode::PerSlot => {
+            for (i, r) in reads.iter().enumerate() {
+                cohort.write_single(&mut range, i, *r).unwrap();
+            }
+        }
+    }
+    range
+}
+
+/// The PhiX index for `meth`, and options in that mode.
+fn index_for(meth: bool) -> Option<(Arc<BwaIndex>, MemOpts)> {
+    let idx = if meth {
+        phix_meth().map(|r| r.idx.clone())
+    } else {
+        shared_idx()
+    }?;
+    let mut opts = MemOpts::new().unwrap();
+    if meth {
+        opts.set_meth(true);
+    }
+    Some((idx, opts))
+}
+
+/// Align `pairs` or `singles` in one range written with `mode`, returning the
+/// packed records.
+fn align_written_range(
+    idx: &BwaIndex,
+    opts: &MemOpts,
+    meth: bool,
+    region: WriteRegion,
+    pairs: &[ReadPair<'_>],
+    singles: &[SingleRead<'_>],
+    mode: WriteMode,
+) -> Records {
+    let cohort = ResidentCohort::new(meth).unwrap();
+    let mut scratch = AlignScratch::new().unwrap();
+    let mut range = match region {
+        WriteRegion::Pairs => write_pair_range(&cohort, pairs, mode),
+        WriteRegion::Singles => write_single_range(&cohort, singles, mode),
+    };
+    cohort
+        .seed_extend(idx, opts, &mut scratch, &mut range)
+        .unwrap();
+    let pestat = match region {
+        WriteRegion::Pairs => Some(cohort.infer_cohort(idx, opts).unwrap()),
+        WriteRegion::Singles => None,
+    };
+    let mut sink = RecordVec::default();
+    cohort
+        .pair_emit(
+            idx,
+            opts,
+            &mut scratch,
+            &mut range,
+            pestat.as_ref(),
+            IdBases::default(),
+            0,
+            &mut sink,
+        )
+        .unwrap();
+    sink.records
+}
+
+/// A range written in one batch (one arena) aligns byte-identically to the
+/// same range written slot by slot, for pairs and singles, with and without
+/// `--meth` (whose original bases and projection then live in the arena too).
+#[rstest]
+fn batch_write_matches_per_slot_write(
+    #[values(WriteRegion::Pairs, WriteRegion::Singles)] region: WriteRegion,
+    #[values(false, true)] meth: bool,
+) {
+    let Some((idx, opts)) = index_for(meth) else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let pairs: Vec<ReadPair<'_>> = fixture.pairs.iter().map(as_read_pair).collect();
+    let singles = fixture_singles(&fixture);
+    let run = |mode| align_written_range(&idx, &opts, meth, region, &pairs, &singles, mode);
+    let (batched, per_slot) = (run(WriteMode::Batch), run(WriteMode::PerSlot));
+    assert!(!batched.is_empty(), "the fixture must emit records");
+    assert_eq!(batched, per_slot);
+}
+
+/// Under `--meth` the original bases are copied whole, not up to the first 0
+/// byte: a read whose bases contain one aligns the same written either way.
+#[rstest]
+fn a_zero_base_byte_is_copied_whole_under_meth(
+    #[values(WriteRegion::Pairs, WriteRegion::Singles)] region: WriteRegion,
+) {
+    let Some((idx, opts)) = index_for(true) else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX meth index");
+        return;
+    };
+    let fixture = field_fixture();
+    let (r1, _) = &fixture.pairs[0];
+    let mut seq_r1 = r1.seq.clone();
+    seq_r1[1] = 0;
+    let pair = ReadPair {
+        seq_r1: &seq_r1,
+        ..as_read_pair(&fixture.pairs[0])
+    };
+    let single = SingleRead {
+        name: &r1.name,
+        seq: &seq_r1,
+        qual: r1.qual.as_deref(),
+    };
+    let run = |mode| align_written_range(&idx, &opts, true, region, &[pair], &[single], mode);
+    let (batched, per_slot) = (run(WriteMode::Batch), run(WriteMode::PerSlot));
+    assert!(!batched.is_empty());
+    assert_eq!(batched, per_slot);
+}
+
+/// A batch write accounts exactly the bytes the per-slot writes do, with and
+/// without `--meth` (which adds each read's original bases).
+#[rstest]
+fn batch_write_counts_the_same_heap_bytes(
+    #[values(WriteRegion::Pairs, WriteRegion::Singles)] region: WriteRegion,
+    #[values(false, true)] meth: bool,
+) {
+    let fixture = field_fixture();
+    let pairs: Vec<ReadPair<'_>> = fixture.pairs.iter().map(as_read_pair).collect();
+    let singles = fixture_singles(&fixture);
+    let bytes = |mode| {
+        let cohort = ResidentCohort::new(meth).unwrap();
+        let _range = match region {
+            WriteRegion::Pairs => write_pair_range(&cohort, &pairs, mode),
+            WriteRegion::Singles => write_single_range(&cohort, &singles, mode),
+        };
+        cohort.heap_bytes()
+    };
+    assert_eq!(bytes(WriteMode::Batch), bytes(WriteMode::PerSlot));
+}
+
+/// How a release test emits its range.
+#[derive(Clone, Copy, Debug)]
+enum EmitVia {
+    Packed,
+    Fields,
+    PanickingSink,
+}
+
+/// Emitting a range releases its reads and regions in the shim and hands their
+/// bytes back: the segment holds nothing afterwards and `heap_bytes` falls to
+/// the headers-only figure, whichever emit call ran, however the range was
+/// written, and even when the sink panics partway.
+#[rstest]
+fn emit_releases_the_ranges_reads(
+    #[values(EmitVia::Packed, EmitVia::Fields, EmitVia::PanickingSink)] via: EmitVia,
+    #[values(WriteMode::Batch, WriteMode::PerSlot)] mode: WriteMode,
+) {
+    struct Boom;
+    impl RecordSink for Boom {
+        fn emit(&mut self, _: RecordOrigin, _: &[u8]) {
+            panic!("boom mid-emission");
+        }
+    }
+    let Some((idx, opts)) = index_for(false) else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    // SAFETY: a pure query with no preconditions.
+    let overhead = unsafe { bwa_mem3_sys::bwa_shim_resident_read_overhead() };
+    let pairs: Vec<ReadPair<'_>> = fixture.pairs.iter().map(as_read_pair).collect();
+    let cohort = ResidentCohort::new(false).unwrap();
+    let mut scratch = AlignScratch::new().unwrap();
+    let mut range = write_pair_range(&cohort, &pairs, mode);
+    cohort
+        .seed_extend(&idx, &opts, &mut scratch, &mut range)
+        .unwrap();
+    let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+    let headers_only = 2 * pairs.len() * overhead;
+    assert!(
+        cohort.range_holds_reads(&range),
+        "the reads are held before emit"
+    );
+    assert!(cohort.heap_bytes() > headers_only, "and counted");
+    let ids = IdBases::default();
+    match via {
+        EmitVia::Packed => cohort
+            .pair_emit(
+                &idx,
+                &opts,
+                &mut scratch,
+                &mut range,
+                Some(&pestat),
+                ids,
+                0,
+                &mut RecordVec::default(),
+            )
+            .unwrap(),
+        EmitVia::Fields => cohort
+            .pair_emit_fields(
+                &idx,
+                &opts,
+                &mut scratch,
+                &mut range,
+                Some(&pestat),
+                ids,
+                0,
+                &mut NullFieldSink,
+            )
+            .unwrap(),
+        EmitVia::PanickingSink => {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cohort.pair_emit(
+                    &idx,
+                    &opts,
+                    &mut scratch,
+                    &mut range,
+                    Some(&pestat),
+                    ids,
+                    0,
+                    &mut Boom,
+                )
+            }));
+            assert!(outcome.is_err(), "the sink's panic propagates");
+        }
+    }
+    assert!(
+        !cohort.range_holds_reads(&range),
+        "the emit released the reads and regions"
+    );
+    assert_eq!(cohort.heap_bytes(), headers_only);
+}
+
+/// `kernel_batch_size` reports the kernel batch the vendored `macro.h` selects
+/// for this build's architecture.
+#[test]
+fn kernel_batch_size_matches_the_build_target() {
+    let expected = if cfg!(target_arch = "aarch64") {
+        1024
+    } else {
+        512
+    };
+    assert_eq!(bwa_mem3_rs::kernel_batch_size(), expected);
+}
+
+/// An empty pair range writes, extends, infers and emits nothing, without error.
+#[test]
+fn an_empty_range_writes_and_emits_nothing() {
+    let Some((idx, opts)) = index_for(false) else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let cohort = ResidentCohort::new(false).unwrap();
+    let mut scratch = AlignScratch::new().unwrap();
+    let mut range = cohort.reserve_pairs(0).unwrap();
+    cohort.write_pairs(&mut range, &[]).unwrap();
+    cohort
+        .seed_extend(&idx, &opts, &mut scratch, &mut range)
+        .unwrap();
+    let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+    let mut sink = RecordVec::default();
+    cohort
+        .pair_emit(
+            &idx,
+            &opts,
+            &mut scratch,
+            &mut range,
+            Some(&pestat),
+            IdBases::default(),
+            0,
+            &mut sink,
+        )
+        .unwrap();
+    assert!(sink.records.is_empty());
+}
+
+/// The longest name the writers accept survives the arena intact in every
+/// emitted record.
+#[test]
+fn the_longest_read_name_survives_the_arena() {
+    let Some((idx, opts)) = index_for(false) else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    // The longest name `ReadPair::validate` accepts (a BAM l_read_name of 255
+    // with the NUL).
+    let name = vec![b'n'; 254];
+    let pair = ReadPair {
+        name_r1: &name,
+        name_r2: &name,
+        ..as_read_pair(&fixture.pairs[0])
+    };
+    let records = align_written_range(
+        &idx,
+        &opts,
+        false,
+        WriteRegion::Pairs,
+        &[pair],
+        &[],
+        WriteMode::Batch,
+    );
+    assert!(!records.is_empty());
+    for (_, body) in &records {
+        // BAM body: l_read_name at byte 8 (NUL included), name at 32.
+        let l_name = usize::from(body[8]);
+        assert_eq!(&body[32..32 + l_name - 1], name.as_slice());
+    }
 }

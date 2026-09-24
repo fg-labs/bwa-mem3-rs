@@ -125,6 +125,9 @@ extern "C" {
     ShimResidentCohort *shim_resident_cohort_new(int meth_mode);
     void   shim_resident_cohort_free(ShimResidentCohort *c);
     size_t shim_resident_read_overhead(void);
+    size_t shim_kernel_batch_size(void);
+    int    shim_scratch_tid(const ShimScratch *sc);
+    int    shim_resident_segment_holds_reads(const ShimResidentSegment *sg);
     ShimResidentSegment *shim_resident_reserve_pairs(ShimResidentCohort *c, size_t n_reads,
                                                      size_t *first_out);
     ShimResidentSegment *shim_resident_reserve_singles(ShimResidentCohort *c, size_t n_reads,
@@ -133,6 +136,10 @@ extern "C" {
                                     size_t *added);
     int    shim_resident_write_single(ShimResidentSegment *sg, size_t i,
                                       const ShimSingleRead *single, size_t *added);
+    int    shim_resident_write_pairs(ShimResidentSegment *sg, const ShimReadPair *pairs,
+                                     size_t n, size_t *added);
+    int    shim_resident_write_singles(ShimResidentSegment *sg, const ShimSingleRead *reads,
+                                       size_t n, size_t *added);
     int    shim_resident_seed_extend(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
                                      ShimResidentSegment *sg);
     int    shim_resident_pestat_cohort(void *fmi, const mem_opt_t *opts,
@@ -649,6 +656,15 @@ extern "C" void bwa_shim_resident_cohort_free(BwaResidentCohort *c) {
 extern "C" size_t bwa_shim_resident_read_overhead(void) {
     return shim_resident_read_overhead();
 }
+extern "C" size_t bwa_shim_kernel_batch_size(void) {
+    return shim_kernel_batch_size();
+}
+extern "C" int bwa_shim_scratch_tid(const BwaScratch *sc) {
+    return sc ? shim_scratch_tid(sc->inner) : -1;
+}
+extern "C" int bwa_shim_resident_segment_holds_reads(const BwaResidentSegment *sg) {
+    return shim_resident_segment_holds_reads(shim_seg(const_cast<BwaResidentSegment *>(sg)));
+}
 
 /* Map a shim status to the public contract, recording why it failed. The -3
  * message is complete on its own: the Rust wrapper surfaces it verbatim. */
@@ -693,6 +709,22 @@ extern "C" int bwa_shim_resident_write_single(BwaResidentSegment *sg, size_t i,
         shim_resident_write_single(shim_seg(sg), i,
                                    reinterpret_cast<const ShimSingleRead *>(single), added),
         "resident_write_single");
+}
+extern "C" int bwa_shim_resident_write_pairs(BwaResidentSegment *sg, const BwaReadPair *pairs,
+                                             size_t n, size_t *added) {
+    shim_clear_err();
+    return resident_status(
+        shim_resident_write_pairs(shim_seg(sg), reinterpret_cast<const ShimReadPair *>(pairs), n,
+                                  added),
+        "resident_write_pairs");
+}
+extern "C" int bwa_shim_resident_write_singles(BwaResidentSegment *sg, const BwaSingleRead *reads,
+                                               size_t n, size_t *added) {
+    shim_clear_err();
+    return resident_status(
+        shim_resident_write_singles(shim_seg(sg), reinterpret_cast<const ShimSingleRead *>(reads),
+                                    n, added),
+        "resident_write_singles");
 }
 extern "C" int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
                                              BwaScratch *sc, BwaResidentSegment *sg) {
