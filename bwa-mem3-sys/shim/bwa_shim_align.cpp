@@ -1838,13 +1838,6 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
         int n_emit = 0;
         for (int j = 0; j < (int)a[k].n; ++j) {
             const mem_alnreg_t *ar = &a[k].a[j];
-            /* D3 (--meth): pass the ORIGINAL read bases so mem_reg2aln
-             * regenerates CIGAR/NM/MD against the original ref (NULL and a
-             * no-op outside --meth). */
-            lists[k][j] = mem_reg2aln(opt, bns, pac, s[k].l_seq, s[k].seq,
-                                      ar, s[k].meth_orig_seq);
-            lists[k][j].XA = XA[k] ? XA[k][j] : nullptr;
-            lists[k][j].HN = HN[k] ? HN[k][j] : -1;
             /* mem_reg2sam emit filter. */
             bool e = ar->score >= opt->T;
             if (e && ar->secondary >= 0 && (ar->is_alt || !(opt->flag & MEM_F_ALL)))
@@ -1852,6 +1845,25 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
             if (e && ar->secondary >= 0 && ar->secondary < INT_MAX
                 && ar->score < a[k].a[ar->secondary].score * opt->drop_ratio)
                 e = false;
+            /* Convert a region only when something reads it: an emitted
+             * record, region 0 (the mate-flag loop below reads lists[!k][0]),
+             * or which[k] (h_rid and the mate anchor). mem_reg2aln regenerates
+             * the CIGAR with a global alignment, and a repetitive read reaching
+             * this branch can carry dozens of secondaries that are only ever
+             * folded into XA:Z, so converting all of them made this loop the
+             * dominant ksw_global2 caller. Upstream mem_reg2sam likewise
+             * converts only what it emits. The skipped entries stay zeroed
+             * from the calloc above (null cigar, so the frees below are
+             * no-ops) and are never emitted or used as an anchor. */
+            if (e || j == 0 || j == which[k]) {
+                /* D3 (--meth): pass the ORIGINAL read bases so mem_reg2aln
+                 * regenerates CIGAR/NM/MD against the original ref (NULL and a
+                 * no-op outside --meth). */
+                lists[k][j] = mem_reg2aln(opt, bns, pac, s[k].l_seq, s[k].seq,
+                                          ar, s[k].meth_orig_seq);
+                lists[k][j].XA = XA[k] ? XA[k][j] : nullptr;
+                lists[k][j].HN = HN[k] ? HN[k][j] : -1;
+            }
             /* (The paired-branch secondary_all fold that once lived here was
              * removed with the rest of the dead paired code: this tail now runs
              * only when paired==0, where `z[]` is undefined and must not be
