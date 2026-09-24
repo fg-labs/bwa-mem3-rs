@@ -1591,6 +1591,18 @@ int shim_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
  * byte-identical to a single batch and to `bwa-mem3 mem -t 1 -p`, however the
  * caller splits the pairs. For n_pairs <= BATCH_SIZE/2 this is a single
  * iteration. */
+/* The CLI's look-ahead hint for the CIGAR-regeneration reference window of an
+ * alignment starting at `rb`: a verbatim copy of mem_prefetch_cigar_ref, which
+ * is static in bwamem.cpp (see its comment there for the strand split and the
+ * locality choice). A pure hint -> byte-identical output. */
+static inline void shim_prefetch_cigar_ref(const bntseq_t *bns, const uint8_t *pac, int64_t rb)
+{
+    if (rb < 0) return;
+    int64_t l_pac = bns->l_pac;
+    int64_t pf = (rb < l_pac) ? (rb >> 2) : (((l_pac << 1) - 1 - rb) >> 2);
+    __builtin_prefetch(&pac[pf], 0, 0);
+}
+
 /* Free one read's alignment regions and leave an empty vector behind, so
  * every later free (the legacy shim_regs_free, a resident segment's teardown)
  * is a no-op on it. */
@@ -1625,6 +1637,12 @@ static void pair_emit_pairs_chunked(ShimEmit *e, const mem_opt_t *opt_pe,
         gcnt = 0;
         kswr_t *myaln = aln;
         for (size_t i = chunk_start; i < chunk_end; ++i) {
+            /* Look-ahead, as worker_sam does (bwamem.cpp:3945-3958): prefetch
+             * the next pair's two emit windows while this pair resolves. */
+            if (i + 1 < chunk_end) {
+                if (regs[2*i + 2].n > 0) shim_prefetch_cigar_ref(bns, pac, regs[2*i + 2].a[0].rb);
+                if (regs[2*i + 3].n > 0) shim_prefetch_cigar_ref(bns, pac, regs[2*i + 3].a[0].rb);
+            }
             int n_pri[2], z[2], q_se[2], extra_flag, paired;
             mem_pair_resolve_batch_post(opt_pe, bns, pac, pestat, first_pair_id + (uint64_t)i,
                                         seqs + 2*i, regs + 2*i, &myaln, &w.mmc, gcnt, 0,
@@ -1649,6 +1667,9 @@ static void emit_singles(ShimEmit *e, const mem_opt_t *opt_se, const bntseq_t *b
                          mem_alnreg_v *regs, size_t n, size_t origin_base)
 {
     for (size_t i = 0; i < n; ++i) {
+        /* Look-ahead, as worker_sam's SE loop does (bwamem.cpp:3984-3985). */
+        if (i + 1 < n && regs[i + 1].n > 0)
+            shim_prefetch_cigar_ref(bns, pac, regs[i + 1].a[0].rb);
         single_and_emit(e, origin_base + i, first_single_id + (uint64_t)i,
                         opt_se, bns, pac, seqs + i, regs + i);
         release_regs(&regs[i]);
