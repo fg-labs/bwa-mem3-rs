@@ -281,7 +281,8 @@ int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
                                     const BwaResidentCohort *c, mem_pestat_t *out);
 
 /* Pair/mate-rescue/emit a seed-extended pair segment, or SE-emit a single
- * segment, WITHOUT freeing it; each segment is emitted once.
+ * segment, then release its reads and regions (the segment's headers stay
+ * until the cohort is freed); each segment is emitted once.
  * `ids.first_pair_id`/`first_single_id` is the GLOBAL read ordinal of the
  * segment's first pair/single; `origin_base` is added to the local index for
  * the sink's origin_idx. Records stream to `sink` in input order. Returns 0, -1

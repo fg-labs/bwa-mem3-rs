@@ -1566,3 +1566,70 @@ fn batch_write_edges(#[case] edge: &str) {
         other => unreachable!("unknown case {other}"),
     }
 }
+
+/// A single range written in one batch aligns byte-identically to the same
+/// range written slot by slot, with and without `--meth` (whose original bases
+/// and projection then live in the arena too).
+#[rstest]
+#[case::plain(false)]
+#[case::meth(true)]
+fn batch_single_write_matches_per_slot_write(#[case] meth: bool) {
+    let idx = if meth {
+        phix_meth().map(|r| r.idx.clone())
+    } else {
+        shared_idx()
+    };
+    let Some(idx) = idx else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let mut opts = MemOpts::new().unwrap();
+    if meth {
+        opts.set_meth(true);
+    }
+    let singles: Vec<SingleRead<'_>> = fixture
+        .singles
+        .iter()
+        .map(|r| SingleRead {
+            name: &r.name,
+            seq: &r.seq,
+            qual: r.qual.as_deref(),
+        })
+        .collect();
+    let run = |batch: bool| -> Records {
+        let cohort = ResidentCohort::new(meth).unwrap();
+        let mut scratch = AlignScratch::new().unwrap();
+        let mut range = cohort.reserve_singles(singles.len()).unwrap();
+        if batch {
+            cohort.write_singles(&mut range, &singles).unwrap();
+        } else {
+            for (i, r) in singles.iter().enumerate() {
+                cohort.write_single(&mut range, i, *r).unwrap();
+            }
+        }
+        cohort
+            .seed_extend(&idx, &opts, &mut scratch, &mut range)
+            .unwrap();
+        let mut sink = RecordVec::default();
+        cohort
+            .pair_emit(
+                &idx,
+                &opts,
+                &mut scratch,
+                &mut range,
+                None,
+                IdBases::default(),
+                0,
+                &mut sink,
+            )
+            .unwrap();
+        sink.records
+    };
+    let (batched, per_slot) = (run(true), run(false));
+    assert!(
+        !batched.is_empty(),
+        "the fixture's singles must emit records"
+    );
+    assert_eq!(batched, per_slot);
+}

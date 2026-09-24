@@ -35,6 +35,48 @@
  * path in shim_pair_emit needs it, so forward-declare it here. */
 extern int64_t sort_classify(mem_cache *mmc, int64_t pcnt, int tid);
 
+/* Kernel thread slots a scratch may use: every `tid` indexes the scratch's own
+ * mem_cache arrays (MAX_THREADS-sized) and the process-global tprof[][LIM_C]
+ * profiling counters, so it must stay below both. stride_slot's 32 lines x 8
+ * slots layout assumes exactly this many. */
+#define SHIM_TID_SLOTS 256
+static_assert(SHIM_TID_SLOTS <= MAX_THREADS && SHIM_TID_SLOTS <= LIM_C,
+              "a shim tid slot must index both mem_cache and tprof");
+static_assert(SHIM_TID_SLOTS == 32 * 8, "stride_slot lays out 32 lines of 8 slots");
+
+/* Kernel thread slots handed to live scratches. The kernels bump
+ * tprof[row][tid] counters on hot paths (per seed extension, per SA lookup);
+ * tprof rows are tid-contiguous uint64_t, so 8 consecutive tids share a 64-byte
+ * line. A new scratch takes the least-shared slot, first in stride-8 order (0,
+ * 8, 16, ..., 248, 1, 9, ...), so up to 32 live scratches -- one per pool
+ * worker on a 32-core box -- sit on 32 distinct lines and up to 256 on distinct
+ * slots. Beyond 256 live scratches slots are shared, which shares nothing but
+ * racy statistics; the per-slot count keeps a shared slot taken until its last
+ * holder frees it. */
+static std::mutex g_tid_mutex;
+static unsigned g_tid_holders[SHIM_TID_SLOTS];
+
+static int stride_slot(unsigned k) {
+    return (int) ((k % 32) * 8 + (k / 32) % 8);
+}
+
+static int acquire_tid_slot(void) {
+    std::lock_guard<std::mutex> lock(g_tid_mutex);
+    int best = stride_slot(0);
+    for (unsigned k = 0; k < SHIM_TID_SLOTS; ++k) {
+        int slot = stride_slot(k);
+        if (g_tid_holders[slot] == 0) { best = slot; break; }
+        if (g_tid_holders[slot] < g_tid_holders[best]) best = slot;
+    }
+    ++g_tid_holders[best];
+    return best;
+}
+
+static void release_tid_slot(int slot) {
+    std::lock_guard<std::mutex> lock(g_tid_mutex);
+    if (g_tid_holders[slot] > 0) --g_tid_holders[slot];
+}
+
 /* worker_alloc / worker_free — per-worker scratch (chaining arrays, BSW
  * buffers, lazy SMEM buffers) sized for one BATCH_SIZE chunk. Upstream defines
  * these in `fastmap.cpp`, but as of bwa-mem3 0.6.0 that TU is transitively
@@ -59,46 +101,10 @@ extern int64_t sort_classify(mem_cache *mmc, int64_t pcnt, int tid);
  * phase_split), so run it with `BWA_MEM3_RS_TEST_REF` set after any refresh.
  * A cleaner long-term fix is to split these into a dependency-light TU in the
  * fg-labs/bwa-mem3 fork and compile that instead of copying. */
-/* Kernel thread slots a scratch may use: every `tid` indexes the scratch's own
- * mem_cache arrays (MAX_THREADS-sized) and the process-global tprof[][LIM_C]
- * profiling counters, so it must stay below both. */
-#define SHIM_TID_SLOTS 256
-static_assert(SHIM_TID_SLOTS <= MAX_THREADS && SHIM_TID_SLOTS <= LIM_C,
-              "a shim tid slot must index both mem_cache and tprof");
-
-/* Kernel thread slots handed to live scratches. The kernels bump
- * tprof[row][tid] counters on hot paths (per seed extension, per SA lookup);
- * tprof rows are tid-contiguous uint64_t, so 8 consecutive tids share a 64-byte
- * line. A new scratch takes the first free slot in stride-8 order (0, 8, 16,
- * ..., 248, 1, 9, ...), so up to 32 live scratches -- one per pool worker on a
- * 32-core box -- sit on 32 distinct lines, and up to 256 on distinct slots.
- * Beyond 256 live scratches slots are shared, which shares nothing but racy
- * statistics. A freed scratch returns its slot. */
-static std::mutex g_tid_mutex;
-static bool g_tid_used[SHIM_TID_SLOTS];
-
-static int stride_slot(unsigned k) {
-    return (int) ((k % 32) * 8 + (k / 32) % 8);
-}
-
-static int acquire_tid_slot(void) {
-    std::lock_guard<std::mutex> lock(g_tid_mutex);
-    for (unsigned k = 0; k < SHIM_TID_SLOTS; ++k) {
-        int slot = stride_slot(k);
-        if (!g_tid_used[slot]) { g_tid_used[slot] = true; return slot; }
-    }
-    static std::atomic<unsigned> overflow{0};
-    return stride_slot(overflow.fetch_add(1, std::memory_order_relaxed) % SHIM_TID_SLOTS);
-}
-
-static void release_tid_slot(int slot) {
-    std::lock_guard<std::mutex> lock(g_tid_mutex);
-    g_tid_used[slot] = false;
-}
-
-/* Allocate the per-thread scratch a fused seed+extend needs. `nthreads` is
- * always 1 here (one ShimScratch per caller thread), kept as a parameter so
- * the loops stay textually close to upstream's worker_alloc. Chain/seed
+/* Allocate the per-thread scratch a fused seed+extend needs, in kernel thread
+ * slot `tid` (one ShimScratch per caller thread, so nthreads is 1). Upstream's
+ * worker_alloc loops over every thread's slot; the loops below run over this
+ * one slot but keep upstream's shape, so a vendor refresh diffs cleanly. Chain/seed
  * windows are BATCH_SIZE-sized because seeding and extension now run
  * chunk-by-chunk inside one call (upstream's v0.9.0 fusion, bwamem.cpp:2782):
  * chains never outlive the chunk that produced them. `regs` are NOT here --
@@ -544,13 +550,6 @@ void shim_opts_apply_meth_defaults(mem_opt_t *opt) {
  * allocation failure (free_seqs is NULL-safe on the un-built calloc'd tail). */
 static void free_seqs(bseq1_t *seqs, int nseqs);
 
-/* Decode one read into `s` from borrowed bytes: copy name/seq/qual into owned
- * buffers and, under --meth, keep the original bases and apply the bisulfite
- * projection. `role` 0 = R1 or a single (OT, C->T), 1 = R2 (OB, G->A).
- * Returns 0, or -1 on OOM; every buffer it did allocate is recorded in `s`, so
- * the caller's free_seqs / segment teardown (NULL-safe on the fields left
- * unbuilt) releases a partial decode. Shared by every path that copies reads
- * in, so the legacy and resident paths cannot project differently. */
 /* The --meth read setup shared by every path that copies reads in, applied
  * after the original bases were saved to s->meth_orig_seq: record the read's
  * chemistry and project s->seq in place. `role` 0 = R1 or a single (OT, C->T),
@@ -575,6 +574,13 @@ static void meth_project_in_place(bseq1_t *s, int role) {
             s->seq[j] = to;
 }
 
+/* Decode one read into `s` from borrowed bytes: copy name/seq/qual into owned
+ * buffers and, under --meth, keep the original bases and apply the bisulfite
+ * projection. `role` 0 = R1 or a single (OT, C->T), 1 = R2 (OB, G->A).
+ * Returns 0, or -1 on OOM; every buffer it did allocate is recorded in `s`, so
+ * the caller's free_seqs / segment teardown (NULL-safe on the fields left
+ * unbuilt) releases a partial decode. Shared by every path that copies reads
+ * in, so the legacy and resident paths cannot project differently. */
 static int decode_read(bseq1_t *s, const char *name, size_t name_len,
                        const uint8_t *seq, size_t seq_len, const uint8_t *qual,
                        int meth_mode, int role, size_t *heap_bytes) {
@@ -1608,6 +1614,27 @@ int shim_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
     return 0;
 }
 
+/* The CLI's look-ahead hint for the CIGAR-regeneration reference window of an
+ * alignment starting at `rb`: a verbatim copy of mem_prefetch_cigar_ref, which
+ * is static in bwamem.cpp (see its comment there for the strand split and the
+ * locality choice). A pure hint -> byte-identical output. */
+static inline void shim_prefetch_cigar_ref(const bntseq_t *bns, const uint8_t *pac, int64_t rb)
+{
+    if (rb < 0) return;
+    int64_t l_pac = bns->l_pac;
+    int64_t pf = (rb < l_pac) ? (rb >> 2) : (((l_pac << 1) - 1 - rb) >> 2);
+    __builtin_prefetch(&pac[pf], 0, 0);
+}
+
+/* Free one read's alignment regions and leave an empty vector behind, so
+ * every later free (the legacy shim_regs_free, a resident segment's teardown)
+ * is a no-op on it. */
+static void release_regs(mem_alnreg_v *v) {
+    free(v->a);
+    v->a = nullptr;
+    v->n = v->m = 0;
+}
+
 /* Pair, mate-rescue and emit `n_pairs` pairs (reads `seqs[0, 2*n_pairs)`, R1/R2
  * interleaved) — the CLI's worker_sam path on AVX2/AVX-512/NEON
  * (bwamem.cpp:2826-2879): gather every pair's rescue jobs, run them through the
@@ -1640,27 +1667,6 @@ int shim_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
  * byte-identical to a single batch and to `bwa-mem3 mem -t 1 -p`, however the
  * caller splits the pairs. For n_pairs <= BATCH_SIZE/2 this is a single
  * iteration. */
-/* The CLI's look-ahead hint for the CIGAR-regeneration reference window of an
- * alignment starting at `rb`: a verbatim copy of mem_prefetch_cigar_ref, which
- * is static in bwamem.cpp (see its comment there for the strand split and the
- * locality choice). A pure hint -> byte-identical output. */
-static inline void shim_prefetch_cigar_ref(const bntseq_t *bns, const uint8_t *pac, int64_t rb)
-{
-    if (rb < 0) return;
-    int64_t l_pac = bns->l_pac;
-    int64_t pf = (rb < l_pac) ? (rb >> 2) : (((l_pac << 1) - 1 - rb) >> 2);
-    __builtin_prefetch(&pac[pf], 0, 0);
-}
-
-/* Free one read's alignment regions and leave an empty vector behind, so
- * every later free (the legacy shim_regs_free, a resident segment's teardown)
- * is a no-op on it. */
-static void release_regs(mem_alnreg_v *v) {
-    free(v->a);
-    v->a = nullptr;
-    v->n = v->m = 0;
-}
-
 static void pair_emit_pairs_chunked(ShimEmit *e, const mem_opt_t *opt_pe,
                                     const bntseq_t *bns, const uint8_t *pac,
                                     const mem_pestat_t *pestat, uint64_t first_pair_id,
@@ -2329,7 +2335,8 @@ void shim_align_out_free(ShimAlignOutput *out) {
  * pair_emit phases, instead of the self-contained-per-sub-batch ShimRegs
  * that shim_seed_extend/shim_pair_emit allocate and free on every call.
  * Each sub-chunk owns one reserved SEGMENT of the resident cohort; no
- * sub-chunk allocates or frees the arrays. A segment is a separate
+ * sub-chunk allocates or frees the cohort's header arrays, and each segment
+ * releases its own reads and regions once it is emitted. A segment is a separate
  * allocation, so a later reserve() -- which only grows the table of segment
  * pointers -- never moves it.
  *
@@ -2376,29 +2383,17 @@ struct ShimResidentCohort {
     int meth_mode;
 };
 
-static void resident_segment_free(ShimResidentSegment *sg) {
+/* Release a segment's reads: its arena (or per-read strings) and any regions
+ * left, zeroing the headers. Runs at the end of the segment's emit -- safe
+ * because `emitted` makes every later call on the segment a lifecycle error
+ * and pestat refuses a cohort with an emitted segment, so the cohort then holds
+ * only the zeroed headers -- and as the first step of resident_segment_free,
+ * where it is a no-op for an already-released segment. */
+static void resident_segment_release_reads(ShimResidentSegment *sg) {
     for (size_t i = 0; i < sg->n; ++i) {
         /* Same per-read teardown as free_seqs + shim_regs_free's regs loop:
          * free() is NULL-safe on the fields a partial write left unbuilt. A
          * batch-written segment's strings live in its arena instead. */
-        if (!sg->arena) {
-            free(sg->seqs[i].name); free(sg->seqs[i].seq); free(sg->seqs[i].qual);
-            free(sg->seqs[i].meth_orig_seq);
-        }
-        free(sg->seqs[i].sam);
-        free(sg->regs[i].a);
-    }
-    free(sg->arena);
-    free(sg->seqs); free(sg->regs); free(sg);
-}
-
-/* Release an emitted segment's reads: its arena (or per-read strings) and any
- * regions left, zeroing the headers so resident_segment_free has nothing more
- * to free. Safe because `emitted` makes every later call on the segment a
- * lifecycle error and pestat refuses a cohort with an emitted segment. The
- * cohort then holds only this segment's zeroed headers until it drops. */
-static void resident_segment_release_reads(ShimResidentSegment *sg) {
-    for (size_t i = 0; i < sg->n; ++i) {
         if (!sg->arena) {
             free(sg->seqs[i].name); free(sg->seqs[i].seq); free(sg->seqs[i].qual);
             free(sg->seqs[i].meth_orig_seq);
@@ -2412,6 +2407,11 @@ static void resident_segment_release_reads(ShimResidentSegment *sg) {
         memset(sg->seqs, 0, sg->n * sizeof(bseq1_t));
         memset(sg->regs, 0, sg->n * sizeof(mem_alnreg_v));
     }
+}
+
+static void resident_segment_free(ShimResidentSegment *sg) {
+    resident_segment_release_reads(sg);
+    free(sg->seqs); free(sg->regs); free(sg);
 }
 
 static void resident_region_free(ShimResidentRegion *rg) {
@@ -2467,12 +2467,13 @@ void shim_resident_cohort_free(ShimResidentCohort *c) {
 /* Reads per bwa-mem3 kernel batch (macro.h's BATCH_SIZE: 1024 on aarch64, 512
  * elsewhere): the chunk seed_extend_reads and pair_emit_pairs_chunked run each
  * kernel call on, and the work item the CLI's kt_for hands a worker. */
-int shim_scratch_tid(const ShimScratch *sc) {
-    return sc ? sc->tid : -1;
-}
-
 size_t shim_batch_size(void) {
     return (size_t) BATCH_SIZE;
+}
+
+/* The kernel thread slot `sc` runs the kernels in, or -1 for NULL. */
+int shim_scratch_tid(const ShimScratch *sc) {
+    return sc ? sc->tid : -1;
 }
 
 /* Heap bytes a reserved read costs before anything is written into it: its
@@ -2632,8 +2633,9 @@ int shim_resident_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
     return 0;
 }
 
-/* Pair + mate-rescue + emit a pair segment, or SE-emit a single segment,
- * WITHOUT freeing it. `ids.first_pair_id` / `first_single_id` is the GLOBAL
+/* Pair + mate-rescue + emit a pair segment, or SE-emit a single segment, then
+ * release its reads and regions (its headers stay until the cohort is freed).
+ * `ids.first_pair_id` / `first_single_id` is the GLOBAL
  * read ordinal of the segment's first pair/single; `origin_base` is added to
  * the local index for the sink's origin_idx. Exactly one of `sink` /
  * `field_sink` is set. Returns 0, -1 on a null arg, -2 when a pair segment has

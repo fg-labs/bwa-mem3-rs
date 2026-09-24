@@ -91,7 +91,7 @@ for (k, r) in regs.into_iter().enumerate() {
 
 ### Resident cohorts: no per-sub-batch copies
 
-Each `AlnRegs` above owns its own copy of its reads and alignment regions, allocated by `seed_extend` and freed by `pair_emit`. A `ResidentCohort` keeps a whole cohort's reads and regions resident instead: every sub-batch reserves a range of it, and nothing is copied or freed until the cohort drops. Output is byte-identical to the three-phase API above.
+Each `AlnRegs` above owns its own copy of its reads and alignment regions, allocated by `seed_extend` and freed by `pair_emit`. A `ResidentCohort` keeps a whole cohort's reads and regions resident instead: every sub-batch reserves a range of it, reads are copied in once, and each range's reads and regions are released as soon as it is emitted. Output is byte-identical to the three-phase API above.
 
 ```rust
 use bwa_mem3_rs::*;
