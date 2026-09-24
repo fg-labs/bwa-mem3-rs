@@ -1443,3 +1443,126 @@ fn batch_size_matches_the_build_target() {
     };
     assert_eq!(bwa_mem3_rs::batch_size(), expected);
 }
+
+/// Batch writes at the arena's edges: an empty range writes, extends and emits
+/// nothing without error; a name of exactly `MAX_READ_NAME_LEN` bytes survives
+/// the arena intact; and a single range written in one batch aligns
+/// byte-identically to the same range written slot by slot.
+#[rstest]
+#[case::empty_pair_range("empty")]
+#[case::longest_name("longest_name")]
+#[case::singles_parity("singles")]
+fn batch_write_edges(#[case] edge: &str) {
+    let Some(idx) = shared_idx() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let opts = MemOpts::new().unwrap();
+    let ids = IdBases {
+        first_single_id: 0,
+        first_pair_id: 0,
+    };
+    match edge {
+        "empty" => {
+            let cohort = ResidentCohort::new(false).unwrap();
+            let mut scratch = AlignScratch::new().unwrap();
+            let mut range = cohort.reserve_pairs(0).unwrap();
+            cohort.write_pairs(&mut range, &[]).unwrap();
+            cohort
+                .seed_extend(&idx, &opts, &mut scratch, &mut range)
+                .unwrap();
+            let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+            let mut sink = RecordVec::default();
+            cohort
+                .pair_emit(
+                    &idx,
+                    &opts,
+                    &mut scratch,
+                    &mut range,
+                    Some(&pestat),
+                    ids,
+                    0,
+                    &mut sink,
+                )
+                .unwrap();
+            assert!(sink.records.is_empty());
+        }
+        "longest_name" => {
+            // The longest name `ReadPair::validate` accepts (a BAM
+            // l_read_name of 255 with the NUL).
+            let name = vec![b'n'; 254];
+            let (r1, r2) = &fixture.pairs[0];
+            let pair = ReadPair {
+                name_r1: &name,
+                seq_r1: &r1.seq,
+                qual_r1: r1.qual.as_deref(),
+                name_r2: &name,
+                seq_r2: &r2.seq,
+                qual_r2: r2.qual.as_deref(),
+            };
+            let cohort = ResidentCohort::new(false).unwrap();
+            let mut scratch = AlignScratch::new().unwrap();
+            let mut range = cohort.reserve_pairs(1).unwrap();
+            cohort.write_pairs(&mut range, &[pair]).unwrap();
+            cohort
+                .seed_extend(&idx, &opts, &mut scratch, &mut range)
+                .unwrap();
+            let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+            let records = emit_range(&cohort, &idx, &opts, &mut scratch, &mut range, &pestat, 0);
+            assert!(!records.is_empty());
+            for (_, body) in &records {
+                // BAM body: l_read_name at byte 8 (NUL included), name at 32.
+                let l_name = usize::from(body[8]);
+                assert_eq!(&body[32..32 + l_name - 1], name.as_slice());
+            }
+        }
+        "singles" => {
+            let singles: Vec<SingleRead<'_>> = fixture
+                .singles
+                .iter()
+                .map(|r| SingleRead {
+                    name: &r.name,
+                    seq: &r.seq,
+                    qual: r.qual.as_deref(),
+                })
+                .collect();
+            let run = |batch: bool| -> Vec<(RecordOrigin, Vec<u8>)> {
+                let cohort = ResidentCohort::new(false).unwrap();
+                let mut scratch = AlignScratch::new().unwrap();
+                let mut range = cohort.reserve_singles(singles.len()).unwrap();
+                if batch {
+                    cohort.write_singles(&mut range, &singles).unwrap();
+                } else {
+                    for (i, r) in singles.iter().enumerate() {
+                        cohort.write_single(&mut range, i, *r).unwrap();
+                    }
+                }
+                cohort
+                    .seed_extend(&idx, &opts, &mut scratch, &mut range)
+                    .unwrap();
+                let mut sink = RecordVec::default();
+                cohort
+                    .pair_emit(
+                        &idx,
+                        &opts,
+                        &mut scratch,
+                        &mut range,
+                        None,
+                        ids,
+                        0,
+                        &mut sink,
+                    )
+                    .unwrap();
+                sink.records
+            };
+            let (batched, per_slot) = (run(true), run(false));
+            assert!(
+                !batched.is_empty(),
+                "the fixture's singles must emit records"
+            );
+            assert_eq!(batched, per_slot);
+        }
+        other => unreachable!("unknown case {other}"),
+    }
+}
