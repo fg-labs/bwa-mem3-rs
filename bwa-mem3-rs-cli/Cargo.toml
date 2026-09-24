@@ -21,7 +21,7 @@ default = []
 debug-poison = ["bwa-mem3-rs/debug-poison"]
 
 [dependencies]
-bwa-mem3-rs = { version = "0.2.3", path = "../bwa-mem3-rs" }
+bwa-mem3-rs = { version = "0.3.0", path = "../bwa-mem3-rs" }
 # Global allocator; the `override` feature also interposes the C `malloc`/`free`
 # so the linked bwa-mem3 C++ uses mimalloc too. Rationale in main.rs.
 mimalloc = { version = "0.1", features = ["override"] }
