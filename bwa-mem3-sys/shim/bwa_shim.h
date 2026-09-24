@@ -239,6 +239,11 @@ size_t bwa_shim_resident_read_overhead(void);
  * extension and mate-rescue kernel call on a full batch. */
 size_t bwa_shim_batch_size(void);
 
+/* The kernel thread slot a scratch runs bwa-mem3's kernels in (its own
+ * mem_cache entry and profiling-counter column), or -1 for NULL. Distinct for
+ * scratches that are alive together; exposed for tests. */
+int bwa_shim_scratch_tid(const BwaScratch *sc);
+
 /* Reserve a new segment of `n_reads` reads in the pair (n_reads even) or single
  * region. Returns the segment, writing its inclusive-start read offset within
  * the region to *first_out, or NULL on a bad argument / allocation failure. */

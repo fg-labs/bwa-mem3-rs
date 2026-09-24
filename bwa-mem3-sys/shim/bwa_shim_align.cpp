@@ -14,6 +14,8 @@
  * BAM emission is direct from mem_aln_t (no SAM intermediate).
  */
 
+#include <atomic>
+#include <mutex>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -57,6 +59,43 @@ extern int64_t sort_classify(mem_cache *mmc, int64_t pcnt, int tid);
  * phase_split), so run it with `BWA_MEM3_RS_TEST_REF` set after any refresh.
  * A cleaner long-term fix is to split these into a dependency-light TU in the
  * fg-labs/bwa-mem3 fork and compile that instead of copying. */
+/* Kernel thread slots a scratch may use: every `tid` indexes the scratch's own
+ * mem_cache arrays (MAX_THREADS-sized) and the process-global tprof[][LIM_C]
+ * profiling counters, so it must stay below both. */
+#define SHIM_TID_SLOTS 256
+static_assert(SHIM_TID_SLOTS <= MAX_THREADS && SHIM_TID_SLOTS <= LIM_C,
+              "a shim tid slot must index both mem_cache and tprof");
+
+/* Kernel thread slots handed to live scratches. The kernels bump
+ * tprof[row][tid] counters on hot paths (per seed extension, per SA lookup);
+ * tprof rows are tid-contiguous uint64_t, so 8 consecutive tids share a 64-byte
+ * line. A new scratch takes the first free slot in stride-8 order (0, 8, 16,
+ * ..., 248, 1, 9, ...), so up to 32 live scratches -- one per pool worker on a
+ * 32-core box -- sit on 32 distinct lines, and up to 256 on distinct slots.
+ * Beyond 256 live scratches slots are shared, which shares nothing but racy
+ * statistics. A freed scratch returns its slot. */
+static std::mutex g_tid_mutex;
+static bool g_tid_used[SHIM_TID_SLOTS];
+
+static int stride_slot(unsigned k) {
+    return (int) ((k % 32) * 8 + (k / 32) % 8);
+}
+
+static int acquire_tid_slot(void) {
+    std::lock_guard<std::mutex> lock(g_tid_mutex);
+    for (unsigned k = 0; k < SHIM_TID_SLOTS; ++k) {
+        int slot = stride_slot(k);
+        if (!g_tid_used[slot]) { g_tid_used[slot] = true; return slot; }
+    }
+    static std::atomic<unsigned> overflow{0};
+    return stride_slot(overflow.fetch_add(1, std::memory_order_relaxed) % SHIM_TID_SLOTS);
+}
+
+static void release_tid_slot(int slot) {
+    std::lock_guard<std::mutex> lock(g_tid_mutex);
+    g_tid_used[slot] = false;
+}
+
 /* Allocate the per-thread scratch a fused seed+extend needs. `nthreads` is
  * always 1 here (one ShimScratch per caller thread), kept as a parameter so
  * the loops stay textually close to upstream's worker_alloc. Chain/seed
@@ -64,11 +103,10 @@ extern int64_t sort_classify(mem_cache *mmc, int64_t pcnt, int tid);
  * chunk-by-chunk inside one call (upstream's v0.9.0 fusion, bwamem.cpp:2782):
  * chains never outlive the chunk that produced them. `regs` are NOT here --
  * they belong to the ShimRegs that outlives the call. */
-static void worker_alloc(worker_t &w, int32_t nthreads)
+static void worker_alloc(worker_t &w, int tid)
 {
-    assert(nthreads > 0);
-    if (nthreads < 1) nthreads = 1;
-    w.nthreads = nthreads;
+    xassert(tid >= 0 && tid < SHIM_TID_SLOTS, "worker_alloc: tid slot out of range");
+    w.nthreads = 1;
     w.regs = NULL;
     /* Vestigial worker_t members that nothing allocates (every real
      * `auxSeedBuf` upstream is a local in test_and_merge, bwamem.cpp:894); zero
@@ -93,7 +131,7 @@ static void worker_alloc(worker_t &w, int32_t nthreads)
     /* SWA mem allocation. NOTE the basis changed in v0.9.0: upstream now sizes
      * this from AVG_SEEDS_PER_READ, not SEEDS_PER_READ (fastmap.cpp:380). */
     int64_t wsize = BATCH_SIZE * AVG_SEEDS_PER_READ;
-    for(int l=0; l<nthreads; l++)
+    for (int l = tid; l <= tid; l++)
     {
         w.mmc.seqBufLeftRef[l*CACHE_LINE]  = (uint8_t *)
             _mm_malloc(wsize * MAX_SEQ_LEN_REF * sizeof(int8_t) + MAX_LINE_LEN, 64);
@@ -113,7 +151,7 @@ static void worker_alloc(worker_t &w, int32_t nthreads)
         xassert(w.mmc.seqBufRightQer[l*CACHE_LINE] != NULL, "out of memory: seqBufRightQer");
     }
 
-    for(int l=0; l<nthreads; l++) {
+    for (int l = tid; l <= tid; l++) {
         w.mmc.seqPairArrayAux[l]      = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.seqPairArrayLeft128[l]  = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.seqPairArrayRight128[l] = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
@@ -129,7 +167,7 @@ static void worker_alloc(worker_t &w, int32_t nthreads)
     // read length on each batch in mem_collect_smem; they're NULL here and
     // grow on first use. `lim` is still a fixed BATCH_SIZE+32 allocation
     // because its size does not depend on read length.
-    for (int l=0; l<nthreads; l++)
+    for (int l = tid; l <= tid; l++)
     {
         w.mmc.wsize_mem[l]     = 0;
         w.mmc.wsize_mem_s[l]   = 0;
@@ -145,14 +183,18 @@ static void worker_alloc(worker_t &w, int32_t nthreads)
         w.mmc.lockstep_prev[l]      = NULL;
         w.mmc.lockstep_match_buf[l] = NULL;
         w.mmc.lockstep_buf_cap[l]   = 0;
+
+        w.mmc.smem_sort_scratch[l].cnt    = NULL;
+        w.mmc.smem_sort_scratch[l].cntCap = 0;
+        w.mmc.smem_sort_scratch[l].tmp    = NULL;
+        w.mmc.smem_sort_scratch[l].tmpCap = 0;
     }
 }
 
-static void worker_free(worker_t &w, int32_t nthreads)
+static void worker_free(worker_t &w, int tid)
 {
-    assert(nthreads > 0);
     // Catch mismatched alloc/free pairs before they drive out-of-bounds frees.
-    assert(w.nthreads == nthreads);
+    assert(w.nthreads == 1);
 
     free(w.chain_scratch);
     /* w.regs is NOT freed here: during seed_extend_reads it aliases the
@@ -160,14 +202,14 @@ static void worker_free(worker_t &w, int32_t nthreads)
      * leaves it NULL and nothing in the scratch ever allocates it. */
     free(w.seed_scratch);
 
-    for(int l=0; l<nthreads; l++) {
+    for (int l = tid; l <= tid; l++) {
         _mm_free(w.mmc.seqBufLeftRef[l*CACHE_LINE]);
         _mm_free(w.mmc.seqBufRightRef[l*CACHE_LINE]);
         _mm_free(w.mmc.seqBufLeftQer[l*CACHE_LINE]);
         _mm_free(w.mmc.seqBufRightQer[l*CACHE_LINE]);
     }
 
-    for(int l=0; l<nthreads; l++) {
+    for (int l = tid; l <= tid; l++) {
         free(w.mmc.seqPairArrayAux[l]);
         free(w.mmc.seqPairArrayLeft128[l]);
         free(w.mmc.seqPairArrayRight128[l]);
@@ -176,7 +218,7 @@ static void worker_free(worker_t &w, int32_t nthreads)
     // NULL-safe: SMEM buffers are now allocated lazily on first batch;
     // workers that never ran a batch leave them as NULL. _mm_free / free
     // are both well-defined on NULL.
-    for(int l=0; l<nthreads; l++) {
+    for (int l = tid; l <= tid; l++) {
         _mm_free(w.mmc.matchArray[l]);
         free(w.mmc.min_intv_ar[l]);
         free(w.mmc.query_pos_ar[l]);
@@ -186,6 +228,9 @@ static void worker_free(worker_t &w, int32_t nthreads)
 
         _mm_free(w.mmc.lockstep_prev[l]);
         _mm_free(w.mmc.lockstep_match_buf[l]);
+
+        _mm_free(w.mmc.smem_sort_scratch[l].cnt);
+        _mm_free(w.mmc.smem_sort_scratch[l].tmp);
     }
 }
 
@@ -214,6 +259,7 @@ struct ShimAlignOutput {
 /* Per-thread reusable scratch (public: BwaScratch). */
 struct ShimScratch {
     worker_t w;              /* mmc + BATCH_SIZE chain/seed windows; nthreads = 1 */
+    int tid;                 /* kernel thread slot: w.mmc's live entry and tprof column */
     uint8_t *rec_buf; size_t rec_cap;   /* one packed record under construction */
     uint8_t *aux_buf; size_t aux_cap;   /* one aux block under construction */
     /* One record's computed fields (compute_record_fields): the emitted CIGAR
@@ -1356,14 +1402,16 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
 ShimScratch *shim_scratch_new(void) {
     ShimScratch *sc = (ShimScratch *) calloc(1, sizeof(ShimScratch));
     if (!sc) return nullptr;
-    worker_alloc(sc->w, 1);
+    sc->tid = acquire_tid_slot();
+    worker_alloc(sc->w, sc->tid);
     sc->rec_cap = 4096; sc->rec_buf = (uint8_t *) malloc(sc->rec_cap);
     sc->aux_cap = 1024; sc->aux_buf = (uint8_t *) malloc(sc->aux_cap);
     /* The emission path grows rec_buf/aux_buf from these caps and dereferences
      * them without re-checking, so a failed malloc here must not yield a
      * scratch with a non-zero cap but a NULL buffer. Fail the whole alloc. */
     if (!sc->rec_buf || !sc->aux_buf) {
-        worker_free(sc->w, 1);
+        worker_free(sc->w, sc->tid);
+        release_tid_slot(sc->tid);
         free(sc->rec_buf); free(sc->aux_buf);
         free(sc);
         return nullptr;
@@ -1373,7 +1421,8 @@ ShimScratch *shim_scratch_new(void) {
 
 void shim_scratch_free(ShimScratch *sc) {
     if (!sc) return;
-    worker_free(sc->w, 1);
+    worker_free(sc->w, sc->tid);
+    release_tid_slot(sc->tid);
     free(sc->rec_buf); free(sc->aux_buf);
     free(sc->cig_buf); free(sc->txt_buf);   /* lazily grown; NULL until first use */
     free(sc);
@@ -1422,9 +1471,9 @@ static void seed_extend_reads(ShimScratch *sc, BwaShimIndex *idx, const mem_opt_
         if (bs > BATCH_SIZE) bs = BATCH_SIZE;
         mem_kernel1_core(fmi, opt, seqs + seq_id, bs,
                          w.chain_scratch, w.seed_scratch, w.seed_scratch_size,
-                         &w.mmc, 0 /* tid */, idx->meth_orig_bns, idx->meth_orig_pac);
+                         &w.mmc, sc->tid, idx->meth_orig_bns, idx->meth_orig_pac);
         mem_kernel2_core(fmi, opt, seqs + seq_id, regs + seq_id, bs,
-                         w.chain_scratch, &w.mmc, w.ref_string, 0 /* tid */,
+                         w.chain_scratch, &w.mmc, w.ref_string, sc->tid,
                          idx->meth_orig_bns, idx->meth_orig_pac);
     }
 }
@@ -1564,7 +1613,7 @@ int shim_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
  * (bwamem.cpp:2826-2879): gather every pair's rescue jobs, run them through the
  * SIMD kswv kernel once, then resolve + emit per pair. Pair `i` gets read
  * ordinal `first_pair_id + i` and sink origin `origin_base + i`. `opt_pe` is the
- * per-call PE copy. tid = 0: one ShimScratch per thread. Shared by the legacy
+ * per-call PE copy. Kernels run in the scratch's own tid slot. Shared by the legacy
  * and resident paths.
  *
  * Batched mate rescue is the only mate-rescue path upstream ships: the scalar
@@ -1619,6 +1668,7 @@ static void pair_emit_pairs_chunked(ShimEmit *e, const mem_opt_t *opt_pe,
                                     size_t origin_base)
 {
     worker_t &w = e->sc->w;
+    const int tid = e->sc->tid;
     const size_t pairs_per_chunk = (size_t)BATCH_SIZE / 2;
     for (size_t chunk_start = 0; chunk_start < n_pairs; chunk_start += pairs_per_chunk) {
         size_t chunk_end = chunk_start + pairs_per_chunk;
@@ -1629,11 +1679,11 @@ static void pair_emit_pairs_chunked(ShimEmit *e, const mem_opt_t *opt_pe,
         for (size_t i = chunk_start; i < chunk_end; ++i)
             mem_sam_pe_batch_pre(opt_pe, bns, pac, pestat, first_pair_id + (uint64_t)i,
                                  seqs + 2*i, regs + 2*i, &w.mmc, pcnt, gcnt,
-                                 maxRefLen, maxQerLen, 0);
-        int64_t pcnt8 = sort_classify(&w.mmc, pcnt, 0);
+                                 maxRefLen, maxQerLen, tid);
+        int64_t pcnt8 = sort_classify(&w.mmc, pcnt, tid);
         kswr_t *aln = (kswr_t *) _mm_malloc((pcnt + SIMD_WIDTH8) * sizeof(kswr_t), 64);
         xassert(aln != NULL, "out of memory: aln");
-        mem_sam_pe_batch(opt_pe, &w.mmc, pcnt, pcnt8, aln, maxRefLen, maxQerLen, 0);
+        mem_sam_pe_batch(opt_pe, &w.mmc, pcnt, pcnt8, aln, maxRefLen, maxQerLen, tid);
         gcnt = 0;
         kswr_t *myaln = aln;
         for (size_t i = chunk_start; i < chunk_end; ++i) {
@@ -1645,7 +1695,7 @@ static void pair_emit_pairs_chunked(ShimEmit *e, const mem_opt_t *opt_pe,
             }
             int n_pri[2], z[2], q_se[2], extra_flag, paired;
             mem_pair_resolve_batch_post(opt_pe, bns, pac, pestat, first_pair_id + (uint64_t)i,
-                                        seqs + 2*i, regs + 2*i, &myaln, &w.mmc, gcnt, 0,
+                                        seqs + 2*i, regs + 2*i, &myaln, &w.mmc, gcnt, tid,
                                         n_pri, z, q_se, &extra_flag, &paired);
             emit_resolved_pair(e, origin_base + i, opt_pe, bns, pac, seqs + 2*i, regs + 2*i,
                                pestat, n_pri, z, q_se, extra_flag, paired);
@@ -2417,6 +2467,10 @@ void shim_resident_cohort_free(ShimResidentCohort *c) {
 /* Reads per bwa-mem3 kernel batch (macro.h's BATCH_SIZE: 1024 on aarch64, 512
  * elsewhere): the chunk seed_extend_reads and pair_emit_pairs_chunked run each
  * kernel call on, and the work item the CLI's kt_for hands a worker. */
+int shim_scratch_tid(const ShimScratch *sc) {
+    return sc ? sc->tid : -1;
+}
+
 size_t shim_batch_size(void) {
     return (size_t) BATCH_SIZE;
 }

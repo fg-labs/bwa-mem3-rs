@@ -1764,6 +1764,9 @@ extern "C" {
     pub fn bwa_shim_batch_size() -> usize;
 }
 extern "C" {
+    pub fn bwa_shim_scratch_tid(sc: *const BwaScratch) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn bwa_shim_resident_reserve_pairs(
         c: *mut BwaResidentCohort,
         n_reads: usize,

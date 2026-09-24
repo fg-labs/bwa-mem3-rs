@@ -398,6 +398,18 @@ pub struct AlignScratch {
 }
 
 impl AlignScratch {
+    /// The kernel thread slot this scratch runs bwa-mem3's kernels in. Test
+    /// hook: scratches alive together get distinct slots, spread so that
+    /// concurrent workers do not write the same profiling-counter line.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn tid_slot(&self) -> usize {
+        // SAFETY: `handle` is a live scratch owned by `self`; the query reads
+        // one field and has no other preconditions.
+        let tid = unsafe { bwa_mem3_sys::bwa_shim_scratch_tid(self.handle) };
+        usize::try_from(tid).expect("a live scratch has a slot")
+    }
+
     pub fn new() -> Result<Self> {
         // SAFETY: `bwa_shim_scratch_new` is an opaque C allocator with no
         // preconditions; it returns null on failure, which we check below
