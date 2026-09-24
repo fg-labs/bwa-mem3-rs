@@ -397,10 +397,22 @@ pub struct AlignScratch {
     pub(crate) handle: *mut bwa_mem3_sys::BwaScratch,
 }
 
+/// Reads per bwa-mem3 kernel batch (`BATCH_SIZE` in the vendored `macro.h`:
+/// 1024 on aarch64, 512 elsewhere). The shim runs each seed, extension and
+/// mate-rescue kernel call on one such batch, as the CLI's workers do, so a
+/// caller splitting a `-K` chunk into sub-batches should size them in
+/// multiples of it. Not to be confused with a [`ReadBatch`] or `-K`.
+#[must_use]
+pub fn kernel_batch_size() -> usize {
+    // SAFETY: a pure query with no preconditions.
+    unsafe { bwa_mem3_sys::bwa_shim_kernel_batch_size() }
+}
+
 impl AlignScratch {
     /// The kernel thread slot this scratch runs bwa-mem3's kernels in. Test
-    /// hook: scratches alive together get distinct slots, spread so that
-    /// concurrent workers do not write the same profiling-counter line.
+    /// hook: up to 256 scratches alive together get distinct slots, spread so
+    /// that concurrent workers do not write the same profiling-counter line;
+    /// beyond 256 they share.
     #[doc(hidden)]
     #[must_use]
     pub fn tid_slot(&self) -> usize {

@@ -14,7 +14,6 @@
  * BAM emission is direct from mem_aln_t (no SAM intermediate).
  */
 
-#include <atomic>
 #include <mutex>
 #include <cstdint>
 #include <cstdio>
@@ -48,10 +47,13 @@ static_assert(SHIM_TID_SLOTS == 32 * 8, "stride_slot lays out 32 lines of 8 slot
  * tprof[row][tid] counters on hot paths (per seed extension, per SA lookup);
  * tprof rows are tid-contiguous uint64_t, so 8 consecutive tids share a 64-byte
  * line. A new scratch takes the least-shared slot, first in stride-8 order (0,
- * 8, 16, ..., 248, 1, 9, ...), so up to 32 live scratches -- one per pool
- * worker on a 32-core box -- sit on 32 distinct lines and up to 256 on distinct
- * slots. Beyond 256 live scratches slots are shared, which shares nothing but
- * racy statistics; the per-slot count keeps a shared slot taken until its last
+ * 8, 16, ..., 248, 1, 9, ...), so on 64-byte-line hardware (Graviton, x86) up
+ * to 32 live scratches -- one per pool worker on a 32-core box -- sit on 32
+ * distinct lines, and up to 256 on distinct slots. On 128-byte-line hardware
+ * (Apple Silicon) a 256-slot row spans only 16 lines, so 32 scratches pair up
+ * two to a line whatever the layout; this one is still the best available.
+ * Beyond 256 live scratches slots are shared, which shares nothing but racy
+ * statistics; the per-slot count keeps a shared slot taken until its last
  * holder frees it. */
 static std::mutex g_tid_mutex;
 static unsigned g_tid_holders[SHIM_TID_SLOTS];
@@ -579,8 +581,9 @@ static void meth_project_in_place(bseq1_t *s, int role) {
  * projection. `role` 0 = R1 or a single (OT, C->T), 1 = R2 (OB, G->A).
  * Returns 0, or -1 on OOM; every buffer it did allocate is recorded in `s`, so
  * the caller's free_seqs / segment teardown (NULL-safe on the fields left
- * unbuilt) releases a partial decode. Shared by every path that copies reads
- * in, so the legacy and resident paths cannot project differently. */
+ * unbuilt) releases a partial decode. Used by the legacy batch path and the
+ * per-slot resident writes; decode_read_arena is its arena-backed twin, and the
+ * two share meth_project_in_place so they cannot project differently. */
 static int decode_read(bseq1_t *s, const char *name, size_t name_len,
                        const uint8_t *seq, size_t seq_len, const uint8_t *qual,
                        int meth_mode, int role, size_t *heap_bytes) {
@@ -1408,6 +1411,18 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
 }
 
 /* ------------------ Phase 1: scratch + fused seed+extend ------------------ */
+
+/* Reads per bwa-mem3 kernel batch (macro.h's BATCH_SIZE: 1024 on aarch64, 512
+ * elsewhere): the chunk seed_extend_reads and pair_emit_pairs_chunked run each
+ * kernel call on, and the work item the CLI's kt_for hands a worker. */
+size_t shim_kernel_batch_size(void) {
+    return (size_t) BATCH_SIZE;
+}
+
+/* The kernel thread slot `sc` runs the kernels in, or -1 for NULL. */
+int shim_scratch_tid(const ShimScratch *sc) {
+    return sc ? sc->tid : -1;
+}
 
 ShimScratch *shim_scratch_new(void) {
     ShimScratch *sc = (ShimScratch *) calloc(1, sizeof(ShimScratch));
@@ -2413,6 +2428,16 @@ static void resident_segment_release_reads(ShimResidentSegment *sg) {
     }
 }
 
+/* Whether `sg` still holds any read string or alignment region -- false once
+ * it has been emitted (and released). A test hook. */
+int shim_resident_segment_holds_reads(const ShimResidentSegment *sg) {
+    if (!sg) return 0;
+    if (sg->arena) return 1;
+    for (size_t i = 0; i < sg->n; ++i)
+        if (sg->seqs[i].name || sg->seqs[i].seq || sg->regs[i].a) return 1;
+    return 0;
+}
+
 static void resident_segment_free(ShimResidentSegment *sg) {
     resident_segment_release_reads(sg);
     free(sg->seqs); free(sg->regs); free(sg);
@@ -2468,17 +2493,6 @@ void shim_resident_cohort_free(ShimResidentCohort *c) {
     free(c);
 }
 
-/* Reads per bwa-mem3 kernel batch (macro.h's BATCH_SIZE: 1024 on aarch64, 512
- * elsewhere): the chunk seed_extend_reads and pair_emit_pairs_chunked run each
- * kernel call on, and the work item the CLI's kt_for hands a worker. */
-size_t shim_batch_size(void) {
-    return (size_t) BATCH_SIZE;
-}
-
-/* The kernel thread slot `sc` runs the kernels in, or -1 for NULL. */
-int shim_scratch_tid(const ShimScratch *sc) {
-    return sc ? sc->tid : -1;
-}
 
 /* Heap bytes a reserved read costs before anything is written into it: its
  * bseq1_t and mem_alnreg_v headers. */

@@ -1660,6 +1660,12 @@ extern "C" {
     pub fn bwa_shim_scratch_free(sc: *mut BwaScratch);
 }
 extern "C" {
+    pub fn bwa_shim_scratch_tid(sc: *const BwaScratch) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_kernel_batch_size() -> usize;
+}
+extern "C" {
     pub fn bwa_shim_seed_extend(
         idx: *const BwaIndex,
         opts: *const mem_opt_t,
@@ -1761,12 +1767,6 @@ extern "C" {
     pub fn bwa_shim_resident_read_overhead() -> usize;
 }
 extern "C" {
-    pub fn bwa_shim_batch_size() -> usize;
-}
-extern "C" {
-    pub fn bwa_shim_scratch_tid(sc: *const BwaScratch) -> ::std::os::raw::c_int;
-}
-extern "C" {
     pub fn bwa_shim_resident_reserve_pairs(
         c: *mut BwaResidentCohort,
         n_reads: usize,
@@ -1810,6 +1810,11 @@ extern "C" {
         reads: *const BwaSingleRead,
         n: usize,
         added: *mut usize,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_resident_segment_holds_reads(
+        sg: *const BwaResidentSegment,
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {

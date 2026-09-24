@@ -36,11 +36,11 @@ pub mod shm;
 pub mod xa;
 
 pub use align::{
-    align_batch, estimate_pestat, extend_batch, pair_emit, seed_batch, seed_extend, AlignScratch,
-    AlignmentBatch, AlnRegs, IdBases, ReadBatch, ReadPair, Record, RecordOrigin, RecordSink,
-    RecordVec, Seeds, SingleRead,
+    align_batch, estimate_pestat, extend_batch, kernel_batch_size, pair_emit, seed_batch,
+    seed_extend, AlignScratch, AlignmentBatch, AlnRegs, IdBases, ReadBatch, ReadPair, Record,
+    RecordOrigin, RecordSink, RecordVec, Seeds, SingleRead,
 };
-pub use build_info::{batch_size, build_info, version, BuildInfo};
+pub use build_info::{build_info, version, BuildInfo};
 pub use error::{Error, Result};
 pub use index::BwaIndex;
 pub use opts::{MemOpts, MemPeStat, MethScoring, Mode, PeOrient, PeOrientation, SeedOrder};

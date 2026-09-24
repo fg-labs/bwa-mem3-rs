@@ -4,10 +4,10 @@
 
 use bwa_mem3_rs::AlignScratch;
 
-/// Scratches that are alive together get distinct kernel thread slots, and
-/// the first 32 land on distinct 64-byte lines of bwa-mem3's per-thread
-/// profiling counters (8 slots per line), so concurrent workers never write
-/// the same counter line.
+/// Scratches that are alive together get distinct kernel thread slots, and 32
+/// of them land on distinct 64-byte lines of bwa-mem3's per-thread profiling
+/// counters (8 slots per line), so concurrent workers never write the same
+/// counter line on 64-byte-line hardware; freed slots are handed out again.
 #[test]
 fn live_scratches_get_distinct_slots_on_distinct_lines_and_freed_slots_return() {
     let scratches: Vec<AlignScratch> = (0..32).map(|_| AlignScratch::new().unwrap()).collect();
@@ -24,11 +24,11 @@ fn live_scratches_get_distinct_slots_on_distinct_lines_and_freed_slots_return() 
     // A freed scratch's slot is reused, so a long-running process that creates
     // and drops scratches never runs out of distinct slots. (One test, run in
     // sequence: the slot pool is process-global.)
-    let freed = slots[5];
     drop(scratches);
     let reused: Vec<AlignScratch> = (0..32).map(|_| AlignScratch::new().unwrap()).collect();
-    assert!(
-        reused.iter().any(|s| s.tid_slot() == freed),
-        "slot {freed} is handed out again"
-    );
+    let mut again: Vec<usize> = reused.iter().map(AlignScratch::tid_slot).collect();
+    let mut first = slots.clone();
+    first.sort_unstable();
+    again.sort_unstable();
+    assert_eq!(again, first, "the freed slots are handed out again");
 }

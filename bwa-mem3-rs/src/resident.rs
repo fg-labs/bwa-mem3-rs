@@ -358,7 +358,8 @@ pub struct ResidentCohort {
     /// regions hold that index's coordinates.
     index_id: AtomicU64,
     /// C-heap bytes this cohort holds for its reads (see
-    /// [`heap_bytes`](Self::heap_bytes)); maintained by `reserve_*`/`write_*`.
+    /// [`heap_bytes`](Self::heap_bytes)); raised by `reserve_*`/`write_*` and
+    /// lowered when a range is emitted.
     heap_bytes: AtomicUsize,
     /// Serializes calls that read or grow the C segment table: `reserve_*`
     /// (writes it) and `infer_cohort` (walks it).
@@ -512,6 +513,19 @@ impl ResidentCohort {
         })
     }
 
+    /// Check that `range` is this cohort's and holds `region` reads.
+    fn check_region(&self, range: &ResidentRange, region: Region, what: &str) -> Result<()> {
+        self.check_owned(range, what)?;
+        if range.region != region {
+            let kind = match region {
+                Region::Pairs => "pair",
+                Region::Singles => "single",
+            };
+            return Err(Error::InvalidInput(format!("{what}: not a {kind} range")));
+        }
+        Ok(())
+    }
+
     /// Validate a write to `range` of an item at local index `i` of `n_items`.
     fn check_write(
         &self,
@@ -521,14 +535,7 @@ impl ResidentCohort {
         n_items: usize,
         what: &str,
     ) -> Result<()> {
-        self.check_owned(range, what)?;
-        if range.region != region {
-            let kind = match region {
-                Region::Pairs => "pair",
-                Region::Singles => "single",
-            };
-            return Err(Error::InvalidInput(format!("{what}: not a {kind} range")));
-        }
+        self.check_region(range, region, what)?;
         if i >= n_items {
             return Err(Error::InvalidInput(format!(
                 "{what}: index {i} out of range ({n_items} in the range)"
@@ -547,20 +554,21 @@ impl ResidentCohort {
         expected: usize,
         what: &str,
     ) -> Result<()> {
-        self.check_owned(range, what)?;
-        if range.region != region {
-            let kind = match region {
-                Region::Pairs => "pair",
-                Region::Singles => "single",
-            };
-            return Err(Error::InvalidInput(format!("{what}: not a {kind} range")));
-        }
+        self.check_region(range, region, what)?;
         if n != expected {
             return Err(Error::InvalidInput(format!(
-                "{what}: {n} items for a range of {expected}"
+                "{what}: a batch of {n} for a range of {expected}"
             )));
         }
         Ok(())
+    }
+
+    /// Record `added` bytes a write to `range` copied into the cohort. Bytes
+    /// copied before a failure are held by the segment (a partly written range
+    /// is never emitted), so they count either way.
+    fn account_write(&self, range: &mut ResidentRange, added: usize) {
+        self.heap_bytes.fetch_add(added, Ordering::Relaxed);
+        range.bytes += added;
     }
 
     /// Decode pair `i` of a pair `range` from borrowed bytes into its resident
@@ -583,10 +591,7 @@ impl ResidentCohort {
         // only; `added` is a live `usize`.
         let rc =
             unsafe { bwa_mem3_sys::bwa_shim_resident_write_pair(range.segment, i, &c, &mut added) };
-        // Bytes copied before a failure are held by the segment (a partly
-        // written range is never emitted), so they count either way.
-        self.heap_bytes.fetch_add(added, Ordering::Relaxed);
-        range.bytes += added;
+        self.account_write(range, added);
         resident_status(rc, "resident_write_pair")
     }
 
@@ -602,10 +607,10 @@ impl ResidentCohort {
             range.n_pairs(),
             "write_pairs",
         )?;
-        for pair in pairs {
-            pair.validate()?;
-        }
-        let cs: Vec<bwa_mem3_sys::BwaReadPair> = pairs.iter().map(c_pair).collect();
+        let cs = pairs
+            .iter()
+            .map(|pair| pair.validate().map(|()| c_pair(pair)))
+            .collect::<Result<Vec<bwa_mem3_sys::BwaReadPair>>>()?;
         let _ranges = self.lock_ranges_shared();
         let mut added = 0usize;
         // SAFETY: `range.segment` is a live segment of this cohort (checked
@@ -621,8 +626,7 @@ impl ResidentCohort {
                 &mut added,
             )
         };
-        self.heap_bytes.fetch_add(added, Ordering::Relaxed);
-        range.bytes += added;
+        self.account_write(range, added);
         resident_status(rc, "resident_write_pairs")
     }
 
@@ -644,8 +648,7 @@ impl ResidentCohort {
         let rc = unsafe {
             bwa_mem3_sys::bwa_shim_resident_write_single(range.segment, i, &c, &mut added)
         };
-        self.heap_bytes.fetch_add(added, Ordering::Relaxed);
-        range.bytes += added;
+        self.account_write(range, added);
         resident_status(rc, "resident_write_single")
     }
 
@@ -660,10 +663,10 @@ impl ResidentCohort {
             range.n_reads,
             "write_singles",
         )?;
-        for read in reads {
-            read.validate()?;
-        }
-        let cs: Vec<bwa_mem3_sys::BwaSingleRead> = reads.iter().map(c_single).collect();
+        let cs = reads
+            .iter()
+            .map(|read| read.validate().map(|()| c_single(read)))
+            .collect::<Result<Vec<bwa_mem3_sys::BwaSingleRead>>>()?;
         let _ranges = self.lock_ranges_shared();
         let mut added = 0usize;
         // SAFETY: as `write_pairs`.
@@ -675,8 +678,7 @@ impl ResidentCohort {
                 &mut added,
             )
         };
-        self.heap_bytes.fetch_add(added, Ordering::Relaxed);
-        range.bytes += added;
+        self.account_write(range, added);
         resident_status(rc, "resident_write_singles")
     }
 
@@ -747,6 +749,23 @@ impl ResidentCohort {
         self.heap_bytes.load(Ordering::Relaxed)
     }
 
+    /// Whether `range`'s segment still holds any read string or alignment
+    /// region on the C heap: `true` once written, `false` after it has been
+    /// emitted. A test hook for the release-at-emit contract.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn range_holds_reads(&self, range: &ResidentRange) -> bool {
+        if self.check_owned(range, "range_holds_reads").is_err() {
+            return false;
+        }
+        let _ranges = self.lock_ranges_shared();
+        // SAFETY: `range.segment` is a live segment of this cohort (checked id;
+        // segments live until the cohort drops); the query only reads it, and
+        // no call can mutate it concurrently because every mutating call needs
+        // the range by `&mut`.
+        unsafe { bwa_mem3_sys::bwa_shim_resident_segment_holds_reads(range.segment) != 0 }
+    }
+
     /// Hand an emitted range's read bytes back: the shim released them at the
     /// end of the emit, even when the sink panicked partway.
     fn release_bytes(&self, range: &mut ResidentRange) {
@@ -775,8 +794,9 @@ impl ResidentCohort {
     }
 
     /// Pair / mate-rescue / emit the reads of a seed-extended `range`, then
-    /// release its reads and alignment regions; each range is emitted once. `ids` gives the global read
-    /// ordinal of the range's first pair/single; `origin_base` is added to the
+    /// release its reads and alignment regions; each range is emitted once.
+    /// `ids` gives the global read ordinal of the range's first pair/single;
+    /// `origin_base` is added to the
     /// local index for each record's [`RecordOrigin`]. `pestat` is the cohort
     /// model from [`infer_cohort`](Self::infer_cohort); it may be `None` only
     /// for a single-end range.

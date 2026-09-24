@@ -125,8 +125,9 @@ extern "C" {
     ShimResidentCohort *shim_resident_cohort_new(int meth_mode);
     void   shim_resident_cohort_free(ShimResidentCohort *c);
     size_t shim_resident_read_overhead(void);
-    size_t shim_batch_size(void);
+    size_t shim_kernel_batch_size(void);
     int    shim_scratch_tid(const ShimScratch *sc);
+    int    shim_resident_segment_holds_reads(const ShimResidentSegment *sg);
     ShimResidentSegment *shim_resident_reserve_pairs(ShimResidentCohort *c, size_t n_reads,
                                                      size_t *first_out);
     ShimResidentSegment *shim_resident_reserve_singles(ShimResidentCohort *c, size_t n_reads,
@@ -655,11 +656,14 @@ extern "C" void bwa_shim_resident_cohort_free(BwaResidentCohort *c) {
 extern "C" size_t bwa_shim_resident_read_overhead(void) {
     return shim_resident_read_overhead();
 }
-extern "C" size_t bwa_shim_batch_size(void) {
-    return shim_batch_size();
+extern "C" size_t bwa_shim_kernel_batch_size(void) {
+    return shim_kernel_batch_size();
 }
 extern "C" int bwa_shim_scratch_tid(const BwaScratch *sc) {
     return sc ? shim_scratch_tid(sc->inner) : -1;
+}
+extern "C" int bwa_shim_resident_segment_holds_reads(const BwaResidentSegment *sg) {
+    return shim_resident_segment_holds_reads(shim_seg(const_cast<BwaResidentSegment *>(sg)));
 }
 
 /* Map a shim status to the public contract, recording why it failed. The -3

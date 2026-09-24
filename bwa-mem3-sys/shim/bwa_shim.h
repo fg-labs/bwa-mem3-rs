@@ -158,6 +158,17 @@ int bwa_shim_estimate_pestat(
 BwaScratch *bwa_shim_scratch_new(void);
 void        bwa_shim_scratch_free(BwaScratch *sc);
 
+/* The kernel thread slot a scratch runs bwa-mem3's kernels in (its own
+ * mem_cache entry and profiling-counter column), or -1 for NULL. Distinct for
+ * up to 256 scratches alive together; beyond that, slots are shared. Exposed
+ * for tests. */
+int bwa_shim_scratch_tid(const BwaScratch *sc);
+
+/* Reads per kernel batch the linked bwa-mem3 was built with (1024 on aarch64,
+ * 512 elsewhere). Filling a sub-batch to a multiple of it runs every seed,
+ * extension and mate-rescue kernel call on a full batch. */
+size_t bwa_shim_kernel_batch_size(void);
+
 /* Phase 1: seed + single-end-extend every read of `batch` (the fused
  * `worker_bwt_aln` work). Per-read independent: safe to split a cohort into
  * any number of batches on any number of threads. Returns NULL + last_error
@@ -234,16 +245,6 @@ void               bwa_shim_resident_cohort_free(BwaResidentCohort *c);
  * read and alignment-region headers). */
 size_t bwa_shim_resident_read_overhead(void);
 
-/* Reads per kernel batch the linked bwa-mem3 was built with (1024 on aarch64,
- * 512 elsewhere). Filling a sub-batch to a multiple of it runs every seed,
- * extension and mate-rescue kernel call on a full batch. */
-size_t bwa_shim_batch_size(void);
-
-/* The kernel thread slot a scratch runs bwa-mem3's kernels in (its own
- * mem_cache entry and profiling-counter column), or -1 for NULL. Distinct for
- * scratches that are alive together; exposed for tests. */
-int bwa_shim_scratch_tid(const BwaScratch *sc);
-
 /* Reserve a new segment of `n_reads` reads in the pair (n_reads even) or single
  * region. Returns the segment, writing its inclusive-start read offset within
  * the region to *first_out, or NULL on a bad argument / allocation failure. */
@@ -269,6 +270,10 @@ int bwa_shim_resident_write_pairs(BwaResidentSegment *sg, const BwaReadPair *pai
                                   size_t *added);
 int bwa_shim_resident_write_singles(BwaResidentSegment *sg, const BwaSingleRead *reads,
                                     size_t n, size_t *added);
+
+/* 1 while a segment still holds any read string or alignment region, 0 once it
+ * has been emitted (which releases them) or for NULL. Exposed for tests. */
+int bwa_shim_resident_segment_holds_reads(const BwaResidentSegment *sg);
 
 /* Seed + SE-extend every read of a fully written segment (pairs or singles).
  * Returns 0, -1, or -3. */
