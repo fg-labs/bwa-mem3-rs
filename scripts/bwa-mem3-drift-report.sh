@@ -491,17 +491,26 @@ check_flags_and_enums() {
 # only declared, across two lines, in bwamem.h) — verified against the
 # vendored tree; pointing this at the wrong file makes the check silently
 # report a real function as "NOT FOUND" on every run.
+#
+# The pairing path is the batched one: the shim calls mem_sam_pe_batch_pre,
+# mem_sam_pe_batch and mem_pair_resolve_batch_post, and mirrors the emission of
+# mem_sam_pe_batch_post, whose no-pairing branch now goes through
+# mem_reg2sam_anchored (the shim's emit loop mirrors that too). The unbatched
+# mem_sam_pe / mem_pair_resolve these entries used to name no longer exist.
 UPSTREAM_CONTRACTS=(
     "worker_alloc:src/fastmap.cpp"
     "worker_free:src/fastmap.cpp"
     "mem_kernel1_core:src/bwamem.cpp"
     "mem_kernel2_core:src/bwamem.cpp"
-    "mem_pair_resolve:src/bwamem_pair.cpp"
+    "mem_sam_pe_batch_pre:src/bwamem_pair.cpp"
+    "mem_sam_pe_batch:src/bwamem_pair.cpp"
+    "mem_pair_resolve_batch_post:src/bwamem_pair.cpp"
+    "mem_sam_pe_batch_post:src/bwamem_pair.cpp"
     "mem_gen_alt:src/bwamem_extra.cpp"
     "mem_reg2aln:src/bwamem.cpp"
     "mem_mark_primary_se:src/bwamem.cpp"
     "mem_reg2sam:src/bwamem.cpp"
-    "mem_sam_pe:src/bwamem_pair.cpp"
+    "mem_reg2sam_anchored:src/bwamem.cpp"
 )
 
 # Check 5: contracts of upstream functions the shim calls or copies.
