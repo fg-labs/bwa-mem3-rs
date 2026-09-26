@@ -1122,6 +1122,7 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	./klib_alloc_fail_test
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
 	./test/regression/ndebug_gate_lint_selftest.sh
 	./test/regression/ndebug_gate_lint.sh
 	./test/regression/debug_macro_flag_lint_selftest.sh
@@ -1535,7 +1536,7 @@ lto-build:
 	# EBADF. This is a known GNU make 4.3 limitation;
 	# `--jobserver-style=fifo` (GNU make 4.4+) would survive the chain by
 	# using a named FIFO instead of FDs, but Debian Bookworm — and therefore
-	# the bwa-mem3-bench Dockerfile's base image — ships make 4.3.
+	# the benchmark suite's Docker base image — ships make 4.3.
 	#
 	# Tried and rejected:
 	#   - `-flto=auto`: still attempts jobserver negotiation on GCC 12.

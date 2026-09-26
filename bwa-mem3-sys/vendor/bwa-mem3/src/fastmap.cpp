@@ -33,7 +33,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> /* strcasecmp(): POSIX declares it here, not in string.h */
-#include "bwa_madvise.h"
 #if NUMA_ENABLED
 #include <numa.h>
 #endif
@@ -60,11 +59,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwa_shm.h"
 #include "bwa_hugepages.h"
 #include "fast_reader_bseq.h"
-
-
-// --------------
-extern uint64_t tprof[LIM_R][LIM_C];
-// ---------------
 
 /* --cohort-slices / BWA_MEM3_COHORT_SLICES. Named here rather than repeated at
  * each site because the value is needed in four places -- the ramp's shift
@@ -811,6 +805,17 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                 char from_lo = is_r2 ? 'g' : 'c';
                 char to   = is_r2 ? 'A' : 'T';
                 int l = s->l_seq;
+                /* The fast FASTQ reader keeps a sequence line's full parsed
+                 * length even when it holds a control byte (0, TAB, CR, ...).
+                 * Everything below treats s->seq as l_seq ASCII bases, and the
+                 * YS:Z/YC:Z comment built from it is read as a tab-separated C
+                 * string, so such a byte would end that comment early (losing
+                 * YC:Z, hence XR:Z, and every -C tag) or forge a tag in it; it
+                 * would also be scored as base code 0-3 by extension while SEQ
+                 * printed N. Write each as N before any copy is taken, so
+                 * seeding, extension, SEQ and the carrier all see one base. */
+                for (int j = 0; j < l; ++j)
+                    if ((unsigned char)s->seq[j] < 0x20) s->seq[j] = 'N';
                 /* Build the YS:Z/YC:Z comment. Preserve any prior FASTQ
                  * comment (e.g. -C carries barcode/UMI SAM tags) by appending
                  * it after YC; otherwise --meth silently strips -C metadata. */
@@ -832,10 +837,15 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                  * Same orientation/order as s->seq (original read order, ASCII);
                  * downstream consumers must RC it wherever they RC s->seq — see
                  * the bseq1_t.meth_orig_seq orientation contract in bwa.h.
-                 * strdup is fine for the draft; freed in the per-batch free
-                 * loop below alongside s->seq. */
-                s->meth_orig_seq = strdup(s->seq);
+                 * Copy exactly l_seq bytes rather than strdup: every consumer
+                 * reads l_seq bytes of this copy, and l_seq, not a terminator,
+                 * is the read's length (a strdup stopped at an embedded 0 byte
+                 * before the normalization above existed). Freed in the
+                 * per-batch free loop below alongside s->seq. */
+                s->meth_orig_seq = (char *)malloc((size_t)l + 1);
                 xassert(s->meth_orig_seq != NULL, "out of memory: s->meth_orig_seq");
+                memcpy(s->meth_orig_seq, s->seq, (size_t)l);
+                s->meth_orig_seq[l] = '\0';
                 /* --meth: read-number chemistry (R1=OT=1, R2=OB=0) for the
                  * seed-chemistry filter in meth_seed_to_orig. */
                 s->meth_base_ot = is_r2 ? 0 : 1;
@@ -1218,7 +1228,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                  * is freed once below — do NOT free them individually here.
                  * comment stays heap-owned (see the reader / --meth notes), and
                  * sam/bams are allocated during processing; those still free
-                 * per-read. meth_orig_seq is a step-0 heap strdup (NULL outside
+                 * per-read. meth_orig_seq is a step-0 heap copy (NULL outside
                  * --meth; free() is NULL-safe). */
                 free(ret->seqs[i+k].comment);
                 free(ret->seqs[i+k].sam);
@@ -1540,7 +1550,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries; --compat implies it [%s]\n", opt->skip_contained_ext? "off":"on");
     fprintf(stderr, "    --skip-contained-ext  DEPRECATED, accepted no-op: contained-seed skipping is now the default; pass --keep-contained-ext to opt out\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
-    fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT do not run at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
+    fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT are not practical at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
     fprintf(stderr, "    --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical full-width extension; also disables the certified band); overrides --adaptive-band and the --adaptive-band that --fast enables\n");
     fprintf(stderr, "    --no-band-cert  disable the certified adaptive extension band (on by default): run the full-width extension ladder for every pair instead of the narrow-probe-plus-certificate. The certified band is byte-identical to full-width, so on a plain run this only removes the speedup; it has no effect under --fast, --adaptive-band, or --no-adaptive-band (which already disable the certified band). Escape hatch / A-B handle [%s]\n", opt->band_cert? "on":"off");
     fprintf(stderr, "    --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [%s]\n", opt->mate_concordant_window? (opt->mate_concordant_window<0? "auto":"fixed") : "off");
@@ -1758,10 +1768,15 @@ static void usage(const mem_opt_t *opt)
  * chrom names) from `prefix` as resident handles for the future extension/scoring
  * phase, distinct from the seed FM-index. Mirrors indexEle::bwa_idx_load_ele's
  * disk path (bns_restore then slurp the full .pac into memory and close fp_pac).
- * On success writes *bns_out / *pac_out and returns 0; on failure frees any
- * partial allocation, leaves the out-params NULL, and returns -1. */
+ * On a bns_restore or pac-allocation failure, frees any partial allocation,
+ * leaves the out-params NULL, and returns -1. (An I/O error or short read during
+ * the .pac slurp itself is fatal — pac_slurp_and_close aborts the process,
+ * matching the seed-index loader.)
+ * `pread_workers` is the already-resolved worker count for the parallel .pac
+ * slurp (as from index_load_threads); 1 reads serially. */
 static int meth_orig_ref_load_handles(const char *prefix,
-                                      bntseq_t **bns_out, uint8_t **pac_out)
+                                      bntseq_t **bns_out, uint8_t **pac_out,
+                                      int pread_workers)
 {
     *bns_out = NULL;
     *pac_out = NULL;
@@ -1780,11 +1795,9 @@ static int meth_orig_ref_load_handles(const char *prefix,
         bns_destroy(bns);
         return -1;
     }
-    bwamem_madv_hugepage(pac, pac_bytes);
-    /* bns_restore left .pac open in bns->fp_pac; slurp it whole, then close. */
-    err_fread_noeof(pac, 1, pac_bytes, bns->fp_pac);
-    err_fclose(bns->fp_pac);
-    bns->fp_pac = NULL;
+    /* bns_restore left .pac open in bns->fp_pac; slurp it whole (in parallel,
+     * same as the seed index) and close it. Shared with bwa_idx_load_ele. */
+    pac_slurp_and_close(&bns->fp_pac, pac, pac_bytes, pread_workers);
 
     *bns_out = bns;
     *pac_out = pac;
@@ -3495,7 +3508,8 @@ int main_mem(int argc, char *argv[])
      * a load-only building block. Freed on every exit path the seed index is. */
     if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
         if (meth_orig_ref_load_handles(meth_orig_ref_prefix,
-                                       &aux.meth_orig_bns, &aux.meth_orig_pac) != 0) {
+                                       &aux.meth_orig_bns, &aux.meth_orig_pac,
+                                       index_load_threads(opt->n_threads)) != 0) {
             delete aux.fmi;
             free(opt);
             if (out_opened) fclose(aux.fp);

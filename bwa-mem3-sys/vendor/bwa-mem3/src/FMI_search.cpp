@@ -833,7 +833,10 @@ void FMI_search::load_index(bool load_pac, int n_threads)
             ref_file_name);
     /* D3 --meth: BNS only for the seed index (skip the ~1.6 GB seed pac). The
      * seed bns drives the seed->original remap; extension uses meth_orig_pac. */
-    bwa_idx_load_ele(ref_file_name, load_pac ? BWA_IDX_ALL : BWA_IDX_BNS);
+    /* Pass the worker count already resolved for this load (line above), so the
+     * .pac slurp reuses it rather than re-parsing BWA3_LOAD_THREADS a second
+     * time within the same load. */
+    bwa_idx_load_ele(ref_file_name, load_pac ? BWA_IDX_ALL : BWA_IDX_BNS, load_nt);
 
     fprintf(stderr, "* Done reading Index!!\n");
 }
@@ -1721,6 +1724,11 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     if (numReads == 0) return;
 
     const int32_t N = g_smem_lockstep_n;
+    // slots[] is a fixed SMEM_LOCKSTEP_N_MAX stack array indexed in [0, N);
+    // the env parser clamps to that range, but a direct g_smem_lockstep_n write
+    // (e.g. a test, or a future calibration) could exceed it -- guard the bound.
+    xassert(N >= 1 && N <= SMEM_LOCKSTEP_N_MAX,
+            "g_smem_lockstep_n out of range [1, SMEM_LOCKSTEP_N_MAX]");
     // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
     // state (~80 B per slot, full array fits in 1-2 cache lines for N=8).
     // Bulk per-slot buffers (prev/match_buf) live separately and are reused
