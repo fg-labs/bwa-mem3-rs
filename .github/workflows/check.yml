@@ -56,6 +56,19 @@ jobs:
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
       - run: cargo ci-lint
 
+  package:
+    # Build every crate from the tarball `cargo publish` would upload, so a file
+    # a build script needs but the crate's `include` list leaves out fails here
+    # rather than in the release job, after the version bump has merged.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+      - run: cargo publish --workspace --exclude bwa-mem3-py --dry-run
+
   bindings:
     # The committed bindgen output must match the shim header on every arch.
     strategy:
