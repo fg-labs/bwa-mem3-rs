@@ -15,11 +15,15 @@
 //! Zero-length reads (single, either mate, or both) are pinned by
 //! `empty_reads_match_cli`.
 //!
+//! One test (`integer_aux_types_match_cli_bam`) compares at the BAM level
+//! instead of through `samtools view`, so the aux type bytes are pinned too.
+//!
 //! Requires `bwa-mem3` + `samtools`; skips otherwise.
 
 mod common;
 mod phix_seq;
 
+use std::io::Read as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -871,6 +875,205 @@ fn mixed_tandem_repeat_tie_break_matches_cli(
 ) {
     let reads = fixture_tandem_mixed(300, 0x7A4D_E110);
     check_tie_break_parity("tandem-mixed", &reads, 12_000, sub, threads);
+}
+
+// ---------------------------------------------------------------------------
+// BAM-level parity: aux type bytes.
+//
+// Every test above compares `samtools view` SAM text, which prints an integer
+// aux value the same whatever its BAM type (`c`/`C`/`s`/`S`/`i`/`I` all render
+// as `i:`), so a record written with a different integer width still matches.
+// This one compares the three-phase records against the CLI's own BAM output
+// (`--bam=0`), record by record: the fixed fields, read name, CIGAR, SEQ and
+// QUAL as raw bytes, and the aux block as ordered (tag, type, value) triples.
+// ---------------------------------------------------------------------------
+
+/// One aux field: tag, BAM type byte, raw value bytes.
+type AuxField = ([u8; 2], u8, Vec<u8>);
+
+/// A BAM record body split into everything before the aux block (raw bytes)
+/// and the aux fields in order.
+#[derive(Debug, PartialEq, Eq)]
+struct BamRecord {
+    core: Vec<u8>,
+    aux: Vec<AuxField>,
+}
+
+impl BamRecord {
+    fn qname(&self) -> String {
+        let l = usize::from(self.core[8]);
+        String::from_utf8_lossy(&self.core[32..32 + l - 1]).into_owned()
+    }
+
+    fn flag(&self) -> u16 {
+        u16::from_le_bytes([self.core[14], self.core[15]])
+    }
+}
+
+/// Split one BAM record body (no `block_size` prefix) into core bytes + aux.
+fn decode_body(body: &[u8]) -> BamRecord {
+    let u32_at = |i: usize| u32::from_le_bytes(body[i..i + 4].try_into().unwrap()) as usize;
+    let l_read_name = usize::from(body[8]);
+    let n_cigar = usize::from(u16::from_le_bytes([body[12], body[13]]));
+    let l_seq = u32_at(16);
+    let aux_start = 32 + l_read_name + 4 * n_cigar + l_seq.div_ceil(2) + l_seq;
+    let mut aux = Vec::new();
+    let mut i = aux_start;
+    while i < body.len() {
+        let tag = [body[i], body[i + 1]];
+        let ty = body[i + 2];
+        let v = i + 3;
+        let len = match ty {
+            b'A' | b'c' | b'C' => 1,
+            b's' | b'S' => 2,
+            b'i' | b'I' | b'f' => 4,
+            b'Z' | b'H' => {
+                body[v..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .expect("unterminated Z/H aux value")
+                    + 1
+            }
+            b'B' => {
+                let width = match body[v] {
+                    b'c' | b'C' => 1,
+                    b's' | b'S' => 2,
+                    _ => 4,
+                };
+                5 + width * u32_at(v + 1)
+            }
+            other => panic!("unknown BAM aux type {:?}", other as char),
+        };
+        aux.push((tag, ty, body[v..v + len].to_vec()));
+        i = v + len;
+    }
+    BamRecord {
+        core: body[..aux_start].to_vec(),
+        aux,
+    }
+}
+
+/// Align `fq` with `bwa-mem3 mem -p --bam=0` and decode its records in output
+/// order. `--bam=0` is uncompressed BGZF; a raw `BAM\1` stream is accepted too.
+fn cli_bam_records(bwa: &str, ref_fa: &Path, fq: &Path, k: u64) -> Vec<BamRecord> {
+    let out = Command::new(bwa)
+        .args(["mem", "-t", "1", "-K", &k.to_string(), "-p", "--bam=0"])
+        .arg(ref_fa)
+        .arg(fq)
+        .output()
+        .expect("run bwa-mem3 mem --bam=0");
+    assert!(
+        out.status.success(),
+        "bwa-mem3 mem --bam=0 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = if out.stdout.starts_with(b"BAM\x01") {
+        out.stdout
+    } else {
+        let mut buf = Vec::new();
+        noodles_bgzf::io::Reader::new(&out.stdout[..])
+            .read_to_end(&mut buf)
+            .expect("decode the CLI's BGZF output");
+        buf
+    };
+    assert!(raw.starts_with(b"BAM\x01"), "CLI output is not BAM");
+    let u32_at = |i: usize| u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
+    let mut i = 8 + u32_at(4); // magic, l_text, text
+    let n_ref = u32_at(i);
+    i += 4;
+    for _ in 0..n_ref {
+        i += 4 + u32_at(i) + 4; // l_name, name, l_ref
+    }
+    let mut records = Vec::new();
+    while i < raw.len() {
+        let n = u32_at(i);
+        records.push(decode_body(&raw[i + 4..i + 4 + n]));
+        i += 4 + n;
+    }
+    records
+}
+
+/// Reads that make the CLI emit every integer tag the shim writes (NM, MQ, AS,
+/// XS, HN) as well as supplementary and unmapped records: unique PhiX pairs,
+/// the SE chimera and junk read, and tandem-repeat pairs/singles that
+/// multi-map. The reference is PhiX followed by the tandem repeat.
+fn fixture_int_tags() -> (Vec<u8>, Vec<Read>) {
+    let mut reference = phix_seq::PHIX_SEQ.as_bytes().to_vec();
+    reference.extend_from_slice(&tandem_reference());
+    let mut reads = fixture_paired(40, 0x01A7_0001);
+    reads.extend(fixture_se_edge_cases(0x01A7_0002));
+    reads.extend(fixture_tandem_mixed(40, 0x01A7_0003));
+    (reference, reads)
+}
+
+/// The three-phase records equal the CLI's `--bam=0` records byte for byte,
+/// including each aux field's type byte: the CLI's BAM writer appends every
+/// integer tag as `i` (int32), which SAM-text parity cannot see.
+#[rstest]
+fn integer_aux_types_match_cli_bam(
+    #[values(10_000u64, 5_000_000)] k: u64,
+    #[values(1usize, 64)] sub: usize,
+    #[values(1usize, 4)] threads: usize,
+) {
+    let Some(bwa) = common::require_bwa_mem3() else {
+        return;
+    };
+    let (reference, reads) = fixture_int_tags();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let ref_fa = common::setup_ref_index(dir, &bwa, "mix", &reference);
+    let fq = dir.join("in.fq");
+    common::write_fastq(
+        &fq,
+        &reads
+            .iter()
+            .map(|r| (r.name.clone(), r.seq.clone()))
+            .collect::<Vec<_>>(),
+    );
+    let cli = cli_bam_records(&bwa, &ref_fa, &fq, k);
+    let idx = BwaIndex::load(&ref_fa).unwrap();
+    let opts = MemOpts::new().unwrap();
+    let rs: Vec<BamRecord> = run_three_phase(&idx, &opts, &reads, k, sub, threads, false)
+        .iter()
+        .map(Vec::as_slice)
+        .map(decode_body)
+        .collect();
+    let label = format!("K={k}, sub={sub}, threads={threads}");
+
+    // Fixture validity, asserted against the CLI rather than assumed: each
+    // integer tag, a supplementary, and an unmapped record must be present, or
+    // the comparison below would not cover them.
+    for tag in [b"NM", b"MQ", b"AS", b"XS", b"HN"] {
+        assert!(
+            cli.iter().any(|r| r.aux.iter().any(|(t, _, _)| t == tag)),
+            "fixture must make the CLI emit {} ({label})",
+            String::from_utf8_lossy(tag)
+        );
+    }
+    assert!(
+        cli.iter().any(|r| r.flag() & 0x800 != 0),
+        "fixture must produce a supplementary record ({label})"
+    );
+    assert!(
+        cli.iter().any(|r| r.flag() & 0x4 != 0),
+        "fixture must produce an unmapped record ({label})"
+    );
+
+    assert_eq!(rs.len(), cli.len(), "record count ({label})");
+    for (i, (a, b)) in rs.iter().zip(&cli).enumerate() {
+        assert_eq!(
+            a.core,
+            b.core,
+            "record {i} ({}): fixed fields/name/CIGAR/SEQ/QUAL differ ({label})",
+            b.qname()
+        );
+        assert_eq!(
+            a.aux,
+            b.aux,
+            "record {i} ({}): aux fields differ ({label})",
+            b.qname()
+        );
+    }
 }
 
 #[test]

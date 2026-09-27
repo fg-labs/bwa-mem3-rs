@@ -841,27 +841,15 @@ static void buf_append(uint8_t **buf, size_t *len, size_t *cap, const void *src,
     *len += n;
 }
 
-/* Emit the smallest-width BAM-encoded integer aux value. */
+/* Emit an integer aux value as BAM type 'i' (int32), the width the bwa-mem3
+ * CLI's BAM writer uses for every integer tag (bam_writer.cpp: NM, MQ, AS, XS,
+ * HN), so the shim's records match `bwa-mem3 mem --bam` byte for byte. */
 static void aux_put_i(uint8_t **buf, size_t *len, size_t *cap,
-                      const char tag[2], int64_t v) {
+                      const char tag[2], int32_t v) {
     uint8_t tmp[3 + 4];
     tmp[0] = (uint8_t)tag[0]; tmp[1] = (uint8_t)tag[1];
-    if (v >= INT8_MIN && v <= INT8_MAX) {
-        tmp[2] = 'c'; int8_t x = (int8_t)v; memcpy(tmp + 3, &x, 1);
-        buf_append(buf, len, cap, tmp, 4);
-    } else if (v >= 0 && v <= UINT8_MAX) {
-        tmp[2] = 'C'; uint8_t x = (uint8_t)v; memcpy(tmp + 3, &x, 1);
-        buf_append(buf, len, cap, tmp, 4);
-    } else if (v >= INT16_MIN && v <= INT16_MAX) {
-        tmp[2] = 's'; int16_t x = (int16_t)v; memcpy(tmp + 3, &x, 2);
-        buf_append(buf, len, cap, tmp, 5);
-    } else if (v >= 0 && v <= UINT16_MAX) {
-        tmp[2] = 'S'; uint16_t x = (uint16_t)v; memcpy(tmp + 3, &x, 2);
-        buf_append(buf, len, cap, tmp, 5);
-    } else {
-        tmp[2] = 'i'; int32_t x = (int32_t)v; memcpy(tmp + 3, &x, 4);
-        buf_append(buf, len, cap, tmp, 7);
-    }
+    tmp[2] = 'i'; memcpy(tmp + 3, &v, 4);
+    buf_append(buf, len, cap, tmp, 7);
 }
 
 static void aux_put_Z(uint8_t **buf, size_t *len, size_t *cap,

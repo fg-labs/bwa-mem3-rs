@@ -360,26 +360,12 @@ pub struct FieldRecord {
     pub meth: Option<(bool, bool)>,
 }
 
-/// Smallest-width BAM integer aux value, the rule the packed path uses.
+/// BAM integer aux value as type `i` (int32), the rule the packed path uses:
+/// the bwa-mem3 CLI's BAM writer appends every integer tag as `i`.
 pub fn put_int_tag(out: &mut Vec<u8>, tag: &[u8; 2], v: i32) {
     out.extend_from_slice(tag);
-    let v = i64::from(v);
-    if (-128..=127).contains(&v) {
-        out.push(b'c');
-        out.push(v as i8 as u8);
-    } else if (0..=255).contains(&v) {
-        out.push(b'C');
-        out.push(v as u8);
-    } else if (-32768..=32767).contains(&v) {
-        out.push(b's');
-        out.extend_from_slice(&(v as i16).to_le_bytes());
-    } else if (0..=65535).contains(&v) {
-        out.push(b'S');
-        out.extend_from_slice(&(v as u16).to_le_bytes());
-    } else {
-        out.push(b'i');
-        out.extend_from_slice(&(v as i32).to_le_bytes());
-    }
+    out.push(b'i');
+    out.extend_from_slice(&v.to_le_bytes());
 }
 
 pub fn put_str_tag(out: &mut Vec<u8>, tag: &[u8; 2], v: &[u8]) {
