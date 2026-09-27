@@ -34,10 +34,10 @@ fn validate_read_name(name: &[u8]) -> Result<()> {
 }
 
 impl<'a> ReadPair<'a> {
+    /// Reject input the shim cannot emit. A zero-length read is accepted: the
+    /// bwa-mem3 CLI aligns it as unmapped (no seeds, SEQ/QUAL `*`), and the
+    /// shim reaches the same record through the same kernels.
     pub fn validate(&self) -> Result<()> {
-        if self.seq_r1.is_empty() || self.seq_r2.is_empty() {
-            return Err(Error::InvalidInput("empty sequence".into()));
-        }
         validate_read_name(self.name_r1)?;
         validate_read_name(self.name_r2)?;
         if let Some(q) = self.qual_r1 {
@@ -334,10 +334,9 @@ pub struct SingleRead<'a> {
 }
 
 impl SingleRead<'_> {
+    /// Same rules as [`ReadPair::validate`]: a zero-length read is accepted and
+    /// emitted as unmapped, as the bwa-mem3 CLI does.
     pub fn validate(&self) -> Result<()> {
-        if self.seq.is_empty() {
-            return Err(Error::InvalidInput("empty sequence".into()));
-        }
         validate_read_name(self.name)?;
         if let Some(q) = self.qual {
             if q.len() != self.seq.len() {
@@ -720,13 +719,36 @@ pub fn pair_emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::empty_r1(b"", None, b"ACGT", None)]
+    #[case::empty_r2(b"ACGT", None, b"", None)]
+    #[case::both_empty(b"", None, b"", None)]
+    #[case::empty_with_empty_qual(b"", Some(b"".as_slice()), b"ACGT", Some(b"IIII".as_slice()))]
+    fn empty_seq_accepted(
+        #[case] seq_r1: &[u8],
+        #[case] qual_r1: Option<&[u8]>,
+        #[case] seq_r2: &[u8],
+        #[case] qual_r2: Option<&[u8]>,
+    ) {
+        let p = ReadPair {
+            name_r1: b"r1",
+            seq_r1,
+            qual_r1,
+            name_r2: b"r2",
+            seq_r2,
+            qual_r2,
+        };
+        assert!(p.validate().is_ok());
+    }
 
     #[test]
-    fn empty_seq_rejected() {
+    fn empty_seq_with_nonempty_qual_rejected() {
         let p = ReadPair {
             name_r1: b"r1",
             seq_r1: b"",
-            qual_r1: None,
+            qual_r1: Some(b"I"),
             name_r2: b"r2",
             seq_r2: b"ACGT",
             qual_r2: None,
@@ -766,7 +788,13 @@ mod tests {
             seq: b"",
             qual: None,
         };
-        assert!(empty.validate().is_err());
+        assert!(empty.validate().is_ok());
+        let empty_bad_qual = SingleRead {
+            name: b"s",
+            seq: b"",
+            qual: Some(b"I"),
+        };
+        assert!(empty_bad_qual.validate().is_err());
     }
 
     #[test]
