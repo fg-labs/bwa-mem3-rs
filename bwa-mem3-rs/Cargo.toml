@@ -20,7 +20,7 @@ default = []
 debug-poison = ["bwa-mem3-sys/debug-poison"]
 
 [dependencies]
-bwa-mem3-sys = { version = "0.2.3", path = "../bwa-mem3-sys" }
+bwa-mem3-sys = { version = "0.3.0", path = "../bwa-mem3-sys" }
 thiserror = "1"
 libc = "0.2"
 
