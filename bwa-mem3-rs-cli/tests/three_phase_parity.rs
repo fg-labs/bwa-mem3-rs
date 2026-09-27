@@ -12,6 +12,8 @@
 //! this crate reaches: a chimeric SE read that produces a `0x800`
 //! supplementary record, and a genuinely-unmappable SE read that produces a
 //! single `0x4` unmapped record (see `single_end_supplementary_and_unmapped_branches`).
+//! Zero-length reads (single, either mate, or both) are pinned by
+//! `empty_reads_match_cli`.
 //!
 //! Requires `bwa-mem3` + `samtools`; skips otherwise.
 
@@ -455,6 +457,11 @@ fn flag(line: &str) -> u32 {
     line.split('\t').nth(1).unwrap().parse().unwrap()
 }
 
+/// A SAM line's SEQ column.
+fn seq_col(line: &str) -> &str {
+    line.split('\t').nth(9).unwrap()
+}
+
 /// A SAM line's MAPQ column.
 fn mapq(line: &str) -> u32 {
     line.split('\t').nth(4).unwrap().parse().unwrap()
@@ -591,6 +598,118 @@ fn single_end_supplementary_and_unmapped_branches(
         0x4,
         "three-phase path must reproduce the SE unmapped branch \
          (K={k}, sub={sub}, threads={threads})"
+    );
+}
+
+/// Zero-length reads mixed into ordinary PhiX pairs. The bwa-mem3 CLI aligns an
+/// empty read as unmapped: it produces no seeds, so the read takes the same
+/// `0x4` branch as unmappable junk, and its record carries SEQ/QUAL `*`. This
+/// fixture covers an empty single (`e_se`), a pair with an empty R2 (`e_r2`),
+/// a pair with an empty R1 (`e_r1`), and a pair with both mates empty
+/// (`e_both`), each among normal reads so read ids and order are exercised.
+/// With `sub = 1` an empty read is also the only read of its sub-batch, a
+/// batch shape the CLI's cohort batching rarely produces.
+fn fixture_empty_reads(seed: u64) -> Vec<Read> {
+    let reference = phix_seq::PHIX_SEQ.as_bytes();
+    let pairs = fixture_paired(60, seed);
+    let empty = |name: &str| Read {
+        name: name.into(),
+        seq: Vec::new(),
+        qual: Vec::new(),
+    };
+    let placed = |name: &str, start: usize, rev: bool| {
+        let mut seq = reference[start..start + 150].to_vec();
+        if rev {
+            seq = common::revcomp(&seq);
+        }
+        Read {
+            name: name.into(),
+            seq,
+            qual: vec![b'I'; 150],
+        }
+    };
+    let mut out = Vec::new();
+    for (i, chunk) in pairs.chunks(2).enumerate() {
+        out.extend_from_slice(chunk);
+        match i {
+            10 => out.push(empty("e_se")),
+            20 => {
+                out.push(placed("e_r2", 1000, false));
+                out.push(empty("e_r2"));
+            }
+            30 => {
+                out.push(empty("e_r1"));
+                out.push(placed("e_r1", 2500, true));
+            }
+            40 => {
+                out.push(empty("e_both"));
+                out.push(empty("e_both"));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Byte parity with the CLI on [`fixture_empty_reads`], plus fixture validity
+/// asserted against the reference aligner: every empty read comes back as an
+/// unmapped record with SEQ `*`, and the placed mate of a half-empty pair
+/// stays mapped, so the parity check covers the half-mapped rewrite too.
+#[rstest]
+fn empty_reads_match_cli(
+    #[values(5_000u64, 5_000_000)] k: u64,
+    #[values(1usize, 7, 256)] sub: usize,
+    #[values(1usize, 4)] threads: usize,
+) {
+    let reads = fixture_empty_reads(0xE397_0001);
+    let Some((_rs, cli)) = check_parity("empty_reads", &reads, k, sub, threads) else {
+        return;
+    };
+
+    let e_se = named(&cli, "e_se");
+    assert_eq!(
+        e_se.len(),
+        1,
+        "CLI must emit exactly one e_se record (K={k})"
+    );
+    assert_eq!(
+        flag(e_se[0]) & 0x4,
+        0x4,
+        "CLI must emit the empty single as unmapped"
+    );
+    assert_eq!(
+        seq_col(e_se[0]),
+        "*",
+        "CLI must emit the empty single's SEQ as `*`"
+    );
+
+    for (qname, empty_mate) in [("e_r2", 0x80u32), ("e_r1", 0x40)] {
+        let recs = named(&cli, qname);
+        assert_eq!(recs.len(), 2, "CLI must emit two {qname} records (K={k})");
+        let empty = recs.iter().find(|l| flag(l) & empty_mate != 0).unwrap();
+        let placed = recs.iter().find(|l| flag(l) & empty_mate == 0).unwrap();
+        assert_eq!(
+            flag(empty) & 0x4,
+            0x4,
+            "{qname}: the empty mate must be unmapped"
+        );
+        assert_eq!(
+            seq_col(empty),
+            "*",
+            "{qname}: the empty mate's SEQ must be `*`"
+        );
+        assert_eq!(
+            flag(placed) & 0x4,
+            0,
+            "{qname}: the non-empty mate must map"
+        );
+    }
+
+    let e_both = named(&cli, "e_both");
+    assert_eq!(e_both.len(), 2, "CLI must emit two e_both records (K={k})");
+    assert!(
+        e_both.iter().all(|l| flag(l) & 0xC == 0xC),
+        "e_both: both empty mates must be unmapped with their mate unmapped"
     );
 }
 
