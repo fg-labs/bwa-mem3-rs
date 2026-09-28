@@ -911,3 +911,81 @@ fn marks_after_infer_cohort_are_refused_and_the_cohort_stays_usable() {
     assert!(!records.is_empty());
 }
 
+/// Eight threads share one cohort: ranges are reserved and marked serially
+/// (the pipeline's Serial prepare step), then written and seeded concurrently
+/// in shuffled order, resolved, and emitted concurrently. The records must
+/// equal the one-thread memo-off run.
+#[test]
+fn concurrent_shuffled_ranges_match_serial_memo_off() {
+    use rayon::prelude::*;
+
+    let Some((idx, opts)) = index_for(false) else {
+        return;
+    };
+    let fixture = field_fixture();
+    let owned = dup_fixture(&fixture);
+    let pairs: Vec<ReadPair<'_>> = owned.iter().map(as_read_pair).collect();
+    let chunk = 6;
+    let (reference, _) = run_cohort_memo(&idx, &opts, &pairs, pairs.len(), false);
+
+    let cohort = Arc::new(ResidentCohort::new(false).unwrap());
+    let mut memo = PairMemo::new();
+    let mut work: Vec<(ResidentRange, usize, Vec<Option<u64>>)> = pairs
+        .chunks(chunk)
+        .enumerate()
+        .map(|(k, c)| {
+            let range = cohort.reserve_pairs(c.len()).unwrap();
+            let reps = memo.mark_range(&range, c).unwrap();
+            (range, k * chunk, reps)
+        })
+        .collect();
+    // Deterministic shuffle (xorshift), so a failure reproduces.
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for i in (1..work.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        work.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build()
+        .unwrap();
+    let done: Vec<(ResidentRange, usize)> = pool.install(|| {
+        work.into_par_iter()
+            .map_init(
+                || AlignScratch::new().unwrap(),
+                |sc, (mut range, p0, reps)| {
+                    let n = range.n_pairs();
+                    cohort.write_pairs(&mut range, &pairs[p0..p0 + n]).unwrap();
+                    cohort
+                        .seed_extend_with_reps(&idx, &opts, sc, &mut range, &reps)
+                        .unwrap();
+                    (range, p0)
+                },
+            )
+            .collect()
+    });
+    let stats = cohort
+        .resolve_memo(&idx, &opts, &mut AlignScratch::new().unwrap())
+        .unwrap();
+    assert_eq!(stats, all_copied(expected_dups(&pairs)));
+    let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+    let mut emitted: Vec<(usize, Records)> = pool.install(|| {
+        done.into_par_iter()
+            .map_init(
+                || AlignScratch::new().unwrap(),
+                |sc, (mut range, p0)| {
+                    let records = emit_range(&cohort, &idx, &opts, sc, &mut range, &pestat, p0);
+                    (p0, records)
+                },
+            )
+            .collect()
+    });
+    emitted.sort_by_key(|(p0, _)| *p0);
+    let got: Records = emitted.into_iter().flat_map(|(_, r)| r).collect();
+    assert!(
+        got == reference,
+        "concurrent shuffled memo run diverged from serial memo off"
+    );
+}
