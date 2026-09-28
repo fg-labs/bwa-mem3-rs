@@ -14,6 +14,7 @@
  * BAM emission is direct from mem_aln_t (no SAM intermediate).
  */
 
+#include <algorithm>
 #include <mutex>
 #include <cstdint>
 #include <cstdio>
@@ -1471,7 +1472,9 @@ void shim_regs_free(ShimRegs *r) {
  * chains are then scattered back to their own slots (a descending pull, each
  * slot touched once) and re-stamped with the chunk-local seqid kernel2 asserts.
  * Duplicate slots get empty chains, so kernel2 gives them empty regs, which
- * shim_resident_resolve_memo later fills. */
+ * shim_resident_resolve_memo later fills. KEEP IN SYNC with worker_bwt_memo on
+ * every vendor refresh; unlike it, this converts only the duplicate reads, since
+ * kernel1 converts the rest and a second conversion turns '-' into N. */
 static void seed_chunk_reps(ShimScratch *sc, BwaShimIndex *idx, const mem_opt_t *opt,
                             bseq1_t *chunk, int bs, int chunk_first, const int64_t *reps)
 {
@@ -2439,10 +2442,15 @@ struct ShimResidentRegion {
     size_t                len;        /* total reserved reads */
 };
 
+/* What shim_resident_resolve_memo did (BwaMemoStats' layout). */
+struct ShimMemoStats { uint64_t dup_pairs, copied, fallback_aligned; };
+
 struct ShimResidentCohort {
     ShimResidentRegion pairs;    /* 2*n_pairs reads, R1/R2 interleaved */
     ShimResidentRegion singles;
     int meth_mode;
+    int           memo_resolved; /* shim_resident_resolve_memo has run */
+    ShimMemoStats memo_stats;    /* what it did, returned again on a repeat call */
 };
 
 /* Release a segment's reads: its arena (or per-read strings) and any regions
@@ -2648,22 +2656,35 @@ int shim_resident_write_singles(ShimResidentSegment *sg, const ShimSingleRead *r
     return 0;
 }
 
-/* Seed + SE-extend a whole segment (pairs or singles). Returns 0, -1 on a null
- * arg, or -3 when it was already extended or any slot is unwritten (a NULL seq
- * would crash the seeding kernel). */
-int shim_resident_seed_extend(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
-                              ShimResidentSegment *sg) {
-    if (!idx_opaque || !opts || !sc || !sg) return -1;
+/* 0 when every slot of `sg` is written and it is not extended yet, else -3 (a
+ * NULL seq would crash the seeding kernel). */
+static int resident_seedable(const ShimResidentSegment *sg) {
     if (sg->extended) return -3;
     for (size_t i = 0; i < sg->n; ++i)
         if (!sg->seqs[i].seq) return -3;
+    return 0;
+}
+
+/* Seed + SE-extend a whole seedable segment under its group's MEM_F_PE setting
+ * (the per-group opt copy shim_seed_extend makes: on for pairs, off for
+ * singles), skipping the pairs its `reps` marks as duplicates. */
+static void resident_seed_extend_run(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
+                                     ShimResidentSegment *sg) {
     BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
-    /* The per-group opt copy shim_seed_extend makes (MEM_F_PE on for pairs, off
-     * for singles). */
     mem_opt_t opt = *opts; opt.n_threads = 1;
     if (sg->is_pairs) opt.flag |= MEM_F_PE; else opt.flag &= ~MEM_F_PE;
-    seed_extend_reads(sc, idx, &opt, sg->seqs, sg->regs, (int) sg->n, nullptr);
+    seed_extend_reads(sc, idx, &opt, sg->seqs, sg->regs, (int) sg->n, sg->reps);
     sg->extended = 1;
+}
+
+/* Seed + SE-extend a whole segment (pairs or singles). Returns 0, -1 on a null
+ * arg, or -3 when it was already extended or any slot is unwritten. */
+int shim_resident_seed_extend(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
+                              ShimResidentSegment *sg) {
+    if (!idx_opaque || !opts || !sc || !sg) return -1;
+    int rc = resident_seedable(sg);
+    if (rc != 0) return rc;
+    resident_seed_extend_run(idx_opaque, opts, sc, sg);
     return 0;
 }
 
@@ -2680,9 +2701,8 @@ int shim_resident_seed_extend_reps(void *idx_opaque, const mem_opt_t *opts, Shim
                                    size_t n_pairs) {
     if (!idx_opaque || !opts || !sc || !sg || (n_pairs > 0 && !reps)) return -1;
     if (!sg->is_pairs || n_pairs != sg->n / 2) return -1;
-    if (sg->extended) return -3;
-    for (size_t i = 0; i < sg->n; ++i)
-        if (!sg->seqs[i].seq) return -3;
+    int rc = resident_seedable(sg);
+    if (rc != 0) return rc;
     size_t n_dups = 0;
     const int64_t first_pair = (int64_t) (sg->base / 2);
     for (size_t p = 0; p < n_pairs; ++p) {
@@ -2696,10 +2716,133 @@ int shim_resident_seed_extend_reps(void *idx_opaque, const mem_opt_t *opts, Shim
         if (!sg->reps) return -1;
         memcpy(sg->reps, reps, n_pairs * sizeof(int64_t));
     }
+    resident_seed_extend_run(idx_opaque, opts, sc, sg);
+    return 0;
+}
+
+/* The pair segment of `rg` holding cohort-local pair ordinal `pair` (and its
+ * pair index within it in *local), or NULL. segs[] is in reserve order with
+ * increasing `base` (resident_region_reserve), so take the last segment whose
+ * first pair is <= `pair`; an empty segment shares its successor's base and so
+ * is never the one taken for a real pair. */
+static ShimResidentSegment *pair_segment_of(const ShimResidentRegion *rg, uint64_t pair,
+                                            size_t *local) {
+    ShimResidentSegment *const *begin = rg->segs;
+    ShimResidentSegment *const *end = rg->segs + rg->n_segments;
+    ShimResidentSegment *const *after = std::upper_bound(
+        begin, end, pair,
+        [](uint64_t p, const ShimResidentSegment *s) { return p < s->base / 2; });
+    if (after == begin) return nullptr;
+    ShimResidentSegment *sg = *(after - 1);
+    if (pair >= (sg->base + sg->n) / 2) return nullptr;
+    *local = (size_t) pair - sg->base / 2;
+    return sg;
+}
+
+/* The first copy a mark leads to: follow marks until a pair that is not itself
+ * marked (only a hand-built mark names a marked pair; PairMemo always names the
+ * first copy). Every mark is below its own pair's ordinal, so this ends. NULL
+ * when a mark names no pair of the cohort. */
+static ShimResidentSegment *first_copy_of(const ShimResidentRegion *rg, int64_t rep,
+                                          size_t *local) {
+    for (;;) {
+        ShimResidentSegment *rs = pair_segment_of(rg, (uint64_t) rep, local);
+        if (!rs || !rs->reps || rs->reps[*local] < 0) return rs;
+        rep = rs->reps[*local];
+    }
+}
+
+/* Two reads with the same 2-bit bases (both are converted once extended). */
+static int same_bases(const bseq1_t *a, const bseq1_t *b) {
+    return a->l_seq == b->l_seq && memcmp(a->seq, b->seq, (size_t) a->l_seq) == 0;
+}
+
+/* Put back the one byte a second 2-bit conversion would change: nst_nt4_table
+ * maps '-' to 5, and kernel1 re-converts 5 to 4 (N), so a read converted once
+ * must hold '-' again before it is seeded again. */
+static void restore_dashes(bseq1_t *s) {
+    for (int i = 0; i < s->l_seq; ++i)
+        if (s->seq[i] == 5) s->seq[i] = '-';
+}
+
+/* Deep-copy one read's regs from its representative: upstream's
+ * read_memo_copy_regs (bwamem.cpp:3793), including the --extend-csub capped_w
+ * side channel. mem_alnreg_t is POD for this purpose (->c is NULL'd at kernel2
+ * exit; ->hash is stamped later per read), and m = n is fine: mate rescue's
+ * kv_push reallocs. Aborts on allocation failure, as upstream's does. KEEP IN
+ * SYNC with read_memo_copy_regs on every vendor refresh. */
+static void copy_regs(mem_alnreg_v *dst, const mem_alnreg_v *src) {
+    free(dst->a);
+    const size_t n = src->n;
+    dst->a = n ? (mem_alnreg_t *) malloc(n * sizeof(mem_alnreg_t)) : nullptr;
+    xassert(n == 0 || dst->a, "copy_regs: out of memory");
+    if (n) memcpy(dst->a, src->a, n * sizeof(mem_alnreg_t));
+    dst->n = dst->m = n;
+    dst->capped_w = src->capped_w;
+}
+
+/* The memo barrier: give every duplicate pair (a pair segment's reps[p] >= 0)
+ * its first copy's alignment regions, after checking their 2-bit bases match; a
+ * mismatch (a hash collision, or a hand-built mark) seed-extends the pair on its
+ * own instead. Must run with every pair segment extended and none emitted --
+ * emitting releases a segment's regs (resident_segment_release_reads), so a
+ * representative emitted early would be copied as empty -- and exclusive of
+ * every other call on the cohort. Every mark is validated before anything is
+ * copied, so an error leaves the cohort unchanged. A repeat call returns the
+ * first call's stats and does nothing. Returns 0, -1 on a null arg, -3 when a
+ * pair segment is not extended, -4 when one was emitted, or -5 when a mark
+ * names no pair of the cohort. */
+int shim_resident_resolve_memo(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
+                               ShimResidentCohort *c, ShimMemoStats *out) {
+    if (!idx_opaque || !opts || !sc || !c || !out) return -1;
+    if (c->memo_resolved) { *out = c->memo_stats; return 0; }
+    const ShimResidentRegion *rg = &c->pairs;
+    for (size_t s = 0; s < rg->n_segments; ++s) {
+        if (!rg->segs[s]->extended) return -3;
+        if (rg->segs[s]->emitted) return -4;
+    }
+    for (size_t s = 0; s < rg->n_segments; ++s) {
+        const ShimResidentSegment *sg = rg->segs[s];
+        if (!sg->reps) continue;
+        for (size_t p = 0; p < sg->n / 2; ++p) {
+            size_t rl = 0;
+            if (sg->reps[p] >= 0 && !first_copy_of(rg, sg->reps[p], &rl)) return -5;
+        }
+    }
     BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
     mem_opt_t opt = *opts; opt.n_threads = 1; opt.flag |= MEM_F_PE;
-    seed_extend_reads(sc, idx, &opt, sg->seqs, sg->regs, (int) sg->n, sg->reps);
-    sg->extended = 1;
+    ShimMemoStats st = { 0, 0, 0 };
+    for (size_t s = 0; s < rg->n_segments; ++s) {
+        ShimResidentSegment *sg = rg->segs[s];
+        if (!sg->reps) continue;
+        for (size_t p = 0; p < sg->n / 2; ++p) {
+            if (sg->reps[p] < 0) continue;
+            size_t rl = 0;
+            ShimResidentSegment *rs = first_copy_of(rg, sg->reps[p], &rl);
+            ++st.dup_pairs;
+            if (same_bases(&sg->seqs[2 * p], &rs->seqs[2 * rl])
+                && same_bases(&sg->seqs[2 * p + 1], &rs->seqs[2 * rl + 1])) {
+                copy_regs(&sg->regs[2 * p], &rs->regs[2 * rl]);
+                copy_regs(&sg->regs[2 * p + 1], &rs->regs[2 * rl + 1]);
+                ++st.copied;
+            } else {
+                /* kernel2 already kv_init'ed the empty regs; release them, then
+                 * align the two reads as a batch of one pair (kernel1's mate cap
+                 * reads l^1 < nseq, which a two-read view satisfies). Their
+                 * bases are already 2-bit and kernel1 converts them again, so
+                 * restore the '-' bytes that pass would change first. */
+                release_regs(&sg->regs[2 * p]);
+                release_regs(&sg->regs[2 * p + 1]);
+                restore_dashes(&sg->seqs[2 * p]);
+                restore_dashes(&sg->seqs[2 * p + 1]);
+                seed_extend_reads(sc, idx, &opt, sg->seqs + 2 * p, sg->regs + 2 * p, 2, nullptr);
+                ++st.fallback_aligned;
+            }
+        }
+    }
+    c->memo_resolved = 1;
+    c->memo_stats = st;
+    *out = st;
     return 0;
 }
 

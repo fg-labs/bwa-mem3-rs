@@ -715,12 +715,6 @@ enum Misuse {
     SeedExtendAfterPairEmit,
 }
 
-/// A structured sink that discards every record.
-struct NullFieldSink;
-impl AlignedFieldsSink for NullFieldSink {
-    fn emit(&mut self, _: RecordOrigin, _: Mate, _: bool, _: AlignedFields<'_>) {}
-}
-
 /// Every lifecycle or contract misuse is reported as the `InvalidInput` naming
 /// that misuse, rather than reaching the C kernels with a range in the wrong
 /// state. Each case runs against its own fresh cohort.
@@ -1325,20 +1319,6 @@ fn write_single_range(
         }
     }
     range
-}
-
-/// The PhiX index for `meth`, and options in that mode.
-fn index_for(meth: bool) -> Option<(Arc<BwaIndex>, MemOpts)> {
-    let idx = if meth {
-        phix_meth().map(|r| r.idx.clone())
-    } else {
-        shared_idx()
-    }?;
-    let mut opts = MemOpts::new().unwrap();
-    if meth {
-        opts.set_meth(true);
-    }
-    Some((idx, opts))
 }
 
 /// Align `pairs` or `singles` in one range written with `mode`, returning the

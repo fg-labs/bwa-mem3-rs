@@ -16,6 +16,7 @@ use crate::align::{
 };
 use crate::error::{shim_err, shim_last_message, Error, Result};
 use crate::index::BwaIndex;
+use crate::memo::MemoStats;
 use crate::opts::{MemOpts, MemPeStat};
 
 // ---------------------------------------------------------------------------
@@ -344,15 +345,19 @@ impl ResidentRange {
 /// - **Duplicate marks are resolved at a barrier.**
 ///   [`seed_extend_with_reps`](Self::seed_extend_with_reps) records a range's
 ///   duplicate marks under the shared lock; `resolve_memo` copies them under
-///   the exclusive lock; `infer_cohort` and the emits refuse while marks are
-///   unresolved.
+///   the exclusive lock; `infer_cohort` and pair emits refuse while marks are
+///   unresolved. One atomic word holds the mark count and the "closed" bit, so
+///   a mark racing a pair emit on another range either lands first (and the
+///   emit refuses) or is refused itself.
 /// - **Lifecycle misuse is an error, not UB.** Writing a slot twice or after
 ///   `seed_extend`, seed-extending an unwritten or already-extended range,
 ///   emitting an unextended or already-emitted range, `infer_cohort` while a
 ///   pair range is unextended or after any was emitted, a range from another
 ///   cohort, a different [`BwaIndex`] than the one the cohort was first
-///   extended against, and options whose `--meth` mode differs from the
-///   cohort's all return `Err`.
+///   extended against, options whose `--meth` mode differs from the
+///   cohort's, `infer_cohort` or a pair emit while duplicate marks await
+///   `resolve_memo`, and duplicate marks once the memo is closed (by
+///   `resolve_memo`, `infer_cohort` or a pair emit) all return `Err`.
 ///
 /// A pair range reserved after `infer_cohort` is not part of that model; it is
 /// the caller's to emit it with a model that fits.
@@ -370,11 +375,16 @@ pub struct ResidentCohort {
     /// [`heap_bytes`](Self::heap_bytes)); raised by `reserve_*`/`write_*` and
     /// lowered when a range is emitted.
     heap_bytes: AtomicUsize,
-    /// Pairs marked as duplicates by [`seed_extend_with_reps`](Self::seed_extend_with_reps);
-    /// while any are unresolved, `infer_cohort` and the emits refuse. Only
-    /// changed under the shared range lock, and read under a range lock.
-    n_dups: AtomicU64,
-    /// Set by `resolve_memo` under the exclusive range lock.
+    /// The memo's state in one word, so the two transitions that race under
+    /// the shared range lock stay atomic: the pairs marked as duplicates by
+    /// [`seed_extend_with_reps`](Self::seed_extend_with_reps), plus
+    /// [`MEMO_CLOSED`] once no more marks are accepted. Marks are added only
+    /// while open; the first pair emit or `infer_cohort` closes it only while
+    /// no marks exist (with marks, they wait for `resolve_memo`, which closes
+    /// it under the exclusive lock).
+    memo: AtomicU64,
+    /// Set by `resolve_memo` under the exclusive range lock: the marked pairs
+    /// hold their representatives' regions.
     memo_resolved: AtomicBool,
     /// Serializes calls that read or grow the C segment table: `reserve_*`
     /// (writes it) and `infer_cohort` (walks it).
@@ -382,6 +392,10 @@ pub struct ResidentCohort {
     /// Range calls hold this shared; `infer_cohort` holds it exclusively.
     ranges: RwLock<()>,
 }
+
+/// [`ResidentCohort`]'s `memo` bit set once no more duplicate marks are
+/// accepted; the other bits count the marks.
+const MEMO_CLOSED: u64 = 1 << 63;
 
 /// Map a resident shim status to an error: -3 is a lifecycle violation (caller
 /// misuse, reported with the shim's complete message), anything else a shim
@@ -413,7 +427,7 @@ impl ResidentCohort {
             meth,
             index_id: AtomicU64::new(0),
             heap_bytes: AtomicUsize::new(0),
-            n_dups: AtomicU64::new(0),
+            memo: AtomicU64::new(0),
             memo_resolved: AtomicBool::new(false),
             table: Mutex::new(()),
             ranges: RwLock::new(()),
@@ -476,21 +490,60 @@ impl ResidentCohort {
         }
     }
 
-    /// Reject a pestat or an emit while duplicate pairs still wait for
-    /// `resolve_memo`: their regions are empty until it copies them. Call it
-    /// under a range lock. That excludes `resolve_memo` (exclusive), but not
-    /// `seed_extend_with_reps` on another range (both shared): an emit may see
-    /// no marks while another range is adding some. That is benign, because a
-    /// range's own marks are always visible to its own emit (same `&mut`
-    /// range), and a later `resolve_memo` refuses a cohort with an emitted
-    /// range.
+    /// Reject a pair pestat or emit while duplicate marks still wait for
+    /// `resolve_memo`: their regions are empty until it copies them.
     fn check_memo_resolved(&self, what: &str) -> Result<()> {
-        if self.n_dups.load(Ordering::Acquire) > 0 && !self.memo_resolved.load(Ordering::Acquire) {
+        if self.memo.load(Ordering::Acquire) & !MEMO_CLOSED > 0
+            && !self.memo_resolved.load(Ordering::Acquire)
+        {
             Err(Error::InvalidInput(format!(
                 "{what}: the cohort has duplicate pairs; call resolve_memo first"
             )))
         } else {
             Ok(())
+        }
+    }
+
+    /// [`check_memo_resolved`](Self::check_memo_resolved), then close the memo
+    /// if it has no marks. One compare-and-swap decides between the two, so a
+    /// concurrent [`add_marks`](Self::add_marks) either lands first (and this
+    /// call refuses) or sees the memo closed (and refuses itself).
+    fn close_memo(&self, what: &str) -> Result<()> {
+        let mut s = self.memo.load(Ordering::Acquire);
+        loop {
+            if s & !MEMO_CLOSED > 0 || s & MEMO_CLOSED != 0 {
+                return self.check_memo_resolved(what);
+            }
+            match self.memo.compare_exchange_weak(
+                s,
+                s | MEMO_CLOSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(now) => s = now,
+            }
+        }
+    }
+
+    /// Count `n` new duplicate marks, unless the memo is closed. Call it under
+    /// the shared range lock, before the marks reach the shim.
+    fn add_marks(&self, n: u64, what: &str) -> Result<()> {
+        let mut s = self.memo.load(Ordering::Acquire);
+        loop {
+            if s & MEMO_CLOSED != 0 {
+                return Err(Error::InvalidInput(format!(
+                    "{what}: the cohort's memo is closed (resolve_memo, infer_cohort or a \
+                     pair emit has run), so it accepts no more duplicate marks"
+                )));
+            }
+            match self
+                .memo
+                .compare_exchange_weak(s, s + n, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(()),
+                Err(now) => s = now,
+            }
         }
     }
 
@@ -749,8 +802,9 @@ impl ResidentCohort {
     /// marked as exact duplicates of earlier pairs of this cohort, as
     /// [`PairMemo::mark_range`](crate::PairMemo::mark_range) returns them:
     /// `reps[i] = Some(rep)` means pair `i` is not seeded, and its alignment
-    /// regions are copied from cohort pair `rep` by `resolve_memo`, which must
-    /// then run before [`infer_cohort`](Self::infer_cohort) or any emit.
+    /// regions are copied from cohort pair `rep` by
+    /// [`resolve_memo`](Self::resolve_memo), which must then run before
+    /// [`infer_cohort`](Self::infer_cohort) or any pair emit.
     /// All-`None` is exactly `seed_extend`.
     ///
     /// # Errors
@@ -758,7 +812,8 @@ impl ResidentCohort {
     /// `InvalidInput` when `range` is not a pair range of this cohort,
     /// `reps.len()` differs from `range.n_pairs()`, a mark does not name an
     /// earlier pair of the cohort, any mark is set on a `--meth` cohort, a mark
-    /// is set after `resolve_memo`, or on any `seed_extend` error.
+    /// is set once the memo is closed (by `resolve_memo`, `infer_cohort` or a
+    /// pair emit), or on any `seed_extend` error.
     pub fn seed_extend_with_reps(
         &self,
         idx: &BwaIndex,
@@ -780,37 +835,35 @@ impl ResidentCohort {
         check_meth_consistency(idx, opts)?;
         self.check_index(idx, WHAT)?;
         let first_pair = (range.first / 2) as u64;
-        let mut c_reps = Vec::with_capacity(reps.len());
-        let mut n_dups = 0u64;
         for (i, rep) in reps.iter().enumerate() {
             let own = first_pair + i as u64;
-            c_reps.push(match *rep {
-                None => -1i64,
-                Some(r) if r < own => {
-                    n_dups += 1;
-                    i64::try_from(r).map_err(|_| {
-                        Error::InvalidInput(format!("{WHAT}: mark {r} overflows an i64"))
-                    })?
-                }
-                Some(r) => {
+            if let Some(r) = *rep {
+                if r >= own {
                     return Err(Error::InvalidInput(format!(
                         "{WHAT}: pair {own} is marked as a duplicate of pair {r}, which is not \
                          an earlier pair of the cohort"
-                    )))
+                    )));
                 }
-            });
+            }
         }
-        if n_dups > 0 && self.meth {
+        let n_dups = reps.iter().filter(|r| r.is_some()).count() as u64;
+        if n_dups == 0 {
+            // Nothing to skip: exactly `seed_extend`, with no marks to pass.
+            return self.seed_extend(idx, opts, scratch, range);
+        }
+        if self.meth {
             return Err(Error::InvalidInput(format!(
                 "{WHAT}: duplicate marks are not supported under --meth"
             )));
         }
+        // Every mark is below `own`, a pair offset that fits in a `usize`, so
+        // the conversion cannot fail.
+        let c_reps: Vec<i64> = reps
+            .iter()
+            .map(|r| r.map_or(-1, |r| i64::try_from(r).unwrap_or(i64::MAX)))
+            .collect();
         let _ranges = self.lock_ranges_shared();
-        if n_dups > 0 && self.memo_resolved.load(Ordering::Acquire) {
-            return Err(Error::InvalidInput(format!(
-                "{WHAT}: the cohort's memo is already resolved"
-            )));
-        }
+        self.add_marks(n_dups, WHAT)?;
         // SAFETY: as `seed_extend`; `c_reps` holds `range.n_pairs()` entries
         // and outlives the call, and the shim copies it before returning.
         let rc = unsafe {
@@ -823,14 +876,81 @@ impl ResidentCohort {
                 c_reps.len(),
             )
         };
-        resident_status(rc, "resident_seed_extend_reps")?;
-        self.n_dups.fetch_add(n_dups, Ordering::Release);
-        Ok(())
+        let status = resident_status(rc, "resident_seed_extend_reps");
+        if status.is_err() {
+            // The shim stored no marks; take them back. A pair emit that saw
+            // them meanwhile refused, as it would for any unresolved mark.
+            self.memo.fetch_sub(n_dups, Ordering::AcqRel);
+        }
+        status
+    }
+
+    /// The memo barrier: give every pair marked by
+    /// [`seed_extend_with_reps`](Self::seed_extend_with_reps) its
+    /// representative's alignment regions, after checking that their bases
+    /// match; a pair whose bases differ is aligned normally, using `scratch`.
+    /// A mark naming a pair that is itself marked resolves through it to the
+    /// first copy. With marks, it needs every pair range extended; holds the
+    /// cohort exclusively (range calls and reserves wait). Run it once every
+    /// range is extended and before [`infer_cohort`](Self::infer_cohort). A
+    /// successful call closes the memo; a second call returns the same stats
+    /// and does nothing, and a cohort with no marks resolves to zero stats at
+    /// any point.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when the cohort has marks and a pair range is not
+    /// seed-extended (the message says so), or on an options/index mismatch
+    /// (as `infer_cohort`). A failed call leaves the marks in place, so it can
+    /// be retried once the range is extended.
+    pub fn resolve_memo(
+        &self,
+        idx: &BwaIndex,
+        opts: &MemOpts,
+        scratch: &mut AlignScratch,
+    ) -> Result<MemoStats> {
+        self.check_cohort_meth(opts, "resolve_memo")?;
+        check_meth_consistency(idx, opts)?;
+        self.check_index(idx, "resolve_memo")?;
+        let _ranges = self.lock_ranges_exclusive();
+        let _table = self.lock_table();
+        // The exclusive lock excludes `add_marks`, so this load cannot race a mark.
+        if self.memo.load(Ordering::Acquire) & !MEMO_CLOSED == 0 {
+            // No marks: nothing to copy, whatever state the ranges are in.
+            self.memo.fetch_or(MEMO_CLOSED, Ordering::AcqRel);
+            return Ok(MemoStats::default());
+        }
+        let mut st = bwa_mem3_sys::BwaMemoStats::default();
+        // SAFETY: `idx`/`opts`/`scratch.handle` are valid for the call and
+        // `scratch` is exclusively borrowed; `st` is a live `BwaMemoStats`; the
+        // exclusive range lock plus the table mutex make this the only call
+        // touching the cohort.
+        let rc = unsafe {
+            bwa_mem3_sys::bwa_shim_resident_resolve_memo(
+                idx.raw(),
+                opts.as_ptr(),
+                scratch.handle,
+                self.handle,
+                &mut st,
+            )
+        };
+        resident_status(rc, "resident_resolve_memo")?;
+        // Close only on success, so a failed call can be retried once the
+        // late ranges are extended with their marks.
+        self.memo.fetch_or(MEMO_CLOSED, Ordering::AcqRel);
+        self.memo_resolved.store(true, Ordering::Release);
+        Ok(MemoStats {
+            dup_pairs: st.dup_pairs,
+            copied: st.copied,
+            fallback_aligned: st.fallback_aligned,
+        })
     }
 
     /// `mem_pestat` over the whole cohort's pair region. Every pair range must
-    /// have been seed-extended and none emitted yet (else `Err`); waits for
-    /// in-flight range calls. Feed the result to every
+    /// have been seed-extended and none emitted yet, and any duplicate marks
+    /// resolved by [`resolve_memo`](Self::resolve_memo) (else `Err`); waits for
+    /// in-flight range calls. It also closes the memo, as the first pair emit
+    /// does: no duplicate marks are accepted after it. Feed the result to every
     /// [`pair_emit`](Self::pair_emit) of this cohort. The model is a histogram,
     /// so it does not depend on the order the ranges were reserved or extended.
     pub fn infer_cohort(&self, idx: &BwaIndex, opts: &MemOpts) -> Result<MemPeStat> {
@@ -852,6 +972,11 @@ impl ResidentCohort {
             )
         };
         resident_status(rc, "resident_pestat_cohort")?;
+        // The model is taken, so close the memo: a later mark could never be
+        // resolved once a range is emitted, and would leave the cohort's
+        // remaining ranges unemittable. With marks, `check_memo_resolved`
+        // above already required `resolve_memo`, which closed it.
+        self.memo.fetch_or(MEMO_CLOSED, Ordering::AcqRel);
         Ok(out)
     }
 
@@ -910,7 +1035,14 @@ impl ResidentCohort {
             )));
         }
         let guard = self.lock_ranges_shared();
-        self.check_memo_resolved(what)?;
+        // A single-end range, or an empty pair range, reads no pair regions,
+        // so it neither waits for nor closes the memo. A pair emit closes it
+        // before the shim runs, even if the emit then fails: closing after
+        // would let a mark land on another range mid-emit, and `resolve_memo`
+        // refuses a cohort with an emitted range.
+        if range.region == Region::Pairs && range.n_reads > 0 {
+            self.close_memo(what)?;
+        }
         Ok(guard)
     }
 
@@ -926,8 +1058,9 @@ impl ResidentCohort {
     /// must not call any method of this cohort other than
     /// [`reserve_pairs`](Self::reserve_pairs)/[`reserve_singles`](Self::reserve_singles)
     /// and [`heap_bytes`](Self::heap_bytes). [`infer_cohort`](Self::infer_cohort)
-    /// would wait on the lock the sink's own call holds, and a nested range
-    /// call (`write_*`, `seed_extend`, `pair_emit*`) re-acquires it shared,
+    /// and [`resolve_memo`](Self::resolve_memo) would wait on the lock the
+    /// sink's own call holds, and a nested range call (`write_*`,
+    /// `seed_extend*`, `pair_emit*`) re-acquires it shared,
     /// which blocks forever once another thread is queued for it exclusively
     /// (the lock prefers writers).
     #[allow(clippy::too_many_arguments)]
@@ -1048,6 +1181,6 @@ unsafe impl Send for ResidentCohort {}
 // `infer_cohort`, which reads every pair range, holds `ranges` exclusively,
 // excluding all range calls (which hold it shared); `resolve_memo`, which
 // writes every marked pair range, holds it exclusively too. The only other
-// shared state is atomics (`index_id`, `heap_bytes`, `n_dups`,
+// shared state is atomics (`index_id`, `heap_bytes`, `memo`,
 // `memo_resolved`). The C code keeps no other mutable shared state per cohort.
 unsafe impl Sync for ResidentCohort {}

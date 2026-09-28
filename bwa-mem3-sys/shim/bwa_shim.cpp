@@ -145,6 +145,9 @@ extern "C" {
     int    shim_resident_seed_extend_reps(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
                                           ShimResidentSegment *sg, const int64_t *reps,
                                           size_t n_pairs);
+    struct ShimMemoStats { uint64_t dup_pairs, copied, fallback_aligned; };
+    int    shim_resident_resolve_memo(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
+                                      ShimResidentCohort *c, ShimMemoStats *out);
     int    shim_resident_pestat_cohort(void *fmi, const mem_opt_t *opts,
                                        const ShimResidentCohort *c, mem_pestat_t *out);
     int    shim_resident_pair_emit(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
@@ -744,6 +747,28 @@ extern "C" int bwa_shim_resident_seed_extend_reps(const BwaIndex *idx, const mem
     return resident_status(shim_resident_seed_extend_reps(idx->fmi, opts, sc->inner,
                                                           shim_seg(sg), reps, n_pairs),
                            "resident_seed_extend_reps");
+}
+extern "C" int bwa_shim_resident_resolve_memo(const BwaIndex *idx, const mem_opt_t *opts,
+                                              BwaScratch *sc, BwaResidentCohort *c,
+                                              BwaMemoStats *out) {
+    shim_clear_err();
+    if (!idx || !opts || !sc || !c || !out) { shim_set_err("null arg"); return -1; }
+    ShimMemoStats st = { 0, 0, 0 };
+    int rc = shim_resident_resolve_memo(idx->fmi, opts, sc->inner, c->inner, &st);
+    /* Name the lifecycle violation: the Rust wrapper surfaces the message. */
+    const char *why = rc == -3 ? "a pair range is not seed-extended"
+                    : rc == -4 ? "a pair range was already emitted"
+                    : rc == -5 ? "a duplicate mark names no pair of the cohort" : nullptr;
+    if (why) {
+        shim_set_err("resident_resolve_memo: %s; resident range lifecycle violated", why);
+        rc = -3;
+    } else {
+        rc = resident_status(rc, "resident_resolve_memo");
+    }
+    out->dup_pairs = st.dup_pairs;
+    out->copied = st.copied;
+    out->fallback_aligned = st.fallback_aligned;
+    return rc;
 }
 extern "C" int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
                                                const BwaResidentCohort *c, mem_pestat_t *out) {
