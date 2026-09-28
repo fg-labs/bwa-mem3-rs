@@ -381,6 +381,10 @@ carries a `patches/0001-*.patch` for it — the vendored tree provides it
 directly. Byte-identity is asserted against `bwa-mem3 mem` on the batched
 kernel (the CLI parity suites + `batched_rescue_spanning_multiple_chunks_*`).
 
+### 19. The read-pair memo converts duplicate reads outside kernel1
+
+`ResidentCohort::seed_extend_with_reps` does not seed pairs marked as duplicates, so kernel1 never converts their bases to 2-bit (gotcha #7); the shim converts them itself (`seed_chunk_reps`, a port of upstream's `worker_bwt_memo`), and `resolve_memo` compares 2-bit bases before copying a representative's regions. To check the memo against the CLI, run `bwa-mem3 mem --dedup-reads on --cohort-slices 0`: the CLI reads its first batch in slices by default, and the slice path disarms its memo (`mem_align_cohort_slice`), which would make "on == off" hold vacuously. `BWAMEM3_DEDUP_READS_STATS=1` prints the CLI's duplicate count to compare with `MemoStats::dup_pairs`. The shim converts only the duplicate reads, and restores `-` before its fallback re-seeds a pair, because a second conversion turns `-` (2-bit 5) into `N` (4). Upstream's `worker_bwt_memo` converts every read, representatives included, before kernel1 converts them again, so the CLI's `--dedup-reads on` output can differ from `off` on representative pairs containing `-`. This crate matches `off` there. The parity fixtures contain no `-`.
+
 ## Commit / PR conventions
 
 - Conventional Commits; sign with `-S`; see `CONTRIBUTING.md`.
