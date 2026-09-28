@@ -30,6 +30,7 @@ pub mod align;
 pub mod build_info;
 pub mod error;
 pub mod index;
+pub mod memo;
 pub mod opts;
 pub mod resident;
 pub mod shm;
@@ -43,6 +44,7 @@ pub use align::{
 pub use build_info::{build_info, version, BuildInfo};
 pub use error::{Error, Result};
 pub use index::BwaIndex;
+pub use memo::{MemoStats, PairMemo};
 pub use opts::{MemOpts, MemPeStat, MethScoring, Mode, PeOrient, PeOrientation, SeedOrder};
 pub use resident::{
     AlignedFields, AlignedFieldsSink, Mate, MethFields, ResidentCohort, ResidentRange,

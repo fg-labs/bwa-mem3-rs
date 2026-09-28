@@ -307,6 +307,10 @@ impl ResidentRange {
     pub fn is_pairs(&self) -> bool {
         self.region == Region::Pairs
     }
+    /// Id of the cohort this range was reserved from.
+    pub(crate) fn cohort_id(&self) -> u64 {
+        self.cohort_id
+    }
 }
 
 /// A whole `-K` cohort's decoded reads + alnreg arrays, kept resident on the C
