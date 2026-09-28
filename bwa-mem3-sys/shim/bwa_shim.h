@@ -280,6 +280,19 @@ int bwa_shim_resident_segment_holds_reads(const BwaResidentSegment *sg);
 int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
                                   BwaScratch *sc, BwaResidentSegment *sg);
 
+/* bwa_shim_resident_seed_extend for a PAIR segment whose pairs may be marked as
+ * exact duplicates of earlier pairs of the cohort (the CLI's --dedup-reads
+ * memo). `reps` has one entry per pair of the segment (n_pairs must equal it):
+ * -1 seeds the pair; otherwise it is the cohort-local pair ordinal (first()/2 +
+ * index, strictly less than the pair's own) of the pair it duplicates, and the
+ * pair is not seeded -- the cohort's memo resolve copies its regions later and
+ * must run before the cohort's pestat or any emit. All -1 is exactly
+ * bwa_shim_resident_seed_extend. Marks are refused on a --meth cohort. Returns
+ * 0, -1 on a bad argument, or -3. */
+int bwa_shim_resident_seed_extend_reps(const BwaIndex *idx, const mem_opt_t *opts,
+                                       BwaScratch *sc, BwaResidentSegment *sg,
+                                       const int64_t *reps, size_t n_pairs);
+
 /* mem_pestat over the whole cohort's pair region. `out` = mem_pestat_t[4].
  * Returns 0, -1 on a null arg / allocation failure, or -3. */
 int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,

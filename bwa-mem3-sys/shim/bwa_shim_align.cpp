@@ -274,6 +274,10 @@ struct ShimScratch {
      * and the MC:Z / SA:Z texts. Grown in place and reused, like aux_buf. */
     uint32_t *cig_buf; size_t cig_cap;  /* cap in ops */
     uint8_t  *txt_buf; size_t txt_cap;
+    /* The non-duplicate pairs of one BATCH_SIZE chunk, compacted for kernel1
+     * by the memo path of seed_extend_reads (upstream keeps this thread_local in
+     * worker_bwt_memo, bwamem.cpp:3672; a scratch is one caller thread's). */
+    bseq1_t compact[BATCH_SIZE];
 };
 
 /* Phase-1 output (public: BwaRegs). Owns the read copies and the per-read
@@ -1458,15 +1462,61 @@ void shim_regs_free(ShimRegs *r) {
     free(r);
 }
 
+/* Kernel1 for one BATCH_SIZE chunk whose duplicate pairs (reps[pair] >= 0, pair
+ * index within the segment = (chunk_first + l) >> 1) are not seeded: upstream's
+ * worker_bwt_memo (bwamem.cpp:3654-3708). Duplicate reads skip kernel1, which is
+ * what converts bases ASCII->2-bit in place, so convert them here (idempotent,
+ * nst_nt4_decode, bntseq.h:98). The non-duplicate pairs are compacted, whole
+ * pairs in order, so kernel1's l^1 mate-concordance cap still pairs mates; their
+ * chains are then scattered back to their own slots (a descending pull, each
+ * slot touched once) and re-stamped with the chunk-local seqid kernel2 asserts.
+ * Duplicate slots get empty chains, so kernel2 gives them empty regs, which
+ * shim_resident_resolve_memo later fills. */
+static void seed_chunk_reps(ShimScratch *sc, BwaShimIndex *idx, const mem_opt_t *opt,
+                            bseq1_t *chunk, int bs, int chunk_first, const int64_t *reps)
+{
+    worker_t &w = sc->w;
+    for (int l = 0; l < bs; ++l) {
+        if (reps[(chunk_first + l) >> 1] < 0) continue;
+        char *s = chunk[l].seq;
+        for (int i = 0; i < chunk[l].l_seq; ++i)
+            s[i] = (char) nst_nt4_decode((unsigned char) s[i], 4);
+    }
+    int n_rep = 0;
+    for (int l = 0; l < bs; ++l)
+        if (reps[(chunk_first + l) >> 1] < 0) sc->compact[n_rep++] = chunk[l];
+    mem_chain_v *cw = w.chain_scratch;
+    if (n_rep > 0)
+        mem_kernel1_core(idx->fmi, opt, sc->compact, n_rep, cw, w.seed_scratch,
+                         w.seed_scratch_size, &w.mmc, sc->tid,
+                         idx->meth_orig_bns, idx->meth_orig_pac);
+    int j = n_rep - 1;
+    for (int l = bs - 1; l >= 0; --l) {
+        if (reps[(chunk_first + l) >> 1] < 0) {
+            if (l != j) cw[l] = cw[j];
+            for (size_t k = 0; k < cw[l].n; ++k) cw[l].a[k].seqid = l;
+            --j;
+        } else {
+            /* kernel2 copies capped_w into the slot's regs, and chain_scratch is
+             * malloc'd, so zero it as kernel1's own empty-batch path does
+             * (bwamem.cpp:3311); resolve overwrites it either way. */
+            kv_init(cw[l]);
+            cw[l].capped_w = 0;
+        }
+    }
+    xassert(j == -1, "seed_chunk_reps: scatter cursor mismatch");
+}
+
 /* Fused seed + SE-extend over reads `seqs[0, n)` / `regs[0, n)` in BATCH_SIZE
  * chunks, the shape of upstream's worker_bwt_aln (bwamem.cpp:2782-2786). `opt`
  * is the per-group copy (MEM_F_PE set for pairs, cleared for singles).
  * Chain/seed windows are chunk-local so the BATCH_SIZE scratch suffices; the
  * pre-0.9.0 tail `seedBufSz` shrink is dropped as upstream did ("output-dead
- * either way", worker_bwt). Shared by the legacy ShimRegs path and the resident
- * segments. */
+ * either way", worker_bwt). `reps` (pairs only; one entry per pair, -1 = seed
+ * it) skips seeding duplicate pairs (seed_chunk_reps); NULL seeds every read.
+ * Shared by the legacy ShimRegs path and the resident segments. */
 static void seed_extend_reads(ShimScratch *sc, BwaShimIndex *idx, const mem_opt_t *opt,
-                              bseq1_t *seqs, mem_alnreg_v *regs, int n)
+                              bseq1_t *seqs, mem_alnreg_v *regs, int n, const int64_t *reps)
 {
     worker_t &w = sc->w;
     FMI_search *fmi = idx->fmi;
@@ -1482,9 +1532,12 @@ static void seed_extend_reads(ShimScratch *sc, BwaShimIndex *idx, const mem_opt_
     for (int seq_id = 0; seq_id < n; seq_id += BATCH_SIZE) {
         int bs = n - seq_id;
         if (bs > BATCH_SIZE) bs = BATCH_SIZE;
-        mem_kernel1_core(fmi, opt, seqs + seq_id, bs,
-                         w.chain_scratch, w.seed_scratch, w.seed_scratch_size,
-                         &w.mmc, sc->tid, idx->meth_orig_bns, idx->meth_orig_pac);
+        if (reps)
+            seed_chunk_reps(sc, idx, opt, seqs + seq_id, bs, seq_id, reps);
+        else
+            mem_kernel1_core(fmi, opt, seqs + seq_id, bs,
+                             w.chain_scratch, w.seed_scratch, w.seed_scratch_size,
+                             &w.mmc, sc->tid, idx->meth_orig_bns, idx->meth_orig_pac);
         mem_kernel2_core(fmi, opt, seqs + seq_id, regs + seq_id, bs,
                          w.chain_scratch, &w.mmc, w.ref_string, sc->tid,
                          idx->meth_orig_bns, idx->meth_orig_pac);
@@ -1531,9 +1584,9 @@ ShimRegs *shim_seed_extend(void *idx_opaque, const mem_opt_t *opts, ShimScratch 
      * (fastmap.cpp:912-921): pairs with the flag SET, singles with it CLEARED. */
     mem_opt_t opt_pe = *opts; opt_pe.n_threads = 1; opt_pe.flag |=  MEM_F_PE;
     mem_opt_t opt_se = *opts; opt_se.n_threads = 1; opt_se.flag &= ~MEM_F_PE;
-    if (r->n_pairs > 0)   seed_extend_reads(sc, idx, &opt_pe, r->seqs, r->regs, (int)(2 * r->n_pairs));
+    if (r->n_pairs > 0)   seed_extend_reads(sc, idx, &opt_pe, r->seqs, r->regs, (int)(2 * r->n_pairs), nullptr);
     if (r->n_singles > 0) seed_extend_reads(sc, idx, &opt_se, r->seqs + 2 * r->n_pairs,
-                                            r->regs + 2 * r->n_pairs, (int)r->n_singles);
+                                            r->regs + 2 * r->n_pairs, (int)r->n_singles, nullptr);
     return r;
 }
 
@@ -2373,6 +2426,8 @@ struct ShimResidentSegment {
     int           meth_mode;
     int           extended;   /* seed_extend has run; the reads are 2-bit encoded */
     int           emitted;    /* pair_emit has run; mate rescue has grown its regs */
+    int64_t      *reps;       /* per pair: -1, or the cohort-local pair ordinal of
+                               * the earlier pair it duplicates; NULL = none */
 };
 
 /* One resident region (pairs or singles) for one bwa-mem3 -p group: a growable
@@ -2428,6 +2483,7 @@ int shim_resident_segment_holds_reads(const ShimResidentSegment *sg) {
 
 static void resident_segment_free(ShimResidentSegment *sg) {
     resident_segment_release_reads(sg);
+    free(sg->reps);
     free(sg->seqs); free(sg->regs); free(sg);
 }
 
@@ -2606,7 +2662,43 @@ int shim_resident_seed_extend(void *idx_opaque, const mem_opt_t *opts, ShimScrat
      * for singles). */
     mem_opt_t opt = *opts; opt.n_threads = 1;
     if (sg->is_pairs) opt.flag |= MEM_F_PE; else opt.flag &= ~MEM_F_PE;
-    seed_extend_reads(sc, idx, &opt, sg->seqs, sg->regs, (int) sg->n);
+    seed_extend_reads(sc, idx, &opt, sg->seqs, sg->regs, (int) sg->n, nullptr);
+    sg->extended = 1;
+    return 0;
+}
+
+/* shim_resident_seed_extend for a pair segment whose pairs may be marked as
+ * duplicates of earlier cohort pairs: `reps[p]` (n_pairs == the segment's pair
+ * count) is -1 to seed pair p, or the cohort-local ordinal (< p's own) of the
+ * pair it duplicates, which is not seeded; shim_resident_resolve_memo copies its
+ * regions later. With no marks this is exactly shim_resident_seed_extend.
+ * Returns 0, -1 on a null arg / singles segment / count mismatch / bad mark /
+ * meth segment with a mark / OOM, or -3 when already extended or any slot is
+ * unwritten. */
+int shim_resident_seed_extend_reps(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
+                                   ShimResidentSegment *sg, const int64_t *reps,
+                                   size_t n_pairs) {
+    if (!idx_opaque || !opts || !sc || !sg || (n_pairs > 0 && !reps)) return -1;
+    if (!sg->is_pairs || n_pairs != sg->n / 2) return -1;
+    if (sg->extended) return -3;
+    for (size_t i = 0; i < sg->n; ++i)
+        if (!sg->seqs[i].seq) return -3;
+    size_t n_dups = 0;
+    const int64_t first_pair = (int64_t) (sg->base / 2);
+    for (size_t p = 0; p < n_pairs; ++p) {
+        if (reps[p] == -1) continue;
+        if (reps[p] < 0 || reps[p] >= first_pair + (int64_t) p) return -1;
+        ++n_dups;
+    }
+    if (n_dups > 0 && sg->meth_mode) return -1;
+    if (n_dups > 0) {
+        sg->reps = (int64_t *) malloc(n_pairs * sizeof(int64_t));
+        if (!sg->reps) return -1;
+        memcpy(sg->reps, reps, n_pairs * sizeof(int64_t));
+    }
+    BwaShimIndex *idx = static_cast<BwaShimIndex *>(idx_opaque);
+    mem_opt_t opt = *opts; opt.n_threads = 1; opt.flag |= MEM_F_PE;
+    seed_extend_reads(sc, idx, &opt, sg->seqs, sg->regs, (int) sg->n, sg->reps);
     sg->extended = 1;
     return 0;
 }

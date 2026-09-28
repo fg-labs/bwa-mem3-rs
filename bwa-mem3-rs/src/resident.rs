@@ -7,7 +7,7 @@
 //! [`AlignedFieldsSink`]) that [`ResidentCohort::pair_emit_fields`] reports
 //! instead of packed BAM bodies.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::align::{
@@ -341,6 +341,11 @@ impl ResidentRange {
 ///   than racing them. Because of that lock, a `pair_emit` sink must not call
 ///   back into its cohort except to reserve (see there), and no range call may
 ///   block waiting on another range call of the same cohort.
+/// - **Duplicate marks are resolved at a barrier.**
+///   [`seed_extend_with_reps`](Self::seed_extend_with_reps) records a range's
+///   duplicate marks under the shared lock; `resolve_memo` copies them under
+///   the exclusive lock; `infer_cohort` and the emits refuse while marks are
+///   unresolved.
 /// - **Lifecycle misuse is an error, not UB.** Writing a slot twice or after
 ///   `seed_extend`, seed-extending an unwritten or already-extended range,
 ///   emitting an unextended or already-emitted range, `infer_cohort` while a
@@ -365,6 +370,12 @@ pub struct ResidentCohort {
     /// [`heap_bytes`](Self::heap_bytes)); raised by `reserve_*`/`write_*` and
     /// lowered when a range is emitted.
     heap_bytes: AtomicUsize,
+    /// Pairs marked as duplicates by [`seed_extend_with_reps`](Self::seed_extend_with_reps);
+    /// while any are unresolved, `infer_cohort` and the emits refuse. Only
+    /// changed under the shared range lock, and read under a range lock.
+    n_dups: AtomicU64,
+    /// Set by `resolve_memo` under the exclusive range lock.
+    memo_resolved: AtomicBool,
     /// Serializes calls that read or grow the C segment table: `reserve_*`
     /// (writes it) and `infer_cohort` (walks it).
     table: Mutex<()>,
@@ -402,6 +413,8 @@ impl ResidentCohort {
             meth,
             index_id: AtomicU64::new(0),
             heap_bytes: AtomicUsize::new(0),
+            n_dups: AtomicU64::new(0),
+            memo_resolved: AtomicBool::new(false),
             table: Mutex::new(()),
             ranges: RwLock::new(()),
         })
@@ -460,6 +473,24 @@ impl ResidentCohort {
             Err(Error::InvalidInput(format!(
                 "{what}: range belongs to a different ResidentCohort"
             )))
+        }
+    }
+
+    /// Reject a pestat or an emit while duplicate pairs still wait for
+    /// `resolve_memo`: their regions are empty until it copies them. Call it
+    /// under a range lock. That excludes `resolve_memo` (exclusive), but not
+    /// `seed_extend_with_reps` on another range (both shared): an emit may see
+    /// no marks while another range is adding some. That is benign, because a
+    /// range's own marks are always visible to its own emit (same `&mut`
+    /// range), and a later `resolve_memo` refuses a cohort with an emitted
+    /// range.
+    fn check_memo_resolved(&self, what: &str) -> Result<()> {
+        if self.n_dups.load(Ordering::Acquire) > 0 && !self.memo_resolved.load(Ordering::Acquire) {
+            Err(Error::InvalidInput(format!(
+                "{what}: the cohort has duplicate pairs; call resolve_memo first"
+            )))
+        } else {
+            Ok(())
         }
     }
 
@@ -714,6 +745,89 @@ impl ResidentCohort {
         resident_status(rc, "resident_seed_extend")
     }
 
+    /// [`seed_extend`](Self::seed_extend) for a pair `range` whose pairs may be
+    /// marked as exact duplicates of earlier pairs of this cohort, as
+    /// [`PairMemo::mark_range`](crate::PairMemo::mark_range) returns them:
+    /// `reps[i] = Some(rep)` means pair `i` is not seeded, and its alignment
+    /// regions are copied from cohort pair `rep` by `resolve_memo`, which must
+    /// then run before [`infer_cohort`](Self::infer_cohort) or any emit.
+    /// All-`None` is exactly `seed_extend`.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when `range` is not a pair range of this cohort,
+    /// `reps.len()` differs from `range.n_pairs()`, a mark does not name an
+    /// earlier pair of the cohort, any mark is set on a `--meth` cohort, a mark
+    /// is set after `resolve_memo`, or on any `seed_extend` error.
+    pub fn seed_extend_with_reps(
+        &self,
+        idx: &BwaIndex,
+        opts: &MemOpts,
+        scratch: &mut AlignScratch,
+        range: &mut ResidentRange,
+        reps: &[Option<u64>],
+    ) -> Result<()> {
+        const WHAT: &str = "seed_extend_with_reps";
+        self.check_region(range, Region::Pairs, WHAT)?;
+        if reps.len() != range.n_pairs() {
+            return Err(Error::InvalidInput(format!(
+                "{WHAT}: {} marks for a range of {} pairs",
+                reps.len(),
+                range.n_pairs()
+            )));
+        }
+        self.check_cohort_meth(opts, WHAT)?;
+        check_meth_consistency(idx, opts)?;
+        self.check_index(idx, WHAT)?;
+        let first_pair = (range.first / 2) as u64;
+        let mut c_reps = Vec::with_capacity(reps.len());
+        let mut n_dups = 0u64;
+        for (i, rep) in reps.iter().enumerate() {
+            let own = first_pair + i as u64;
+            c_reps.push(match *rep {
+                None => -1i64,
+                Some(r) if r < own => {
+                    n_dups += 1;
+                    i64::try_from(r).map_err(|_| {
+                        Error::InvalidInput(format!("{WHAT}: mark {r} overflows an i64"))
+                    })?
+                }
+                Some(r) => {
+                    return Err(Error::InvalidInput(format!(
+                        "{WHAT}: pair {own} is marked as a duplicate of pair {r}, which is not \
+                         an earlier pair of the cohort"
+                    )))
+                }
+            });
+        }
+        if n_dups > 0 && self.meth {
+            return Err(Error::InvalidInput(format!(
+                "{WHAT}: duplicate marks are not supported under --meth"
+            )));
+        }
+        let _ranges = self.lock_ranges_shared();
+        if n_dups > 0 && self.memo_resolved.load(Ordering::Acquire) {
+            return Err(Error::InvalidInput(format!(
+                "{WHAT}: the cohort's memo is already resolved"
+            )));
+        }
+        // SAFETY: as `seed_extend`; `c_reps` holds `range.n_pairs()` entries
+        // and outlives the call, and the shim copies it before returning.
+        let rc = unsafe {
+            bwa_mem3_sys::bwa_shim_resident_seed_extend_reps(
+                idx.raw(),
+                opts.as_ptr(),
+                scratch.handle,
+                range.segment,
+                c_reps.as_ptr(),
+                c_reps.len(),
+            )
+        };
+        resident_status(rc, "resident_seed_extend_reps")?;
+        self.n_dups.fetch_add(n_dups, Ordering::Release);
+        Ok(())
+    }
+
     /// `mem_pestat` over the whole cohort's pair region. Every pair range must
     /// have been seed-extended and none emitted yet (else `Err`); waits for
     /// in-flight range calls. Feed the result to every
@@ -725,6 +839,7 @@ impl ResidentCohort {
         let mut out = MemPeStat::zero()?;
         let _ranges = self.lock_ranges_exclusive();
         let _table = self.lock_table();
+        self.check_memo_resolved("infer_cohort")?;
         // SAFETY: `idx`/`opts` valid for the call; `out.as_mut_ptr()` is a live
         // `mem_pestat_t[4]` owned by `out`; the exclusive lock plus the table
         // mutex make this the only call touching the cohort.
@@ -794,7 +909,9 @@ impl ResidentCohort {
                 "{what}: a range with pairs requires the cohort pestat"
             )));
         }
-        Ok(self.lock_ranges_shared())
+        let guard = self.lock_ranges_shared();
+        self.check_memo_resolved(what)?;
+        Ok(guard)
     }
 
     /// Pair / mate-rescue / emit the reads of a seed-extended `range`, then
@@ -929,7 +1046,8 @@ unsafe impl Send for ResidentCohort {}
 // touched through an exclusive `&mut ResidentRange` whose segment is disjoint
 // from every other range's and pointer-stable for the cohort's lifetime; and
 // `infer_cohort`, which reads every pair range, holds `ranges` exclusively,
-// excluding all range calls (which hold it shared). The only other shared
-// state is atomics (`index_id`, `heap_bytes`). The C code keeps no other
-// mutable shared state per cohort.
+// excluding all range calls (which hold it shared); `resolve_memo`, which
+// writes every marked pair range, holds it exclusively too. The only other
+// shared state is atomics (`index_id`, `heap_bytes`, `n_dups`,
+// `memo_resolved`). The C code keeps no other mutable shared state per cohort.
 unsafe impl Sync for ResidentCohort {}

@@ -1826,6 +1826,16 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn bwa_shim_resident_seed_extend_reps(
+        idx: *const BwaIndex,
+        opts: *const mem_opt_t,
+        sc: *mut BwaScratch,
+        sg: *mut BwaResidentSegment,
+        reps: *const i64,
+        n_pairs: usize,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn bwa_shim_resident_pestat_cohort(
         idx: *const BwaIndex,
         opts: *const mem_opt_t,

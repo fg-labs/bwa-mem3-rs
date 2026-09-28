@@ -142,6 +142,9 @@ extern "C" {
                                        size_t n, size_t *added);
     int    shim_resident_seed_extend(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
                                      ShimResidentSegment *sg);
+    int    shim_resident_seed_extend_reps(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
+                                          ShimResidentSegment *sg, const int64_t *reps,
+                                          size_t n_pairs);
     int    shim_resident_pestat_cohort(void *fmi, const mem_opt_t *opts,
                                        const ShimResidentCohort *c, mem_pestat_t *out);
     int    shim_resident_pair_emit(void *fmi, const mem_opt_t *opts, ShimScratch *sc,
@@ -732,6 +735,15 @@ extern "C" int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_
     if (!idx || !opts || !sc || !sg) { shim_set_err("null arg"); return -1; }
     return resident_status(shim_resident_seed_extend(idx->fmi, opts, sc->inner, shim_seg(sg)),
                            "resident_seed_extend");
+}
+extern "C" int bwa_shim_resident_seed_extend_reps(const BwaIndex *idx, const mem_opt_t *opts,
+                                                  BwaScratch *sc, BwaResidentSegment *sg,
+                                                  const int64_t *reps, size_t n_pairs) {
+    shim_clear_err();
+    if (!idx || !opts || !sc || !sg) { shim_set_err("null arg"); return -1; }
+    return resident_status(shim_resident_seed_extend_reps(idx->fmi, opts, sc->inner,
+                                                          shim_seg(sg), reps, n_pairs),
+                           "resident_seed_extend_reps");
 }
 extern "C" int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
                                                const BwaResidentCohort *c, mem_pestat_t *out) {
