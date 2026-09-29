@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-py"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bwa-mem3-rs",
  "pyo3",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-rs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bwa-mem3-sys",
  "libc",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-rs-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "bwa-mem3-rs",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-sys"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bindgen",
  "cc",
