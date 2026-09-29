@@ -23,85 +23,18 @@
 mod common;
 mod phix_seq;
 
+use common::{classify, cut_cohorts, ids_for, Collector, Read};
+
 use std::io::Read as _;
 use std::path::Path;
 use std::process::Command;
 
 use bwa_mem3_rs::{
     pair_emit, seed_extend, AlignScratch, AlnRegs, BwaIndex, IdBases, MemOpts, MemPeStat,
-    ReadBatch, ReadPair, RecordOrigin, RecordSink, SingleRead,
+    ReadBatch, ReadPair, SingleRead,
 };
 use rayon::prelude::*;
 use rstest::{fixture, rstest};
-
-/// One FASTQ record in input order.
-#[derive(Clone)]
-struct Read {
-    name: String,
-    seq: Vec<u8>,
-    qual: Vec<u8>,
-}
-
-/// Reference cohort cut: indices `[start, end)` into the read list.
-fn cut_cohorts(reads: &[Read], k: u64) -> Vec<std::ops::Range<usize>> {
-    let mut out = Vec::new();
-    let (mut start, mut size, mut n) = (0usize, 0u64, 0usize);
-    for (i, r) in reads.iter().enumerate() {
-        size += r.seq.len() as u64;
-        n += 1;
-        if size >= k && n % 2 == 0 {
-            out.push(start..i + 1);
-            start = i + 1;
-            size = 0;
-            n = 0;
-        }
-    }
-    if start < reads.len() {
-        out.push(start..reads.len());
-    }
-    out
-}
-
-/// `bseq_classify`: consecutive same-name reads pair; the rest are singles.
-/// Returns (singles as read indices, pairs as (r1 idx, r2 idx)), in order.
-fn classify(reads: &[Read], range: std::ops::Range<usize>) -> (Vec<usize>, Vec<(usize, usize)>) {
-    let (mut singles, mut pairs) = (Vec::new(), Vec::new());
-    let mut i = range.start;
-    while i < range.end {
-        if i + 1 < range.end && reads[i].name == reads[i + 1].name {
-            pairs.push((i, i + 1));
-            i += 2;
-        } else {
-            singles.push(i);
-            i += 1;
-        }
-    }
-    (singles, pairs)
-}
-
-/// Id bases for a sub-batch: `cohort_base` = global reads before the cohort,
-/// `n_se` = singles in the cohort, offsets = singles/pairs before this batch.
-fn ids_for(cohort_base: u64, n_se: u64, se_offset: u64, pe_offset: u64) -> IdBases {
-    IdBases {
-        first_single_id: cohort_base + se_offset,
-        first_pair_id: ((cohort_base + n_se) >> 1) + pe_offset,
-    }
-}
-
-struct Collector<'a> {
-    out: &'a mut Vec<(usize, Vec<u8>)>, // (global read index of origin's first read, body)
-    single_idx: &'a [usize],
-    pair_idx: &'a [(usize, usize)],
-}
-impl RecordSink for Collector<'_> {
-    fn emit(&mut self, origin: RecordOrigin, body: &[u8]) {
-        let key = match origin {
-            RecordOrigin::Pair(i) => self.pair_idx[i].0,
-            RecordOrigin::Single(i) => self.single_idx[i],
-        };
-        self.out.push((key, body.to_vec()));
-    }
-}
 
 /// One template of a `-p` batch: a pair (as `(r1_idx, r2_idx)`) or a single
 /// (as its read index) into the input read list. Exactly one side is `Some`.

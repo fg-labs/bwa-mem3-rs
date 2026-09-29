@@ -116,6 +116,8 @@ for range in &mut ranges {
 
 `ResidentCohort` is `Send + Sync` and every method is safe: a `ResidentRange` is a move-only token (neither `Clone` nor `Copy`), and range calls take it by `&mut`, so two calls can only run at once on different ranges. Lifecycle misuse (writing a slot twice, emitting a range before extending it or twice, a range from another cohort, a different `BwaIndex` than the cohort was aligned against, options whose `--meth` mode differs from the cohort's) returns `Err`. `pair_emit_fields` reports each record as structured `AlignedFields` through an `AlignedFieldsSink` instead of a packed BAM body; a record rebuilt from those fields plus the input read is byte-identical to the packed one.
 
+**Duplicate read pairs.** On PCR-duplicate-rich input (UMI or amplicon libraries), a caller can skip seeding exact duplicate pairs, as `bwa-mem3 mem --dedup-reads on` does. Mark each pair range in reservation order with a per-cohort `PairMemo`, seed it with `seed_extend_with_reps(.., &marks)` instead of `seed_extend`, and call `resolve_memo` once every range is extended and before `infer_cohort`. A duplicate is a pair with the same bases in both mates as an earlier pair of the cohort; its alignment regions are copied from that pair after its bases are checked, and each duplicate keeps its own name, qualities and read id, so output is byte-identical to aligning every pair. The memo is off unless the caller uses it, and it applies to pairs only and not under `--meth`. `resolve_memo` returns `MemoStats` (`dup_pairs`, `copied`, `fallback_aligned`).
+
 ## CLI
 
 The `bwa-mem3-rs-cli` crate ships a minimal `bwa-rs` binary that wraps the library:

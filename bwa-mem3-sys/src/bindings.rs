@@ -1726,6 +1726,58 @@ fn bindgen_test_layout_BwaIdBases() {
         )
     );
 }
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct BwaMemoStats {
+    pub dup_pairs: u64,
+    pub copied: u64,
+    pub fallback_aligned: u64,
+}
+#[test]
+fn bindgen_test_layout_BwaMemoStats() {
+    const UNINIT: ::std::mem::MaybeUninit<BwaMemoStats> = ::std::mem::MaybeUninit::uninit();
+    let ptr = UNINIT.as_ptr();
+    assert_eq!(
+        ::std::mem::size_of::<BwaMemoStats>(),
+        24usize,
+        concat!("Size of: ", stringify!(BwaMemoStats))
+    );
+    assert_eq!(
+        ::std::mem::align_of::<BwaMemoStats>(),
+        8usize,
+        concat!("Alignment of ", stringify!(BwaMemoStats))
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).dup_pairs) as usize - ptr as usize },
+        0usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaMemoStats),
+            "::",
+            stringify!(dup_pairs)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).copied) as usize - ptr as usize },
+        8usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaMemoStats),
+            "::",
+            stringify!(copied)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).fallback_aligned) as usize - ptr as usize },
+        16usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaMemoStats),
+            "::",
+            stringify!(fallback_aligned)
+        )
+    );
+}
 pub type BwaRecordSinkFn = ::std::option::Option<
     unsafe extern "C" fn(
         ctx: *mut ::std::os::raw::c_void,
@@ -1823,6 +1875,25 @@ extern "C" {
         opts: *const mem_opt_t,
         sc: *mut BwaScratch,
         sg: *mut BwaResidentSegment,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_resident_seed_extend_reps(
+        idx: *const BwaIndex,
+        opts: *const mem_opt_t,
+        sc: *mut BwaScratch,
+        sg: *mut BwaResidentSegment,
+        reps: *const i64,
+        n_pairs: usize,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_resident_resolve_memo(
+        idx: *const BwaIndex,
+        opts: *const mem_opt_t,
+        sc: *mut BwaScratch,
+        c: *mut BwaResidentCohort,
+        out: *mut BwaMemoStats,
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {

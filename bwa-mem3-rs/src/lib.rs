@@ -24,12 +24,20 @@
 //! shared, thread-safe index for this API goes through
 //! [`BwaIndex::load_with_threads`].
 //!
+//! A [`ResidentCohort`] can also skip seeding exact duplicate read pairs,
+//! like `bwa-mem3 mem --dedup-reads on`: a per-cohort [`PairMemo`] marks
+//! them, [`ResidentCohort::seed_extend_with_reps`] seeds only the rest, and
+//! [`ResidentCohort::resolve_memo`] copies each duplicate's alignment regions
+//! from the first copy before the cohort's insert-size model, with
+//! byte-identical output.
+//!
 //! [bwa-mem3]: https://github.com/fg-labs/bwa-mem3
 
 pub mod align;
 pub mod build_info;
 pub mod error;
 pub mod index;
+pub mod memo;
 pub mod opts;
 pub mod resident;
 pub mod shm;
@@ -43,6 +51,7 @@ pub use align::{
 pub use build_info::{build_info, version, BuildInfo};
 pub use error::{Error, Result};
 pub use index::BwaIndex;
+pub use memo::{MemoStats, PairMemo};
 pub use opts::{MemOpts, MemPeStat, MethScoring, Mode, PeOrient, PeOrientation, SeedOrder};
 pub use resident::{
     AlignedFields, AlignedFieldsSink, Mate, MethFields, ResidentCohort, ResidentRange,

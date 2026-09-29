@@ -843,3 +843,23 @@ pub fn assert_invalid(result: bwa_mem3_rs::Result<()>, needle: &str, what: &str)
         other => panic!("{what}: expected InvalidInput naming {needle:?}, got {other:?}"),
     }
 }
+
+/// The PhiX index for `meth`, and options in that mode.
+pub fn index_for(meth: bool) -> Option<(Arc<BwaIndex>, MemOpts)> {
+    let idx = if meth {
+        phix_meth().map(|r| r.idx.clone())
+    } else {
+        shared_idx()
+    }?;
+    let mut opts = MemOpts::new().unwrap();
+    if meth {
+        opts.set_meth(true);
+    }
+    Some((idx, opts))
+}
+
+/// A structured sink that discards every record.
+pub struct NullFieldSink;
+impl AlignedFieldsSink for NullFieldSink {
+    fn emit(&mut self, _: RecordOrigin, _: Mate, _: bool, _: AlignedFields<'_>) {}
+}

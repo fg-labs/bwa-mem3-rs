@@ -193,6 +193,9 @@ size_t   bwa_shim_regs_heap_bytes(const BwaRegs *r);
  * read offset and the SE/PE group layout (fastmap.cpp:924-944). */
 typedef struct { uint64_t first_single_id; uint64_t first_pair_id; } BwaIdBases;
 
+/* What bwa_shim_resident_resolve_memo did; dup_pairs == copied + fallback_aligned. */
+typedef struct { uint64_t dup_pairs; uint64_t copied; uint64_t fallback_aligned; } BwaMemoStats;
+
 /* Called once per emitted record with the packed BAM BODY (no u32 block_size
  * prefix). `origin_idx` indexes the batch's pairs or singles. The pointer is
  * valid only for the duration of the call. */
@@ -279,6 +282,30 @@ int bwa_shim_resident_segment_holds_reads(const BwaResidentSegment *sg);
  * Returns 0, -1, or -3. */
 int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
                                   BwaScratch *sc, BwaResidentSegment *sg);
+
+/* bwa_shim_resident_seed_extend for a PAIR segment whose pairs may be marked as
+ * exact duplicates of earlier pairs of the cohort (the CLI's --dedup-reads
+ * memo). `reps` has one entry per pair of the segment (n_pairs must equal it):
+ * -1 seeds the pair; otherwise it is the cohort-local pair ordinal (first()/2 +
+ * index, strictly less than the pair's own) of the pair it duplicates, and the
+ * pair is not seeded -- bwa_shim_resident_resolve_memo copies its regions later
+ * and must run before the cohort's pestat or any emit. All -1 is exactly
+ * bwa_shim_resident_seed_extend. Marks are refused on a --meth cohort. Returns
+ * 0, -1 on a bad argument, or -3. */
+int bwa_shim_resident_seed_extend_reps(const BwaIndex *idx, const mem_opt_t *opts,
+                                       BwaScratch *sc, BwaResidentSegment *sg,
+                                       const int64_t *reps, size_t n_pairs);
+
+/* The memo barrier for a cohort seeded with bwa_shim_resident_seed_extend_reps:
+ * give every marked duplicate pair its representative's alignment regions when
+ * their 2-bit bases match, else seed-extend it on its own (using `sc`); a mark
+ * naming a marked pair resolves through it to the first copy. Every pair
+ * segment must be extended and none emitted (-3 otherwise, with the reason in
+ * the last error); must not run concurrently with any other call on the cohort.
+ * Run it before bwa_shim_resident_pestat_cohort. A repeat call returns the same
+ * stats. Aborts on allocation failure. Returns 0, -1 on a null arg, or -3. */
+int bwa_shim_resident_resolve_memo(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *sc,
+                                   BwaResidentCohort *c, BwaMemoStats *out);
 
 /* mem_pestat over the whole cohort's pair region. `out` = mem_pestat_t[4].
  * Returns 0, -1 on a null arg / allocation failure, or -3. */
