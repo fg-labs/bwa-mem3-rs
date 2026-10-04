@@ -30,6 +30,7 @@
 #include "kswv.h"      /* kswr_t / SIMD_WIDTH8 — batched mate-rescue path below */
 #include "rescue_band.h" /* rescue_band_batch_free — worker_free's per-thread band plans */
 #include "bwa_shim_fields.h"  /* BwaAlignedFields — the structured-fields sink */
+#include "bwa_shim_meth.h"    /* BWA_SHIM_METH_SET_* — the --meth defaults mask */
 
 /* sort_classify has external linkage in bwamem.cpp but no header declaration
  * (the CLI's worker_sam calls it from the same TU). The batched mate-rescue
@@ -510,49 +511,65 @@ const char *shim_compat_hd_line(const mem_opt_t *opt) {
     return opt->compat->hd_line;
 }
 
-/* Apply upstream's bwameth-compatibility defaults for --meth.
+/* Apply what `bwa-mem3 mem --meth` sets for bisulfite alignment: upstream's
+ * bwameth-compatibility bundle plus the knobs main_mem sets around it
+ * (fastmap.cpp, the `opt->meth_mode` block). `explicit_mask` is a set of
+ * BWA_SHIM_METH_SET_* bits naming the knobs the caller set itself.
  *
- * Delegates to mem_opt_apply_meth_defaults (bwamem.cpp:504) rather than
- * replicating the bundle. The replicated version this replaces applied
- * bwameth's constants FLAT, but they are quoted at bwameth's match score
- * (a == 1) and upstream scales each by opt->a -- so `--meth` combined with a
- * non-default -A silently discarded it, leaving T at 40 while the alignment
- * scores it gates had doubled. Gotcha #13 exists for this class of drift:
- * where upstream factors a policy out, call it.
+ * The bundle delegates to mem_opt_apply_meth_defaults rather than replicating
+ * it. The replicated version this replaced applied bwameth's constants FLAT,
+ * but they are quoted at bwameth's match score (a == 1) and upstream scales
+ * each by opt->a -- so `--meth` combined with a non-default -A silently
+ * discarded it. Gotcha #13 exists for this class of drift: where upstream
+ * factors a policy out, call it.
  *
- * The `opt0` sentinel is upstream's "did the user set this explicitly" mask
- * (non-zero field == user supplied). A zeroed one means "nothing was set", so
- * every default applies. Taking no mask is the deliberate simplification:
- * expressing one would mean tracking per-field "was set" state on MemOpts.
+ * The three knobs main_mem sets OUTSIDE that helper have no upstream function
+ * to call, so they are mirrored here, in upstream's order, and must be
+ * re-checked against main_mem on every vendor refresh:
  *
- * That makes the ordering contract asymmetric, in three ways:
+ *   - TAPS chemistry defaults meth_scoring to NEUTRAL unless the user chose a
+ *     scoring mode. It comes first because the bundle's -B branch keys off the
+ *     resolved mode.
+ *   - meth_seed_prune defaults to SPEC30 unless the user chose one. This one
+ *     changes OUTPUT: it decides which SMEMs survive to SA resolution. Without
+ *     it this crate seeded every SMEM, so `bwa-rs mem --meth` differed from the
+ *     CLI on XS/XA/MAPQ and placement for ~half the records of an hg38 chr22
+ *     EM-seq simulation, while the PhiX parity fixtures (whose seeds are all
+ *     unique, so nothing is pruned) stayed byte-identical.
+ *   - band_cert is turned off. Byte-identical either way; upstream keeps the
+ *     exact full-width ladder under --meth, and so do we.
  *
- *   - `a` and `meth_scoring` are INPUTS -- the constants are expressed in units
- *     of `a`, and the -B branch keys off the resolved scoring mode -- so both
- *     must be set BEFORE this call.
+ * `opt0` is upstream's "did the user set this explicitly" mask (non-zero field
+ * == user supplied). Only the two bits above are expressible; every other
+ * field of it stays zero, which makes the bundle's ordering contract
+ * asymmetric:
+ *
+ *   - `a`, `meth_scoring` and `meth_chem` are INPUTS, so set them BEFORE.
  *   - `T`, `pen_clip5`, `pen_clip3` and `pen_unpaired` are written
- *     unconditionally (the empty mask says nobody set them), so a caller
- *     wanting its own must set them AFTER.
+ *     unconditionally, so a caller wanting its own must set them AFTER.
  *   - `b` is written only under COLLAPSED. GENOMIC and NEUTRAL are
  *     variant-aware and keep bwa's default, because their mirror cell must stay
- *     a real mismatch (bwamem.cpp:511-515), so a caller-set -B survives the
- *     bundle under those two modes and is clobbered under COLLAPSED.
+ *     a real mismatch, so a caller-set -B survives the bundle under those two
+ *     modes and is clobbered under COLLAPSED.
  *
  * Refilling the matrices is part of the operation, not the caller's job: the
- * COLLAPSED branch can change opt->b, and a stale mat/mat_ot/mat_ob would
- * score every subsequent alignment with the pre-default penalty. Upstream
- * refills at the same point (fastmap.cpp:2726, :2730).
- *
- * NOT replicated here: upstream's TAPS => NEUTRAL scoring default, which it
- * applies just BEFORE this call (fastmap.cpp:2695-2696). It is unreachable for
- * this crate -- mem_opt_init defaults meth_chem to METH_CHEM_EMSEQ and no API
- * exposes meth_chem -- but it must be added here if one ever does, because the
- * COLLAPSED -B branch below keys off the resolved scoring mode. */
-void shim_opts_apply_meth_defaults(mem_opt_t *opt) {
+ * COLLAPSED branch can change opt->b and the TAPS default changes
+ * meth_scoring, and a stale mat/mat_ot/mat_ob would score every subsequent
+ * alignment with the old values. Upstream refills at the same point. */
+void shim_opts_apply_meth_defaults(mem_opt_t *opt, unsigned explicit_mask) {
     if (opt == NULL) return;
     mem_opt_t opt0;
     memset(&opt0, 0, sizeof(opt0));
+    if (explicit_mask & BWA_SHIM_METH_SET_SCORING)    opt0.meth_scoring = 1;
+    if (explicit_mask & BWA_SHIM_METH_SET_SEED_PRUNE) opt0.meth_seed_prune = 1;
+
+    if (opt->meth_chem == METH_CHEM_TAPS && !opt0.meth_scoring)
+        opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
+    if (!opt0.meth_seed_prune)
+        opt->meth_seed_prune = MEM_METH_PRUNE_SPEC30;
     mem_opt_apply_meth_defaults(opt, &opt0);
+    opt->band_cert = 0;
+
     bwa_fill_scmat(opt->a, opt->b, opt->mat);
     mem_opt_fill_meth_mat(opt);
 }

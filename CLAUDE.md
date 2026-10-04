@@ -197,6 +197,23 @@ related rules both writers share and the shim follows: a raw-`0x100`
 (`-a` secondary) record carries no SEQ/QUAL, and `bin` is htslib `bam_set1`'s
 (`reg2bin(pos, pos + max(rlen, 1))`, so a placed-unmapped read is not 4680).
 
+**`--meth` is more than `mem_opt_apply_meth_defaults`.** `main_mem`'s
+`opt->meth_mode` block (`fastmap.cpp`) sets three knobs *around* that helper,
+and the shim mirrors them in `shim_opts_apply_meth_defaults` because upstream
+has no function to call: TAPS (`meth_chem`) defaults `meth_scoring` to NEUTRAL
+(before the helper, whose `-B` branch keys off the mode), `meth_seed_prune`
+defaults to SPEC30, and `band_cert` goes off. SPEC30 changes **output** — it
+decides which SMEMs reach SA resolution. Until it was mirrored, `bwa-rs mem
+--meth` differed from `bwa-mem3 mem --meth` on ~half the records of an hg38
+chr22 EM-seq simulation while every PhiX parity test stayed green, because on
+PhiX every seed is unique and nothing is pruned.
+`meth_cli_parity_chem.rs` pins it on a repeat-family reference and first checks
+that pruning changes the CLI's output there. Upstream's "explicit flag wins"
+`opt0` mask is carried as `MemOpts::meth_explicit`
+(`BWA_SHIM_METH_SET_*`, `shim/bwa_shim_meth.h`) for the two knobs whose default
+depends on it. **On every refresh**, diff that `main_mem` block for new `--meth`
+defaults.
+
 ### 12. `emit_resolved_pair` folds secondaries into `XA:Z` like `mem_reg2sam`
 
 The shim emits records from the per-read alnreg list itself rather than calling
