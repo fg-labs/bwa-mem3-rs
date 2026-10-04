@@ -25,8 +25,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bwa_mem3_rs::{align_batch, shm, BwaIndex, MemOpts, ReadPair};
-use clap::{Parser, Subcommand};
+use bwa_mem3_rs::{align_batch, shm, BwaIndex, MemOpts, MethChem, ReadPair};
+use clap::{Parser, Subcommand, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use noodles_bgzf as bgzf;
 
@@ -60,18 +60,46 @@ enum Cmd {
         /// Minimum seed length (`-k`).
         #[arg(short = 'k', long)]
         min_seed_len: Option<i32>,
-        /// Bisulfite (BS-seq) alignment (`--meth`). Requires a dual index built
-        /// with `bwa-mem3 index --meth`: `<prefix>` is the original reference
-        /// and `<prefix>.meth` the converted seed index. Emits Bismark
-        /// `XR`/`XG`/`XM` tags.
-        #[arg(long)]
-        meth: bool,
+        /// Bisulfite (BS-seq) alignment (`--meth[=emseq|taps]`). Requires a
+        /// dual index built with `bwa-mem3 index --meth`: `<prefix>` is the
+        /// original reference and `<prefix>.meth` the converted seed index.
+        /// Emits Bismark `XR`/`XG`/`XM` tags. The chemistry decides which base
+        /// `XM` calls methylated and defaults to `emseq`; as with `bwa-mem3`,
+        /// give it as `--meth=taps`, not `--meth taps`.
+        #[arg(
+            long,
+            value_name = "CHEM",
+            value_enum,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "emseq"
+        )]
+        meth: Option<MethChemArg>,
     },
     /// Manage indexes pinned in POSIX shared memory.
     Shm {
         #[command(subcommand)]
         action: ShmAction,
     },
+}
+
+/// `--meth` chemistry, spelled as `bwa-mem3 mem --meth=...` accepts it.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MethChemArg {
+    /// Bisulfite or EM-seq: unmethylated C converts to T.
+    #[value(alias = "em-seq", alias = "bisulfite")]
+    Emseq,
+    /// TAPS: methylated C converts to T.
+    Taps,
+}
+
+impl From<MethChemArg> for MethChem {
+    fn from(arg: MethChemArg) -> Self {
+        match arg {
+            MethChemArg::Emseq => MethChem::EmSeq,
+            MethChemArg::Taps => MethChem::Taps,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -111,7 +139,7 @@ fn main() -> Result<()> {
             output.as_deref(),
             batch_size,
             min_seed_len,
-            meth,
+            meth.map(MethChem::from),
         ),
         Cmd::Shm { action } => run_shm(action),
     }
@@ -140,11 +168,11 @@ fn run_mem(
     output: Option<&std::path::Path>,
     batch_size: usize,
     min_seed_len: Option<i32>,
-    meth: bool,
+    meth: Option<MethChem>,
 ) -> Result<()> {
     // In --meth mode the seed index is `<prefix>.meth` and the original
     // reference is `<prefix>` (built together by `bwa-mem3 index --meth`).
-    let idx = if meth {
+    let idx = if meth.is_some() {
         let mut seed = prefix.as_os_str().to_owned();
         seed.push(".meth");
         let seed = std::path::PathBuf::from(seed);
@@ -155,11 +183,14 @@ fn run_mem(
     };
     let mut opts = MemOpts::new()?;
     opts.set_pe(true);
-    if meth {
+    if let Some(chem) = meth {
         opts.set_meth(true);
-        // The bwameth-compatibility bundle `bwa-mem3 mem --meth` applies, so
-        // `bwa-rs mem --meth` is a drop-in for it. This calls bwa-mem3's own
-        // `mem_opt_apply_meth_defaults` rather than reproducing the list: it
+        // Before the defaults: TAPS changes the scoring mode they pick.
+        opts.set_meth_chem(chem);
+        // What `bwa-mem3 mem --meth` sets, so `bwa-rs mem --meth` is a drop-in
+        // for it: the bwameth-compatibility bundle, the TAPS scoring default,
+        // and SPEC30 seed pruning (which changes output). The bundle is
+        // bwa-mem3's own `mem_opt_apply_meth_defaults` rather than a copy: it
         // used to be a hand-ported copy and had already drifted, applying
         // bwameth's constants flat where upstream scales each by the match
         // score (see gotcha #13, and `MemOpts::apply_meth_defaults`).

@@ -19,6 +19,7 @@
 
 #include "bwa_shim_types.h"  /* mem_opt_t, mem_pestat_t POD layouts */
 #include "bwa_shim_fields.h" /* BwaAlignedFields, BwaFieldSinkFn */
+#include "bwa_shim_meth.h"   /* BWA_SHIM_METH_SET_* */
 
 #ifdef __cplusplus
 extern "C" {
@@ -90,24 +91,45 @@ int bwa_shim_opts_set_int(mem_opt_t *opts, const char *key, int value);
  * compat table; do not free it. */
 const char *bwa_shim_compat_hd_line(const mem_opt_t *opts);
 
-/* Apply bwa-mem3's bwameth-compatibility defaults for `--meth`, then refill the
- * scoring matrices (the bundle can change `b`, so they would otherwise be
- * stale).
+/* `bwa_shim_opts_apply_meth_defaults_masked(opts, 0)` (below): every default
+ * listed there applies, including TAPS => NEUTRAL over any `meth_scoring`
+ * already set and SPEC30 over any `meth_seed_prune` already set. */
+void bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts);
+
+/* Apply what `bwa-mem3 mem --meth` sets for bisulfite alignment, so `--meth`
+ * output matches the CLI's, then refill the scoring matrices (the bundle can
+ * change `b` and the TAPS default changes `meth_scoring`, so they would
+ * otherwise be stale). That is upstream's bwameth-compatibility bundle plus the
+ * knobs main_mem sets around it (fastmap.cpp, the `opt->meth_mode` block):
+ *   - TAPS chemistry (`meth_chem`) defaults `meth_scoring` to NEUTRAL, unless
+ *     BWA_SHIM_METH_SET_SCORING. Applied first, because the bundle's `-B`
+ *     branch keys off the resolved scoring mode.
+ *   - `meth_seed_prune` defaults to SPEC30, unless BWA_SHIM_METH_SET_SEED_PRUNE.
+ *     This changes which seeds survive, so it changes output.
+ *   - `band_cert` is turned off (byte-identical either way; upstream keeps the
+ *     exact full-width ladder under --meth).
  *
- * Wraps upstream's `mem_opt_apply_meth_defaults`, so the constants scale with
- * the match score `a` exactly as upstream scales them.
+ * `explicit_mask` is a set of BWA_SHIM_METH_SET_* bits (from the mask header
+ * included above) naming the knobs the caller set itself; those are left
+ * alone, as `bwa-mem3 mem --meth` leaves a flag the user passed.
+ *
+ * The bundle wraps upstream's `mem_opt_apply_meth_defaults`, so its constants
+ * scale with the match score `a` exactly as upstream scales them.
  *
  * Ordering is not symmetric across the knobs involved:
- *   - `a` (`-A`) is an INPUT -- the constants are expressed in units of it --
- *     so set it BEFORE calling. So is `meth_scoring`: the `-B` branch keys off
- *     the resolved mode.
+ *   - `a` (`-A`) and `meth_chem` are INPUTS -- the constants are expressed in
+ *     units of `a`, and TAPS picks the scoring default -- so set them BEFORE
+ *     calling. So is `meth_scoring`: the `-B` branch keys off the resolved
+ *     mode. Under TAPS it survives only with BWA_SHIM_METH_SET_SCORING.
+ *   - `meth_seed_prune` survives only with BWA_SHIM_METH_SET_SEED_PRUNE.
  *   - `T`/`pen_clip5`/`pen_clip3`/`pen_unpaired` (`-T`/`-L`/`-U`) are
- *     OVERWRITTEN unconditionally, because upstream's "user set this" mask is
- *     passed empty, so set any of those AFTER or they are silently clobbered.
+ *     OVERWRITTEN unconditionally, because upstream's "user set this" mask
+ *     cannot express them, so set any of those AFTER or they are silently
+ *     clobbered.
  *   - `b` (`-B`) is overwritten ONLY under COLLAPSED scoring. GENOMIC and
  *     NEUTRAL keep bwa's default (bwamem.cpp:511-515), so a caller-set `-B`
  *     survives the bundle under those two modes. */
-void bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts);
+void bwa_shim_opts_apply_meth_defaults_masked(mem_opt_t *opts, unsigned explicit_mask);
 
 /* PE-stats lifecycle. `pestat_zero` returns a zeroed 4-orientation array. */
 mem_pestat_t *bwa_shim_pestat_zero(void);

@@ -60,6 +60,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/bwa_shim.h");
     println!("cargo:rerun-if-changed=shim/bwa_shim_types.h");
     println!("cargo:rerun-if-changed=shim/bwa_shim_fields.h");
+    println!("cargo:rerun-if-changed=shim/bwa_shim_meth.h");
     println!("cargo:rerun-if-changed=vendor/COMMIT");
     println!("cargo:rerun-if-changed=patches");
 
@@ -694,6 +695,7 @@ fn check_or_regenerate_bindings(manifest: &Path, out: &Path) {
             .allowlist_function("bwa_shim_.*")
             .allowlist_var("MEM_F_.*")
             .allowlist_var("BWA_ORIGIN_.*")
+            .allowlist_var("BWA_SHIM_METH_.*")
             .derive_default(true)
             .generate()
             .expect("bindgen failed")

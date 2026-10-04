@@ -101,9 +101,99 @@ impl TryFrom<i32> for MethScoring {
     }
 }
 
+/// Methylation chemistry (`--meth=emseq|taps`), mirroring bwa-mem3's
+/// `meth_chem_t`. Only meaningful under [`MemOpts::set_meth`].
+///
+/// Both chemistries turn a C into a T and align the same way, so the
+/// chemistry only changes which bases mean "methylated":
+///
+/// - [`EmSeq`](Self::EmSeq) (bisulfite or EM-seq): *unmethylated* C converts.
+///   A retained C is methylated.
+/// - [`Taps`](Self::Taps): *methylated* C converts. A retained C is
+///   unmethylated.
+///
+/// That flips the `XM:Z` methylation call. TAPS also changes one default that
+/// [`MemOpts::apply_meth_defaults`] applies: [`MethScoring::Neutral`] instead
+/// of [`MethScoring::Collapsed`] (TAPS conversions are ~20-30× rarer, so a
+/// full match over-credits spurious C→T alignments). The SPEC30 seed-pruning
+/// default applies to both chemistries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethChem {
+    /// Bisulfite or EM-seq: unmethylated C converts to T. bwa-mem3's default.
+    EmSeq = 0,
+    /// TET-assisted pyridine borane sequencing: methylated C converts to T.
+    Taps = 1,
+}
+
+impl TryFrom<i32> for MethChem {
+    type Error = crate::Error;
+
+    /// Map the raw `meth_chem_t` value to a [`MethChem`].
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) for
+    /// a value bwa-mem3 does not define, rather than falling back to
+    /// [`MethChem::EmSeq`], which would flip every `XM:Z` call of a new
+    /// chemistry without a trace.
+    fn try_from(v: i32) -> std::result::Result<Self, Self::Error> {
+        match v {
+            0 => Ok(MethChem::EmSeq),
+            1 => Ok(MethChem::Taps),
+            other => Err(crate::Error::UnrecognizedEnum {
+                kind: "meth_chem",
+                value: other,
+            }),
+        }
+    }
+}
+
+/// Bisulfite seed pruning (`--meth-seed-prune`), mirroring bwa-mem3's
+/// `mem_meth_seed_prune`. Only meaningful under [`MemOpts::set_meth`].
+///
+/// The 3-letter alphabet over-seeds with short, high-multiplicity SMEMs.
+/// Pruning them before SA resolution is much faster and **changes output**
+/// (XS, XA, MAPQ, and occasionally placement), so it must match the CLI's
+/// setting for byte parity. [`MemOpts::apply_meth_defaults`] selects
+/// [`Spec30`](Self::Spec30), as `bwa-mem3 mem --meth` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethSeedPrune {
+    /// Keep every SMEM.
+    Off = 0,
+    /// Per read, if the longest SMEM is at least 30 bp, keep an SMEM only if
+    /// it is at least 25 bp, or unique and at least 22 bp. The `--meth`
+    /// default.
+    Spec30 = 1,
+    /// Drop an SMEM shorter than 25 bp with more than one hit.
+    Baseline = 2,
+}
+
+impl TryFrom<i32> for MethSeedPrune {
+    type Error = crate::Error;
+
+    /// Map the raw `mem_meth_seed_prune` value to a [`MethSeedPrune`].
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) for
+    /// a value bwa-mem3 does not define.
+    fn try_from(v: i32) -> std::result::Result<Self, Self::Error> {
+        match v {
+            0 => Ok(MethSeedPrune::Off),
+            1 => Ok(MethSeedPrune::Spec30),
+            2 => Ok(MethSeedPrune::Baseline),
+            other => Err(crate::Error::UnrecognizedEnum {
+                kind: "meth_seed_prune",
+                value: other,
+            }),
+        }
+    }
+}
+
 /// bwa-mem3 alignment options (`mem_opt_t`).
 pub struct MemOpts {
     pub(crate) handle: *mut sys::mem_opt_t,
+    /// The bisulfite knobs the caller set explicitly, as
+    /// `sys::BWA_SHIM_METH_SET_*` bits. [`MemOpts::apply_meth_defaults`]
+    /// leaves these alone, as `bwa-mem3 mem --meth` leaves a flag the user
+    /// passed.
+    meth_explicit: u32,
 }
 
 impl MemOpts {
@@ -113,7 +203,10 @@ impl MemOpts {
         if handle.is_null() {
             return Err(shim_err("opts_new"));
         }
-        Ok(MemOpts { handle })
+        Ok(MemOpts {
+            handle,
+            meth_explicit: 0,
+        })
     }
 
     /// The `@HD` header line the active output-compatibility target calls for
@@ -140,20 +233,24 @@ impl MemOpts {
         unsafe { std::ffi::CStr::from_ptr(p) }.to_str().ok()
     }
 
-    /// Apply bwa-mem3's bwameth-compatibility defaults for `--meth`, as
-    /// `bwa-mem3 mem --meth` applies them: `-L 10,10`, `-U 100`, `-T 40`, `-M`,
-    /// and (COLLAPSED scoring only) `-B 2`.
+    /// Apply what `bwa-mem3 mem --meth` sets for bisulfite alignment, so this
+    /// crate's `--meth` output matches the CLI's:
     ///
-    /// Each constant is **scaled by the match score** `a`, because bwameth
-    /// quotes them at bwa's default `a == 1` and bwa scales every other
-    /// score-derived default the same way. Applying them flat would silently
-    /// discard a non-default match score: `--meth` with `-A 2` would leave the
-    /// minimum score at 40 while the alignment scores it gates had doubled. At
-    /// the default `a == 1` the scaling is a no-op.
+    /// - bwameth's compatibility bundle: `-L 10,10`, `-U 100`, `-T 40`, `-M`,
+    ///   and (COLLAPSED scoring only) `-B 2`;
+    /// - [`MethScoring::Neutral`] under [`MethChem::Taps`], unless
+    ///   [`set_meth_scoring`](Self::set_meth_scoring) was called;
+    /// - [`MethSeedPrune::Spec30`], unless
+    ///   [`set_meth_seed_prune`](Self::set_meth_seed_prune) was called;
+    /// - the certified adaptive band off (byte-identical either way).
     ///
-    /// This calls bwa-mem3's own `mem_opt_apply_meth_defaults` rather than
-    /// reproducing the bundle, so it cannot drift from upstream, and it refills
-    /// the scoring matrices afterwards (the COLLAPSED branch can change `b`).
+    /// Each bundle constant is **scaled by the match score** `a`, because
+    /// bwameth quotes them at bwa's default `a == 1` and bwa scales every other
+    /// score-derived default the same way. At the default `a == 1` the scaling
+    /// is a no-op.
+    ///
+    /// The bundle is bwa-mem3's own `mem_opt_apply_meth_defaults`, so it cannot
+    /// drift from upstream, and the scoring matrices are refilled afterwards.
     ///
     /// # Ordering
     ///
@@ -163,11 +260,16 @@ impl MemOpts {
     /// **Set before** — these are *inputs*:
     /// - [`set_match_score`](Self::set_match_score), since every constant is
     ///   expressed in units of it;
+    /// - [`set_meth_chem`](Self::set_meth_chem), since TAPS picks the scoring
+    ///   default;
     /// - [`set_meth_scoring`](Self::set_meth_scoring), since the `-B 2` branch
-    ///   keys off the resolved mode.
+    ///   keys off the resolved mode. An explicit mode always wins over the
+    ///   TAPS default.
     ///
-    /// **Set after** — these are *overwritten* unconditionally, because
-    /// upstream's "the user set this" mask is passed empty:
+    /// **Either order** — [`set_meth_seed_prune`](Self::set_meth_seed_prune):
+    /// an explicit choice is remembered and survives this call.
+    ///
+    /// **Set after** — these are *overwritten* unconditionally:
     /// [`set_minimum_score`](Self::set_minimum_score),
     /// [`set_clip_penalty`](Self::set_clip_penalty),
     /// [`set_unpaired_penalty`](Self::set_unpaired_penalty).
@@ -178,7 +280,7 @@ impl MemOpts {
     /// [`Neutral`](MethScoring::Neutral) are variant-aware and keep bwa's
     /// default, so under those two a `-B` set *before* the call survives it.
     pub fn apply_meth_defaults(&mut self) -> &mut Self {
-        unsafe { sys::bwa_shim_opts_apply_meth_defaults(self.handle) };
+        unsafe { sys::bwa_shim_opts_apply_meth_defaults_masked(self.handle, self.meth_explicit) };
         self
     }
 
@@ -590,11 +692,15 @@ impl MemOpts {
 
     /// Bisulfite scoring mode (`--meth-scoring`); only meaningful under
     /// [`set_meth(true)`](Self::set_meth). Rebuilds the scoring matrices.
+    ///
+    /// An explicit mode wins over the [`MethChem::Taps`] default that
+    /// [`apply_meth_defaults`](Self::apply_meth_defaults) would otherwise pick.
     pub fn set_meth_scoring(&mut self, m: MethScoring) -> &mut Self {
         unsafe {
             (*self.handle).meth_scoring = m as i32;
             sys::bwa_shim_opts_fill_meth_mat(self.handle);
         }
+        self.meth_explicit |= sys::BWA_SHIM_METH_SET_SCORING;
         self
     }
     /// Bisulfite scoring mode (`--meth-scoring`); only meaningful under
@@ -606,6 +712,48 @@ impl MemOpts {
     /// the vendored bwa-mem3 reports a mode this crate does not know.
     pub fn meth_scoring(&self) -> Result<MethScoring> {
         MethScoring::try_from(unsafe { (*self.handle).meth_scoring })
+    }
+
+    /// Methylation chemistry (`--meth=emseq|taps`); only meaningful under
+    /// [`set_meth(true)`](Self::set_meth). Defaults to [`MethChem::EmSeq`].
+    ///
+    /// Set it **before** [`apply_meth_defaults`](Self::apply_meth_defaults):
+    /// TAPS changes the scoring default that call picks.
+    pub fn set_meth_chem(&mut self, chem: MethChem) -> &mut Self {
+        unsafe {
+            (*self.handle).meth_chem = chem as i32;
+        }
+        self
+    }
+    /// Methylation chemistry (`--meth=emseq|taps`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) if
+    /// the vendored bwa-mem3 reports a chemistry this crate does not know.
+    pub fn meth_chem(&self) -> Result<MethChem> {
+        MethChem::try_from(unsafe { (*self.handle).meth_chem })
+    }
+
+    /// Bisulfite seed pruning (`--meth-seed-prune`); only meaningful under
+    /// [`set_meth(true)`](Self::set_meth). An explicit choice survives
+    /// [`apply_meth_defaults`](Self::apply_meth_defaults), whichever is
+    /// called first.
+    pub fn set_meth_seed_prune(&mut self, prune: MethSeedPrune) -> &mut Self {
+        unsafe {
+            (*self.handle).meth_seed_prune = prune as i32;
+        }
+        self.meth_explicit |= sys::BWA_SHIM_METH_SET_SEED_PRUNE;
+        self
+    }
+    /// Bisulfite seed pruning (`--meth-seed-prune`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) if
+    /// the vendored bwa-mem3 reports a mode this crate does not know.
+    pub fn meth_seed_prune(&self) -> Result<MethSeedPrune> {
+        MethSeedPrune::try_from(unsafe { (*self.handle).meth_seed_prune })
     }
 
     /// bwameth.py-style longest-`M` chimera QC heuristic (`--meth-chimera-qc`);
@@ -1039,6 +1187,103 @@ mod tests {
         for v in [0, 1] {
             let scoring = MethScoring::try_from(v).unwrap();
             assert_eq!(scoring as i32, v, "discriminant must round-trip");
+        }
+    }
+
+    #[test]
+    fn meth_chem_and_seed_prune_round_trip_through_the_raw_discriminant() {
+        for v in [0, 1] {
+            assert_eq!(MethChem::try_from(v).unwrap() as i32, v);
+        }
+        for v in [0, 1, 2] {
+            assert_eq!(MethSeedPrune::try_from(v).unwrap() as i32, v);
+        }
+    }
+
+    #[test]
+    fn unknown_meth_chem_and_seed_prune_values_are_errors_not_fallbacks() {
+        assert!(matches!(
+            MethChem::try_from(2).unwrap_err(),
+            Error::UnrecognizedEnum {
+                kind: "meth_chem",
+                value: 2
+            }
+        ));
+        assert!(matches!(
+            MethSeedPrune::try_from(3).unwrap_err(),
+            Error::UnrecognizedEnum {
+                kind: "meth_seed_prune",
+                value: 3
+            }
+        ));
+    }
+
+    /// Fresh options with `--meth` on and the chemistry set, as a caller sets
+    /// them up before `apply_meth_defaults`.
+    fn meth_opts(chem: MethChem) -> MemOpts {
+        let mut o = MemOpts::new().unwrap();
+        o.set_meth(true).set_meth_chem(chem);
+        o
+    }
+
+    #[test]
+    fn meth_defaults_follow_the_cli_for_emseq() {
+        let mut o = meth_opts(MethChem::EmSeq);
+        let default_b = o.mismatch_penalty();
+        assert_eq!(
+            o.meth_seed_prune().unwrap(),
+            MethSeedPrune::Off,
+            "mem_opt_init default"
+        );
+        o.apply_meth_defaults();
+        assert_eq!(o.meth_chem().unwrap(), MethChem::EmSeq);
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
+        assert_eq!(o.meth_seed_prune().unwrap(), MethSeedPrune::Spec30);
+        assert_eq!(o.mismatch_penalty(), 2, "COLLAPSED takes bwameth's -B 2");
+        assert_ne!(default_b, 2, "the -B check above must not hold vacuously");
+    }
+
+    #[test]
+    fn taps_defaults_to_neutral_scoring_and_keeps_bwas_mismatch_penalty() {
+        let mut o = meth_opts(MethChem::Taps);
+        let default_b = o.mismatch_penalty();
+        o.apply_meth_defaults();
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Neutral);
+        assert_eq!(o.meth_seed_prune().unwrap(), MethSeedPrune::Spec30);
+        assert_eq!(
+            o.mismatch_penalty(),
+            default_b,
+            "NEUTRAL is variant-aware: no -B 2"
+        );
+    }
+
+    #[test]
+    fn explicit_meth_scoring_wins_over_the_taps_default_in_either_order() {
+        let mut before = MemOpts::new().unwrap();
+        before
+            .set_meth(true)
+            .set_meth_scoring(MethScoring::Genomic)
+            .set_meth_chem(MethChem::Taps)
+            .apply_meth_defaults();
+        assert_eq!(before.meth_scoring().unwrap(), MethScoring::Genomic);
+
+        let mut after = meth_opts(MethChem::Taps);
+        after
+            .set_meth_scoring(MethScoring::Collapsed)
+            .apply_meth_defaults();
+        assert_eq!(
+            after.meth_scoring().unwrap(),
+            MethScoring::Collapsed,
+            "an explicit COLLAPSED is not the same as unset"
+        );
+    }
+
+    #[test]
+    fn explicit_meth_seed_prune_survives_the_defaults() {
+        for prune in [MethSeedPrune::Off, MethSeedPrune::Baseline] {
+            let mut o = meth_opts(MethChem::EmSeq);
+            o.set_meth_seed_prune(prune).apply_meth_defaults();
+            assert_eq!(o.meth_seed_prune().unwrap(), prune);
         }
     }
 }

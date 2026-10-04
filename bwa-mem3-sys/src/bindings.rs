@@ -11,6 +11,8 @@ pub const MEM_F_SMARTPE: u32 = 1024;
 pub const MEM_F_PRIMARY5: u32 = 2048;
 pub const MEM_F_KEEP_SUPP_MAPQ: u32 = 4096;
 pub const MEM_F_XB: u32 = 8192;
+pub const BWA_SHIM_METH_SET_SCORING: u32 = 1;
+pub const BWA_SHIM_METH_SET_SEED_PRUNE: u32 = 2;
 pub const BWA_ORIGIN_PAIR: u32 = 0;
 pub const BWA_ORIGIN_SINGLE: u32 = 1;
 #[repr(C)]
@@ -1572,6 +1574,12 @@ extern "C" {
 }
 extern "C" {
     pub fn bwa_shim_opts_apply_meth_defaults(opts: *mut mem_opt_t);
+}
+extern "C" {
+    pub fn bwa_shim_opts_apply_meth_defaults_masked(
+        opts: *mut mem_opt_t,
+        explicit_mask: ::std::os::raw::c_uint,
+    );
 }
 extern "C" {
     pub fn bwa_shim_pestat_zero() -> *mut mem_pestat_t;

@@ -76,7 +76,7 @@ extern "C" {
      * (bwamem.h declares it outside any extern "C" block -- see gotcha #5), so
      * it can only be reached from bwa_shim_align.cpp where the real header is
      * included. */
-    void shim_opts_apply_meth_defaults(mem_opt_t *opts);
+    void shim_opts_apply_meth_defaults(mem_opt_t *opts, unsigned explicit_mask);
 
     struct ShimSeeds;
     struct ShimScratch; struct ShimRegs;
@@ -303,7 +303,11 @@ extern "C" const char *bwa_shim_compat_hd_line(const mem_opt_t *opts) {
 }
 
 extern "C" void bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts) {
-    if (opts) shim_opts_apply_meth_defaults(opts);
+    if (opts) shim_opts_apply_meth_defaults(opts, 0u);
+}
+
+extern "C" void bwa_shim_opts_apply_meth_defaults_masked(mem_opt_t *opts, unsigned explicit_mask) {
+    if (opts) shim_opts_apply_meth_defaults(opts, explicit_mask);
 }
 
 /* D3 (--meth): (re)build the per-hypothesis bisulfite scoring matrices

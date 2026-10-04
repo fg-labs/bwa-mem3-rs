@@ -52,7 +52,10 @@ pub use build_info::{build_info, version, BuildInfo};
 pub use error::{Error, Result};
 pub use index::BwaIndex;
 pub use memo::{MemoStats, PairMemo};
-pub use opts::{MemOpts, MemPeStat, MethScoring, Mode, PeOrient, PeOrientation, SeedOrder};
+pub use opts::{
+    MemOpts, MemPeStat, MethChem, MethScoring, MethSeedPrune, Mode, PeOrient, PeOrientation,
+    SeedOrder,
+};
 pub use resident::{
     AlignedFields, AlignedFieldsSink, Mate, MethFields, ResidentCohort, ResidentRange,
 };
