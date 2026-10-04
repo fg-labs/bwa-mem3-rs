@@ -28,6 +28,7 @@
 #include "FMI_search.h"
 #include "meth_xm.h"   /* meth_build_xm — D3 (--meth) XM:Z tag */
 #include "kswv.h"      /* kswr_t / SIMD_WIDTH8 — batched mate-rescue path below */
+#include "rescue_band.h" /* rescue_band_batch_free — worker_free's per-thread band plans */
 #include "bwa_shim_fields.h"  /* BwaAlignedFields — the structured-fields sink */
 
 /* sort_classify has external linkage in bwamem.cpp but no header declaration
@@ -165,6 +166,9 @@ static void worker_alloc(worker_t &w, int tid)
         w.mmc.seqPairArrayLeft128[l]  = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.seqPairArrayRight128[l] = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.wsize[l] = wsize;
+        w.mmc.rescue_narrow_off[l] = NULL;   // grown on demand by mem_matesw_batch_pre
+        w.mmc.rescue_narrow_cap[l] = 0;
+        w.mmc.rescue_band[l] = NULL;         // created on demand by mem_matesw_batch_pre
 
         xassert(w.mmc.seqPairArrayAux[l] != NULL, "out of memory: seqPairArrayAux");
         xassert(w.mmc.seqPairArrayLeft128[l] != NULL, "out of memory: seqPairArrayLeft128");
@@ -220,6 +224,8 @@ static void worker_free(worker_t &w, int tid)
 
     for (int l = tid; l <= tid; l++) {
         free(w.mmc.seqPairArrayAux[l]);
+        free(w.mmc.rescue_narrow_off[l]);
+        rescue_band_batch_free(w.mmc.rescue_band[l]);
         free(w.mmc.seqPairArrayLeft128[l]);
         free(w.mmc.seqPairArrayRight128[l]);
     }

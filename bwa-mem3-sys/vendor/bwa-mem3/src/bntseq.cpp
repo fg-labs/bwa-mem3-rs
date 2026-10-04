@@ -207,6 +207,11 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 	err_fatal(__func__, "Parse error reading %s\n", fname);
 }
 
+void bns_pac_path(char *out, size_t outsz, const char *prefix)
+{
+	bns_build_path(out, outsz, prefix, ".pac");
+}
+
 bntseq_t *bns_restore(const char *prefix)
 {  
 	char ann_filename[PATH_MAX], amb_filename[PATH_MAX], pac_filename[PATH_MAX], alt_filename[PATH_MAX];
@@ -214,7 +219,7 @@ bntseq_t *bns_restore(const char *prefix)
 	bntseq_t *bns;
 	bns_build_path(ann_filename, sizeof(ann_filename), prefix, ".ann");
 	bns_build_path(amb_filename, sizeof(amb_filename), prefix, ".amb");
-	bns_build_path(pac_filename, sizeof(pac_filename), prefix, ".pac");
+	bns_pac_path(pac_filename, sizeof(pac_filename), prefix);
 	bns = bns_restore_core(ann_filename, amb_filename, pac_filename);
 	if (bns == 0) return 0;
 	bns_build_path(alt_filename, sizeof(alt_filename), prefix, ".alt");
@@ -720,9 +725,12 @@ void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
 	}
 }
 
-void bns_fetch_seq_into(const bntseq_t *bns, const uint8_t *pac,
-                        int64_t *beg, int64_t mid, int64_t *end, int *rid,
-                        uint8_t *dst, int64_t *len_out)
+/* The window arithmetic shared by bns_fetch_seq_into, bns_fetch_seq_v2 and
+ * bns_fetch_bounds: order [*beg, *end), find the contig holding `mid`, and clamp
+ * the window to it on mid's strand. *far_beg / *far_end get that contig's bounds
+ * in the same doubled coordinates as the window (for the callers' diagnostics). */
+static void bns_clamp_window(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end, int *rid,
+                             int64_t *far_beg_out, int64_t *far_end_out)
 {
 	int64_t far_beg, far_end;
 	int is_rev;
@@ -740,6 +748,17 @@ void bns_fetch_seq_into(const bntseq_t *bns, const uint8_t *pac,
 	}
 	*beg = *beg > far_beg? *beg : far_beg;
 	*end = *end < far_end? *end : far_end;
+	*far_beg_out = far_beg;
+	*far_end_out = far_end;
+}
+
+void bns_fetch_seq_into(const bntseq_t *bns, const uint8_t *pac,
+                        int64_t *beg, int64_t mid, int64_t *end, int *rid,
+                        uint8_t *dst, int64_t *len_out)
+{
+	int64_t far_beg, far_end;
+
+	bns_clamp_window(bns, beg, mid, end, rid, &far_beg, &far_end);
 
 	bns_get_seq_into(bns->l_pac, pac, *beg, *end, dst, len_out);
 
@@ -848,27 +867,20 @@ uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t 
 	return seq;
 }
 
+void bns_fetch_bounds(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end, int *rid)
+{
+	int64_t far_beg, far_end;
+	bns_clamp_window(bns, beg, mid, end, rid, &far_beg, &far_end);
+}
+
 uint8_t *bns_fetch_seq_v2(const bntseq_t *bns, const uint8_t *pac,
                           int64_t *beg, int64_t mid, int64_t *end, int *rid,
                           uint8_t *ref_string, uint8_t *seqb)
 {
-	int64_t far_beg, far_end, len;
-	int is_rev;
+	int64_t len, far_beg, far_end;
 	uint8_t *seq;
 
-	if (*end < *beg) *end ^= *beg, *beg ^= *end, *end ^= *beg; // if end is smaller, swap
-	assert(*beg <= mid && mid < *end);
-
-	*rid = bns_pos2rid(bns, bns_depos(bns, mid, &is_rev));
-	far_beg = bns->anns[*rid].offset;
-	far_end = far_beg + bns->anns[*rid].len;
-	if (is_rev) { // flip to the reverse strand
-		int64_t tmp = far_beg;
-		far_beg = (bns->l_pac<<1) - far_end;
-		far_end = (bns->l_pac<<1) - tmp;
-	}
-	*beg = *beg > far_beg? *beg : far_beg;
-	*end = *end < far_end? *end : far_end;
+	bns_clamp_window(bns, beg, mid, end, rid, &far_beg, &far_end);
 
 	seq = bns_get_seq_v2(bns->l_pac, pac, *beg, *end, &len, ref_string, seqb);
 

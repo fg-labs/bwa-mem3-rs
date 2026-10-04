@@ -121,6 +121,9 @@ extern "C" {
 
 	void bns_dump(const bntseq_t *bns, const char *prefix);
 	bntseq_t *bns_restore(const char *prefix);
+	/* Build the .pac path bns_restore opens for `prefix` ("<prefix>.pac") into
+	 * `out` (sized `outsz`, e.g. PATH_MAX); aborts if it would not fit. */
+	void bns_pac_path(char *out, size_t outsz, const char *prefix);
 	bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, const char* pac_filename);
 	void bns_destroy(bntseq_t *bns);
 	int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only);
@@ -173,6 +176,11 @@ extern "C" {
 	uint8_t *bns_fetch_seq_v2(const bntseq_t *bns, const uint8_t *pac,
 	                          int64_t *beg, int64_t mid, int64_t *end, int *rid,
 	                          uint8_t *ref_string, uint8_t *seqb);
+	// The window arithmetic of bns_fetch_seq_v2 without the fetch: swaps
+	// [*beg, *end) into order, sets *rid to the contig holding `mid`, and clamps
+	// the window to that contig on mid's strand. For callers that need only the
+	// clamped bounds and rid, not the bases.
+	void bns_fetch_bounds(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end, int *rid);
 	int bns_intv2rid(const bntseq_t *bns, int64_t rb, int64_t re);
 
 #ifdef __cplusplus

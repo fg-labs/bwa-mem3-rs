@@ -231,12 +231,12 @@ typedef struct mem_opt_t {
      *   GENOMIC: that cell alone is freed, to a MATCH (+a); the mirror
      *     (mat[T][C], mat[A][G]) STAYS at −b so genuine variants score as
      *     mismatches → one freed cell at +a ⇒ the SIMD rank-1 fast path.
-     *     Variant-aware: real variants stay visible in NM/MD.
+     *     Variant-aware: real variants still count toward NM.
      *   NEUTRAL: that cell alone is freed, to 0 (tolerated, not rewarded); the
      *     mirror STAYS at −b. One freed cell, but NOT rank-1 (the value is
      *     neither match nor mismatch) → bandedSWA's general path; the kswv
      *     freed-cell blend expresses it directly. Variant-aware: real variants
-     *     stay visible in NM/MD.
+     *     still count toward NM.
      *   COLLAPSED: the mirror cell is ALSO freed (two cells, both to +a) so C/T
      *     and G/A are interchangeable → reproduces bwameth; uses bandedSWA's
      *     general path.
@@ -294,7 +294,7 @@ typedef struct mem_opt_t {
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
     int    smem_dedup;        // 1 = dedup fully-identical SMEMs before SA expansion (--smem-dedup); 0 = off (default, byte-identical to baseline)
     int    alnreg_sort_fast;  // 1 = strict-total-order comparator + pdqsort at the mem_sort_dedup_patch sort sites (set by --fast); 0 = bwa-mem2's re-only comparator + ks_introsort (default, bwa-mem2-compatible)
-    int    skip_contained_ext; // 1 (default) = skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; 0 = the reference extension path (--keep-contained-ext; --compat forces 0). Byte-identical to the reference path on all read lengths and under --meth: a contained seed is deferred past the main extension batch and skipped only when the real post-extension containment purge (PE18) confirms it against its container's extended alnreg; otherwise it is extended in a second batch. Pure speed lever, so it is on by default; --skip-contained-ext is the deprecated (accepted, no-op) spelling of the default.
+    int    skip_contained_ext; // 1 (default, --compat included) = skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; 0 = the reference extension path (--keep-contained-ext). Byte-identical to the reference path on all read lengths and under --meth: a contained seed is deferred past the main extension batch and skipped only when the real post-extension containment purge (PE18) confirms it against its container's extended alnreg; otherwise it is extended in a second batch. The proof needs a non-negative -A (mem_skip_contained_ext_sound); the extension driver runs the reference path outside that envelope whatever this says. Pure speed lever, so it is on by default; --skip-contained-ext is the deprecated (accepted, no-op) spelling of the default.
     int    band_start;       // >0 = adaptive chain-geometry banding active (start band; set to ADAPTIVE_BAND_START by --adaptive-band); 0 = off (byte-identical). Long-read speed lever; no-op on the 8-bit short-read tier.
     int    band_cert;        // 1 = sound (byte-identical) adaptive band via per-pair tie-break certificate (default); 0 = off, set by --fast/--adaptive-band (which use the aggressive band_start heuristic instead). Skips the wide DP on provably-narrow pairs with bit-for-bit-identical output.
     /* --compat: the selected output-compatibility target. Non-NULL on any
@@ -312,6 +312,7 @@ typedef struct mem_opt_t {
 
 
 struct mem_alnreg_t;
+class RescueBandBatch;   // rescue_band.h
 // * Chaining *
 typedef struct abc {
     abc() {
@@ -514,6 +515,24 @@ typedef struct
     // by construction even though the FMI_search instance itself is shared.
     SmemSortScratch smem_sort_scratch[MAX_THREADS];
 
+    // Per-tid narrowing offsets for batched mate rescue, indexed by regid:
+    // mem_matesw_batch_pre records how far it moved each enqueued window's start
+    // (--rescue-kmer narrowing or an exact-pruning hull) and mem_matesw_batch_post
+    // applies the same offset to the result. Kept with the rest of the batch's
+    // per-tid state (seqPairArrayAux / gar) rather than per OS thread, so _pre and
+    // _post may run on different threads for the same tid. Plain pointer + capacity
+    // (not a std::vector) so a zero-filled mem_cache is a valid empty one. Grown on
+    // demand by _pre; freed with the other per-tid buffers.
+    int32_t *rescue_narrow_off[MAX_THREADS];
+    int64_t  rescue_narrow_cap[MAX_THREADS];
+
+    // Per-tid banded-rescue plans (rescue_band.h): mem_matesw_batch_pre plans the
+    // banded pass 0 of each enqueued pair and mem_sam_pe_batch runs it, so the plan
+    // lives with the batch's other per-tid state for the same reason as
+    // rescue_narrow_off. NULL until the first plan; created by _pre, freed with the
+    // other per-tid buffers (rescue_band_batch_free).
+    RescueBandBatch *rescue_band[MAX_THREADS];
+
     // Pointer into worker_t::ref_string (the unpacked .0123 reference).
     // Set once in the worker_aln/worker_sam entry points; lets helpers like
     // mem_seed_sw and the mem_matesw_* family invoke bns_fetch_seq_v2 without
@@ -611,6 +630,13 @@ typedef kvec_t(int) int_v;
 
 mem_opt_t *mem_opt_init(void);
 void mem_fill_scmat(int a, int b, int8_t mat[25]);
+/* True iff the contained-seed extension skip (opt->skip_contained_ext) is
+ * byte-identical to the reference extension path under opt's scoring: the
+ * proof needs cal_max_gap to be non-decreasing in its argument, which holds for
+ * every non-negative match score (-A). The extension driver runs the reference
+ * path when this is false, whatever the flag says; main_mem reads it only to
+ * report that. */
+int mem_skip_contained_ext_sound(const mem_opt_t *opt);
 /* True iff the certified adaptive band (opt->band_cert) is safe to apply under the
  * current scoring/gap/zdrop parameters. The certificate bounds the optimal score but
  * not the extension kernel's early-termination heuristics; outside a conservative
@@ -760,6 +786,12 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          mem_cache *mmc,  int64_t &pcnt, int32_t &gcnt,
                          int32_t&, int32_t&, int tid);
 
+/* Cache hints for the reference windows mem_matesw_batch_pre will fetch for
+ * one pair (seqs[0..1], regs[0..1]); pure hints, output-neutral. */
+void mem_prefetch_rescue_pac(const bntseq_t *bns, const uint8_t *pac,
+                             const mem_pestat_t pes[4],
+                             const bseq1_t *seqs, const mem_alnreg_v *regs);
+
 int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
@@ -829,12 +861,48 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                                 int n_pri[2], int z[2], int q_se[2],
                                 int *extra_flag_out, int *paired_out);
 
+/* Caller-owned state of one mate-rescue alnreg vector across
+ * mem_matesw_batch_post calls: `fixpoint` = 1 when the vector, apart from
+ * `pushed`, is exactly the output of a dedup that reported a fixed point
+ * (mem_dedup_only_fixpoint); `pushed` = index of the one record added since,
+ * or -1 for none. Start at {0, -1}; reset it if the vector is modified
+ * elsewhere. */
+typedef struct {
+    int fixpoint;
+    int pushed;
+} mem_rescue_dedup_state_t;
+
+/* The dedup-only call mem_sort_dedup_patch(opt, 0, 0, 0, n, a), byte for byte,
+ * that also reports whether its output is a fixed point (src/bwamem.cpp has
+ * the argument). */
+int mem_dedup_only_fixpoint(const mem_opt_t *opt, int n, mem_alnreg_t *a, int *fixpoint_out);
+/* mem_dedup_only_fixpoint when a[0, n) is a fixed-point output plus the one new
+ * record a[pos], in O(n) where that is provably exact (src/bwamem.cpp). */
+int mem_dedup_only_insert1(const mem_opt_t *opt, int n, mem_alnreg_t *a, int pos,
+                           int *fixpoint_out, int *fast_out);
+
+/* Where mem_matesw_batch_post inserts a rescued region into the mate's
+ * by-score list a[0, n): before the first record with a strictly lower score,
+ * after any equal-score run. Shared with the tests that replay it. */
+static inline int mem_rescue_insert_pos(const mem_alnreg_t *a, int n, int score)
+{
+    int i = 0;
+    while (i < n && !(a[i].score < score)) ++i;
+    return i;
+}
+
+/* `dedup_state`, if non-NULL, tracks `ma` across calls (see
+ * mem_rescue_dedup_state_t) so the post-rescue dedup can be skipped when it is
+ * provably a no-op, or done in O(n) for a single new record. NULL dedups
+ * unconditionally. Output is byte-identical either way. */
 int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const uint8_t *pac, const mem_pestat_t pes[4],
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
-                          int32_t *gar, mem_cache *mmc, const char *ms_orig = NULL,
-                          const int8_t *mat = NULL, int mate_meth_ot = -1);
+                          int32_t *gar, mem_cache *mmc, int32_t tid,
+                          const char *ms_orig = NULL,
+                          const int8_t *mat = NULL, int mate_meth_ot = -1,
+                          mem_rescue_dedup_state_t *dedup_state = NULL);
 
 /* The scalar mem_sam_pe / mem_pair_resolve pairing path was removed; the batched
  * mem_sam_pe_batch* path above is the only mate-rescue/pairing path. */
