@@ -327,8 +327,9 @@ private:
 	 * (fr_ref x fr_read -> fr_val) override per cell; otherwise the override
 	 * blocks compile out entirely. LazyQE selects, for the two-row sweep only,
 	 * post-row query-end recovery from the stored H (true) over the per-cell
-	 * argmax blend (false); it is meaningless when RowPair is false. */
-	template<bool HasFreed, bool USQADD, bool RowPair, bool LazyQE>
+	 * argmax blend (false); it is meaningless when RowPair is false. FScan
+	 * selects the G-based cell; see rescue_fscan_enabled. */
+	template<bool HasFreed, bool USQADD, bool RowPair, bool LazyQE, bool FScan>
 	int kswv_neon_u8_impl(uint8_t seq1SoA[],
 					      uint8_t seq2SoA[],
 					      int16_t nrow,
@@ -363,8 +364,9 @@ private:
 	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
 	/* Templated 16-bit kernel body. RowPair / LazyQE mirror the u8 kernel's
 	 * two-row sweep and its lazy query-end recovery (LazyQE is meaningless
-	 * when RowPair is false; the one-row body is always lazy). */
-	template<bool HasFreed, bool RowPair, bool LazyQE>
+	 * when RowPair is false; the one-row body is always lazy). FScan selects
+	 * the G-based cell; see rescue_fscan_enabled. */
+	template<bool HasFreed, bool RowPair, bool LazyQE, bool FScan>
 	int kswv_neon_16_impl(int16_t seq1SoA[],
                           int16_t seq2SoA[],
                           int16_t nrow,
@@ -409,8 +411,8 @@ private:
 				   int32_t numPairs,
 				   int phase);
 
-	/* Templated u8 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed>
+	/* Templated u8 kernel body; see kswv_neon_u8_impl. Sgn: the signed-domain FScan body. */
+	template<bool HasFreed, bool FScan, bool Sgn>
 	int kswv256_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
@@ -443,7 +445,7 @@ private:
 				   int phase);
 
 	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed>
+	template<bool HasFreed, bool FScan>
 	int kswv256_16_impl(int16_t seq1SoA[],
 				   int16_t seq2SoA[],
 				   int16_t nrow,
@@ -478,7 +480,7 @@ private:
 				   int phase);
 
 	/* Templated u8 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed>
+	template<bool HasFreed, bool FScan, bool Sgn>
 	int kswv512_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
@@ -511,7 +513,7 @@ private:
                    int phase);
 
 	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed>
+	template<bool HasFreed, bool FScan>
 	int kswv512_16_impl(int16_t seq1SoA[],
                    int16_t seq2SoA[],
                    int16_t nrow,
@@ -589,7 +591,8 @@ private:
 	 * kswv.cpp. */
 	uint8_t *colIdx8;
 
-	/* 16-bit twins for the NEON 16-bit kernel's lazy query-end recovery:
+	/* 16-bit twins for the lazy query-end recovery of the NEON and AVX2 16-bit
+	 * kernels:
 	 * colIdx16[j*W16 + k] == (int16_t) j, and qeBlk16 holds TWO rows' worth of
 	 * per-QE_BLK running-max checkpoints (row i at qeBlk16, row i+1 at
 	 * qeBlk16 + qeBlk16Stride) for the two-row sweep. Both are sized from

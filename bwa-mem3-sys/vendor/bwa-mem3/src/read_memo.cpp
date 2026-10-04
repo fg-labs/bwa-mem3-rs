@@ -17,6 +17,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "bntseq.h"       /* nst_nt4_decode */
 #include "bwa.h"          /* bseq1_t */
 #include "utils.h"        /* xassert (survives a hypothetical -DNDEBUG build) */
 #include "robin_hood.h"
@@ -239,6 +240,19 @@ read_memo_result read_memo_prepass(const mem_opt_t * /*opt*/, const bseq1_t *seq
     return read_memo_result{ (int64_t)npairs, dup, probe_ns };
 }
 
+void read_memo_convert_non_reps(const read_memo_state *st, bseq1_t *seqs, int seq_id, int n)
+{
+    for (int l = 0; l < n; ++l) {
+        if (st->role[(seq_id + l) >> 1] == READ_MEMO_ROLE_REP) continue;
+        char *s = seqs[l].seq;
+        const int len = seqs[l].l_seq;
+        for (int i = 0; i < len; ++i) {
+            unsigned char ch = (unsigned char) s[i];
+            s[i] = nst_nt4_decode(ch, 4);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------------- *
  * Two-sample A/B controller. The observation unit is one align invocation; the
  * quantity is that chunk's REALIZED per-pair total cost:
@@ -289,6 +303,15 @@ int read_memo_verify(void)
 {
     static const int on = []() {
         const char *e = getenv("BWAMEM3_DEDUP_READS_VERIFY");
+        return (e && *e && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+    }();
+    return on;
+}
+
+int read_memo_check_bases(void)
+{
+    static const int on = []() {
+        const char *e = getenv("BWAMEM3_DEDUP_READS_CHECK_BASES");
         return (e && *e && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
     }();
     return on;

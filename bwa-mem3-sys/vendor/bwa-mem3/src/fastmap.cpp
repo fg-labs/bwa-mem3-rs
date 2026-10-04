@@ -59,6 +59,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwa_shm.h"
 #include "bwa_hugepages.h"
 #include "fast_reader_bseq.h"
+#include "rescue_band.h"
 
 /* --cohort-slices / BWA_MEM3_COHORT_SLICES. Named here rather than repeated at
  * each site because the value is needed in four places -- the ramp's shift
@@ -418,6 +419,9 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         w.mmc.seqPairArrayLeft128[l]  = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.seqPairArrayRight128[l] = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.wsize[l] = wsize;
+        w.mmc.rescue_narrow_off[l] = NULL;   // grown on demand by mem_matesw_batch_pre
+        w.mmc.rescue_narrow_cap[l] = 0;
+        w.mmc.rescue_band[l] = NULL;         // created on demand by mem_matesw_batch_pre
 
         xassert(w.mmc.seqPairArrayAux[l] != NULL, "out of memory: w.mmc.seqPairArrayAux[l]");
         xassert(w.mmc.seqPairArrayLeft128[l] != NULL, "out of memory: w.mmc.seqPairArrayLeft128[l]");
@@ -487,6 +491,8 @@ void worker_free(worker_t &w, int32_t nthreads)
 
     for(int l=0; l<nthreads; l++) {
         free(w.mmc.seqPairArrayAux[l]);
+        free(w.mmc.rescue_narrow_off[l]);
+        rescue_band_batch_free(w.mmc.rescue_band[l]);
         free(w.mmc.seqPairArrayLeft128[l]);
         free(w.mmc.seqPairArrayRight128[l]);
     }
@@ -1547,7 +1553,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
     fprintf(stderr, "    --ks-dedup STR  cross-read SA-interval dedup: 'off', 'on' (resolve each distinct (k,s) suffix-array interval once per SA-resolve chunk and copy the coordinates to the reads that repeat it), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode [auto]\n");
     fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
-    fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries; --compat implies it [%s]\n", opt->skip_contained_ext? "off":"on");
+    fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth and --compat, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries. The skip stays off on its own under a negative -A, the one scoring outside its proof [%s]\n", opt->skip_contained_ext? "off":"on");
     fprintf(stderr, "    --skip-contained-ext  DEPRECATED, accepted no-op: contained-seed skipping is now the default; pass --keep-contained-ext to opt out\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT are not practical at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
@@ -1607,8 +1613,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,\n");
     fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order); --fast and --meth are\n");
     fprintf(stderr, "                  always refused. Override the forceable ones with --compat-allow-divergent.\n");
-    fprintf(stderr, "                  Also runs the reference contained-seed extension path (implies\n");
-    fprintf(stderr, "                  --keep-contained-ext; the default skip is byte-identical to it).\n");
+    fprintf(stderr, "                  Keeps every byte-identical optimization, the default contained-seed\n");
+    fprintf(stderr, "                  extension skip included (--keep-contained-ext still opts out of it).\n");
     fprintf(stderr, "                  [off]\n");
     fprintf(stderr, "    --compat-allow-divergent  downgrade that refusal to a warning: keep the target's\n");
     fprintf(stderr, "                  output conventions while still running a bwa-mem3-only lever. Output is\n");
@@ -1700,13 +1706,13 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 placement (sets -B 2).\n");
     fprintf(stderr, "                 genomic: free only the conversion direction, scored as a full\n");
     fprintf(stderr, "                 match, keep variants as mismatches (variant-aware: variants\n");
-    fprintf(stderr, "                 outside the conversion direction visible in NM/MD; -B 4).\n");
+    fprintf(stderr, "                 outside the conversion direction counted in NM; -B 4).\n");
     fprintf(stderr, "                 neutral: free only the conversion direction but score it 0\n");
     fprintf(stderr, "                 (tolerated, not rewarded); best for TAPS (variant-aware:\n");
-    fprintf(stderr, "                 variants visible in NM/MD as in genomic; -B 4).\n");
+    fprintf(stderr, "                 variants counted in NM as in genomic; -B 4).\n");
     fprintf(stderr, "                 In genomic/neutral a real variant in the conversion direction\n");
     fprintf(stderr, "                 itself (C->T at a reference C) is indistinguishable from a\n");
-    fprintf(stderr, "                 conversion and stays hidden in NM/MD.\n");
+    fprintf(stderr, "                 conversion and is not counted in NM.\n");
     fprintf(stderr, "   --meth-seed-prune[=spec30|baseline|off]\n");
     fprintf(stderr, "                 prune the 3-letter alphabet's short, repetitive spurious SMEMs\n");
     fprintf(stderr, "                 before SA resolution: ~30%% faster --meth at ~0 accuracy cost\n");
@@ -1797,7 +1803,9 @@ static int meth_orig_ref_load_handles(const char *prefix,
     }
     /* bns_restore left .pac open in bns->fp_pac; slurp it whole (in parallel,
      * same as the seed index) and close it. Shared with bwa_idx_load_ele. */
-    pac_slurp_and_close(&bns->fp_pac, pac, pac_bytes, pread_workers);
+    char pac_path[PATH_MAX];
+    bns_pac_path(pac_path, sizeof(pac_path), prefix);
+    pac_slurp_and_close(&bns->fp_pac, pac_path, pac, pac_bytes, pread_workers);
 
     *bns_out = bns;
     *pac_out = pac;
@@ -2229,10 +2237,40 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == 'O')
         {
+            // A negative gap open makes opening a gap cheaper than extending one
+            // (o + e < e). The SIMD Smith-Waterman kernels assume it is not:
+            // kswv (mate rescue) returns scores, ends and suboptimal scores that
+            // differ from the exact affine-gap DP there, and the striped
+            // ksw_u8/ksw_i16 return differing scores on some of the same inputs.
+            // So reject it rather than align inexactly.
+            // Upstream bwa/bwa-mem2 accept it and return those inexact results.
+            // Parse as -E does: each value as a long, the whole token consumed
+            // (the old parser silently dropped a non-digit second value, so
+            // -O 8,-1 ran with an insertion open of 8), no ERANGE, and at most
+            // INT_MAX before narrowing. Zero stays valid, so a first value with
+            // no digits ("" or ",1"), which strtol() also returns as 0, is
+            // rejected on the parse itself rather than on its value.
             opt0.o_del = opt0.o_ins = 1;
-            opt->o_del = opt->o_ins = strtol(optarg, &p, 10);
-            if (*p != 0 && ispunct(*p) && isdigit(p[1]))
-                opt->o_ins = strtol(p+1, &p, 10);
+            errno = 0;
+            long o_del_val = strtol(optarg, &p, 10);
+            int o_no_digits = (p == optarg);
+            int o_range = (errno == ERANGE);
+            long o_ins_val = o_del_val;
+            if (*p != 0 && ispunct(*p) && (isdigit(p[1]) || p[1] == '-')) {
+                errno = 0;
+                o_ins_val = strtol(p + 1, &p, 10);
+                o_range = o_range || (errno == ERANGE);
+            }
+            if (o_no_digits || o_range || *p != 0 || o_del_val < 0 || o_del_val > INT_MAX ||
+                o_ins_val < 0 || o_ins_val > INT_MAX) {
+                fprintf(stderr, "ERROR: -O gap-open penalty must be a non-negative integer in 0..%d (got %s)\n",
+                        INT_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->o_del = (int)o_del_val;
+            opt->o_ins = (int)o_ins_val;
         }
         else if (c == 'E')
         {
@@ -2695,6 +2733,14 @@ int main_mem(int argc, char *argv[])
             aux.pes0 = pes;
             pes[1].failed = 0;
             pes[1].avg = strtod(optarg, &p);
+            // strtod() returns 0 for a token with no digits, so a missing mean
+            // (e.g. -I ,50) would run with a mean insert size of 0; require it.
+            if (p == optarg) {
+                fprintf(stderr, "ERROR: -I expects mean[,std[,max[,min]]] numeric values (got %s)\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
             pes[1].std = pes[1].avg * .1;
             if (*p != 0 && ispunct(*p) && isdigit(p[1]))
                 pes[1].std = strtod(p+1, &p);
@@ -2986,8 +3032,11 @@ int main_mem(int argc, char *argv[])
      *
      * The contained-seed extension skip (skip_contained_ext, on by default) is
      * deliberately NOT a row: it is byte-identical to the reference extension
-     * path, and --compat pins the reference path below regardless, so there is
-     * nothing to refuse and nothing for --compat-allow-divergent to allow.
+     * path by proof (mem_skip_contained_ext_sound states the envelope, and the
+     * extension driver enforces it), so --compat keeps it like every other
+     * byte-identical optimization -- there is nothing to refuse and nothing for
+     * --compat-allow-divergent to allow. --keep-contained-ext remains the opt-out
+     * under --compat too.
      *
      * Riders deliberately NOT listed (each is a no-op unless a lever that IS
      * listed is also engaged, so the listed lever already guards them):
@@ -3074,14 +3123,21 @@ int main_mem(int argc, char *argv[])
         }
         free(joined.s);   /* NULL when nothing was appended -- free(NULL) is a no-op */
     }
-    /* --compat pins the reference extension path (as --keep-contained-ext does).
-     * The default contained-seed skip is byte-identical to it, so this changes no
-     * output; it just keeps a bit-exact-fidelity mode on the same extension code
-     * the targets run rather than on a speed lever. Applied after option parsing
-     * so it overrides the mem_opt_init default, and unconditionally, so
-     * `--compat --keep-contained-ext` (both asking for the reference path) and a
-     * deprecated `--compat --skip-contained-ext` both resolve the same way. */
-    if (compat_on) opt->skip_contained_ext = 0;
+    /* The contained-seed extension skip is kept under --compat. It used to be
+     * forced off here ("pin the reference extension path"), but the compat
+     * policy is proof-based: a target keeps every optimization that is
+     * byte-identical by construction or proven inside a code-enforced envelope,
+     * and drops only output shaping. The skip is proven (see
+     * mem_skip_contained_ext_sound in bwamem.cpp), and the extension driver
+     * itself falls back to the reference path outside the envelope, so the flag
+     * is never load-bearing for soundness. Report that fallback once, so a run
+     * record explains why the skip is not in force. The flag is left set: the
+     * driver's own guard (two_wave) is what disables it. Read after every
+     * rejection above and before the --fast preset, like the audit lines. */
+    if (opt->skip_contained_ext && !mem_skip_contained_ext_sound(opt))
+        fprintf(stderr, "[W::%s] contained-seed extension skip disabled: -A %d is negative, "
+                "outside the scoring its byte-identity proof covers; running the "
+                "reference extension path (output is unaffected)\n", __func__, opt->a);
     /* --compat with an @HD in -H: WARN, do not reject. Emitted only after every
      * rejection above (--fast, --meth, and the centralized divergence guard), so
      * a run that is about to be refused does not also collect a warning about how its
@@ -3260,11 +3316,11 @@ int main_mem(int argc, char *argv[])
         opt->band_cert = 0;
     }
 
-    /* Under --meth, NM/MD are derived from the scoring matrix (a column is a
-     * mismatch iff the matrix penalizes it), so a non-positive -B makes every
-     * substitution cell non-negative and silently collapses NM to 0 and MD to
-     * a bare match run -- hiding real variants, not just conversions. Refuse it
-     * rather than emit output that looks clean because scoring is degenerate.
+    /* Under --meth, NM is derived from the scoring matrix (an aligned column
+     * is an edit iff the matrix penalizes it; indels always count), so a
+     * non-positive -B makes every substitution cell non-negative and silently
+     * collapses NM to 0 -- hiding real variants, not just conversions. Refuse
+     * it rather than emit output that looks clean because scoring is degenerate.
      * The bound is `<= 0`, not `== 0`: bwa_fill_scmat stores -b, so a NEGATIVE
      * -B turns every substitution into a positive reward, which hides real
      * variants at least as thoroughly as -B 0 does.
@@ -3275,7 +3331,7 @@ int main_mem(int argc, char *argv[])
     if (opt->meth_mode && opt->b <= 0) {
         fprintf(stderr, "ERROR: --meth requires a positive mismatch penalty, but the "
                         "effective penalty is %d; a non-positive penalty makes every "
-                        "substitution free or rewarded, which collapses NM/MD to zero "
+                        "substitution free or rewarded, which collapses NM to zero "
                         "and hides real variants (check -B and -A)\n", opt->b);
         free(opt);
         if (out_opened) fclose(aux.fp);
@@ -3488,14 +3544,18 @@ int main_mem(int argc, char *argv[])
     /* Resolve the third-pass bwtseed lockstep on/off once, before the seeding
      * workers spawn (policy: lockstep_width.h). Scheduling only, never output. */
     {
-        const int32_t phys = bwa3_init_bwtseed_lockstep(opt->n_threads);
+        bwa3_init_bwtseed_lockstep();
         /* Resolve the lockstep WIDTH too (the compile-time default, or a
          * BWA3_BWTSEED_LOCKSTEP_N pin): how many reads' cp_occ misses the driver
          * overlaps. Scheduling only. */
         bwa3_init_bwtseed_lockstep_width();
-        if (bwa_verbose >= 3)
-            fprintf(stderr, "[M::%s] third-pass bwtseed lockstep: %s (threads %d, physical cores %d; 0 = unknown), width %d\n",
-                    __func__, g_bwtseed_lockstep ? "on" : "off", opt->n_threads, phys, g_bwtseed_lockstep_n);
+        if (bwa_verbose >= 3) {
+            const int32_t pin = bwa3_bwtseed_lockstep_parse_env(getenv("BWA3_BWTSEED_LOCKSTEP"));
+            fprintf(stderr, "[M::%s] third-pass bwtseed lockstep: %s (%s), width %d, threads %d\n",
+                    __func__, g_bwtseed_lockstep ? "on" : "off",
+                    (pin == 0 || pin == 1) ? "BWA3_BWTSEED_LOCKSTEP" : "default",
+                    g_bwtseed_lockstep_n, opt->n_threads);
+        }
     }
 #endif
 

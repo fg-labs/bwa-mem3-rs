@@ -453,7 +453,7 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/system.o src/libsais_build.o \
 			src/bwa_shm.o src/bwa_hugepages.o src/simd_dispatch.o \
 			src/fast_reader.o src/fast_reader_bseq.o src/fr_fastq.o src/stage_prof.o \
-			src/smem_dedup.o src/lockstep_width.o src/read_memo.o
+			src/smem_dedup.o src/lockstep_width.o src/read_memo.o src/rescue_band.o
 
 # Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
 # and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
@@ -474,7 +474,8 @@ HTS_LIB=    ext/htslib/libhts.a
 # generated header dependencies, so there must be exactly one copy of it.
 STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    bandedswa_padding_test bandedswa_highzdrop_seed_test \
-                   bandedswa_high_h0_zdrop_test shm_section_find_test \
+                   bandedswa_high_h0_zdrop_test bandedswa_negative_h0_test \
+                   shm_section_find_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
                    kt_for_pool_test bns_zero_calloc_test \
                    err_fgets_eof_test \
@@ -661,7 +662,7 @@ endif
 # target as permanently out of date, so listing them relinked all nine on every
 # invocation. Their own rules (and the generated .d header deps this Makefile
 # now emits) already decide when a relink is needed.
-.PHONY:all myall arm64 clean single all-single print-mimalloc-config test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
+.PHONY:all myall arm64 clean single all-single print-mimalloc-config test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-rescue-knobs docs-clean docs-install-tools
 .SUFFIXES:.cpp .c .o
 
 .cpp.o:
@@ -692,6 +693,18 @@ src/%.avx512bw.o: src/%.cpp
 
 NATIVE_KERNEL_OBJS = src/kswv.native.o src/bandedSWA.native.o
 
+# Extra compile flags for a test TU that defines its own calloc (today
+# test/bns_zero_calloc_test.cpp and test/mem_gen_alt_zero_calloc_test.cpp).
+# Such a calloc is malloc + memset, and GCC at -O2 and above folds that pair
+# back into a call to calloc -- i.e. into itself, so the test hangs. Disabling
+# the malloc builtin stops the fold. Upstream GCC 11 through 15 all do it;
+# toolchains that default to _FORTIFY_SOURCE=3 (e.g. Ubuntu 24.04's) dodge it
+# only by accident, because memset becomes __memset_chk. Clang does not fold
+# inside a function named calloc but accepts the flag. Part of FLAGS_SIG so an
+# object built without it is rebuilt. test/regression/calloc_interpose_flag_lint.sh
+# fails if a calloc-defining test's recipe does not pass it.
+CALLOC_INTERPOSE_CXXFLAGS = -fno-builtin-malloc
+
 # Every object also depends on the compile flags themselves, for two reasons.
 #
 # Flags that change without any source changing must invalidate the objects
@@ -711,7 +724,7 @@ NATIVE_KERNEL_OBJS = src/kswv.native.o src/bandedSWA.native.o
 # cost a full rebuild, while a command-line flag change must. Same
 # write-only-if-changed trick as src/version.h below.
 FLAGS_STAMP = .build-flags
-FLAGS_SIG = CXX=$(CXX)|CC=$(CC)|CXXFLAGS=$(CXXFLAGS)|BASE_CXXFLAGS=$(BASE_CXXFLAGS)|CFLAGS=$(CFLAGS)|CPPFLAGS=$(CPPFLAGS)|INCLUDES=$(INCLUDES)|LIBSAIS_CFLAGS=$(LIBSAIS_CFLAGS)|TIERS=$(KERNEL_FLAGS_sse41),$(KERNEL_FLAGS_sse42),$(KERNEL_FLAGS_avx),$(KERNEL_FLAGS_avx2),$(KERNEL_FLAGS_avx512bw)
+FLAGS_SIG = CXX=$(CXX)|CC=$(CC)|CXXFLAGS=$(CXXFLAGS)|BASE_CXXFLAGS=$(BASE_CXXFLAGS)|CFLAGS=$(CFLAGS)|CPPFLAGS=$(CPPFLAGS)|INCLUDES=$(INCLUDES)|LIBSAIS_CFLAGS=$(LIBSAIS_CFLAGS)|CALLOC_INTERPOSE_CXXFLAGS=$(CALLOC_INTERPOSE_CXXFLAGS)|TIERS=$(KERNEL_FLAGS_sse41),$(KERNEL_FLAGS_sse42),$(KERNEL_FLAGS_avx),$(KERNEL_FLAGS_avx2),$(KERNEL_FLAGS_avx512bw)
 
 # Passed through the ENVIRONMENT and expanded double-quoted in the recipe, not
 # interpolated by make into single quotes. `printf '%s\n' '$(FLAGS_SIG)'` puts the
@@ -868,6 +881,11 @@ kernel_padded_lane_uninit_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o tes
 bandedswa_highzdrop_seed_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_highzdrop_seed_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_highzdrop_seed_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
 
+# Negative-h0 regression: an 8-bit lane whose seed score is negative (--meth
+# rescores seeds in original space) must score the same alone as in any group.
+bandedswa_negative_h0_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_negative_h0_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_negative_h0_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
+
 # High-h0 / small-zdrop z-drop regression: getScores8 vs scalar with the seed
 # score h0 above zdrop+1 at small zdrop (the region a relaxed 8-bit routing
 # envelope would newly admit), where the z-drop drift's unset-best sentinel used
@@ -954,6 +972,39 @@ fmi_seed_api_smoke: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_
 test/fmi_seed_api_smoke.o: test/fmi_seed_api_smoke.cpp $(FLAGS_STAMP)
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
+# Exactness + timing harness for the banded mate rescue (src/rescue_band.{h,cpp});
+# its header lists the modes. CI runs a bounded `eq` on generated jobs on every
+# row, at the row's own arch=; longer runs and real-data dumps are manual. The
+# banded kernel is NEON on aarch64 and AVX2 on x86, so on x86 build it with
+# arch=avx2 or arch=avx512bw: the default x86 flags stop at SSE4.1, where there
+# is no kernel, rescue_band_enabled() is false and the harness fails rather than
+# compare kswv with itself.
+.PHONY: rescue-band-harness
+rescue-band-harness: rescue_band_harness
+
+# The SIMD rescue-pruning filter (NEON on aarch64, the SSE4.1 / SSSE3 port on x86) vs the scalar
+# filter: decisions, the view band planning reads, the component list and the repeat memo
+# (test/rescue_prune_eq.cpp). Header-only. CI runs a bounded `fuzz` on every row, at the row's own
+# arch= (and on x86 also an AVX-512BW build, where the runner has it); real-data dumps are manual.
+# On x86 build it with arch=avx2 or arch=avx512bw: the default x86 flags stop at SSE4.1, where no
+# SIMD filter is compiled in and the test's #error stops the build.
+.PHONY: rescue-prune-eq
+rescue-prune-eq: rescue_prune_eq
+
+# Compiled and linked in one step, so the dependency file is named explicitly: it lands in
+# test/, where the `-include test/*.d` below and `clean` already find it, and lists every
+# header the harness reads. The hand list stays as the bootstrap for a tree with no .d yet.
+rescue_prune_eq: test/rescue_prune_eq.cpp src/rescue_prune.h src/rescue_prune_neon.h src/rescue_prune_x86.h src/x86_soa_pack.h src/neon_transpose.h src/kswv_quantum.h $(FLAGS_STAMP)
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(DEPFLAGS) -MF test/rescue_prune_eq.d -MT $@ $< -o $@
+
+# libbwa.a carries the per-tier kswv objects make_kswv dispatches to, so the harness's kswv
+# reference runs at the host's tier (or BWAMEM3_FORCE_TIER's).
+rescue_band_harness: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/rescue_band_harness.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/rescue_band_harness.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+
+test/rescue_band_harness.o: test/rescue_band_harness.cpp $(FLAGS_STAMP)
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
 # Regression test for the fmi_seed_api.h facade's max_occ guard: forwarding
 # max_occ <= 0 into FMI_search::get_sa_entries_prefetch divides by max_occ.
 # Requires a real index prefix argument (see test/run_unit_tests.sh), unlike
@@ -990,7 +1041,7 @@ test/packed_text_overflow_nbases_test.o: test/packed_text_overflow_nbases_test.c
 mem_gen_alt_zero_calloc_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/mem_gen_alt_zero_calloc_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/mem_gen_alt_zero_calloc_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 test/mem_gen_alt_zero_calloc_test.o: test/mem_gen_alt_zero_calloc_test.cpp
-	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CXX) -c $(CXXFLAGS) $(CALLOC_INTERPOSE_CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # err_fgets must name EOF as EOF, not a stale strerror. Links libbwa for
 # err_fgets / _err_fatal_simple; forked child captures the abort diagnostic.
@@ -1125,6 +1176,8 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
 	./test/regression/ndebug_gate_lint_selftest.sh
 	./test/regression/ndebug_gate_lint.sh
+	./test/regression/calloc_interpose_flag_lint_selftest.sh
+	./test/regression/calloc_interpose_flag_lint.sh
 	./test/regression/debug_macro_flag_lint_selftest.sh
 	./test/regression/debug_macro_flag_lint.sh
 	./test/regression/shell_lint_selftest.sh
@@ -1183,6 +1236,9 @@ test/bandedswa_padding_test.o: test/bandedswa_padding_test.cpp
 test/bandedswa_highzdrop_seed_test.o: test/bandedswa_highzdrop_seed_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
+test/bandedswa_negative_h0_test.o: test/bandedswa_negative_h0_test.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
 test/bandedswa_high_h0_zdrop_test.o: test/bandedswa_high_h0_zdrop_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
@@ -1220,7 +1276,7 @@ test/pwrite_all_status_test.o: test/pwrite_all_status_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/bns_zero_calloc_test.o: test/bns_zero_calloc_test.cpp
-	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CXX) -c $(CXXFLAGS) $(CALLOC_INTERPOSE_CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # Header-only: exercises BamRecScratch::grow() geometric growth. Uses no lib
 # symbols (POD kstring_t + malloc/free), so it links against libc alone.
@@ -1359,7 +1415,7 @@ $(ZLIBNG_LIB):
 	cd $(ZLIBNG_BUILD) && cmake $(ZLIBNG_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test bwa-mem3.arm64
+	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test rescue_band_harness rescue_prune_eq bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS) $(LIBSAIS_OBJS:.o=.d)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean
@@ -1411,6 +1467,13 @@ docs-cli: $(EXE)
 			       /^SIMD runtime: / {print "SIMD runtime: <RUNTIME-TIER> (<FORCE-TIER-STATE>)"; next} {print}' \
 			> docs/_generated/cli/$$sub.txt; \
 	done
+
+# The BWA3_RESCUE_* knob table of the rescue developer-guide page, rendered from the knob list in
+# src/rescue_env.h; test/regression/rescue_docs_lint.sh fails when the committed copy is stale.
+docs-rescue-knobs:
+	@mkdir -p docs/_generated/rescue
+	@echo "  RENDER   docs/_generated/rescue/knobs.md"
+	@bash scripts/rescue_knobs.sh > docs/_generated/rescue/knobs.md
 
 docs-clean:
 	rm -rf docs/book
