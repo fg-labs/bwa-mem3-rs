@@ -301,6 +301,51 @@ fn load_with_threads_matches_load() {
     );
 }
 
+/// Loading the `--meth` seed index with threads must not change it: the dual
+/// index from [`BwaIndex::load_meth_with_threads`] aligns a `--meth` batch
+/// byte for byte like the single-threaded [`BwaIndex::load_meth`] one.
+#[test]
+fn load_meth_with_threads_matches_load_meth() {
+    let Some(meth) = phix_meth() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX meth index");
+        return;
+    };
+    let mut seed = meth.prefix.clone().into_os_string();
+    seed.push(".meth");
+    let threaded = BwaIndex::load_meth_with_threads(&seed, &meth.prefix, 4).unwrap();
+    assert!(threaded.is_meth());
+    assert_eq!(
+        threaded.contigs().collect::<Vec<_>>(),
+        meth.idx.contigs().collect::<Vec<_>>()
+    );
+
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture
+        .pairs
+        .iter()
+        .map(|(r1, r2)| ReadPair {
+            name_r1: &r1.name,
+            seq_r1: &r1.seq,
+            qual_r1: r1.qual.as_deref(),
+            name_r2: &r2.name,
+            seq_r2: &r2.seq,
+            qual_r2: r2.qual.as_deref(),
+        })
+        .collect();
+    let mut opts = MemOpts::new().unwrap();
+    opts.set_pe(true).set_meth(true).apply_meth_defaults();
+    let records = |idx: &BwaIndex| -> Vec<(usize, Vec<u8>)> {
+        let (batch, _) = align_batch(idx, &opts, &pv, None).unwrap();
+        batch
+            .iter()
+            .map(|r| (r.pair_idx, r.bytes.to_vec()))
+            .collect()
+    };
+    let single = records(&meth.idx);
+    assert!(!single.is_empty(), "the meth fixture produced no records");
+    assert_eq!(records(&threaded), single);
+}
+
 /// A sink whose `emit` panics on its first call. Used to prove that a panic
 /// inside `RecordSink::emit` propagates out of `pair_emit` as an ordinary
 /// panic rather than aborting the process or corrupting state -- the

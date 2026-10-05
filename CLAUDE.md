@@ -153,7 +153,8 @@ allowlist.)
 `--meth` (D3) alignment needs a **dual index** built by `bwa-mem3 index --meth`:
 the converted, f/r-doubled seed FM-index (`<ref>.meth.*`) plus the original
 un-converted reference (`<ref>.*`). Load both via `BwaIndex::load_meth(seed,
-orig)` → `shim_align_idx_load_meth`; the shim keeps the original `bns`/`pac`
+orig)` (or `load_meth_with_threads`, which loads the seed FM-index with `-t`
+threads as the CLI does) → `shim_align_idx_load_meth_threads`; the shim keeps the original `bns`/`pac`
 resident on `BwaShimIndex` and pac-fetches the original reference from
 `meth_orig_pac` on demand (nothing unpacked is resident). Seeding runs
 against the converted index; **everything after the seed→original remap in

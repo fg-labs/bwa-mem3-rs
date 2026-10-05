@@ -143,6 +143,10 @@ BwaIndex *bwa_shim_idx_load_threads(const char *prefix, int n_threads);
 /* D3 (--meth): load a dual index — `seed_prefix` = converted `<ref>.meth`,
  * `orig_prefix` = un-converted `<ref>`. Use with meth_mode set on the opts. */
 BwaIndex *bwa_shim_idx_load_meth(const char *seed_prefix, const char *orig_prefix);
+/* As bwa_shim_idx_load_meth, loading the seed FM-index with `n_threads` (>= 1)
+ * threads, as the CLI loads it with `-t`. `n_threads < 1` is clamped to 1. */
+BwaIndex *bwa_shim_idx_load_meth_threads(const char *seed_prefix, const char *orig_prefix,
+                                         int n_threads);
 /* Non-zero iff `idx` is a --meth dual index (loaded via bwa_shim_idx_load_meth). */
 int       bwa_shim_idx_is_meth(const BwaIndex *idx);
 void      bwa_shim_idx_free(BwaIndex *idx);

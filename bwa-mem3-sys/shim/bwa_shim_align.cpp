@@ -442,12 +442,16 @@ void *shim_align_idx_load(const char *prefix) {
 
 /* D3 (--meth): load a dual index. `seed_prefix` is the converted seed index
  * (`<ref>.meth`), `orig_prefix` the un-converted original reference (`<ref>`).
- * The seed FM-index plus the original bns/pac stay resident; the original
+ * The seed FM-index is loaded with `n_threads` threads, as the CLI loads it
+ * with `-t` (fastmap.cpp, main_mem's `load_index`); the original bns/pac are
+ * read single-threaded either way. The seed FM-index plus the original bns/pac
+ * stay resident; the original
  * reference is NOT unpacked — extension pac-fetches it from `meth_orig_pac` on
  * demand (bns_get_seq_v2's `ref_string == NULL` path via mem_kernel2_core's
  * meth aln_pac routing), matching upstream bwa-mem3. */
-void *shim_align_idx_load_meth(const char *seed_prefix, const char *orig_prefix) {
-    void *opaque = shim_align_idx_load(seed_prefix);
+void *shim_align_idx_load_meth_threads(const char *seed_prefix, const char *orig_prefix,
+                                       int n_threads) {
+    void *opaque = shim_align_idx_load_threads(seed_prefix, n_threads);
     if (!opaque) return nullptr;
     BwaShimIndex *idx = static_cast<BwaShimIndex *>(opaque);
     if (shim_meth_orig_ref_load(orig_prefix, &idx->meth_orig_bns, &idx->meth_orig_pac) != 0) {
