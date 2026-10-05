@@ -170,6 +170,21 @@ impl BwaIndex {
     /// carry Bismark `XG`/`XR`/`XM` tags and original-reference coordinates, so
     /// the contig accessors below report the original contigs.
     pub fn load_meth(seed_prefix: impl AsRef<Path>, orig_prefix: impl AsRef<Path>) -> Result<Self> {
+        Self::load_meth_with_threads(seed_prefix, orig_prefix, 1)
+    }
+
+    /// As [`load_meth`](Self::load_meth), but loads the converted seed FM-index
+    /// with `n_threads` threads, as `bwa-mem3 mem --meth -t` does. The original
+    /// reference is read single-threaded either way. `0` is treated as `1`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`load_meth`](Self::load_meth).
+    pub fn load_meth_with_threads(
+        seed_prefix: impl AsRef<Path>,
+        orig_prefix: impl AsRef<Path>,
+        n_threads: usize,
+    ) -> Result<Self> {
         let seed = seed_prefix.as_ref();
         let orig = orig_prefix.as_ref();
 
@@ -180,8 +195,12 @@ impl BwaIndex {
 
         let seed_c = prefix_to_cstring(seed, "seed prefix")?;
         let orig_c = prefix_to_cstring(orig, "orig prefix")?;
-        let handle =
-            unsafe { bwa_mem3_sys::bwa_shim_idx_load_meth(seed_c.as_ptr(), orig_c.as_ptr()) };
+        let n = i32::try_from(n_threads.max(1)).unwrap_or(i32::MAX);
+        // SAFETY: `seed_c` and `orig_c` are valid, NUL-terminated C strings for
+        // the duration of this call.
+        let handle = unsafe {
+            bwa_mem3_sys::bwa_shim_idx_load_meth_threads(seed_c.as_ptr(), orig_c.as_ptr(), n)
+        };
         if handle.is_null() {
             return Err(Error::IndexLoad {
                 path: seed.to_owned(),

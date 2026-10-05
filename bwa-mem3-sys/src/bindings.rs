@@ -1603,6 +1603,13 @@ extern "C" {
     ) -> *mut BwaIndex;
 }
 extern "C" {
+    pub fn bwa_shim_idx_load_meth_threads(
+        seed_prefix: *const ::std::os::raw::c_char,
+        orig_prefix: *const ::std::os::raw::c_char,
+        n_threads: ::std::os::raw::c_int,
+    ) -> *mut BwaIndex;
+}
+extern "C" {
     pub fn bwa_shim_idx_is_meth(idx: *const BwaIndex) -> ::std::os::raw::c_int;
 }
 extern "C" {

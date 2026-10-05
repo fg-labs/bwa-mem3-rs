@@ -60,7 +60,8 @@ extern "C" {
 
     void *shim_align_idx_load(const char *prefix);
     void *shim_align_idx_load_threads(const char *prefix, int n_threads);
-    void *shim_align_idx_load_meth(const char *seed_prefix, const char *orig_prefix);
+    void *shim_align_idx_load_meth_threads(const char *seed_prefix, const char *orig_prefix,
+                                           int n_threads);
     int   shim_align_idx_is_meth(void *fmi);
     void  shim_align_idx_free(void *fmi);
     size_t shim_align_idx_n_contigs(void *fmi);
@@ -401,6 +402,14 @@ extern "C" BwaIndex *bwa_shim_idx_load_threads(const char *prefix, int n_threads
  * Used with a mem_opt_t whose meth_mode is set. */
 extern "C" BwaIndex *bwa_shim_idx_load_meth(const char *seed_prefix,
                                             const char *orig_prefix) {
+    return bwa_shim_idx_load_meth_threads(seed_prefix, orig_prefix, /*n_threads=*/1);
+}
+
+/* As bwa_shim_idx_load_meth, loading the seed FM-index with `n_threads` (>= 1)
+ * threads, as the CLI loads it with `-t`. `n_threads < 1` is clamped to 1. */
+extern "C" BwaIndex *bwa_shim_idx_load_meth_threads(const char *seed_prefix,
+                                                    const char *orig_prefix,
+                                                    int n_threads) {
     shim_clear_err();
     if (!seed_prefix || !orig_prefix) {
         shim_set_err("null prefix");
@@ -411,7 +420,7 @@ extern "C" BwaIndex *bwa_shim_idx_load_meth(const char *seed_prefix,
         shim_set_err("calloc failed");
         return NULL;
     }
-    h->fmi = shim_align_idx_load_meth(seed_prefix, orig_prefix);
+    h->fmi = shim_align_idx_load_meth_threads(seed_prefix, orig_prefix, n_threads);
     if (!h->fmi) {
         shim_set_err("meth dual-index load failed for seed '%s' / orig '%s'",
                      seed_prefix, orig_prefix);
