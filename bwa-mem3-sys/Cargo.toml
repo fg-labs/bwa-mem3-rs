@@ -46,7 +46,7 @@ regenerate-bindings = ["dep:bindgen"]
 libc = "0.2"
 
 [build-dependencies]
-cc = "1"
+cc = "1.2" # link_lib_modifier
 bindgen = { version = "0.69", optional = true }
 
 [dev-dependencies]

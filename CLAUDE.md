@@ -129,7 +129,7 @@ with `-DKERNEL_VARIANT=_<tier>` plus the tier's `-m...` flag set; `kernel_dispat
 mangles every exported symbol to `<name><tier>`. `simd_dispatch.cpp` (compiled
 once at the baseline) provides unmangled wrappers (`make_banded_pair_wise_sw`,
 `make_kswv`, `ksw_extend2`, `sam_encode_seq_fwd`, …) that pick a tier at
-runtime via `__builtin_cpu_supports`. `build.rs` walks
+runtime via `__builtin_cpu_supports`. `build.rs` (step 4b) walks
 `KERNEL_TIERS_X86` to emit the five `bwa-mem3-kernel-<tier>` archives and
 excludes the kernel TUs from the baseline build. On aarch64, kernel TUs are
 compiled once with `KERNEL_VARIANT` unset and the dispatcher's `#else` branch
@@ -140,14 +140,16 @@ calls them directly.
 `-m` flags, and the linker keeps the first copy it loads. If the avx512bw copy
 wins, the AVX2 and baseline paths call AVX-512 code and the binary dies with
 SIGILL on x86_64 CPUs without AVX-512 (it did, through v0.4.2). `build.rs`
-therefore compiles the baseline (4a) before the kernel tiers (4b, sse41 up to
-avx512bw), each with cc's `link_lib_modifier("+whole-archive")`: cc emits the
-link lines in compile order, so load order alone decides and a safe copy wins.
-Don't reorder those compiles. Upstream's Makefile links `main.o`, then the
-kernel objects sse41 → avx512bw, then `libbwa.a`, so its lowest tier wins the
-same way. CI's `isa-leak` job runs
-`scripts/check-isa-leak.sh` on the release binary; run it after any change to
-the kernel build or link setup.
+therefore compiles the baseline (4a) before the kernel tiers (4b, in
+`KERNEL_TIERS_X86` order, sse41 up to avx512bw), each with cc's
+`link_lib_modifier("+whole-archive")`: cc emits the link lines in compile
+order, so load order alone decides, and the baseline's copy (or, for code only
+kernels use, the lowest tier's) wins. Don't reorder those compiles or the tier
+array; `build.rs` asserts the order. Upstream's Makefile links `main.o`, then
+the kernel objects sse41 → avx512bw, then `libbwa.a`: it also loads every lower
+tier before avx512bw, though it keeps the sse41 copy where this crate keeps the
+baseline's. CI's `isa-leak` job runs `scripts/check-isa-leak.sh` on the release
+binary; run it after any change to the kernel build or link setup.
 
 ### 10. The Python stub mirrors `bwa-mem3-py/src/lib.rs` by hand
 
