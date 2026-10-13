@@ -140,7 +140,7 @@ fn main() {
     // generates version.h from scripts/version.sh (Makefile:635); the pruned
     // vendor tree has no git metadata, so version.txt is the source of truth.
     // Computed here (before the kernel loop below) so every compiled TU --
-    // the five per-tier kernel builds in 4a and the main build in 4b -- gets
+    // the main build in 4a and the five per-tier kernel builds in 4b -- gets
     // the same `-DPACKAGE_VERSION` define.
     let version = fs::read_to_string(vendor_root.join("version.txt"))
         .expect("vendor/bwa-mem3/version.txt")
@@ -149,44 +149,20 @@ fn main() {
     println!("cargo:rustc-env=BWA_MEM3_SYS_VERSION={version}");
     println!("cargo:rerun-if-changed=vendor/bwa-mem3/version.txt");
 
-    // 4a. Per-tier kernel TUs (x86_64 only). bwa-mem3 v0.2.0 picks the
-    // matching tier at runtime in `simd_dispatch.cpp`; we must supply all
-    // five mangled tier copies of bandedSWA/kswv/ksw/sam_encode so the
-    // dispatcher's `make_bsw_kernel_<tier>` / `ksw_extend2_<tier>` /
-    // `sam_encode_seq_fwd_<tier>` references resolve at link time.
-    if is_x86 {
-        for (tier, isa_flags) in KERNEL_TIERS_X86 {
-            let mut k_build = cc::Build::new();
-            k_build.cpp(true);
-            for src in KERNEL_SRCS {
-                k_build.file(vendor_src.join(src));
-            }
-            if s2n.is_dir() {
-                k_build.include(&s2n);
-            }
-            k_build.include(manifest.join("shim"));
-            k_build.include(&vendor_src);
-            for flag in *isa_flags {
-                k_build.flag_if_supported(flag);
-            }
-            k_build.std("c++17");
-            k_build.define("ENABLE_PREFETCH", None);
-            k_build.define("V17", Some("1"));
-            k_build.define("MATE_SORT", Some("0"));
-            k_build.define("PACKAGE_VERSION", Some(format!("\"{version}\"").as_str()));
-            // kernel_dispatch.h mangles every exported kernel symbol to
-            // `<name><KERNEL_VARIANT>` (e.g. `_avx2`). The dispatcher in
-            // simd_dispatch.cpp expects this exact suffix per tier.
-            k_build.define("KERNEL_VARIANT", Some(format!("_{}", tier).as_str()));
-            if cfg!(feature = "debug-poison") {
-                k_build.define("BWA_MEM3_DEBUG_POISON", None);
-            }
-            apply_common_warning_silencing(&mut k_build);
-            k_build.compile(&format!("bwa-mem3-kernel-{}", tier));
-        }
-    }
-
-    // 4b. bwa-mem3 + shim: C++.
+    // 4a. bwa-mem3 + shim: C++.
+    //
+    // Link order: this baseline archive first, then the x86_64 kernel archives (4b) from the
+    // lowest SIMD tier to the highest, every member of each (`+whole-archive`). cc emits each
+    // `rustc-link-lib` line when its `compile()` runs, so the compile order below is the link
+    // order. Inline and template functions a kernel TU instantiates
+    // (`std::vector<short>::_M_fill_assign`, ...) are weak/COMDAT symbols compiled with that
+    // tier's `-m` flags, and the linker keeps the first copy it loads. Pulled on demand from
+    // archives, the avx512bw copy could win (and did, through v0.4.2); the AVX2 and baseline paths
+    // then called AVX-512 code and died with SIGILL on x86_64 CPUs without AVX-512. Loading every
+    // member in this fixed order makes the baseline copy win for anything the baseline also uses
+    // and the lowest tier's copy win for anything only kernels use. (Upstream's Makefile links
+    // `main.o`, then the kernel objects sse41 -> avx512bw, then `libbwa.a`, so its lowest tier wins
+    // the same way.) `scripts/check-isa-leak.sh` checks a linked binary for the failure.
     let mut build = cc::Build::new();
     build.cpp(true);
 
@@ -209,7 +185,7 @@ fn main() {
     // not `.cpp`, so the *.cpp glob below never picks them up; they sit unused
     // in the vendor tree.
     //
-    // On x86_64 the kernel TUs are compiled separately per tier in 4a
+    // On x86_64 the kernel TUs are compiled separately per tier in 4b
     // (`KERNEL_TIERS_X86`); skip them here so the baseline build doesn't
     // also emit unmangled copies (and so this build inherits no `-mavx512bw`
     // surprises from the baseline ISA). On arm64 the kernels compile once
@@ -277,7 +253,46 @@ fn main() {
     };
     println!("cargo:rustc-env=BWA_MEM3_SYS_X86_TIERS={tiers}");
 
+    build.link_lib_modifier("+whole-archive");
     build.compile("bwa-mem3");
+
+    // 4b. Per-tier kernel TUs (x86_64 only), compiled after the baseline so they link after it,
+    // lowest tier first (see the link-order note at 4a). bwa-mem3 v0.2.0 picks the matching tier
+    // at runtime in `simd_dispatch.cpp`; we must supply all five mangled tier copies of
+    // bandedSWA/kswv/ksw/sam_encode so the dispatcher's `make_bsw_kernel_<tier>` /
+    // `ksw_extend2_<tier>` / `sam_encode_seq_fwd_<tier>` references resolve at link time.
+    if is_x86 {
+        for (tier, isa_flags) in KERNEL_TIERS_X86 {
+            let mut k_build = cc::Build::new();
+            k_build.cpp(true);
+            for src in KERNEL_SRCS {
+                k_build.file(vendor_src.join(src));
+            }
+            if s2n.is_dir() {
+                k_build.include(&s2n);
+            }
+            k_build.include(manifest.join("shim"));
+            k_build.include(&vendor_src);
+            for flag in *isa_flags {
+                k_build.flag_if_supported(flag);
+            }
+            k_build.std("c++17");
+            k_build.define("ENABLE_PREFETCH", None);
+            k_build.define("V17", Some("1"));
+            k_build.define("MATE_SORT", Some("0"));
+            k_build.define("PACKAGE_VERSION", Some(format!("\"{version}\"").as_str()));
+            // kernel_dispatch.h mangles every exported kernel symbol to
+            // `<name><KERNEL_VARIANT>` (e.g. `_avx2`). The dispatcher in
+            // simd_dispatch.cpp expects this exact suffix per tier.
+            k_build.define("KERNEL_VARIANT", Some(format!("_{}", tier).as_str()));
+            if cfg!(feature = "debug-poison") {
+                k_build.define("BWA_MEM3_DEBUG_POISON", None);
+            }
+            apply_common_warning_silencing(&mut k_build);
+            k_build.link_lib_modifier("+whole-archive");
+            k_build.compile(&format!("bwa-mem3-kernel-{}", tier));
+        }
+    }
 
     println!("cargo:rustc-link-lib=z");
     println!("cargo:rustc-link-lib=pthread");

@@ -135,6 +135,20 @@ excludes the kernel TUs from the baseline build. On aarch64, kernel TUs are
 compiled once with `KERNEL_VARIANT` unset and the dispatcher's `#else` branch
 calls them directly.
 
+**Link order matters.** A kernel TU's inline and template functions (e.g.
+`std::vector<short>::_M_fill_assign`) are weak symbols compiled with that tier's
+`-m` flags, and the linker keeps the first copy it loads. If the avx512bw copy
+wins, the AVX2 and baseline paths call AVX-512 code and the binary dies with
+SIGILL on x86_64 CPUs without AVX-512 (it did, through v0.4.2). `build.rs`
+therefore compiles the baseline (4a) before the kernel tiers (4b, sse41 up to
+avx512bw), each with cc's `link_lib_modifier("+whole-archive")`: cc emits the
+link lines in compile order, so load order alone decides and a safe copy wins.
+Don't reorder those compiles. Upstream's Makefile links `main.o`, then the
+kernel objects sse41 → avx512bw, then `libbwa.a`, so its lowest tier wins the
+same way. CI's `isa-leak` job runs
+`scripts/check-isa-leak.sh` on the release binary; run it after any change to
+the kernel build or link setup.
+
 ### 10. The Python stub mirrors `bwa-mem3-py/src/lib.rs` by hand
 
 `bwa-mem3-py/python/bwa_mem3/_bwa_mem3.pyi` is a hand-written type stub for

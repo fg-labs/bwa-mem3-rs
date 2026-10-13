@@ -83,6 +83,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - run: cargo build -p bwa-mem3-sys --features regenerate-bindings
 
+  isa-leak:
+    # bwa-mem3's kernel TUs are compiled per SIMD tier, so the avx512bw TU's copies of shared
+    # inline/template functions contain AVX-512 code. If the linker keeps one of those copies,
+    # the AVX2 and baseline paths call it and the binary dies with SIGILL on x86_64 CPUs without
+    # AVX-512 (build.rs `emit_link_order`). A runner may or may not have AVX-512, so running the
+    # tests cannot catch this reliably; inspect the optimized binary instead (debug builds compile
+    # the C++ at -O0 and auto-vectorize nothing).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+      - run: cargo build --release -p bwa-mem3-rs-cli --locked
+      - run: bash scripts/check-isa-leak.sh target/release/bwa-rs
+
   scripts:
     # The vendor-bump automation is bash, so unit-test it like anything else.
     # shellcheck runs alongside: these scripts push branches and open PRs, so
