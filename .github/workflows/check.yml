@@ -84,12 +84,10 @@ jobs:
       - run: cargo build -p bwa-mem3-sys --features regenerate-bindings
 
   isa-leak:
-    # bwa-mem3's kernel TUs are compiled per SIMD tier, so the avx512bw TU's copies of shared
-    # inline/template functions contain AVX-512 code. If the linker keeps one of those copies,
-    # the AVX2 and baseline paths call it and the binary dies with SIGILL on x86_64 CPUs without
-    # AVX-512 (build.rs `emit_link_order`). A runner may or may not have AVX-512, so running the
-    # tests cannot catch this reliably; inspect the optimized binary instead (debug builds compile
-    # the C++ at -O0 and auto-vectorize nothing).
+    # Fails if the release bwa-rs can run AVX-512 code from outside the avx512bw kernel tier,
+    # which dies with SIGILL on x86_64 CPUs without AVX-512 (link order: bwa-mem3-sys/build.rs
+    # step 4a). Whether a runner has AVX-512 varies, so running the tests cannot catch this; the
+    # binary is inspected instead, optimized because debug builds compile the C++ at -O0.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

@@ -23,6 +23,10 @@ const KERNEL_SRCS: &[&str] = &["bandedSWA.cpp", "kswv.cpp", "ksw.cpp", "sam_enco
 /// -mpopcnt`). It is harmless here — the kernels use intrinsics, not
 /// auto-vec — but capping vector width matches upstream's intent on Skylake-X
 /// where 512-bit ops can downclock.
+///
+/// The order is load-bearing: the tiers are compiled, and therefore linked, in this order, lowest
+/// first, so that a shared function's avx512bw copy never wins (see step 4a in `main`). `main`
+/// asserts it.
 const KERNEL_TIERS_X86: &[(&str, &[&str])] = &[
     ("sse41", &["-msse4.1"]),
     ("sse42", &["-msse4.2", "-mpopcnt"]),
@@ -160,9 +164,12 @@ fn main() {
     // archives, the avx512bw copy could win (and did, through v0.4.2); the AVX2 and baseline paths
     // then called AVX-512 code and died with SIGILL on x86_64 CPUs without AVX-512. Loading every
     // member in this fixed order makes the baseline copy win for anything the baseline also uses
-    // and the lowest tier's copy win for anything only kernels use. (Upstream's Makefile links
-    // `main.o`, then the kernel objects sse41 -> avx512bw, then `libbwa.a`, so its lowest tier wins
-    // the same way.) `scripts/check-isa-leak.sh` checks a linked binary for the failure.
+    // and the lowest tier's copy win for anything only kernels use. The lower tiers then share the
+    // baseline's copy, compiled at the baseline ISA (AVX2 by default, `apply_simd_flags`), which
+    // the binary requires anyway. (Upstream's Makefile links `main.o`, then the kernel objects
+    // sse41 -> avx512bw, then `libbwa.a`: it also loads every lower tier before avx512bw, though
+    // it keeps the sse41 copy where this build keeps the baseline's.) `scripts/check-isa-leak.sh`
+    // checks a linked binary for the failure.
     let mut build = cc::Build::new();
     build.cpp(true);
 
@@ -262,6 +269,12 @@ fn main() {
     // bandedSWA/kswv/ksw/sam_encode so the dispatcher's `make_bsw_kernel_<tier>` /
     // `ksw_extend2_<tier>` / `sam_encode_seq_fwd_<tier>` references resolve at link time.
     if is_x86 {
+        let tiers: Vec<&str> = KERNEL_TIERS_X86.iter().map(|(tier, _)| *tier).collect();
+        assert_eq!(
+            tiers,
+            ["sse41", "sse42", "avx", "avx2", "avx512bw"],
+            "KERNEL_TIERS_X86 must stay lowest tier first: its order is the link order (step 4a)"
+        );
         for (tier, isa_flags) in KERNEL_TIERS_X86 {
             let mut k_build = cc::Build::new();
             k_build.cpp(true);
