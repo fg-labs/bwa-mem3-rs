@@ -44,6 +44,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwa.h"
 #include "bwamem.h"
 #include "kthread.h"
+#include "read_memo.h"
 #include "stage_prof.h"
 #include "kvec.h"
 #include "utils.h"
@@ -57,6 +58,7 @@ KSEQ_DECLARE(gzFile)
 struct bam_writer_s;
 
 #include "fast_reader.h"
+#include "bwa_thp.h"
 
 typedef struct {
 	kseq_t *ks, *ks2;
@@ -131,6 +133,8 @@ typedef struct {
 	 * via _mm_malloc here (never shm) and _mm_free'd on teardown. NULL outside
 	 * --meth (or when no original prefix resolved). */
 	uint8_t  *meth_orig_ref_string;
+	/* THP-fallback stderr check (bwa_thp.h), driven from the write step. */
+	bwa_thp_monitor_t thp;
 } ktp_aux_t;
 
 typedef struct {
@@ -147,6 +151,11 @@ typedef struct {
 	 * aligns the slice and returns an empty item, which the pipeline passes
 	 * through harmlessly -- returning NULL would retire the worker. */
 	int cohort_complete;
+	/* [dedup-reads] read-memo pre-pass run by step 0 for this item (when
+	 * has_memo), consumed and freed by step 1. ktp_data_t is calloc'd, so an
+	 * item step 0 did not run it for has has_memo 0 and an empty state. */
+	int has_memo;
+	struct read_memo_handoff memo;
 } ktp_data_t;
 
     

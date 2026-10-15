@@ -991,8 +991,10 @@ static inline mem_alnreg_t *alnreg_save_buf(int n)
 
 /* Emit `static void fn(int n, mem_alnreg_t *a)` that sorts `a` exactly as
  * ks_introsort(name, n, a) would, but via pdqsort_##name whenever `lt` sees no
- * tie. `lt` must be the comparator KSORT_INIT and PDQSORT_INIT were given.
- * Used for the dedup sorts below and the primary-marking sorts. */
+ * tie. `lt` must be the comparator KSORT_INIT was given, and pdqsort_##name's
+ * comparator must define the same strict order (it may be a branch-free
+ * spelling of it, as for the primary-marking sorts). Used for the dedup sorts
+ * below and the primary-marking sorts. */
 #define DEDUP_TIE_SORT_INIT(fn, name, lt)                                        \
     static void fn(int n, mem_alnreg_t *a)                                       \
     {                                                                            \
@@ -1066,8 +1068,17 @@ typedef struct { int score; int64_t rb; int qb; uint32_t idx; } dedup_pair_sc;
                             ((a).rb < (b).rb || ((a).rb == (b).rb && (a).qb < (b).qb))))
 KSORT_INIT(dedup_pre, dedup_pair_re, dedup_pre_lt)
 KSORT_INIT(dedup_psc, dedup_pair_sc, dedup_psc_lt)
-PDQSORT_INIT(dedup_pre, dedup_pair_re, dedup_pre_lt)
-PDQSORT_INIT(dedup_psc, dedup_pair_sc, dedup_psc_lt)
+/* Every pdqsort of these pairs is followed by the tie scan in
+ * dedup_pre_finish / dedup_psc_finish, which keeps the result only when it is
+ * tie-free (hence unique) and otherwise re-sorts with the introsort, so the
+ * branchless partition is output-identical here. dedup_psc_lt_bf is
+ * dedup_psc_lt without short-circuits; the tie scan uses dedup_psc_lt, so if
+ * the two ever disagreed the scan would see an out-of-order pair as a tie and
+ * fall back to the introsort rather than keep a wrong order. */
+#define dedup_psc_lt_bf(a, b) (((a).score > (b).score) | (((a).score == (b).score) & \
+                               (((a).rb < (b).rb) | (((a).rb == (b).rb) & ((a).qb < (b).qb)))))
+PDQSORT_BRANCHLESS_INIT(dedup_pre, dedup_pair_re, dedup_pre_lt)
+PDQSORT_BRANCHLESS_INIT(dedup_psc, dedup_pair_sc, dedup_psc_lt_bf)
 
 /* Below this the pair indirection costs more than the 112-byte moves it saves,
  * and the in-place path pays no save-copy there anyway (< DEDUP_SORT_PDQ_MIN). */
@@ -1432,8 +1443,19 @@ KSORT_INIT(mem_ars_hash2, mem_alnreg_t, alnreg_hlt2)
  * the dedup sorts, since pdqsort wins nothing there; above it the whole-array
  * ks_introsort of 112-byte records is replaced by pdqsort plus the save-copy
  * and tie scan the scheme pays. */
-PDQSORT_INIT(mem_ars_hash,  mem_alnreg_t, alnreg_hlt)
-PDQSORT_INIT(mem_ars_hash2, mem_alnreg_t, alnreg_hlt2)
+/* These pdqsorts back DEDUP_TIE_SORT_INIT only, which keeps the pdqsort result
+ * only when it has no tied adjacent pair (the order is then unique) and
+ * otherwise restores the input and runs the introsort. So the partition
+ * scheme cannot change the output, and the branchless one is used, with the
+ * same orders written without short-circuits. The tie check uses the original
+ * alnreg_hlt / alnreg_hlt2, so a drifted _bf order would fall back to the
+ * introsort rather than survive. */
+#define alnreg_hlt_bf(a, b)  (((a).score > (b).score) | (((a).score == (b).score) & \
+                              (((a).is_alt < (b).is_alt) | (((a).is_alt == (b).is_alt) & ((a).hash < (b).hash)))))
+#define alnreg_hlt2_bf(a, b) (((a).is_alt < (b).is_alt) | (((a).is_alt == (b).is_alt) & \
+                              (((a).score > (b).score) | (((a).score == (b).score) & ((a).hash < (b).hash)))))
+PDQSORT_BRANCHLESS_INIT(mem_ars_hash,  mem_alnreg_t, alnreg_hlt_bf)
+PDQSORT_BRANCHLESS_INIT(mem_ars_hash2, mem_alnreg_t, alnreg_hlt2_bf)
 DEDUP_TIE_SORT_INIT(primary_sort_by_hash,     mem_ars_hash,  alnreg_hlt)
 DEDUP_TIE_SORT_INIT(primary_sort_by_hash_alt, mem_ars_hash2, alnreg_hlt2)
 
@@ -1442,6 +1464,19 @@ DEDUP_TIE_SORT_INIT(primary_sort_by_hash_alt, mem_ars_hash2, alnreg_hlt2)
 void bwamem3_primary_sort_by_hash(int n, mem_alnreg_t *a)               { primary_sort_by_hash(n, a); }
 void bwamem3_primary_sort_by_hash_exact(int n, mem_alnreg_t *a)         { ks_introsort(mem_ars_hash, n, a); }
 void bwamem3_primary_sort_by_hash_alt(int n, mem_alnreg_t *a)           { primary_sort_by_hash_alt(n, a); }
+/* Exposed for test/unit/test_alnreg_sort_dedup.cpp: 1 if each branch-free
+ * comparator the pdqsorts use agrees with its short-circuit twin on (a, b).
+ * A drifted twin would not change output (the tie scans use the originals and
+ * fall back to the introsort), only silently lose the fast path. */
+int bwamem3_sort_cmp_twins_agree(const mem_alnreg_t *a, const mem_alnreg_t *b)
+{
+    dedup_pair_sc pa, pb;
+    pa.score = a->score; pa.rb = a->rb; pa.qb = a->qb; pa.idx = 0;
+    pb.score = b->score; pb.rb = b->rb; pb.qb = b->qb; pb.idx = 1;
+    return (!!alnreg_hlt(*a, *b) == !!alnreg_hlt_bf(*a, *b)) &&
+           (!!alnreg_hlt2(*a, *b) == !!alnreg_hlt2_bf(*a, *b)) &&
+           (!!dedup_psc_lt(pa, pb) == !!dedup_psc_lt_bf(pa, pb));
+}
 void bwamem3_primary_sort_by_hash_alt_exact(int n, mem_alnreg_t *a)     { ks_introsort(mem_ars_hash2, n, a); }
 
 #if MATE_SORT
@@ -3237,7 +3272,12 @@ struct ChainFlat {
         size_t n = keys.size();
         if (n == 0) return 0;
         const int64_t *b = keys.data();
-        while (n > 1) { const size_t h = n >> 1; b = (b[h] <= pos) ? b + h : b; n -= h; }
+        /* The step must stay a conditional move: the comparison is data-dependent
+         * (a coin flip per level), and as a branch it mispredicted ~37% of the time
+         * on x86 -- clang's cmov-conversion pass had turned the select back into a
+         * jump. BWA_UNPREDICTABLE (__builtin_unpredictable under clang) keeps it a
+         * cmov there; other compilers get the plain select. */
+        while (n > 1) { const size_t h = n >> 1; b = BWA_UNPREDICTABLE(b[h] <= pos) ? b + h : b; n -= h; }
         return (int)(b - keys.data()) + (*b <= pos);
     }
     /* Chain one seed. TIE / CAP: the tree must take this read (nothing mutated). */
@@ -4101,8 +4141,8 @@ static void worker_aln(void *data, int seq_id, int batch_size, int tid)
  * original slot and leave DUP slots empty. Kernel2 (worker_aln) then runs
  * UNMODIFIED over the original view -- a DUP's empty chains yield empty regs,
  * which read_memo_copy_regs later overwrites with the REP's. The work item
- * [seq_id, seq_id+batch_size) is pair-aligned (kt_for splits on the even
- * BATCH_SIZE and the PE tail is even), so whole pairs move as a unit and
+ * [seq_id, seq_id+batch_size) is pair-aligned (kt_for items start and end on
+ * even reads, see kt_item_layout), so whole pairs move as a unit and
  * kernel1's l^1 mate-concordant cap still pairs mates correctly. */
 static void worker_bwt_memo(worker_t *w, int seq_id, int batch_size, int tid)
 {
@@ -4556,7 +4596,7 @@ void mem_pair_and_emit_cohort(mem_opt_t *opt,
             const bntseq_t *pestat_bns = mem_aln_bns(&w);
             fprintf(stderr, "[0000] Inferring insert size distribution of PE reads from data, "
                     "l_pac: %lld, n: %d\n", (long long)pestat_bns->l_pac, n);
-            mem_pestat(opt, pestat_bns->l_pac, n, w.regs, pes);
+            mem_pestat_par(opt, pestat_bns->l_pac, n, w.regs, pes, w.nthreads);
         }
         /* Publish the FR proper-pair insert high bound onto opt so the NEXT
          * cohort's mate-concordant chain cap (which runs before pairing) can use
@@ -4590,12 +4630,19 @@ void mem_readmemo_teardown(void)
     read_memo_teardown();
 }
 
+int mem_read_memo_prepass_eligible(const mem_opt_t *opt, int n)
+{
+    return (read_memo_mode() != READMEMO_OFF || read_memo_verify()) && (opt->flag & MEM_F_PE)
+           && !opt->meth_mode && n > 0 && (n & 1) == 0;
+}
+
 void mem_process_seqs(mem_opt_t *opt,
                       int64_t n_processed,
                       int n,
                       bseq1_t *seqs,
                       const mem_pestat_t *pes0,
-                      worker_t &w)
+                      worker_t &w,
+                      const read_memo_handoff *pre)
 {
     mem_pestat_t pes[4];
     double ctime, rtime;
@@ -4639,9 +4686,19 @@ void mem_process_seqs(mem_opt_t *opt,
      * stays false), so the regs-invariance check actually fires instead of
      * silently doing nothing. */
     const bool rm_verify = read_memo_verify();
-    if ((read_memo_mode() != READMEMO_OFF || rm_verify) && (opt->flag & MEM_F_PE)
-        && !opt->meth_mode && n_ > 0 && (n_ & 1) == 0) {
-        rm_r = read_memo_prepass(opt, seqs, n_, &g_readmemo_state);
+    const read_memo_state *rm_st = &g_readmemo_state;
+    if (mem_read_memo_prepass_eligible(opt, n_)) {
+        /* The pipeline's read step usually ran the pre-pass on these same reads
+         * already (fastmap.cpp step 0). It is a pure function of the reads' bases
+         * and order, so its result is the one computing it here would give. */
+        if (pre != NULL) {
+            xassert(pre->r.pairs == n_ / 2 && pre->st.npairs == n_ / 2,
+                    "read-memo pre-pass from the read step does not match this chunk");
+            rm_r = pre->r;
+            rm_st = &pre->st;
+        } else {
+            rm_r = read_memo_prepass(opt, seqs, n_, &g_readmemo_state);
+        }
         rm_measure = true;
         rm_arm = read_memo_should_arm(rm_r.dup_pairs) != 0;
     }
@@ -4651,7 +4708,7 @@ void mem_process_seqs(mem_opt_t *opt,
      * and their independently-computed regs are compared to the representative's;
      * real memo copying stays gated on rm_arm below. */
     const bool rm_run_pairs = rm_arm || (rm_measure && rm_verify);
-    w.memo = rm_run_pairs ? &g_readmemo_state : NULL;
+    w.memo = rm_run_pairs ? rm_st : NULL;
     const auto rm_t0 = std::chrono::steady_clock::now();
 
     uint64_t tim = __rdtsc();
@@ -4703,8 +4760,8 @@ void mem_process_seqs(mem_opt_t *opt,
             const bntseq_t *pestat_bns = mem_aln_bns(&w);
             fprintf(stderr, "[0000] Inferring insert size distribution of PE reads from data, "
                     "l_pac: %lld, n: %d\n", (long long)pestat_bns->l_pac, n);
-            mem_pestat(opt, pestat_bns->l_pac, n, w.regs, pes); // otherwise, infer the insert size
-                                                         // distribution from data
+            mem_pestat_par(opt, pestat_bns->l_pac, n, w.regs, pes, w.nthreads); // otherwise, infer the
+                                                                                 // insert size distribution from data
         }
         /* Publish the FR proper-pair insert high bound onto opt so the NEXT
          * chunk's mate-concordant chain cap (which runs before pairing) can use
@@ -4721,8 +4778,9 @@ void mem_process_seqs(mem_opt_t *opt,
     kt_for(worker_sam, &w,  n_);   // SAM
     tprof[WORKER20][0] += __rdtsc() - tim;
 
-    /* [dedup-reads] The memo points at g_readmemo_state, whose role[]/rep_pair[]
-     * describe THIS chunk only; clear it so it can never be reused by a later
+    /* [dedup-reads] The memo points at g_readmemo_state or the read step's
+     * pre-pass, whose role[]/rep_pair[] describe THIS chunk only (and the latter
+     * is freed once this returns); clear it so it can never be reused by a later
      * chunk or a different align entry path. */
     w.memo = NULL;
 
