@@ -1182,34 +1182,36 @@ void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
  * Target the interval the lookahead slot will actually read next, which
  * differs by phase:
  *
- *   PH_FWD: smem is live and the next forward step consumes it, so warm all
- *           four of its checkpoint blocks (k, l, k+s, l+s).
- *
  *   PH_BWD: ls_advance_backward_step runs entirely out of prev[] and NEVER
  *           rewrites smem, so smem here is the STALE leftover from the end of
- *           the forward phase -- warming it prefetches lines the backward walk
- *           will not touch. The next backward step instead calls backwardExt on
- *           each live prev[p], reading cp_occ[prev[p].k] and cp_occ[prev[p].k +
- *           prev[p].s]. Aim the lookahead at those. This keeps the N/2-ahead L2
- *           memory-level parallelism (the part that was actually hiding DRAM
- *           latency) but points it at blocks that are really read. Pure hint,
- *           so output is unchanged. */
+ *           the forward phase. The next backward step calls backwardExt on
+ *           prev[0] first, reading cp_occ[prev[0].k] and
+ *           cp_occ[prev[0].k + prev[0].s]; warm those two blocks.
+ *   otherwise: warm smem.l and smem.l + smem.s, the blocks the next forward
+ *           step reads for its sp/ep.
+ *
+ * The lookahead slot's phase is effectively random from step to step, so a
+ * phase test (and a loop over prev[]) mispredicts heavily. Instead the two
+ * prefetches are always issued, with the interval chosen by mask selects. Only
+ * the two blocks the next step reads first are warmed; warming more (all of
+ * smem's blocks, or every live prev[p]) needs the branches back and measured
+ * slower.
+ * For PH_DONE / PH_BWD_INIT slots smem holds a stale but in-range interval
+ * (zeros for a never-used slot), so the prefetch is merely wasted. prev[0] is
+ * only dereferenced when phase == PH_BWD, where numPrev >= 1 holds. Pure hint,
+ * so output is unchanged. */
 void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
 {
 #ifdef ENABLE_PREFETCH
-    if (s->phase == PH_BWD) {
-        const int32_t np = s->numPrev;
-        for (int32_t p = 0; p < np; p++) {
-            const SMEM m = s->prev[p];
-            _mm_prefetch((const char *)(&cp_occ[(m.k) >> CP_SHIFT]), _MM_HINT_T1);
-            _mm_prefetch((const char *)(&cp_occ[(m.k + m.s) >> CP_SHIFT]), _MM_HINT_T1);
-        }
-    } else {
-        _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
-        _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
-        _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
-        _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
-    }
+    /* Written as ?: (even with BWA_UNPREDICTABLE) clang still emitted a branch
+     * on the phase test, so the select is mask arithmetic behind BWA_OPAQUE
+     * (macro.h). Checked branch-free with clang 19 on x86-64 and arm64. */
+    uint64_t mask = (uint64_t)0 - (uint64_t)(s->phase == PH_BWD);
+    BWA_OPAQUE(mask);
+    const SMEM *m = (const SMEM *)(((uintptr_t)s->prev & mask) | ((uintptr_t)&s->smem & ~mask));
+    const int64_t lo = (int64_t)(((uint64_t)m->k & mask) | ((uint64_t)m->l & ~mask));
+    _mm_prefetch((const char *)(&cp_occ[(lo) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(lo + m->s) >> CP_SHIFT]), _MM_HINT_T1);
 #else
     (void)s;
 #endif
@@ -1758,8 +1760,8 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
 
     const int32_t N = g_smem_lockstep_n;
     // slots[] is a fixed SMEM_LOCKSTEP_N_MAX stack array indexed in [0, N);
-    // the env parser clamps to that range, but a direct g_smem_lockstep_n write
-    // (e.g. a test, or a future calibration) could exceed it -- guard the bound.
+    // the env parser and the host default clamp to that range, but a direct
+    // g_smem_lockstep_n write (e.g. a test) could exceed it -- guard the bound.
     xassert(N >= 1 && N <= SMEM_LOCKSTEP_N_MAX,
             "g_smem_lockstep_n out of range [1, SMEM_LOCKSTEP_N_MAX]");
     // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
@@ -1785,7 +1787,8 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     // bound (e.g. MAX_SMEM_PER_SLOT) or shrink when cache.per_slot greatly
     // exceeds the current batch.
     /* Fixed-size on the stack (compile-time MAX); only the first N are used,
-     * where N = g_smem_lockstep_n is the startup-probed runtime width. */
+     * where N = g_smem_lockstep_n is the runtime width resolved at startup
+     * (env pin, opt-in probe, host-tuned default, or compile-time default). */
     BatchSlot slots[SMEM_LOCKSTEP_N_MAX] = {};
     static thread_local LockstepSmemCache cache;
     const size_t per_slot_smems = (size_t)max_readlength;
@@ -1793,7 +1796,8 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
         if (cache.prev  != nullptr) _mm_free(cache.prev);
         if (cache.match != nullptr) _mm_free(cache.match);
         // Grow on EITHER dimension: g_smem_lockstep_n (N) can rise after first
-        // use (BWA3_SMEM_LOCKSTEP_N / the MLP probe), and sizing only on per_slot
+        // use (BWA3_SMEM_LOCKSTEP_N / the MLP probe / the host default, or a
+        // direct write in a test), and sizing only on per_slot
         // would leave slots[N-1] pointing past the allocation.
         const size_t alloc_slots = (size_t)(N > cache.n_slots ? N : cache.n_slots);
         const size_t alloc_per   = per_slot_smems > cache.per_slot ? per_slot_smems : cache.per_slot;
@@ -1827,6 +1831,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
 
     int32_t next_input   = initial;
     int32_t flush_cursor = 0;
+    int32_t flush_slot   = 0;   // slot holding input flush_cursor (see the flush pass)
     int64_t numTotalSmem = *__numTotalSmem;
 
     while (flush_cursor < numReads) {
@@ -1861,37 +1866,35 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
             // replaces the division. Byte-identical.
             int32_t s_la = s + (N >> 1);
             if (s_la >= N) s_la -= N;
-            if (slots[s_la].phase == PH_FWD || slots[s_la].phase == PH_BWD) {
-                ls_prefetch_cp_occ_t1(&slots[s_la]);
-            }
+            ls_prefetch_cp_occ_t1(&slots[s_la]);
         }
 
         // --- Flush pass: in-order emit + slot recycle. ---
-        bool progress = true;
-        while (progress) {
-            progress = false;
-            for (int32_t s = 0; s < N; s++) {
-                if (slots[s].phase == PH_DONE &&
-                    slots[s].ready &&
-                    slots[s].input_idx == flush_cursor) {
-                    for (int32_t m = 0; m < slots[s].match_count; m++) {
-                        matchArray[numTotalSmem++] = slots[s].match_buf[m];
-                    }
-                    query_pos_array[slots[s].input_idx] = slots[s].next_x;
-                    flush_cursor++;
+        // Input i always lives in slot i mod N: slot s is seeded with input s,
+        // and while inputs remain the live window [flush_cursor, next_input) is
+        // exactly N wide, so the slot freed by input k is refilled with input
+        // k + N. So the slot holding input `flush_cursor` is a counter that
+        // wraps at N, instead of a scan of every slot. The emit order and the
+        // slot each new input lands in match the scan.
+        while (flush_cursor < numReads) {
+            const int32_t s = flush_slot;
+            if (!(slots[s].phase == PH_DONE && slots[s].ready)) break;
+            for (int32_t m = 0; m < slots[s].match_count; m++) {
+                matchArray[numTotalSmem++] = slots[s].match_buf[m];
+            }
+            query_pos_array[slots[s].input_idx] = slots[s].next_x;
+            flush_cursor++;
+            if (++flush_slot == N) flush_slot = 0;
 
-                    if (next_input < numReads) {
-                        ls_init_slot(&slots[s], next_input,
-                                     query_pos_array, min_intv_array,
-                                     rid_array, seq_, query_cum_len_ar, enc_qdb);
-                        if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
-                        next_input++;
-                    } else {
-                        slots[s].input_idx = -1;  // retired
-                        slots[s].ready = false;
-                    }
-                    progress = true;
-                }
+            if (next_input < numReads) {
+                ls_init_slot(&slots[s], next_input,
+                             query_pos_array, min_intv_array,
+                             rid_array, seq_, query_cum_len_ar, enc_qdb);
+                if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
+                next_input++;
+            } else {
+                slots[s].input_idx = -1;  // retired
+                slots[s].ready = false;
             }
         }
     }
@@ -2018,13 +2021,14 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
     if (numReads <= 0) return 0;
 
     // Runtime lockstep width (g_bwtseed_lockstep_n, resolved once at startup from
-    // the compile-time default or a BWA3_BWTSEED_LOCKSTEP_N pin). Byte-identical
+    // a BWA3_BWTSEED_LOCKSTEP_N pin, else the host default: 32 on AMD Zen 5
+    // (bwa3_bwtseed_host_default_width), the compile-time default elsewhere). Byte-identical
     // across widths -- batching only. The on-stack slot array is sized to the
     // compile-time BWTSEED_LOCKSTEP_N_MAX so the runtime width can exceed the default.
     const int32_t N = g_bwtseed_lockstep_n;
     // slots[] is a fixed BWTSEED_LOCKSTEP_N_MAX stack array indexed in [0, N);
-    // the env parser clamps to that range, but a direct g_bwtseed_lockstep_n write
-    // (e.g. a test, or a future calibration) could exceed it -- guard the bound.
+    // the env parser and the host default clamp to that range, but a direct
+    // g_bwtseed_lockstep_n write (e.g. a test) could exceed it -- guard the bound.
     xassert(N >= 1 && N <= BWTSEED_LOCKSTEP_N_MAX,
             "g_bwtseed_lockstep_n out of range [1, BWTSEED_LOCKSTEP_N_MAX]");
 
@@ -2038,7 +2042,8 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
     if (per_slot_smems > cache.per_slot || N > cache.n_slots) {
         if (cache.match != nullptr) _mm_free(cache.match);
         // Grow on EITHER dimension: g_bwtseed_lockstep_n (N) can rise after first
-        // use (a BWA3_BWTSEED_LOCKSTEP_N pin / a future per-host calibration), and
+        // use (a BWA3_BWTSEED_LOCKSTEP_N pin / the host default, or a direct
+        // write in a test), and
         // sizing only on per_slot would leave slots[N-1] pointing past the
         // allocation. Mirrors the phase-2 SMEM cache (LockstepSmemCache) above.
         const size_t alloc_slots = (size_t)(N > cache.n_slots ? N : cache.n_slots);
@@ -2068,6 +2073,7 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
 
     int32_t next_input   = initial;
     int32_t flush_cursor = 0;
+    int32_t flush_slot   = 0;   // slot holding input flush_cursor (see the flush pass)
     int64_t numTotalSeed = 0;
 
     while (flush_cursor < numReads) {
@@ -2085,31 +2091,27 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
         }
 
         // Flush pass: emit retired slots in input order; recycle into the
-        // next pending read. Loop until no progress so a chain of newly
-        // retired slots at the cursor flushes in one pass.
-        bool progress = true;
-        while (progress) {
-            progress = false;
-            for (int32_t s = 0; s < N; s++) {
-                if (slots[s].phase == BSD_DONE &&
-                    slots[s].ready &&
-                    slots[s].input_idx == flush_cursor) {
-                    for (int32_t m = 0; m < slots[s].match_count; m++) {
-                        matchArray[numTotalSeed++] = slots[s].match_buf[m];
-                    }
-                    flush_cursor++;
+        // next pending read. As in the SMEM driver, input i always lives in
+        // slot i mod N (slot s is seeded with input s, and the slot freed by
+        // input k is refilled with input k + N), so the slot holding input
+        // `flush_cursor` is a counter that wraps at N instead of a scan.
+        while (flush_cursor < numReads) {
+            const int32_t s = flush_slot;
+            if (!(slots[s].phase == BSD_DONE && slots[s].ready)) break;
+            for (int32_t m = 0; m < slots[s].match_count; m++) {
+                matchArray[numTotalSeed++] = slots[s].match_buf[m];
+            }
+            flush_cursor++;
+            if (++flush_slot == N) flush_slot = 0;
 
-                    if (next_input < numReads) {
-                        bsd_init_slot(&slots[s], next_input,
-                                      max_intv_array, seq_, query_cum_len_ar, enc_qdb);
-                        if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
-                        next_input++;
-                    } else {
-                        slots[s].input_idx = -1;
-                        slots[s].ready     = false;
-                    }
-                    progress = true;
-                }
+            if (next_input < numReads) {
+                bsd_init_slot(&slots[s], next_input,
+                              max_intv_array, seq_, query_cum_len_ar, enc_qdb);
+                if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
+                next_input++;
+            } else {
+                slots[s].input_idx = -1;
+                slots[s].ready     = false;
             }
         }
     }
