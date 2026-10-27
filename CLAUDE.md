@@ -102,7 +102,7 @@ shared list).
 `fast_reader` FASTQ path (libdeflate + zlib-ng), `numa`, and htslib — none of
 which this crate vendors — so it is excluded again. We instead carry verbatim
 file-local copies of just `worker_alloc` / `worker_free` in
-`shim/bwa_shim_align.cpp`; **keep them in sync** (v0.14.0 added the per-thread `mem_cache::rescue_narrow_off` / `rescue_narrow_cap` / `rescue_band` mate-rescue buffers, which `worker_alloc` NULLs and `worker_free` releases via `free` / `rescue_band_batch_free` — a missed field is an uninitialized pointer that `mem_matesw_batch_pre` grows from) with upstream's `fastmap.cpp`
+`shim/bwa_shim_align.cpp`; **keep them in sync** (v0.14.0 added the per-thread `mem_cache::rescue_narrow_off` / `rescue_narrow_cap` / `rescue_band` mate-rescue buffers, which `worker_alloc` NULLs and `worker_free` releases via `free` / `rescue_band_batch_free` — a missed field is an uninitialized pointer that `mem_matesw_batch_pre` grows from; v0.15.1 added `rescue_skip_set` / `rescue_skip_set_cap` on the same terms, plus `worker_t::emit_prefix` / `emit_prefix_ctx`, which `worker_alloc` NULLs) with upstream's `fastmap.cpp`
 on every vendor refresh (the buffer set must match what `mem_kernel1_core` /
 `mem_kernel2_core` expect).
 

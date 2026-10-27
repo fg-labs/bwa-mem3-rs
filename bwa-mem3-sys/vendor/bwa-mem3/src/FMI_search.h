@@ -254,9 +254,10 @@ class FMI_search: public indexEle
      * SMEM_LOCKSTEP_N reads' SMEM walks in slot-interleaved order to expose
      * N independent backwardExt dependency chains to the CPU's out-of-order
      * engine. Per-read algorithm is byte-identical to the scalar path; only
-     * the cross-read interleaving is new. Output in matchArray is written
-     * in the same (read, smem) order as the scalar path via per-slot match
-     * buffers flushed by input-index cursor.
+     * the cross-read interleaving is new. A slot is refilled as soon as its
+     * read finishes; finished reads are emitted in input order through a
+     * per-thread parked list (smem_parked.h), so matchArray is written in the
+     * same (read, smem) order as the scalar path.
      * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                                           int32_t *query_pos_array,
@@ -339,7 +340,14 @@ class FMI_search: public indexEle
                         uint32_t count,
                         int32_t max_occ,
                         int tid);
-    /* drop_sentinel_offset selects the coordinate reported when the LF walk
+    /* One step of a lane's LF walk in the pipelined resolver. `offset` is the
+     * lane's in/out walk length: 0 when a row is first staged, then passed back
+     * unchanged with each continuation. Returns 1 with sa_entry = the resolved
+     * coordinate (sample(pos) + offset, or the sentinel value below). Returns 0
+     * with sa_entry = the next row to pass back in as `pos`; that row may itself
+     * be sampled (the step does not read the sample, so the caller can prefetch
+     * it), and the next call resolves it.
+     * drop_sentinel_offset selects the coordinate reported when the LF walk
      * reaches the sentinel row: 0 = the accumulated walk offset (correct, bwa's
      * behaviour), 1 = 0 (bwa-mem2 v2.2.1's behaviour, selected by
      * --compat=bwa-mem2; see compat_target_t::sa_sentinel_drop_offset). */

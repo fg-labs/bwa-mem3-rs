@@ -118,10 +118,13 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
     __m128i frref128  = _mm_set1_epi8(fc.ref);
     __m128i frread128 = _mm_set1_epi8(fc.read);
     __m128i pmat128 = _mm_load_si128((__m128i *)bsw_pmat_bytes_);
+#if !BSW8_DIAG_SGN
     __m128i pmat_pos128, pmat_neg128;
     SBT_SPLIT8(pmat128, pmat_pos128, pmat_neg128, _mm_setzero_si128());
+#endif
     __m128i amat128 = _mm_load_si128((__m128i *)bsw_amat_bytes_);
     __m128i three128 = _mm_set1_epi8(3);
+    BSW8_SCORES_NOMIN8();
     __m128i e_del128    = _mm_set1_epi8(this->e_del);
     __m128i oe_del128   = _mm_set1_epi8(this->o_del + this->e_del);
     __m128i e_ins128    = _mm_set1_epi8(this->e_ins);
@@ -312,6 +315,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                 cmpim = _mm_or_si128(cmpim, _mm_cmpgt_epi8(head128, tail128));
                 exit0 = blendv_fullmask8(exit0, zero128, cmpim);
             }
+            const __m128i qsent128 = bsw8_qsent128(qlen_off128, qlen_valid128, tail128, exit0);
 
             j128 = _mm_set1_epi8(beg - i);
             __m128i nf_seen128 = zero128, nf_acc128 = zero128;   // see BSW8_NF_TRACK
@@ -325,6 +329,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                 if (fast_hi < fast_lo) fast_hi = fast_lo;
                 if (fast_hi > end) fast_hi = end;
             }
+            __m128i hband128, hwid128;
+            bsw8_hband128(head128, tail128, &hband128, &hwid128);
             /* the cell loops of smithWaterman128_8, through its own macros */
             if (!gen_mat) {
                 EXT13_RUN_SPLIT8_128(EXT13_SBT8_XOR);

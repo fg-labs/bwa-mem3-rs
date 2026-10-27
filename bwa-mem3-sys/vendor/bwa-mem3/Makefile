@@ -34,9 +34,10 @@ endif
 
 EXE=		bwa-mem3
 #CXX=		icpc
-# Pair CC with CXX for the toolchains we know about so libsais.c (the only
-# C TU in this build) doesn't silently fall back to make's default `cc`,
-# which can drift from CXX (e.g. CXX=icpx + CC=gcc would mix toolchains).
+# Pair CC with CXX for the toolchains we know about so the C TUs (libsais.c
+# and the FASTQ reader, src/fast_reader*.c and src/fr_fastq.c) don't silently
+# fall back to make's default `cc`, which can drift from CXX (e.g. CXX=icpx +
+# CC=gcc would mix toolchains). The compiler floor below checks $(CXX) only.
 ifeq ($(CXX), icpc)
 	CC= icc
 else ifeq ($(CXX), icpx)
@@ -622,6 +623,21 @@ DEFAULT_BUILD_GOAL ?= all
 
 CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS) #-Wall ##-xSSE2
 
+# The C TUs in $(OBJS) (src/fast_reader*.c, src/fr_fastq.c: the FASTQ reader)
+# get the C++ TUs' -g -O3 and $(ARCH_FLAGS). Outside sanitizer builds nothing
+# else gives CFLAGS an -O level, so without this they built at the compiler
+# default -O0. SRC_CFLAGS follows $(CFLAGS) on the .c.o line, so this -O3 wins
+# over an -O level in CFLAGS, from the environment or the command line (a
+# command-line CXXFLAGS, by contrast, replaces the C++ -O3). $(ASAN_FLAGS)
+# keeps sanitizer builds at their -O1. To change the reader's flags, e.g. to
+# debug it at -O0, use EXTRA_CFLAGS, which comes last.
+#
+# Not every C++ build mode reaches these TUs: COVERAGE=1 leaves them
+# uninstrumented (as it always has), and EXTRA_CXXFLAGS, which carries the PGO
+# and legacy lto-build flags, is C++ only. libsais is not compiled by .c.o and
+# keeps LIBSAIS_CFLAGS.
+SRC_CFLAGS = -g -O3 $(ARCH_FLAGS) $(ASAN_FLAGS) $(EXTRA_CFLAGS)
+
 # CXXFLAGS used for per-tier kernel TU compilation. Must NOT contain any
 # -m... ISA flag — each per-tier rule appends the right one.
 BASE_CXXFLAGS = -g -O3 -std=gnu++14 -fpermissive $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS)
@@ -681,6 +697,122 @@ ifneq ($(COVERAGE),)
     LDFLAGS       += --coverage
 endif
 
+# Link-time optimization (LTO). LTO=auto (default) | full | thin | off.
+#
+# The default build links the bwa-mem3 binary with clang full LTO, which measured
+# 1.7-3.5% lower wall and CPU time than a plain -O3 build, and 0.3-0.9% lower
+# wall time than ThinLTO (see docs/src/developer-guide/building.md). The gain is
+# cross-file inlining of the glue code around the SIMD kernels (seeding,
+# chaining, the extension driver, paired-end post-processing).
+#
+# Only the objects that go into the binary are compiled for LTO (LTO_CFLAGS on
+# the .cpp.o / .c.o / per-tier / libsais rules), and only the two link recipes
+# that produce the binary ($(EXE) and all-single) link with LTO (LTO_LDFLAGS).
+# The objects are fat LTO objects (-ffat-lto-objects): each .o carries native
+# code plus the bitcode the LTO link reads. So libbwa.a stays an ordinary static
+# archive for every other consumer (the standalone tests below, the doctest
+# suites in test/Makefile, out-of-tree harnesses that link it): their ordinary
+# links just use the native code, GNU ar indexes it without an LTO plugin, and
+# no test binary pays for an LTO link.
+#
+# LTO=auto turns LTO on only where it is known to work, and builds without it
+# otherwise, so a toolchain without LTO support still builds:
+#   - $(CXX) and $(CC) are clang on an ELF target, and a probe compile + link
+#     with -flto=full -ffat-lto-objects -fuse-ld=lld succeeds (clang >= 18 and
+#     ld.lld installed). The probe links the system libraries the real link
+#     uses (-lpthread -lm -lz -ldeflate, OpenMP, htslib's static deps once
+#     htslib is configured), because lld, unlike ld.bfd, has no built-in
+#     search path: a library only ld.bfd would find (e.g. one under /usr/local
+#     without LIBRARY_PATH set) fails the probe instead of the real link. A
+#     clang whose probe fails, or a clang CXX with a non-clang CC, gets a NOTE
+#     on stderr and a non-LTO build.
+#   - GCC: off. Clang is the shipping compiler and GCC LTO is not measured here.
+#   - macOS: off. Apple clang has no -ffat-lto-objects for Mach-O.
+#   - ASAN=1, MSAN=1, COVERAGE=1: off (instrumented, non-shipping builds).
+# LTO=full or LTO=thin force that mode and fail at parse time when it cannot be
+# had. LTO=off builds without it. Like the compiler floor, this resolves only
+# for goals that build: a clean-only goal leaves LTO off.
+#
+# The top-level make resolves the mode and exports it as BWA_LTO_MODE so the
+# recursive makes (single, arm64, all-single) reuse it instead of probing again;
+# a BWA_LTO_MODE inherited from the environment at the top level is ignored.
+# lto-build sets it on its inner make's command line to turn this off.
+LTO ?= auto
+# Exactly one word, and one of the four: a multi-word value ("auto off") would
+# otherwise pass a bare $(filter).
+LTO_VALID := $(if $(filter 1,$(words $(LTO))),$(filter auto thin full off,$(LTO)))
+ifeq ($(LTO_VALID),)
+    ifeq ($(origin LTO),environment)
+        $(warning LTO='$(LTO)' from the environment is not auto, thin, full or off; ignoring it (LTO=auto))
+        override LTO := auto
+    else
+        $(error LTO must be one of auto, thin, full or off (got '$(LTO)'))
+    endif
+endif
+ifeq ($(origin BWA_LTO_MODE),command line)
+    BWA_LTO_RESOLVE :=
+else ifeq ($(MAKELEVEL),0)
+    BWA_LTO_RESOLVE := 1
+else ifndef BWA_LTO_MODE
+    BWA_LTO_RESOLVE := 1
+else
+    BWA_LTO_RESOLVE :=
+endif
+ifeq ($(BWA_LTO_RESOLVE),1)
+    BWA_LTO_MODE := off
+    ifneq ($(strip $(ASAN)$(MSAN)$(COVERAGE)),)
+        ifneq ($(filter thin full,$(LTO)),)
+            $(warning NOTE: LTO=$(LTO) ignored: ASAN, MSAN and COVERAGE builds link without LTO.)
+        endif
+    else ifeq ($(ENFORCE_COMPILER_FLOOR),1)
+    ifneq ($(LTO),off)
+        BWA_LTO_WANT := $(if $(filter auto,$(LTO)),full,$(LTO))
+        BWA_LTO_CXX_CLANG := $(findstring clang,$(shell $(CXX) --version 2>/dev/null | head -1))
+        BWA_LTO_CC_CLANG  := $(findstring clang,$(shell $(CC) --version 2>/dev/null | head -1))
+        ifeq ($(UNAME_S),Darwin)
+            ifneq ($(LTO),auto)
+                $(error LTO=$(LTO) is not supported on macOS (Apple clang has no -ffat-lto-objects); build with LTO=off)
+            endif
+        else ifeq ($(BWA_LTO_CXX_CLANG)$(BWA_LTO_CC_CLANG),clangclang)
+            # Compile a C and a C++ TU as fat LTO objects and link them with lld
+            # against the system libraries the real link uses.
+            BWA_LTO_PROBE_LIBS := -lpthread -lm -lz -ldeflate $(LIBSAIS_OPENMP_LIBS) $(LIBS_EXTRA) \
+                $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),,-lz-ng) $(HTSLIB_static_LIBS)
+            BWA_LTO_PROBE := $(shell d=$$(mktemp -d 2>/dev/null) || exit 0; \
+                printf 'int lto_probe_c(void){return 0;}\n' > "$$d/a.c"; \
+                printf 'extern "C" int lto_probe_c(void);\nint main(){return lto_probe_c();}\n' > "$$d/m.cpp"; \
+                $(CC) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/a.c" -o "$$d/a.o" >/dev/null 2>&1 && \
+                $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/m.cpp" -o "$$d/m.o" >/dev/null 2>&1 && \
+                $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -fuse-ld=lld $(LDFLAGS) "$$d/m.o" "$$d/a.o" $(BWA_LTO_PROBE_LIBS) -o "$$d/x" >/dev/null 2>&1 && \
+                echo ok; rm -rf "$$d")
+            ifeq ($(BWA_LTO_PROBE),ok)
+                BWA_LTO_MODE := $(BWA_LTO_WANT)
+            else ifeq ($(LTO),auto)
+                $(warning NOTE: building without LTO: $(CXX) could not link a -flto=$(BWA_LTO_WANT) -ffat-lto-objects test with -fuse-ld=lld (install lld, or set LTO=off to silence this).)
+            else
+                $(error LTO=$(LTO) needs clang with -ffat-lto-objects and ld.lld; the test link failed. Install lld or build with LTO=off)
+            endif
+        else ifneq ($(BWA_LTO_CXX_CLANG),)
+            ifeq ($(LTO),auto)
+                $(warning NOTE: building without LTO: CXX=$(CXX) is clang but CC=$(CC) is not; set CC to the matching clang to build with LTO.)
+            else
+                $(error LTO=$(LTO) needs clang for both CXX and CC (CXX=$(CXX), CC=$(CC)); build with LTO=off)
+            endif
+        else ifneq ($(LTO),auto)
+            $(error LTO=$(LTO) needs clang for both CXX and CC (CXX=$(CXX), CC=$(CC)); build with LTO=off)
+        endif
+    endif
+    endif
+    export BWA_LTO_MODE
+endif
+ifneq ($(BWA_LTO_MODE),off)
+    LTO_CFLAGS  = -flto=$(BWA_LTO_MODE) -ffat-lto-objects
+    LTO_LDFLAGS = -flto=$(BWA_LTO_MODE) -ffat-lto-objects -fuse-ld=lld
+else
+    LTO_CFLAGS  =
+    LTO_LDFLAGS =
+endif
+
 # (The DISABLE_BATCHED_MATESW control flag was removed with the scalar
 # mate-rescue path: mate rescue is always the batched SIMD kernel now.)
 
@@ -693,30 +825,30 @@ endif
 .SUFFIXES:.cpp .c .o
 
 .cpp.o:
-	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CXX) -c $(CXXFLAGS) $(LTO_CFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # The C TUs in $(OBJS) (src/fast_reader*.c, src/fr_fastq.c). Declared as a
 # suffix rule rather than three explicit recipes so a newly added src/*.c cannot
 # silently fall through to make's built-in .c.o rule, which carries neither
 # $(INCLUDES) (libdeflate, zlib-ng, project headers) nor $(DEPFLAGS).
 .c.o:
-	$(CC) -c $(CFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CC) -c $(CFLAGS) $(LTO_CFLAGS) $(SRC_CFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # Per-tier kernel compile rules. Active only on x86_64 multi-tier builds.
 src/%.sse41.o: src/%.cpp
-	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_sse41) $(CPPFLAGS) -DKERNEL_VARIANT=_sse41 $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CXX) -c $(BASE_CXXFLAGS) $(LTO_CFLAGS) $(KERNEL_FLAGS_sse41) $(CPPFLAGS) -DKERNEL_VARIANT=_sse41 $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 src/%.sse42.o: src/%.cpp
-	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_sse42) $(CPPFLAGS) -DKERNEL_VARIANT=_sse42 $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CXX) -c $(BASE_CXXFLAGS) $(LTO_CFLAGS) $(KERNEL_FLAGS_sse42) $(CPPFLAGS) -DKERNEL_VARIANT=_sse42 $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 src/%.avx.o: src/%.cpp
-	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_avx) $(CPPFLAGS) -DKERNEL_VARIANT=_avx $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CXX) -c $(BASE_CXXFLAGS) $(LTO_CFLAGS) $(KERNEL_FLAGS_avx) $(CPPFLAGS) -DKERNEL_VARIANT=_avx $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 src/%.avx2.o: src/%.cpp
-	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_avx2) $(CPPFLAGS) -DKERNEL_VARIANT=_avx2 $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CXX) -c $(BASE_CXXFLAGS) $(LTO_CFLAGS) $(KERNEL_FLAGS_avx2) $(CPPFLAGS) -DKERNEL_VARIANT=_avx2 $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 src/%.avx512bw.o: src/%.cpp
-	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_avx512bw) $(CPPFLAGS) -DKERNEL_VARIANT=_avx512bw $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CXX) -c $(BASE_CXXFLAGS) $(LTO_CFLAGS) $(KERNEL_FLAGS_avx512bw) $(CPPFLAGS) -DKERNEL_VARIANT=_avx512bw $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 NATIVE_KERNEL_OBJS = src/kswv.native.o src/bandedSWA.native.o
 
@@ -751,7 +883,7 @@ CALLOC_INTERPOSE_CXXFLAGS = -fno-builtin-malloc
 # cost a full rebuild, while a command-line flag change must. Same
 # write-only-if-changed trick as src/version.h below.
 FLAGS_STAMP = .build-flags
-FLAGS_SIG = CXX=$(CXX)|CC=$(CC)|CXXFLAGS=$(CXXFLAGS)|BASE_CXXFLAGS=$(BASE_CXXFLAGS)|CFLAGS=$(CFLAGS)|CPPFLAGS=$(CPPFLAGS)|INCLUDES=$(INCLUDES)|LIBSAIS_CFLAGS=$(LIBSAIS_CFLAGS)|CALLOC_INTERPOSE_CXXFLAGS=$(CALLOC_INTERPOSE_CXXFLAGS)|TIERS=$(KERNEL_FLAGS_sse41),$(KERNEL_FLAGS_sse42),$(KERNEL_FLAGS_avx),$(KERNEL_FLAGS_avx2),$(KERNEL_FLAGS_avx512bw)
+FLAGS_SIG = CXX=$(CXX)|CC=$(CC)|CXXFLAGS=$(CXXFLAGS)|BASE_CXXFLAGS=$(BASE_CXXFLAGS)|CFLAGS=$(CFLAGS)|SRC_CFLAGS=$(SRC_CFLAGS)|CPPFLAGS=$(CPPFLAGS)|INCLUDES=$(INCLUDES)|LIBSAIS_CFLAGS=$(LIBSAIS_CFLAGS)|LTO_CFLAGS=$(LTO_CFLAGS)|CALLOC_INTERPOSE_CXXFLAGS=$(CALLOC_INTERPOSE_CXXFLAGS)|TIERS=$(KERNEL_FLAGS_sse41),$(KERNEL_FLAGS_sse42),$(KERNEL_FLAGS_avx),$(KERNEL_FLAGS_avx2),$(KERNEL_FLAGS_avx512bw)
 
 # Passed through the ENVIRONMENT and expanded double-quoted in the recipe, not
 # interpolated by make into single quotes. `printf '%s\n' '$(FLAGS_SIG)'` puts the
@@ -777,7 +909,7 @@ $(FLAGS_STAMP): FORCE
 	@printf '%s\n' "$$FLAGS_SIG" > $@.tmp
 	@if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
 
-$(OBJS) $(KERNEL_TIER_OBJS) $(NATIVE_KERNEL_OBJS) $(STANDALONE_TEST_OBJS) $(LIBSAIS_OBJS): $(FLAGS_STAMP)
+src/main.o $(OBJS) $(KERNEL_TIER_OBJS) $(NATIVE_KERNEL_OBJS) $(STANDALONE_TEST_OBJS) $(LIBSAIS_OBJS): $(FLAGS_STAMP)
 
 all:$(EXE)
 
@@ -839,7 +971,7 @@ endif
 # non-kernel TUs and links all KERNEL_TIER_OBJS_LINK on top.
 .PHONY: all-single
 all-single: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),$(ZLIBNG_LIB)) $(KERNEL_TIER_OBJS_LINK) src/main.o
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(KERNEL_TIER_OBJS_LINK) $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $(EXE)
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) $(LTO_LDFLAGS) src/main.o $(KERNEL_TIER_OBJS_LINK) $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $(EXE)
 
 # ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
 arm64:
@@ -849,7 +981,7 @@ arm64:
 
 
 $(EXE):$(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),$(ZLIBNG_LIB)) src/main.o
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) $(LTO_LDFLAGS) src/main.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
 # Regression test for issue 38 / upstream PR 289: exercises an all-len1==0
 # batch that drives each SIMD kswv kernel through the nrow==0 path. Without
@@ -888,8 +1020,10 @@ src/bandedSWA.native.o: src/bandedSWA.cpp
 # Test-only second copy of bandedSWA.cpp (aarch64 only), linked into the unit
 # binary next to libbwa.a's copy: BSW8_ROW_LEAN and BSW8_SKEW flipped, symbols
 # renamed with a _rowalt suffix. See BSW8_ROW_LEAN in src/bandedSWA.cpp. Built
-# here with the libbwa.a object's compile line plus the two -D flags (test/Makefile's
-# standalone path is the exception, noted there). Never linked into bwa-mem3.
+# here with the libbwa.a object's compile line plus the two -D flags, minus
+# $(LTO_CFLAGS): it is linked only into test binaries, whose links are not LTO
+# links (test/Makefile's standalone path is the exception, noted there). Never
+# linked into bwa-mem3.
 ifneq ($(IS_ARM),)
 ROWALT_KERNEL_OBJ := src/bandedSWA.rowalt.o
 $(ROWALT_KERNEL_OBJ): src/bandedSWA.cpp $(FLAGS_STAMP)
@@ -1150,8 +1284,10 @@ fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c test/gz_test
 
 # Differential test: fr_fastq vs kseq, byte-identical record parsing. Links only
 # zlib + zlib-ng + libdeflate (kseq.h is header-only), so it needs no bwa-mem3 build.
-fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $(FAST_READER_TEST_DEP)
-	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+# Built with $(SRC_CFLAGS), the flags the aligner's reader TUs get, so it checks
+# the parser at the shipped optimization level and ISA flags.
+fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $(FAST_READER_TEST_DEP) $(FLAGS_STAMP)
+	$(CC) $(SRC_CFLAGS) -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Read+parse microbenchmark: kseq vs fr_fastq on a real FASTQ (no index/align).
 # Usage: ./fr_fastq_bench {kseq|frfastq} reads.fq[.gz] [reps]
@@ -1251,8 +1387,9 @@ shell-lint:
 shell-fix:
 	./test/regression/shell_lint.sh --fix
 
-# Regression test that requires a binary built with TESTING_BUILD=1
-# (enables BWAMEM3_TESTING_HOST_TIER env-var injection). Not invoked by
+# Regression tests that require a binary built with TESTING_BUILD=1
+# (enables the BWAMEM3_TESTING_HOST_TIER, BWAMEM3_TESTING_WRITE_DELAY_MS and
+# BWAMEM3_TESTING_HOLD_LAST_ITEM env-var injection hooks). Not invoked by
 # the default `test` target because it requires a non-production build.
 # CI invokes this target on the canonical row, after rebuilding in-row with
 # TESTING_BUILD=1 (see "SIMD floor enforcement" in .github/workflows/ci.yml).
@@ -1263,6 +1400,7 @@ shell-fix:
 test-injection: bwa-mem3
 	BWA_MEM3_TESTING=./bwa-mem3 INJECTED_TIER=sse41 PARITY_FA=/dev/null \
 		./test/regression/host_floor_enforce.sh
+	BWA_MEM3_TESTING=./bwa-mem3 ./test/regression/stream_output_order.sh
 
 test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
@@ -1440,7 +1578,7 @@ $(LIBSAIS_DIR)/src/%.o: $(LIBSAIS_DIR)/src/%.c
 	    echo "ERROR: libomp not found. Install with 'brew install libomp', or set LIBOMP_PREFIX to its install prefix."; \
 	    exit 1; \
 	fi
-	$(CC) -c $(CPPFLAGS) $(CFLAGS) $(ASAN_FLAGS) $(LIBSAIS_CFLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(DEPFLAGS) $< -o $@
+	$(CC) -c $(CPPFLAGS) $(CFLAGS) $(LTO_CFLAGS) $(ASAN_FLAGS) $(LIBSAIS_CFLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(DEPFLAGS) $< -o $@
 
 # Build mimalloc via its own CMake system. Shells out to cmake once and
 # caches the build tree under ext/mimalloc/build. This rule always builds
@@ -1619,7 +1757,10 @@ profile-build:
 profile-clean:
 	rm -f bwa-mem3.profile
 
-# Link-Time Optimization build.
+# Separate Link-Time Optimization build (bwa-mem3.lto). The default build
+# already links with LTO where the toolchain supports it (see LTO above);
+# this target predates that and is kept for GCC LTO and single-ISA cross-builds.
+# It passes its own -flto, so it turns the default LTO off for its inner make.
 # Usage: make lto-build
 #        make lto-build LTO_ARCH=avx2             # cross-build
 #        ./bwa-mem3.lto mem -t N idx r1.fq.gz r2.fq.gz
@@ -1685,7 +1826,7 @@ lto-build:
 	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto=$$LTO_JOBS ;; esac; \
 	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH), lto-jobs: $$LTO_JOBS)"; \
 	  MAKEFLAGS= MAKEOVERRIDES= \
-	    $(MAKE) -j1 arch=$(LTO_ARCH) EXE=bwa-mem3.lto EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
+	    $(MAKE) -j1 arch=$(LTO_ARCH) EXE=bwa-mem3.lto BWA_LTO_MODE=off EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
 	@echo "LTO binary: bwa-mem3.lto (arch=$(LTO_ARCH))"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -flto / -fno-semantic-interposition

@@ -119,6 +119,9 @@ static void worker_alloc(worker_t &w, int tid)
     xassert(tid >= 0 && tid < SHIM_TID_SLOTS, "worker_alloc: tid slot out of range");
     w.nthreads = 1;
     w.regs = NULL;
+    w.memo = NULL;   /* the shim runs its own read-pair memo (gotcha #19), never upstream's */
+    w.emit_prefix = NULL; w.emit_prefix_ctx = NULL;   /* no output streaming: the shim
+                      * never runs upstream's worker_sam pass, which is what reads these */
     /* Vestigial worker_t members that nothing allocates (every real
      * `auxSeedBuf` upstream is a local in test_and_merge, bwamem.cpp:894); zero
      * them so worker_free and any future upstream code cannot act on an
@@ -169,6 +172,8 @@ static void worker_alloc(worker_t &w, int tid)
         w.mmc.wsize[l] = wsize;
         w.mmc.rescue_narrow_off[l] = NULL;   // grown on demand by mem_matesw_batch_pre
         w.mmc.rescue_narrow_cap[l] = 0;
+        w.mmc.rescue_skip_set[l] = NULL;     // grown on demand by mem_matesw_batch_pre
+        w.mmc.rescue_skip_set_cap[l] = 0;
         w.mmc.rescue_band[l] = NULL;         // created on demand by mem_matesw_batch_pre
 
         xassert(w.mmc.seqPairArrayAux[l] != NULL, "out of memory: seqPairArrayAux");
@@ -226,6 +231,7 @@ static void worker_free(worker_t &w, int tid)
     for (int l = tid; l <= tid; l++) {
         free(w.mmc.seqPairArrayAux[l]);
         free(w.mmc.rescue_narrow_off[l]);
+        free(w.mmc.rescue_skip_set[l]);
         rescue_band_batch_free(w.mmc.rescue_band[l]);
         free(w.mmc.seqPairArrayLeft128[l]);
         free(w.mmc.seqPairArrayRight128[l]);
