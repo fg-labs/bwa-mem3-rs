@@ -346,6 +346,10 @@ typedef struct abc {
 
 typedef struct {
     int32_t seqid, cseed;
+    /* n: the seed count. m: after chain_pool_drain (chain_seed_pool.h), only who
+     * owns `seeds` -- SEEDS_PER_CHAIN for the per-thread seed window,
+     * SEEDS_PER_CHAIN + 1 for a heap array, which the free sites test; it is not
+     * a capacity, and n may exceed it. */
     int32_t n, m, first, rid;
     /* meth_hypothesis lives in this bitfield word — NOT as a trailing byte — so
      * sizeof(mem_chain_t) is unchanged from upstream bwa-mem2 (48 B). This struct
@@ -372,8 +376,21 @@ typedef struct {
     int32_t  meth_hypothesis:2;        /* signed: needs -1; packs into the same 4-byte word (static_assert below) */
     float frac_rep;
     int64_t pos;
-    mem_seed_t *seeds;
+    /* While mem_chain_seeds chains a read, a chain's seeds live in the per-thread
+     * seed pool as a list linked by index (`link`: the pool indices of its first
+     * and last seed), so a merge appends without allocating, and `seeds` is not
+     * valid yet. When the read's chains are drained, each chain's seeds are
+     * copied, contiguous and in merge order, into the seed window (or a heap
+     * array of its own once the window is full) and `seeds` points at them;
+     * every reader after that sees only `seeds`. Same size as the pointer, so
+     * sizeof stays 48 (static_assert below and in bwamem.cpp). */
+    union {
+        mem_seed_t *seeds;
+        struct { int32_t head, tail; } link;
+    };
 } mem_chain_t;
+static_assert(sizeof(((mem_chain_t *) 0)->link) <= sizeof(mem_seed_t *),
+              "mem_chain_t::link must fit in the seeds pointer it shares storage with");
 
 typedef struct { size_t n, m, cc; mem_chain_t *a; int capped_w; } mem_chain_v;
 
@@ -526,6 +543,14 @@ typedef struct
     int32_t *rescue_narrow_off[MAX_THREADS];
     int64_t  rescue_narrow_cap[MAX_THREADS];
 
+    // Per-tid rescue skip sets (the orientations an anchor needs no rescue SW for; unrelated to
+    // the --rescue-skip option), indexed by anchor (gcnt / 4): mem_matesw_batch_pre records each
+    // anchor's 4-bit set (scanned, or probed from a sorted copy of the mate list) and
+    // mem_pair_resolve_batch_post hands it back to mem_matesw_batch_post while the mate list is
+    // still the one _pre scanned. Same lifetime and growth as rescue_narrow_off.
+    uint8_t *rescue_skip_set[MAX_THREADS];
+    int64_t  rescue_skip_set_cap[MAX_THREADS];
+
     // Per-tid banded-rescue plans (rescue_band.h): mem_matesw_batch_pre plans the
     // banded pass 0 of each enqueued pair and mem_sam_pe_batch runs it, so the plan
     // lives with the batch's other per-tid state for the same reason as
@@ -584,6 +609,12 @@ typedef struct worker_t {
     /* [dedup-reads] per-chunk memoization state (Phase 2 consumer). NULL = no
      * memoization; Phase 1 always leaves it NULL (measure-only). */
     const struct read_memo_state *memo;
+    /* Output streaming (see stream_emit_prefix in fastmap.cpp). When non-NULL,
+     * the worker_sam pass runs through kt_for_prefix with this callback and
+     * context, so finished records can be written while the pass runs. NULL =
+     * a plain kt_for. Set and cleared by the pipeline's process step. */
+    int             (*emit_prefix)(void *ctx, int st, int ed);
+    void             *emit_prefix_ctx;
 } worker_t;
 
 /* D3 (--meth, PR-3) helpers. In --meth, this returns the ORIGINAL bns/pac/
@@ -680,6 +711,21 @@ void mem_dedup_configure(const char *mode_arg);
 // chain in place (stable; surviving seeds keep their order). Returns the new
 // seed count. min_ext_len <= 0 is a no-op. See mem_opt_t::min_ext_len.
 int mem_chain_drop_short_seeds(mem_chain_t *c, int min_ext_len);
+
+// Seed-SW screen over a read's chains (the --min-ext-len filter, then a per-seed
+// rescore that only runs for long reads). mem_flt_chained_seeds_noop returns 1
+// when mem_flt_chained_seeds would leave every chain of a read of length l_query
+// unchanged; it depends only on opt and l_query. Declared here so both are
+// unit-testable.
+int mem_flt_chained_seeds_noop(const mem_opt_t *opt, int l_query);
+// One-entry memo of mem_flt_chained_seeds_noop on the read length, for a loop
+// over reads (libraries are usually fixed-length, so log() runs about once per
+// batch). Start from MEM_FLT_NOOP_MEMO_INIT; no read has length -1.
+typedef struct { int l_query; int noop; } mem_flt_noop_memo_t;
+#define MEM_FLT_NOOP_MEMO_INIT { -1, 0 }
+int mem_flt_chained_seeds_noop_memo(mem_flt_noop_memo_t *m, const mem_opt_t *opt, int l_query);
+void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                           bseq1_t *seq_, int n_chn, mem_chain_t *a);
 
 // Chain weight: the smaller of the chain's query-axis and reference-axis
 // coverage, counting each base once however many seeds span it. Saturates at
@@ -801,7 +847,10 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const char *ms_orig,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
                          int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid,
-                         int mate_meth_ot = -1);
+                         int mate_meth_ot = -1, int known_skip = -1);
+/* known_skip (mem_matesw_batch_pre and mem_matesw_batch_post): -1 scans ma for the anchor's skip
+ * set; 0..15 is that set (bit r for orientation r, as mem_matesw_skip computes it) for exactly
+ * this anchor against exactly this ma, which the caller vouches for. */
 
 /* Given two alignment begin positions (rb) on the 2-bit-packed concat-with-
  * reverse-complement index, infer the pair orientation (0=FF, 1=FR, 2=RF,
@@ -813,9 +862,30 @@ int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
 /* The mate-rescue orientations a region at `rb` needs no SW for: skip[r] = 1 when pes[r] failed
  * or a region of the mate `ma` already lies, in orientation r (mem_infer_dir), at a distance
  * inside [pes[r].low, pes[r].high]. Returns whether all four are set (a consistent pair exists).
- * Shared by mem_matesw_batch_pre and mem_matesw_batch_post. */
+ * mem_matesw_skip_query_init + mem_matesw_skip_scan as one call (the form mem_matesw_batch_pre and
+ * mem_matesw_batch_post compute, through a static helper that also takes a known skip set). */
 bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const mem_pestat_t pes[4],
                      int skip[4]);
+
+/* mem_matesw_skip's test for one region at `rb`, as four intervals of mate rb values, one per
+ * orientation: bit r of the skip set is pes[r].failed, or some mate region's rb lies in
+ * [lo[r], hi[r]] (inclusive; empty when lo[r] > hi[r], and `live` has bit r set exactly when it
+ * is not). A mate on rb's strand has p2 = m and one on the other strand p2 = 2*l_pac - 1 - m;
+ * orientations 0 (same strand) and 1 (other) take p2 > rb at distance p2 - rb, 3 (same) and 2
+ * (other) take p2 <= rb at distance rb - p2, as in mem_infer_dir. So each orientation's window
+ * [pes[r].low, pes[r].high] is one interval of p2, which maps to one interval of m clipped to the
+ * matching strand half. */
+typedef struct {
+    int64_t lo[4], hi[4];
+    unsigned failed, live;   // bit r: pes[r].failed / [lo[r], hi[r]] non-empty
+} mem_matesw_skip_query_t;
+
+void mem_matesw_skip_query_init(int64_t l_pac, int64_t rb, const mem_pestat_t pes[4],
+                                mem_matesw_skip_query_t *q);
+/* The skip set (bit r for orientation r) over the n regions at m: same flags as mem_matesw_skip. */
+unsigned mem_matesw_skip_scan(const mem_matesw_skip_query_t *q, const mem_alnreg_t *m, size_t n);
+/* The same skip set from the mate's rb values sorted ascending (one binary search per orientation). */
+unsigned mem_matesw_skip_probe(const mem_matesw_skip_query_t *q, const int64_t *sorted, size_t n);
 
 /* Proper-pair bit (FLAG 0x2) for a pair emitted on the batched pairing path's
  * no-pairing fallback. Returns 2 when properly paired and 0 otherwise, so the result ORs
@@ -854,7 +924,11 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
  * current hardened path (folds each end's second-best SE hit into the pair
  * MAPQ), so it differs from the removed scalar resolver there. Call after
  * mem_sam_pe_batch_pre for every pair of the batch, sort_classify, and
- * mem_sam_pe_batch.
+ * mem_sam_pe_batch, with the same tid, the same gcnt base, and a[] and pes
+ * unchanged since mem_sam_pe_batch_pre: like the gar slots, the per-anchor
+ * rescue skip sets _pre recorded (mem_cache::rescue_skip_set) are read back
+ * here, and they are those of the mate lists _pre saw. The same holds for
+ * mem_sam_pe_batch_post, which calls this.
  *
  * Out-param contract: n_pri[] is ALWAYS set. q_se[] is written ONLY when
  * *paired_out == 1. z[] is valid ONLY when *paired_out == 1; mem_pair may
@@ -875,11 +949,14 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
  * mem_matesw_batch_post calls: `fixpoint` = 1 when the vector, apart from
  * `pushed`, is exactly the output of a dedup that reported a fixed point
  * (mem_dedup_only_fixpoint); `pushed` = index of the one record added since,
- * or -1 for none. Start at {0, -1}; reset it if the vector is modified
- * elsewhere. */
+ * or -1 for none; `tie_free` = 1 when the vector, apart from `pushed`, is the
+ * output of a fast mem_dedup_only_insert1 (so no two records tie on
+ * (score, rb, qb)), which that function maintains itself. Start at {0, -1, 0};
+ * reset it if the vector is modified elsewhere. */
 typedef struct {
     int fixpoint;
     int pushed;
+    int tie_free;
 } mem_rescue_dedup_state_t;
 
 /* The dedup-only call mem_sort_dedup_patch(opt, 0, 0, 0, n, a), byte for byte,
@@ -888,8 +965,12 @@ typedef struct {
 int mem_dedup_only_fixpoint(const mem_opt_t *opt, int n, mem_alnreg_t *a, int *fixpoint_out);
 /* mem_dedup_only_fixpoint when a[0, n) is a fixed-point output plus the one new
  * record a[pos], in O(n) where that is provably exact (src/bwamem.cpp). */
+/* `tie_free` (in/out, may be NULL) carries "the list without a[pos] is this
+ * function's fast-path output" across calls. Precondition: pass *tie_free = 1
+ * only for exactly such a list. It is set to 1 on return iff this call took
+ * the fast path. */
 int mem_dedup_only_insert1(const mem_opt_t *opt, int n, mem_alnreg_t *a, int pos,
-                           int *fixpoint_out, int *fast_out);
+                           int *tie_free, int *fixpoint_out, int *fast_out);
 
 /* Where mem_matesw_batch_post inserts a rescued region into the mate's
  * by-score list a[0, n): before the first record with a strictly lower score,
@@ -912,7 +993,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           int32_t *gar, mem_cache *mmc, int32_t tid,
                           const char *ms_orig = NULL,
                           const int8_t *mat = NULL, int mate_meth_ot = -1,
-                          mem_rescue_dedup_state_t *dedup_state = NULL);
+                          mem_rescue_dedup_state_t *dedup_state = NULL,
+                          int known_skip = -1);
 
 /* The scalar mem_sam_pe / mem_pair_resolve pairing path was removed; the batched
  * mem_sam_pe_batch* path above is the only mate-rescue/pairing path. */
@@ -1015,10 +1097,15 @@ void mem_pair_and_emit_cohort(mem_opt_t *opt, int64_t n_processed,
  * ORIGINAL reference with the per-hypothesis asymmetric matrix
  * (mem_opt_meth_mat(opt, ar->meth_hypothesis)) so output is native-alphabet.
  * NULL (the default) preserves the legacy symmetric `seq`-vs-ref regen exactly
- * for the non-meth path. */
+ * for the non-meth path.
+ *
+ * `want_md` 0 builds no MD string: the returned cigar holds only the n_cigar
+ * ops, so the result must not be passed to anything that reads MD after them
+ * (mem_aln2sam). NM, the CIGAR and everything else are unchanged. Used for the
+ * XA hits in mem_gen_alt, which read only the CIGAR and NM. */
 mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                       int l_seq, const char *seq, const mem_alnreg_t *ar,
-                      const char *meth_orig_query = NULL);
+                      const char *meth_orig_query = NULL, int want_md = 1);
 
 
 /**

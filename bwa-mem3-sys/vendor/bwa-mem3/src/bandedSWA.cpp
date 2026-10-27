@@ -5658,19 +5658,34 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         sbt11_out = blendv_fullmask8(sbt_, match128, freed_);            \
     }
 
-// MAIN_CODE8_CORE_SPLIT runs the cell-update half of MAIN_CODE8 from a score
-// that is ALREADY split into its +bonus (`sbt_pos`) and -penalty (`sbt_neg`)
-// parts. EXT-1/EXT-11: the fused DP loop derives sbt_pos/sbt_neg per cell either
-// from two LUT shuffles (symmetric XOR fast path) or from the sbt11 split below,
-// so the split is not recomputed inside this macro.
-#define MAIN_CODE8_CORE_SPLIT(sbt_pos, sbt_neg, h00, h11, e11, f11, f21, zero128, e_ins128, oe_ins128, e_del128, oe_del128) \
+// The diagonal term m11 = clamp(h00 + s, 0, 255) of a cell's signed substitution score s.
+// x86 adds the score PRE-SPLIT into its +bonus (S_pos) and -penalty (S_neg) halves (SBT_SPLIT8):
+// adds_epu8 (no wrap past 255) then subs_epu8 (floors at 0). One half is zero in every lane, so
+// that is clamp(h00 + s, 0, 255), which NEON's USQADD (unsigned h00 plus signed s, unsigned
+// saturation) computes in one operation from the signed score itself, S_sgn (BSW8_DIAG_SGN). The
+// one byte where the two differ is s = -128: SBT_SPLIT8 splits it into (0, 0) (0 - (-128) wraps
+// back to -128), so it adds nothing, where USQADD would subtract 128. The aarch64 drivers
+// therefore map every -128 score to 0 once, before the row loop (bsw8_sbt_nomin8), which gives
+// USQADD(h, 0) = h, the split's result. S is the score's name prefix: the score prologues
+// (EXT13_SBT8_*) declare S_pos / S_neg, or S_sgn, under that prefix.
+#if defined(__aarch64__)
+#define BSW8_DIAG_SGN 1
+#define BSW8_DIAG8(h_, S)                                               \
+    vreinterpretq_m128i_u8(vsqaddq_u8(vreinterpretq_u8_m128i(h_), vreinterpretq_s8_m128i(S##_sgn)))
+#else
+#define BSW8_DIAG_SGN 0
+#define BSW8_DIAG8(h_, S) _mm_subs_epu8(_mm_adds_epu8((h_), S##_pos), S##_neg)
+#endif
+
+// MAIN_CODE8_CORE_SPLIT runs the cell-update half of MAIN_CODE8 from the cell's score S (see
+// BSW8_DIAG8). EXT-1/EXT-11: the fused DP loop derives the score per cell from LUT shuffles
+// (symmetric XOR fast path) or from the sbt11 of the RANK1/AMAT prepasses.
+#define MAIN_CODE8_CORE_SPLIT(S, h00, h11, e11, f11, f21, zero128, e_ins128, oe_ins128, e_del128, oe_del128) \
     {                                                                   \
         /* M = max(0, h00 + sbt) computed in UNSIGNED-saturating form so a    \
          * legitimate score in [128,255] is kept (the old signed `m11 &       \
-         * (m11 > 0)` floor mis-read >127 as negative and zeroed it). The     \
-         * signed substitution score arrives pre-split into +bonus/-penalty:  \
-         * adds_epu8 (no wrap past 255) then subs_epu8 (floors at 0). */       \
-        __m128i m11 = _mm_subs_epu8(_mm_adds_epu8(h00, sbt_pos), sbt_neg); \
+         * (m11 > 0)` floor mis-read >127 as negative and zeroed it). */      \
+        __m128i m11 = BSW8_DIAG8(h00, S);                               \
         __m128i cmp11 = _mm_cmpeq_epi8(h00, zero128);                   \
         m11 = blendv_fullmask8(m11, zero128, cmp11);  /* h00==0 -> local restart */ \
         h11 = _mm_max_epu8(m11, e11);                                   \
@@ -5696,25 +5711,41 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         sbt_neg_out = _mm_max_epi8(_mm_sub_epi8(zero128, sbt11), zero128); \
     } while (0)
 
-// MAIN_CODE8_CORE runs the cell-update half of MAIN_CODE8 using a pre-computed
-// signed score vector `sbt11`, splitting it in-place. Retained for any caller
-// that still passes a combined sbt11.
-#define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero128, e_ins128, oe_ins128, e_del128, oe_del128) \
-    {                                                                   \
-        __m128i sbt_pos_, sbt_neg_;                                     \
-        SBT_SPLIT8(sbt11, sbt_pos_, sbt_neg_, zero128);                 \
-        MAIN_CODE8_CORE_SPLIT(sbt_pos_, sbt_neg_, h00, h11, e11, f11, f21, zero128, \
-                              e_ins128, oe_ins128, e_del128, oe_del128); \
-    }
+#if BSW8_DIAG_SGN
+// A signed score vector with every -128 byte replaced by 0 (see BSW8_DIAG8): the score
+// SBT_SPLIT8 + adds/subs applies for that byte is 0, and USQADD applies 0 for a 0 byte. Every
+// other byte is kept, and for it USQADD equals the split form.
+static inline __m128i bsw8_sbt_nomin8(__m128i v)
+{
+    return _mm_andnot_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(-128)), v);
+}
+// The score sources of both 8-bit drivers (smithWaterman128_8 and the lane-compaction driver),
+// mapped once per kernel call so every cell score they yield is free of -128: the XOR LUT pmat128,
+// gathered directly as the signed score (bsw8_sbt_nomin8(pmat) is exactly SBT_SPLIT8's
+// pos - neg), and the vectors the RANK1/AMAT prepasses select a score from. A new score source
+// for those prepasses must be added here.
+#define BSW8_SCORES_NOMIN8()                                            \
+    do {                                                                \
+        pmat128     = bsw8_sbt_nomin8(pmat128);                         \
+        match128    = bsw8_sbt_nomin8(match128);                        \
+        amat128     = bsw8_sbt_nomin8(amat128);                         \
+        w_ambig_128 = bsw8_sbt_nomin8(w_ambig_128);                     \
+    } while (0)
+#else
+#define BSW8_SCORES_NOMIN8() ((void) 0)
+#endif
 
 // EXT-1: fused DP cell body for smithWaterman128_8. Everything a single band
-// column does AFTER its (sbt_pos, sbt_neg) score split is available. This macro
-// is instantiated once per SBT variant (XOR / RANK1 / AMAT) so the matrix-type
-// branch is hoisted OUT of the inner loop (loop unswitching), while the body
-// stays byte-identical across all three by construction. Expects in scope:
-//   sbt_pos, sbt_neg  -- this cell's split score (from LUT or SBT_SPLIT8)
-//   j, j128, one128, head128, tail128, zero128, ff128, h00, h11, h10, e11,
-//   maxRS1, y1_128, minq, qlen_off128, qlen_valid128, exit0, hqe128, qfire128,
+// column does once its score is available. This macro is instantiated once per SBT
+// variant (XOR / RANK1 / AMAT) so the matrix-type branch is hoisted OUT of the inner
+// loop (loop unswitching), while the body stays byte-identical across all three by
+// construction. Expects in scope:
+//   S's score variables -- this cell's score under the prefix S (EXT13_SBT8_*_AT: the
+//                          SBT_SPLIT8 halves S_pos / S_neg on x86, the signed S_sgn on
+//                          aarch64; see BSW8_DIAG8)
+//   hband128, hwid128   -- the row's H band (bsw8_hband128), for BSW8_HMASK8_BAND
+//   j, j128, one128, head128, tail128, zero128, h00, h11, h10, e11,
+//   maxRS1, y1_128, minq, qsent128, hqe128, qfire128,
 //   H_h, F, e_ins128, oe_ins128, e_del128, oe_del128
 // The load of sbt from the removed pre-pass scratch (sbt_buf) is gone: the score
 // is now produced in-register in the enclosing loop and consumed here directly.
@@ -5739,11 +5770,20 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 // needs a "none" constant and a copy of the mask.) Columns run in increasing j in every loop form
 // (plain bodies, the EXT-13 sub-loops, the pipelined finishes), which the count relies on.
 #if defined(__aarch64__)
+// The tracker's nonzero mask, CMTST v, v. Written as an asm block so the compiler cannot rewrite
+// it: from vtstq_u8 (or from vceqzq_u8 with ORN / BSL) the shipping compiler keeps both the mask
+// and its complement, CMTST plus CMEQ #0 (or an extra AND), six vector operations for the tracker where
+// five do. Not volatile and without a memory clobber, so it schedules like the intrinsic.
+static inline uint8x16_t bsw8_nonzero_u8(uint8x16_t v)
+{
+    uint8x16_t r;
+    __asm__("cmtst %0.16b, %1.16b, %1.16b" : "=w"(r) : "w"(v));
+    return r;
+}
 #define BSW8_NF_TRACK_ON(hs_, fs_, pj_)                                 \
         {                                                               \
-            const __m128i v_ = _mm_or_si128((hs_), (fs_));              \
-            const __m128i nz_ = vreinterpretq_m128i_u8(vtstq_u8(        \
-                vreinterpretq_u8_m128i(v_), vreinterpretq_u8_m128i(v_))); \
+            const __m128i nz_ = vreinterpretq_m128i_u8(bsw8_nonzero_u8( \
+                vreinterpretq_u8_m128i(_mm_or_si128((hs_), (fs_)))));   \
             nf_seen128 = _mm_or_si128(nf_seen128, nz_);                 \
             nf_acc128  = _mm_add_epi8(nf_acc128, nf_seen128);           \
             nf_last128 = blendv_fullmask8(nf_last128, (pj_), nz_);      \
@@ -5756,17 +5796,65 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 #define BSW8_NF_TRACK_OFF(hs_, fs_, pj_) { (void) (pj_); }
 #define BSW8_NF_TRACK(hs_, fs_, pj_) BSW8_NF_TRACK_OFF(hs_, fs_, pj_)   /* off outside the lean rows */
 // The query-end (gscore) capture of one column, j128 already advanced past it: shared by
-// DP_CELL_BODY8_128, DP_CELL_BODY8_128_FAST and the BSW8_SKEW finishes.
+// DP_CELL_BODY8_128, DP_CELL_BODY8_128_FAST and the BSW8_SKEW finishes. The capture is the
+// conjunction j128 == qlen_off128 && tail128 == qlen_off128 && qlen_valid128 && exit0, whose
+// last three terms are row-invariant: bsw8_qsent128 folds them into the per-row sentinel
+// qsent128, so the cell loops read one vector for the test instead of three.
 #define BSW8_QE_CAPTURE8_128()                                          \
         {                                                               \
-            __m128i cmp = _mm_cmpeq_epi8(j128, qlen_off128);            \
-            cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128)); \
-            cmp = _mm_and_si128(cmp, qlen_valid128);                    \
-            cmp = _mm_and_si128(cmp, exit0);                            \
+            const __m128i cmp = _mm_cmpeq_epi8(j128, qsent128);         \
             hqe128   = blendv_fullmask8(hqe128, h11, cmp);               \
-            qfire128 = blendv_fullmask8(qfire128, ff128, cmp);          \
+            qfire128 = _mm_or_si128(qfire128, cmp);                     \
         }
-#define DP_CELL_BODY8_128(sbt_pos, sbt_neg)                             \
+// The per-row query-end sentinel: qlen_off where tail == qlen_off, qlen_valid and exit0 all
+// hold, -128 elsewhere. Built once tail and exit0 are final for the row (the cell loops write
+// neither). The offsets the capture compares lie in [-w + 1, w + 1], so they never equal -128:
+// j128 == qsent128 is exactly the four-term conjunction. Exact for w <= 126 (the 8-bit route caps
+// w at BSW8_MAX_W = 124, in bwamem.cpp); at w = 127, w + 1 wraps to -128, a width the int8
+// offset frame already gets wrong elsewhere (test_bandedswa_longread.cpp pins it).
+static inline __m128i bsw8_qsent128(__m128i qlen_off, __m128i qlen_valid, __m128i tail,
+                                    __m128i exit0)
+{
+    const __m128i gate = _mm_and_si128(_mm_and_si128(_mm_cmpeq_epi8(tail, qlen_off), qlen_valid),
+                                       exit0);
+    return blendv_fullmask8(_mm_set1_epi8(-128), qlen_off, gate);
+}
+// The masked bodies test their H band, head <= pj <= tail, as one range compare on the per-row
+// hband128 / hwid128 (bsw8_hband128) instead of two compares and an OR.
+#if defined(__aarch64__)
+#define BSW8_HMASK8_BAND(pj_)                                               \
+        h10 = vreinterpretq_m128i_u8(vandq_u8(vreinterpretq_u8_m128i(h10), vcleq_u8( \
+                  vsubq_u8(vreinterpretq_u8_m128i(pj_), vreinterpretq_u8_m128i(hband128)), \
+                  vreinterpretq_u8_m128i(hwid128))));
+#else
+#define BSW8_HMASK8_BAND(pj_)                                               \
+        h10 = _mm_andnot_si128(_mm_cmpgt_epi8(_mm_sub_epi8((pj_), hband128), hwid128), h10);
+#endif
+
+// The masked bodies' H band as one range compare (BSW8_HMASK8_BAND), set up once per row from
+// the row's final head128 / tail128. Every column offset the cell bodies test lies in
+// [-w - 1, w + 2] with w <= BSW8_MAX_W = 124, so pj != 127. For a lane with tail >= head, let
+// d = (pj - head) mod 256 and W = tail - head, in [0, 255] read unsigned. If pj >= head, d is
+// pj - head exactly, and d <= W iff pj <= tail. If pj < head, d = pj - head + 256 > W, as
+// pj + 256 > 127 >= tail. So d >u W is exactly (head > pj) | (pj > tail). A lane with
+// tail < head is out of band at every pj; it gets the band [127, 127] (W = 0), which only
+// pj = 127 would be in. (Such a lane has already had exit0 cleared for this row, so its cells are
+// never read for a result; the band only keeps the zero writes the two-compare form made.) On aarch64 the test is the unsigned d <= W (sub, cmhs, and); x86 has
+// no unsigned byte compare, so both sides carry a 0x80 bias: XOR with 0x80 adds 128 mod 256, so
+// pj - (band ^ 0x80) = d ^ 0x80, and the signed (d ^ 0x80) > (W ^ 0x80) is the unsigned d > W
+// (psubb, pcmpgtb, pandn).
+static inline void bsw8_hband128(__m128i head128, __m128i tail128, __m128i *band, __m128i *wid)
+{
+    const __m128i hinv = _mm_cmpgt_epi8(head128, tail128);          // lanes with tail < head
+    *band = blendv_fullmask8(head128, _mm_set1_epi8(127), hinv);
+    *wid  = _mm_andnot_si128(hinv, _mm_sub_epi8(tail128, head128));
+#if !defined(__aarch64__)
+    *band = _mm_xor_si128(*band, _mm_set1_epi8((char) 0x80));
+    *wid  = _mm_xor_si128(*wid, _mm_set1_epi8((char) 0x80));
+#endif
+}
+
+#define DP_CELL_BODY8_128(S)                                            \
     {                                                                   \
         __m128i f11, f21;                                               \
         h00 = _mm_load_si128((__m128i *)(H_h + j * SIMD_WIDTH8));       \
@@ -5775,20 +5863,17 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i pj128 = j128;                                           \
         j128 = _mm_add_epi8(j128, one128);                             \
                                                                         \
-        MAIN_CODE8_CORE_SPLIT(sbt_pos, sbt_neg, h00, h11, e11, f11, f21, zero128, \
+        MAIN_CODE8_CORE_SPLIT(S, h00, h11, e11, f11, f21, zero128,      \
                               e_ins128, oe_ins128, e_del128, oe_del128); \
                                                                         \
         /* Masked writing */                                            \
-        __m128i cmp1 = _mm_cmpgt_epi8(head128, pj128);                  \
-        __m128i cmp2 = _mm_cmpgt_epi8(pj128, tail128);                  \
-        cmp1 = _mm_or_si128(cmp1, cmp2);                                \
-        h10 = blendv_fullmask8(h10, zero128, cmp1);                     \
+        BSW8_HMASK8_BAND(pj128)                                         \
                                                                         \
         /* got this block out of MAIN_CODE */                           \
         __m128i bmaxRS = maxRS1;                                        \
         maxRS1 = _mm_max_epu8(maxRS1, h11);                            \
         __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);                     \
-        cmp1 = _mm_cmpgt_epi8(j128, tail128);                           \
+        __m128i cmp1 = _mm_cmpgt_epi8(j128, tail128);                   \
         f21 = blendv_fullmask8(f21, zero128, cmp1);                     \
         cmpA = blendv_fullmask8(y1_128, j128, cmpA);                    \
         y1_128 = blendv_fullmask8(cmpA, y1_128, cmp1);                  \
@@ -5835,7 +5920,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 #else
 #define BSW8_ASSERT_FAST8_128(pjv) ((void) 0)
 #endif
-#define DP_CELL_BODY8_128_FAST(sbt_pos, sbt_neg)                        \
+#define DP_CELL_BODY8_128_FAST(S)                                       \
     {                                                                   \
         __m128i f11, f21;                                               \
         h00 = _mm_load_si128((__m128i *)(H_h + j * SIMD_WIDTH8));       \
@@ -5845,7 +5930,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         const __m128i pjf_ = j128;                                      \
         j128 = _mm_add_epi8(j128, one128);                             \
                                                                         \
-        MAIN_CODE8_CORE_SPLIT(sbt_pos, sbt_neg, h00, h11, e11, f11, f21, zero128, \
+        MAIN_CODE8_CORE_SPLIT(S, h00, h11, e11, f11, f21, zero128,      \
                               e_ins128, oe_ins128, e_del128, oe_del128); \
                                                                         \
         /* Unmasked argmax: cmp1 (out-of-band) is all-zero here, so the masked \
@@ -5902,18 +5987,17 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 #define BSW8_SK_NOUNROLL
 #endif
 // Expects in scope what DP_CELL_BODY8_128 does (j, j128, one128, head128, tail128, zero128,
-// ff128, h10, h11, e11, maxRS1, y1_128, minq, qlen_off128, qlen_valid128, exit0, hqe128,
+// h10, h11, e11, maxRS1, y1_128, minq, qsent128, hqe128,
 // qfire128, H_h, F, e_ins128, oe_ins128, e_del128, oe_del128, plus what the SBTAT score needs).
 // Stage registers: m_ = m11, f_ = the loaded F cell (f11), ti_ = m11 - oe_ins, fo_ = f21,
 // mf_ = max(m11, f11). The finishes store column j, so j must be the column being finished.
 // S1 of column jj: score (SBTAT), loads, m11 and f11
 #define BSW8_SK_S1(SBTAT, jj, m_, f_)                                         \
     {                                                                       \
-        __m128i sp_, sn_;                                                   \
-        SBTAT(jj, sp_, sn_)                                                 \
+        SBTAT(jj, sk)                                                       \
         __m128i h_ = _mm_load_si128((__m128i *)(H_h + (jj) * SIMD_WIDTH8)); \
         f_ = _mm_load_si128((__m128i *)(F + (jj) * SIMD_WIDTH8));          \
-        m_ = _mm_subs_epu8(_mm_adds_epu8(h_, sp_), sn_);                    \
+        m_ = BSW8_DIAG8(h_, sk);                                           \
         m_ = blendv_fullmask8(m_, zero128, _mm_cmpeq_epi8(h_, zero128));    \
     }
 // S2: the insertion-open term (ti_), f21 (fo_) and max(m11, f11) (mf_)
@@ -5930,13 +6014,11 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         e11 = _mm_max_epu8(ti_, _mm_subs_epu8(e11, e_ins128));              \
         __m128i pj128 = j128;                                               \
         j128 = _mm_add_epi8(j128, one128);                                  \
-        __m128i cmp1 = _mm_or_si128(_mm_cmpgt_epi8(head128, pj128),         \
-                                    _mm_cmpgt_epi8(pj128, tail128));        \
-        h10 = blendv_fullmask8(h10, zero128, cmp1);                         \
+        BSW8_HMASK8_BAND(pj128)                                             \
         __m128i bmaxRS = maxRS1;                                            \
         maxRS1 = _mm_max_epu8(maxRS1, h11);                                 \
         __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);                         \
-        cmp1 = _mm_cmpgt_epi8(j128, tail128);                               \
+        __m128i cmp1 = _mm_cmpgt_epi8(j128, tail128);                       \
         __m128i fs_ = blendv_fullmask8(fo_, zero128, cmp1);                 \
         cmpA = blendv_fullmask8(y1_128, j128, cmpA);                        \
         y1_128 = blendv_fullmask8(cmpA, y1_128, cmp1);                      \
@@ -5996,7 +6078,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     }
 // columns [lo_, hi_) through the plain body BODY (its own j >= minq test included)
 #define BSW8_SK_PLAIN(SBTAT, BODY, lo_, hi_)                                  \
-    for (j = (lo_); j < (hi_); j++) { __m128i sbt_pos, sbt_neg; SBTAT(j, sbt_pos, sbt_neg) BODY(sbt_pos, sbt_neg); }
+    for (j = (lo_); j < (hi_); j++) { SBTAT(j, sbt) BODY(sbt); }
 // one sub-loop of the EXT-13 split, columns [lo_, hi_): the plain body BODY for a short run,
 // else the pipeline, split at minq (the plain body captures the query end only on columns
 // j >= minq). A part of one column runs the plain body, which tests j >= minq itself.
@@ -6409,17 +6491,20 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     __m128i frref128  = _mm_set1_epi8(fc.ref);
     __m128i frread128 = _mm_set1_epi8(fc.read);
     __m128i pmat128 = _mm_load_si128((__m128i *)bsw_pmat_bytes_);
-    // EXT-11: two per-band split LUTs for the symmetric XOR fast path.
+    // EXT-11 (x86): two per-band split LUTs for the symmetric XOR fast path.
     // sbt_pos = max(sbt,0) and sbt_neg = max(-sbt,0) are an ELEMENTWISE transform
     // of the pmat entries, so transforming the whole 16-byte LUT once per pair and
     // gathering with the same XOR index (_mm_shuffle_epi8) is byte-identical to the
     // per-cell split, turning the 3-op split into a load (shuffle). The two builds
-    // use the exact ops of SBT_SPLIT8, so the fused XOR path reproduces the old
-    // MAIN_CODE8_CORE split bit-for-bit.
+    // use the exact ops of SBT_SPLIT8, so the fused XOR path reproduces the per-cell
+    // SBT_SPLIT8 bit-for-bit.
+#if !BSW8_DIAG_SGN
     __m128i pmat_pos128, pmat_neg128;
     SBT_SPLIT8(pmat128, pmat_pos128, pmat_neg128, _mm_setzero_si128());
+#endif
     __m128i amat128 = _mm_load_si128((__m128i *)bsw_amat_bytes_);
     __m128i three128 = _mm_set1_epi8(3);                     // N threshold (base > 3)
+    BSW8_SCORES_NOMIN8();
 
     __m128i e_del128    = _mm_set1_epi8(this->e_del);
     __m128i oe_del128   = _mm_set1_epi8(this->o_del + this->e_del);
@@ -6783,35 +6868,23 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         cmpim = _mm_or_si128(cmpim, cmpht);
 
         exit0 = blendv_fullmask8(exit0, zero128, cmpim);
+        const __m128i qsent128 = bsw8_qsent128(qlen_off128, qlen_valid128, tail128, exit0);
 
-        /* Row-invariant part of the gscore query-end gate (see the per-cell block
-         * below). Of its four terms, only cmpeq(j128, qlen_off128) varies with j:
-         * tail128 is finalised by the band-grow above, qlen_valid128 is loaded in
-         * the row prologue, and exit0 was just updated for this row -- none are
-         * touched inside the j loop. Factoring them out turns a 4-op mask into a
-         * 1-op cmpeq + 1 and, and lets a row whose gate is entirely zero skip the
-         * capture (both blends would be identity). AND is associative, so this is
-         * byte-identical. Worth doing because `minq` is min(len2) over all 16
-         * lanes, so ONE short-query lane switches this block on for nearly the
-         * whole band, for every lane, on every row. */
-        /* MEASURED DEAD END -- do not retry without new evidence.
+        /* The query-end capture's three row-invariant terms (tail128 == qlen_off128,
+         * qlen_valid128, exit0) fold into qsent128 above, so the cell loops read one
+         * vector for the test where they read three (qlen_off128 is still read after
+         * the loops, by the narrowing).
          *
-         * The gscore gate below ANDs four terms per DP cell, three of which are
-         * row-invariant (tail128, qlen_valid128, exit0). Hoisting them into a
-         * per-row `gscore_row_gate` is provably byte-identical and strictly fewer
-         * ops per cell, so it looks like free money. It measured:
-         *
-         *   +3.9%  SLOWER  (hoist + an _mm_movemask_epi8 row-skip)
-         *   +4.5%  SLOWER  (hoist alone, no movemask)
-         *
-         * Both regressed, so it is the hoist, not the movemask. The mechanism is
-         * register pressure: keeping the gate vector live across the whole j loop
-         * costs a register in a kernel that is already spilling, and the spill
-         * traffic dwarfs the 2 ALU ops per cell it saves. Recomputing inside the
-         * loop is cheaper than keeping it alive.
-         *
-         * Lesson: in this kernel, op-count reduction does not predict wall time.
-         */
+         * MEASURED DEAD ENDS, for contrast:
+         * - Hoisting the same three terms into a per-row gate vector, ANDed per cell
+         *   with cmpeq(j128, qlen_off128), measured 3.9-4.5% slower: the gate was live
+         *   on top of qlen_off128 in a kernel that already spills.
+         * - Keeping only the column's own offset pj in the cell bodies (F-store mask
+         *   tail > pj, argmax recording pj with a +1 after the loops), and forming pj
+         *   per column as set1(j - i) instead of carrying j128 and one128: both
+         *   byte-identical, both measured slower than the sentinel alone on Graviton4
+         *   (clang 19; set1 per column cost 5% of 8-bit kernel throughput).
+         * In this kernel op counts do not predict wall time. */
 
 #if RDT
         tim1 = __rdtsc();
@@ -6828,10 +6901,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         // Byte-identity: the fused per-cell score equals the old pre-pass value
         // bit-for-bit (same SBT_PREPASS8_* macro on the same s10/s2, and the
         // eliminated store/reload was a lossless int8 round-trip through the slab).
-        // For the XOR fast path the sbt_pos/sbt_neg split is now two LUT gathers
-        // (pmat_pos128/pmat_neg128, an elementwise transform of pmat gathered by
-        // the same XOR index) which reproduces SBT_SPLIT8 exactly (see EXT-11 note
-        // at the LUT build). RANK1/AMAT split via SBT_SPLIT8 unchanged. Neither
+        // For the XOR fast path the score is gathered from LUTs built once per call by the same
+        // XOR index: on x86 the split halves (pmat_pos128/pmat_neg128, see the EXT-11 note at the
+        // LUT build), on aarch64 the signed pmat128 itself (BSW8_SCORES_NOMIN8). RANK1/AMAT on
+        // x86 split via SBT_SPLIT8 unchanged; on aarch64 they keep the signed score. Neither
         // s10 nor s2 is mutated by the DP body, so the fused score is identical to
         // the pre-pass score.
         j128 = _mm_set1_epi8(beg - i);   // diagonal offset of first band column
@@ -6867,66 +6940,65 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             if (fast_hi < fast_lo) fast_hi = fast_lo;
             if (fast_hi > end) fast_hi = end;
         }
+        __m128i hband128, hwid128;
+        bsw8_hband128(head128, tail128, &hband128, &hwid128);
 
         // EXT-13 three-way band split, defined once: the masked/unmasked/masked
         // sub-loops are identical across the three matrix branches -- only the
-        // per-cell score prologue (SBT_PROLOGUE, which declares sbt_pos/sbt_neg)
-        // differs. Parameterising it here keeps the beg->fast_lo->fast_hi->end
-        // traversal in one place so a future change can't drift between branches.
-        // Under BSW8_SKEW the sub-loops run through the software pipeline instead.
-        // SBT_PROLOGUE##_AT (EXT13_SBT8_*_AT below) computes the same score for an explicit
-        // column; it is pasted, not passed, so the prologue's top-level commas never reach the
-        // pipeline macros' argument lists.
+        // per-cell score prologue differs: SBT_PROLOGUE names one of EXT13_SBT8_XOR / _RANK1 /
+        // _AMAT, and SBT_PROLOGUE##_AT (EXT13_SBT8_*_AT below) is that score for an explicit
+        // column. Parameterising it here keeps the beg->fast_lo->fast_hi->end traversal in one
+        // place so a future change can't drift between branches. Under BSW8_SKEW the sub-loops
+        // run through the software pipeline instead. The prologue is pasted, not passed, so its
+        // top-level commas never reach the pipeline macros' argument lists.
 #if BSW8_SKEW
 #define EXT13_RUN_SPLIT8_128(SBT_PROLOGUE) EXT13_RUN_SKEW8_128(SBT_PROLOGUE##_AT)
 #else
 #define EXT13_RUN_SPLIT8_128(SBT_PROLOGUE) \
         do { \
-            for (j = beg; j < fast_lo; j++)     { SBT_PROLOGUE DP_CELL_BODY8_128(sbt_pos, sbt_neg); }      \
-            for (j = fast_lo; j < fast_hi; j++) { SBT_PROLOGUE DP_CELL_BODY8_128_FAST(sbt_pos, sbt_neg); } \
-            for (j = fast_hi; j < end; j++)     { SBT_PROLOGUE DP_CELL_BODY8_128(sbt_pos, sbt_neg); }      \
+            for (j = beg; j < fast_lo; j++)     { SBT_PROLOGUE##_AT(j, sbt) DP_CELL_BODY8_128(sbt); }      \
+            for (j = fast_lo; j < fast_hi; j++) { SBT_PROLOGUE##_AT(j, sbt) DP_CELL_BODY8_128_FAST(sbt); } \
+            for (j = fast_hi; j < end; j++)     { SBT_PROLOGUE##_AT(j, sbt) DP_CELL_BODY8_128(sbt); }      \
         } while (0)
 #endif
-        // EXT13_SBT8_* for column jj into (pos_, neg_): the same loads and operations; keep
-        // each in step with its EXT13_SBT8_* twin above.
-#define EXT13_SBT8_XOR_AT(jj, pos_, neg_) \
-            { __m128i s2_ = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
-              __m128i x_ = _mm_xor_si128(s10, s2_); \
-              pos_ = shuffle_lut_lowidx8(pmat_pos128, x_); \
-              neg_ = shuffle_lut_lowidx8(pmat_neg128, x_); }
-#define EXT13_SBT8_RANK1_AT(jj, pos_, neg_) \
-            { __m128i s2_ = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
-              __m128i sbt11_; \
-              SBT_PREPASS8_RANK1(s10, s2_, rowfreed, sbt11_, pmat128, match128, frread128); \
-              SBT_SPLIT8(sbt11_, pos_, neg_, zero128); }
-#define EXT13_SBT8_AMAT_AT(jj, pos_, neg_) \
-            { __m128i s2_ = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
-              __m128i sbt11_; \
-              SBT_PREPASS8_AMAT(s10, s2_, sbt11_, amat128, w_ambig_128, three128); \
-              SBT_SPLIT8(sbt11_, pos_, neg_, zero128); }
+        // The cell score of column jj, as the name prefix S of the variables it declares: S_pos /
+        // S_neg (the SBT_SPLIT8 halves) on x86, S_sgn (the signed score) on aarch64 (BSW8_DIAG8).
+        // Declared at the scope of the column's body, so the temporaries carry the prefix too.
+#if BSW8_DIAG_SGN
+#define EXT13_SBT8_XOR_AT(jj, S) \
+            __m128i S##_s2 = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+            __m128i S##_sgn = shuffle_lut_lowidx8(pmat128, _mm_xor_si128(s10, S##_s2));
+#define EXT13_SBT8_RANK1_AT(jj, S) \
+            __m128i S##_s2 = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+            __m128i S##_sgn; \
+            SBT_PREPASS8_RANK1(s10, S##_s2, rowfreed, S##_sgn, pmat128, match128, frread128);
+#define EXT13_SBT8_AMAT_AT(jj, S) \
+            __m128i S##_s2 = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+            __m128i S##_sgn; \
+            SBT_PREPASS8_AMAT(s10, S##_s2, S##_sgn, amat128, w_ambig_128, three128);
+#else
+#define EXT13_SBT8_XOR_AT(jj, S) \
+            __m128i S##_s2 = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+            __m128i S##_x = _mm_xor_si128(s10, S##_s2); \
+            __m128i S##_pos = shuffle_lut_lowidx8(pmat_pos128, S##_x); \
+            __m128i S##_neg = shuffle_lut_lowidx8(pmat_neg128, S##_x);
+#define EXT13_SBT8_RANK1_AT(jj, S) \
+            __m128i S##_s2 = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+            __m128i S##_sbt, S##_pos, S##_neg; \
+            SBT_PREPASS8_RANK1(s10, S##_s2, rowfreed, S##_sbt, pmat128, match128, frread128); \
+            SBT_SPLIT8(S##_sbt, S##_pos, S##_neg, zero128);
+#define EXT13_SBT8_AMAT_AT(jj, S) \
+            __m128i S##_s2 = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+            __m128i S##_sbt, S##_pos, S##_neg; \
+            SBT_PREPASS8_AMAT(s10, S##_s2, S##_sbt, amat128, w_ambig_128, three128); \
+            SBT_SPLIT8(S##_sbt, S##_pos, S##_neg, zero128);
+#endif
         if (!gen_mat) {
-#define EXT13_SBT8_XOR \
-                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
-                __m128i xor_ = _mm_xor_si128(s10, s2); \
-                __m128i sbt_pos = shuffle_lut_lowidx8(pmat_pos128, xor_); \
-                __m128i sbt_neg = shuffle_lut_lowidx8(pmat_neg128, xor_);
             EXT13_RUN_SPLIT8_128(EXT13_SBT8_XOR);
         } else if (fc.rank1) {
             __m128i rowfreed = _mm_cmpeq_epi8(s10, frref128);
-#define EXT13_SBT8_RANK1 \
-                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
-                __m128i sbt11; \
-                SBT_PREPASS8_RANK1(s10, s2, rowfreed, sbt11, pmat128, match128, frread128); \
-                __m128i sbt_pos, sbt_neg; \
-                SBT_SPLIT8(sbt11, sbt_pos, sbt_neg, zero128);
             EXT13_RUN_SPLIT8_128(EXT13_SBT8_RANK1);
         } else {
-#define EXT13_SBT8_AMAT \
-                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
-                __m128i sbt11; \
-                SBT_PREPASS8_AMAT(s10, s2, sbt11, amat128, w_ambig_128, three128); \
-                __m128i sbt_pos, sbt_neg; \
-                SBT_SPLIT8(sbt11, sbt_pos, sbt_neg, zero128);
             EXT13_RUN_SPLIT8_128(EXT13_SBT8_AMAT);
         }
         __m128i cmp1 = _mm_cmpgt_epi8(head128, j128);
@@ -7479,9 +7551,6 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 #include "bandedSWA_compact.inc"
 #undef BSW8_GSCORE_NARROW
 #undef EXT13_RUN_SPLIT8_128
-#undef EXT13_SBT8_XOR
-#undef EXT13_SBT8_RANK1
-#undef EXT13_SBT8_AMAT
 #undef EXT13_SBT8_XOR_AT
 #undef EXT13_SBT8_RANK1_AT
 #undef EXT13_SBT8_AMAT_AT

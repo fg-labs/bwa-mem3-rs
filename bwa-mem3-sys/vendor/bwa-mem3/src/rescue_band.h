@@ -33,7 +33,7 @@
  *    computes every component at minsc (skipping those confined to (te - Z, te) with bound < S) and
  *    is exact unconditionally.
  *  - score2 is reproduced from the merged row maxima with kswv's own emulation (lagged rising-row
- *    zeroing, kswv.cpp:~932-936, then the b[] scan, kswv.cpp:~1436-1519); the result
+ *    zeroing, kswv.cpp:~932-936, then the b[] scan, kswv_score2_scan_bits_u8 in kswv_score2.h); the result
  *    depends only on rows the rule above keeps exact.
  *
  * Pass 1 (tb, qb) of every 8-bit job is banded too (take_pass1 / run_pass1),
@@ -151,10 +151,39 @@ struct rb_band { int32_t r0, r1, dlo, dhi, ub; };
 bool rescue_band_components(const rescue_prune_view &v, int tau, int xa, int xb,
                             std::vector<rb_comp> &out, int cap);
 
+/* Width class of a band of w diagonals: classes of 4 diagonals up to 16, of 8 up to 64, of 16 up to
+ * 128 and of 32 beyond. This and rb_group_key are RescueBandBatch::run_jobs internals, exported
+ * for test/unit/test_rescue_band_key.cpp. */
+static inline int rb_width_bucket(int w)
+{
+    return w <= 16 ? (w + 3) >> 2 : w <= 64 ? 4 + ((w - 16 + 7) >> 3) : w <= 128 ? 10 + ((w - 64 + 15) >> 4)
+                                                                                 : 14 + ((w - 128 + 31) >> 5);
+}
+
+/* Sort key of a band job in RescueBandBatch::run_jobs, which runs the jobs in key order in groups
+ * of RB_L lanes, each widened to its group's largest width: the width, then the row count.
+ * Pass 0 keys on the width class (exact_w false): lanes of one class then share their live-cell
+ * clipping (rb_dp_core), which measured better than grouping by the clipped width. Pass 1 keys on
+ * the exact width (exact_w true; BWA3_RESCUE_BAND_P1_EXACT=0 gives it the class key too): its
+ * groups are then mostly uniform, and only a group that straddles two widths widens a lane, so
+ * fewer of its cells are padding. Either way the grouping leaves every output unchanged (a lane
+ * only ever gains diagonals, and its result goes to its own parent). The width or class is clamped
+ * to 15 bits and the rows to 16, so the key stays a non-negative int32_t; jobs past a clamp share a
+ * group, as jobs of one class do. */
+static inline int32_t rb_group_key(bool exact_w, int w, int nrows)
+{
+    int k = exact_w ? w : rb_width_bucket(w);
+    if (k > 32767) k = 32767;
+    return (int32_t)(k << 16) | (nrows < 65535 ? nrows : 65535);
+}
+
 struct rescue_band_stats {
     uint64_t parents = 0, bands1 = 0, bands2 = 0, r2_band = 0, r2_kswv = 0, single = 0;
     uint64_t cells_req = 0, cells_pad = 0, hull_cells = 0, groups = 0, planned_no = 0, comp_cap = 0, tight = 0;
     uint64_t p1_band = 0, p1_kswv = 0, p1_guard = 0;
+    /* Pass 1's cells the kernel computed (as cells_pad for pass 0) and its lanes' widening: the sum
+     * over lanes of the group's width minus the lane's own (rb_group_key). */
+    uint64_t p1_cells_pad = 0, p1_wpad = 0;
 };
 
 /* Per-batch banding state, one per tid (mem_cache::rescue_band). mem_matesw_batch_pre plans (plan +
@@ -180,7 +209,15 @@ public:
     {
         return regid >= 0 && regid < (int)regid2parent_.size() && regid2parent_[regid] >= 0;
     }
-    /* Stable-partition pairs[0, n) so the banded pairs come first; returns their count. */
+    /* Whether any parent has been planned since the last reset(): the same test partition() returns
+     * early on. When none has, banded() is false for every regid committed since then (an older
+     * regid may still read the previous batch's entry), so mem_sam_pe_batch checks this to skip
+     * the partition and its banded() lookups. */
+    bool has_plans() const { return !recs_.empty(); }
+    /* Stable-partition pairs[0, n) so the banded pairs come first; returns their count. The band
+     * harness orders its jobs with this; mem_sam_pe_batch applies the same stable partition to its
+     * job keys instead (matesw_order in bwamem_pair.cpp, checked against this loop's logic by
+     * test_matesw_order.cpp). */
     int partition(SeqPair *pairs, int n);
     /* Pass 0 for the banded parents pairs[0, nb): fills aln[regid].{score, te, qe, score2, te2}
      * exactly as kswv phase 0 on the hull would. Parents that need a round 2 which is not banded

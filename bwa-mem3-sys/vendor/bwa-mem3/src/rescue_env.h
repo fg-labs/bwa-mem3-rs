@@ -38,6 +38,10 @@
  *                                   contention in an instrumented run)
  * BWA3_RESCUE_DEDUP_SKIP      1     skip a post-rescue dedup proven to be a no-op, and add a
  *                                   single new region in one pass where that is provably exact
+ * BWA3_RESCUE_SKIP_REUSE      1     reuse a rescue skip set instead of scanning the mate list: the
+ *                                   set the pre step recorded, after the kernels while the list is
+ *                                   unchanged, and binary searches of a sorted list many anchors
+ *                                   rescue into
  * BWA3_RESCUE_REPEAT          1     a rescue job repeating one of the last eight filtered jobs byte
  *                                   for byte reads that job's result instead of being enqueued again
  * BWA3_RESCUE_FSCAN           1     the 11-op kswv rescue cell in every SIMD body; 0 also selects
@@ -49,6 +53,12 @@
  * BWA3_RESCUE_ROWPAIR         1     NEON kswv (8- and 16-bit): sweep two target rows per pass
  * BWA3_RESCUE_LAZYQE          1     NEON kswv two-row sweep: recover the query end after the row
  *                                   instead of inline
+ * BWA3_RESCUE_SCORE2_BITS     1     u8 kswv score2/te2 scan: visit only each lane's rows at or above
+ *                                   minsc (0: walk every row)
+ * BWA3_RESCUE_PADCOLS         1     NEON u8 kswv: take the diagonal as is in a lane group's all-pad
+ *                                   query columns, where the score is provably 0 (0: gather it)
+ * BWA3_RESCUE_QE_REVSCAN      1     NEON kswv (8- and 16-bit): rescan a query-end block last to first
+ *                                   (0: first to last with a found mask)
  * BWA3_RESCUE_BAND            1     run rescue jobs as diagonal bands (NEON or AVX2 kernel)
  * BWA3_RESCUE_BAND_COST       auto  band a pass-0 parent iff its band cells cost less than this %
  *                                   of the hull's; auto is 0 (no pass-0 banding) where kswv runs
@@ -63,6 +73,8 @@
  * BWA3_RESCUE_BAND_KERNEL     2     banded-DP kernel while BWA3_RESCUE_FSCAN is on: 0 original
  *                                   cell, 1 fused cell, 2 fused cell on two rows per step
  * BWA3_RESCUE_BAND_SHIFT      1     shift each lane's band so a lane group's query offsets align
+ * BWA3_RESCUE_BAND_P1_EXACT   1     group pass-1 band lanes by exact band width (0: by width class,
+ *                                   as pass 0)
  * BWA3_RESCUE_BAND_METH       1     --meth banding (both passes, the group's matrix): 1 except on top
  *                                   of converted-copy pruning (EM-seq), 0 never, 2 or more always
  * rescue-knobs:end */
