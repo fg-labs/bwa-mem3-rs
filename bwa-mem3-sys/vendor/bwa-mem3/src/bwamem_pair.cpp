@@ -33,6 +33,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <cmath>           /* std::isfinite: mem_pair's pair-score conversion */
 #include "kstring.h"
 #include "bwamem.h"
 #include "bam_writer.h"
@@ -45,8 +46,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "simd_dispatch.h"
 #include "rescue_prune.h"
 #include "rescue_band.h"
+#include "seq_reverse.h"
 #include "rescue_env.h"
+#include "rescue_rb_index.h"
 #include "meth_xm.h"   /* meth_chem_t: exact rescue pruning under --meth is EM-seq only */
+#include "meth_model.h" /* --meth-context cpg: the 7-code rescue matrices and window labelling */
 #include <chrono>
 
 #ifdef USE_MALLOC_WRAPPERS
@@ -171,10 +175,21 @@ static matesw_anchor_t matesw_kmer_anchor(const mem_opt_t *opt, const uint8_t *r
     constexpr int HS = 1024, HMASK = HS - 1;
     constexpr int HMAX = HS - (HS >> 2);                   /* stop inserting at 75% load */
     static_assert(HMAX < HS, "the table must retain empty slots or linear probing cannot terminate");
-    static thread_local std::vector<uint32_t> slot_code;   /* 0xFFFFFFFF = empty */
+    /* The empty marker must be a value no k-mer code can take. Codes are 2k bits,
+     * so at k = 16 every uint32 is a code: the all-T k-mer is 0xFFFFFFFF. With a
+     * uint32 table and that as the marker, an all-T query k-mer claimed a slot
+     * that still read as empty (so later codes overwrote it, and each repeat
+     * pushed the slot onto `touched` again), and an all-T window k-mer "matched"
+     * the first empty slot on its probe and voted with that slot's slot_pos,
+     * which the reset never clears: a position from an earlier read on the same
+     * thread. Storing codes in 64 bits puts the marker outside the code space at
+     * every k; for k < 16, and for every code but the all-T one at k = 16, the
+     * probes and votes are unchanged. */
+    constexpr uint64_t EMPTY = UINT64_MAX;
+    static thread_local std::vector<uint64_t> slot_code;   /* EMPTY = empty */
     static thread_local std::vector<int>      slot_pos;     /* newest query pos per code */
     static thread_local std::vector<int>      touched;
-    if ((int)slot_code.size() < HS) { slot_code.assign(HS, 0xFFFFFFFFu); slot_pos.assign(HS, -1); }
+    if ((int)slot_code.size() < HS) { slot_code.assign(HS, EMPTY); slot_pos.assign(HS, -1); }
     touched.clear();
 
     uint32_t mask = (k >= 16) ? 0xffffffffu : ((1u << (2*k)) - 1);
@@ -186,8 +201,8 @@ static matesw_anchor_t matesw_kmer_anchor(const mem_opt_t *opt, const uint8_t *r
           if (++valid >= k) {
               int pos = i - k + 1;
               uint32_t h = (code * 2654435761u) >> (32 - 10);   /* HS = 1<<10 */
-              while (slot_code[h] != 0xFFFFFFFFu && slot_code[h] != code) h = (h + 1) & HMASK;
-              if (slot_code[h] == 0xFFFFFFFFu) {
+              while (slot_code[h] != EMPTY && slot_code[h] != code) h = (h + 1) & HMASK;
+              if (slot_code[h] == EMPTY) {
                   if ((int)touched.size() >= HMAX) break;   /* table full enough: stop indexing */
                   slot_code[h] = code; touched.push_back((int)h);
               }
@@ -216,7 +231,7 @@ static matesw_anchor_t matesw_kmer_anchor(const mem_opt_t *opt, const uint8_t *r
           if (++valid >= k) {
               int opos = o - k + 1;
               uint32_t h = (code * 2654435761u) >> (32 - 10);
-              while (slot_code[h] != 0xFFFFFFFFu && slot_code[h] != code) h = (h + 1) & HMASK;
+              while (slot_code[h] != EMPTY && slot_code[h] != code) h = (h + 1) & HMASK;
               if (slot_code[h] == code) {
                   int p = slot_pos[h];
                   int idx = (opos - p) + l_ms;
@@ -235,7 +250,7 @@ static matesw_anchor_t matesw_kmer_anchor(const mem_opt_t *opt, const uint8_t *r
      * crash and is invisible to the byte-identity gate, because --rescue-kmer
      * output is not covered by it. Keep the single exit below: do not add an
      * early return past this point. */
-    for (int h : touched) slot_code[h] = 0xFFFFFFFFu;
+    for (int h : touched) slot_code[h] = EMPTY;
 
     res.scanned = true;
     res.best_v  = best_v;
@@ -364,7 +379,8 @@ static bool rescue_prune_on()
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the rescue shortcuts' counters to stderr at exit as one line,
  * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. b1_16=.. b2_16=..
  * kmer_jobs=.. memo_hits=.. reused=.. <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=..
- * dedup_skip_regs=.. dedup_insert1=.. dedup_insert1_fast=.. dedup_insert1_tf=.. dedup_s=..". The first fields are the
+ * dedup_skip_regs=.. dedup_insert1=.. dedup_insert1_fast=.. dedup_insert1_tf=.. dedup_s=..
+ * post_rb_builds=.. post_rb_probes=.. post_rb_drops=..". The first fields are the
  * filter's: jobs filtered, and of them how many kept the full window, were proven to fail (b1, not
  * enqueued) or were narrowed to a hull (b2), with the reference rows before and after, the calls the
  * SIMD filter answered from its repeat memo, and of those the jobs answered from an identical
@@ -375,7 +391,11 @@ static bool rescue_prune_on()
  * counts the jobs the SIMD filter decided with K-mers longer than 5 (rescue_prune_kmax; not the
  * scalar filter's decisions), the same check for a scoring that admits them. The dedup_*
  * fields are the post-rescue dedup's (below), which runs on every architecture, so in a run that
- * does not prune (rescue_prune_runs) they and jobs16 are the line's only nonzero counters. */
+ * does not prune (rescue_prune_runs) they, jobs16 and the post_rb_* fields are the line's only
+ * nonzero counters. post_rb_* count the sorted mate-rb copies mem_pair_resolve_batch_post built
+ * once a rescue had changed the list, the skip sets answered from them and the copies discarded
+ * after a dedup dropped a region (BWA3_RESCUE_POST_RB_INDEX): the non-vacuity check for that
+ * shortcut. */
 struct rescue_prune_stats_t {
     std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, b1_16{0},
         b2_16{0}, kmer_jobs{0}, memo_hits{0}, reused{0};
@@ -388,6 +408,10 @@ struct rescue_prune_stats_t {
      * with the list known tie-free (the adjacent-tie check skipped), and their time. */
     std::atomic<uint64_t> dedup_run{0}, dedup_skip{0}, dedup_run_regs{0}, dedup_skip_regs{0},
         dedup_insert1{0}, dedup_insert1_fast{0}, dedup_insert1_tf{0}, ns_dedup{0};
+    /* The sorted mate-rb copy mem_pair_resolve_batch_post keeps once a rescue has changed the list
+     * (BWA3_RESCUE_POST_RB_INDEX): copies built, skip sets answered from one, copies discarded
+     * after a dedup dropped a region. */
+    std::atomic<uint64_t> post_rb_builds{0}, post_rb_probes{0}, post_rb_drops{0};
     bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
@@ -395,7 +419,7 @@ struct rescue_prune_stats_t {
                         "kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f band_pass1_s=%.3f dedup_run=%llu "
                         "dedup_skip=%llu dedup_run_regs=%llu "
                         "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_insert1_tf=%llu "
-                        "dedup_s=%.3f\n",
+                        "dedup_s=%.3f post_rb_builds=%llu post_rb_probes=%llu post_rb_drops=%llu\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
                         (unsigned long long)jobs16, (unsigned long long)b1_16,
@@ -406,7 +430,8 @@ struct rescue_prune_stats_t {
                         (unsigned long long)dedup_skip, (unsigned long long)dedup_run_regs,
                         (unsigned long long)dedup_skip_regs, (unsigned long long)dedup_insert1,
                         (unsigned long long)dedup_insert1_fast, (unsigned long long)dedup_insert1_tf,
-                        ns_dedup * 1e-9);
+                        ns_dedup * 1e-9, (unsigned long long)post_rb_builds,
+                        (unsigned long long)post_rb_probes, (unsigned long long)post_rb_drops);
     }
 };
 static inline uint64_t rescue_now_ns()
@@ -429,6 +454,7 @@ struct rescue_prune_tstats_t {
     uint64_t ns_filter = 0, ns_k0 = 0, ns_band = 0, ns_k1 = 0, ns_b1 = 0;
     uint64_t dedup_run = 0, dedup_skip = 0, dedup_run_regs = 0, dedup_skip_regs = 0, dedup_insert1 = 0,
         dedup_insert1_fast = 0, dedup_insert1_tf = 0, ns_dedup = 0;
+    uint64_t post_rb_builds = 0, post_rb_probes = 0, post_rb_drops = 0;
     ~rescue_prune_tstats_t() {
         rescue_prune_stats_t &g = g_rescue_prune_stats;
         g.jobs += jobs; g.full += full; g.b1 += b1; g.b2 += b2; g.rows_in += rows_in;
@@ -439,6 +465,8 @@ struct rescue_prune_tstats_t {
         g.dedup_skip_regs += dedup_skip_regs; g.dedup_insert1 += dedup_insert1;
         g.dedup_insert1_fast += dedup_insert1_fast; g.dedup_insert1_tf += dedup_insert1_tf;
         g.ns_dedup += ns_dedup;
+        g.post_rb_builds += post_rb_builds; g.post_rb_probes += post_rb_probes;
+        g.post_rb_drops += post_rb_drops;
     }
 };
 static thread_local rescue_prune_tstats_t t_rescue_prune_stats;
@@ -457,6 +485,15 @@ static bool rescue_dedup_skip_enabled()
 static bool rescue_skip_reuse_enabled()
 {
     static const bool on = rescue_env_on("BWA3_RESCUE_SKIP_REUSE");
+    return on;
+}
+/* Answer the mate-rescue skip sets in mem_matesw_batch_post, once the mate list has changed, from
+ * a sorted copy of its rb values kept across the calls (rescue_rb_index.h, see
+ * mem_pair_resolve_batch_post). Default ON; BWA3_RESCUE_POST_RB_INDEX=0 scans the list for every
+ * such anchor, which is how the byte-identity A/B is run. */
+static bool post_rb_index_enabled()
+{
+    static const bool on = rescue_env_on("BWA3_RESCUE_POST_RB_INDEX");
     return on;
 }
 /* Answer a rescue job that repeats one of the last filtered jobs byte for byte from that job's
@@ -529,6 +566,9 @@ static bool rescue_meth_rel(const mem_opt_t *opt)
 {
     static const int mode = rescue_env_int("BWA3_RESCUE_PRUNE_REL", 1);
     if (!opt->meth_mode || mode == 0 || (mode == 1 && opt->meth_chem != METH_CHEM_TAPS)) return false;
+    /* --meth-context cpg frees the conversion only at a CpG, which the
+     * relation (a 5-code matrix property) does not model. */
+    if (meth_cpg_on(opt)) return false;
     return rescue_meth_rel_matrix_ok(opt->mat_ot, 1, opt->a, opt->b)
            && rescue_meth_rel_matrix_ok(opt->mat_ob, 0, opt->a, opt->b);
 }
@@ -550,6 +590,10 @@ static bool rescue_prune_runs(const mem_opt_t *opt, const rescue_prune_params &p
         bwamem3_simd_init();
         return bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW;
     }();
+    /* --meth-context cpg never prunes: the filter's bounds model 5-code matrices, and its
+     * repeat reuse compares the unlabelled window with a staged, CpG-labelled one. (The cost
+     * gate refuses every cpg run anyway: cpg excludes EM-seq and the relation.) */
+    if (meth_cpg_on(opt)) return false;
     return rescue_prune_on() && p.valid
         && rescue_prune_cost_ok(p, opt->meth_mode != 0,
                                 opt->meth_chem == METH_CHEM_EMSEQ || rescue_meth_rel(opt), avx512);
@@ -571,6 +615,10 @@ static bool rescue_band_meth_on(const mem_opt_t *opt, bool run_prunes)
 {
     static const int mode = rescue_env_int("BWA3_RESCUE_BAND_METH", 1);
     if (!rescue_prune_on() || !rescue_band_enabled() || mode == 0) return false;
+    /* --meth-context cpg: the band kernels score 5-code matrices only and have no
+     * CpG gate, so a cpg rescue runs through kswv alone (its Cpg arm) or, on a tier
+     * without the freed-cell kernels, the scalar ksw_align2. */
+    if (meth_cpg_on(opt)) return false;
     /* Pruning applies only without --rescue-kmer (rescue_prune_applies), so a --rescue-kmer run
      * (--fast sets it) prunes nothing and bands as an unpruned run does. */
     const bool prunes = run_prunes && !opt->rescue_kmer;
@@ -604,7 +652,7 @@ struct rescue_run_t {
     /* The inputs the decisions are derived from, so a mem_opt_t rebuilt at the same address or
      * edited in place is derived anew: the opt, the fields the derivation reads (RESCUE_RUN_KEYS of
      * them, rescue_run_key) and, under --meth, the two matrices (rescue_meth_rel). */
-    static const int RESCUE_RUN_KEYS = 10;
+    static const int RESCUE_RUN_KEYS = 11;
     const mem_opt_t *opt = NULL;
     int key[RESCUE_RUN_KEYS] = {0};
     int8_t mat_ot[25] = {0}, mat_ob[25] = {0};
@@ -617,7 +665,7 @@ static void rescue_run_key(const mem_opt_t *opt, int key[rescue_run_t::RESCUE_RU
 {
     key[0] = opt->a; key[1] = opt->b; key[2] = opt->o_del; key[3] = opt->e_del; key[4] = opt->o_ins;
     key[5] = opt->e_ins; key[6] = opt->min_seed_len; key[7] = opt->meth_mode; key[8] = opt->meth_chem;
-    key[9] = opt->rescue_kmer;
+    key[9] = opt->rescue_kmer; key[10] = opt->meth_context;
 }
 static void rescue_run_derive(rescue_run_t &r, const mem_opt_t *opt, const int key[rescue_run_t::RESCUE_RUN_KEYS])
 {
@@ -1180,8 +1228,23 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
                 // is 0/0=NaN, the (int) cast of NaN is UB, and pairing silently
                 // collapses (q=0 for every pair).
                 ns = pes[dir].std > 0. ? (dist - pes[dir].avg) / pes[dir].std : 0.;
-                q = (int)((v.a[i].y>>32) + (v.a[k].y>>32) + .721 * log(2. * erfc(fabs(ns) * M_SQRT1_2)) * opt->a + .499); // .721 = 1/log(4)
-                if (q < 0) q = 0;
+                /* The scores ride in the key's high 32 bits: read them back signed. A
+                 * region scores below zero only under --meth, where the seed is rescored
+                 * against the per-strand matrix. A candidate with such an end scores q = 0,
+                 * so it is never the chosen pair, but it is still pushed to u and counts
+                 * toward *sub / *n_sub (a `continue` would change both, and with them
+                 * q_pe). The pair score is converted to int only when it is finite and
+                 * non-negative: a far-off insert size underflows erfc to 0, and the int
+                 * conversion of log(0) = -inf is undefined. Every other input gives the
+                 * same q as before; test/unit/test_mem_pair_negative_score.cpp has the
+                 * per-architecture history. */
+                const int sc_i = (int32_t)(uint32_t)(v.a[i].y >> 32);
+                const int sc_k = (int32_t)(uint32_t)(v.a[k].y >> 32);
+                if (sc_i < 0 || sc_k < 0) q = 0;
+                else {
+                    const double qd = (double)sc_i + sc_k + .721 * log(2. * erfc(fabs(ns) * M_SQRT1_2)) * opt->a + .499; // .721 = 1/log(4)
+                    q = qd >= 0. && std::isfinite(qd) ? (int)qd : 0;
+                }
                 p = kv_pushp(pair64_t, u);
                 p->y = (uint64_t)k<<32 | i;
                 p->x = (uint64_t)q<<32 | (hash_64(p->y ^ id<<8) & 0xffffffffU);
@@ -1252,6 +1315,20 @@ static const size_t MATESW_SKIP_INDEX_MIN_ANCHORS = 8;
 static const size_t MATESW_SKIP_INDEX_MIN_REGS = 16;
 #endif
 
+/* mem_pair_resolve_batch_post keeps a sorted copy of a mate list's rb values once the list has
+ * changed when at least this many anchors are left against a list of at least this many regions.
+ * Higher than the _pre gate, since the copy is sorted anew per changed list and then kept up to
+ * date. Thread-summed skip-set time, 5 M WGS read pairs -t16, Graviton 4: 2.99 s with the scan,
+ * 2.47 s gated at 8 / 16, 2.22 s at 16 / 64. The XCHECK build indexes every list with an anchor
+ * left, so its cross-checks cover the copy and every skip set probed from it. */
+#ifdef BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK
+static const size_t POST_RB_INDEX_MIN_ANCHORS = 1;
+static const size_t POST_RB_INDEX_MIN_REGS = 1;
+#else
+static const size_t POST_RB_INDEX_MIN_ANCHORS = 16;
+static const size_t POST_RB_INDEX_MIN_REGS = 64;
+#endif
+
 int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
@@ -1293,18 +1370,14 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             const bool indexed = n_anchor >= MATESW_SKIP_INDEX_MIN_ANCHORS
                               && a[!i].n >= MATESW_SKIP_INDEX_MIN_REGS
                               && rescue_skip_reuse_enabled();
-            static thread_local std::vector<int64_t> mate_rb;
-            if (indexed) {
-                mate_rb.resize(a[!i].n);
-                for (size_t k = 0; k < a[!i].n; ++k) mate_rb[k] = a[!i].a[k].rb;
-                std::sort(mate_rb.begin(), mate_rb.end());
-            }
+            static thread_local rescue_rb_index mate_rb;
+            if (indexed) mate_rb.build(a[!i].a, a[!i].n);
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
                 int known_skip = -1;
                 if (indexed) {
                     mem_matesw_skip_query_t q;
                     mem_matesw_skip_query_init(bns->l_pac, b[i].a[j].rb, pes, &q);
-                    known_skip = (int)mem_matesw_skip_probe(&q, mate_rb.data(), mate_rb.size());
+                    known_skip = (int)mate_rb.probe(&q);
                 }
                 int64_t val = mem_matesw_batch_pre(opt, bns, pac, pes, &b[i].a[j],
                                                    s[!i].l_seq, (uint8_t*)s[!i].seq,
@@ -1323,11 +1396,12 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
     return 1;
 }
 
+/* Reverse s[0, l) in place: the aligned prefixes of the query and reference
+ * windows that go on to the start-position kswv pass. Vectorized (seq_reverse.h);
+ * byte-identical to the scalar swap loop. */
 static inline void revseq(int l, uint8_t *s)
 {
-    int i, t;
-    for (i = 0; i < l>>1; ++i)
-        t = s[i], s[i] = s[l - 1 - i], s[l - 1 - i] = t;
+    seq_reverse_inplace(s, l);
 }
 
 /* Task 5: Read the BWAMEM3_METH_BATCHED_RESCUE escape hatch once. Default ON
@@ -1381,7 +1455,13 @@ static bool meth_freed_cell_tier_supported()
  * with mem_opt_fill_meth_mat and the kswv mat-aware ctor. */
 static inline bool meth_scoring_batched_expressible(const mem_opt_t *opt)
 {
-    (void)opt;   /* every mem_opt_fill_meth_mat matrix is kernel-expressible */
+    /* Every mem_opt_fill_meth_mat matrix is kernel-expressible, and so are the
+     * --meth-context cpg matrices (mat7_ot / mat7_ob, meth_model.h): the kernels'
+     * Cpg arm frees the conversion only on rows whose reference byte carries the
+     * CpG label, which _pre writes into the staged window (meth_label_window).
+     * So cpg, too, is batched exactly where the tier has the freed-cell kernels,
+     * and takes the scalar ksw_align2 at m = 7 everywhere else. */
+    (void) opt;
     return meth_freed_cell_tier_supported();
 }
 
@@ -1493,8 +1573,13 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         int xtra = sp.h0;
         uint8_t *qs = seqBufQer + sp.idq;
         uint8_t *rs = seqBufRef + sp.idr;
-        aln[i] = ksw_align2(sp.len2, qs, sp.len1, rs, 5,
-                            opt->mat, opt->o_del, opt->e_del,
+        /* --meth-context cpg: rs is a CpG-labelled window (_pre), so score it with
+         * the pair's 7-code matrix at m = 7 (meth_model_mat), as _post's scalar path does. */
+        int m = 5;
+        const int8_t *mm = opt->mat;
+        if (meth_cpg_on(opt)) mm = meth_model_mat(opt, sp.meth_hyp, &m);
+        aln[i] = ksw_align2(sp.len2, qs, sp.len1, rs, m,
+                            mm, opt->o_del, opt->e_del,
                             opt->o_ins, opt->e_ins, xtra, 0);
     }
     // tprof[SAM2][0] += __rdtsc() - tim;
@@ -1531,23 +1616,29 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         // the 16-bit shift headroom (a group is <= pcnt <= wsize_pair pairs).
         SeqPair *scratch = mmc->seqPairArrayRight128[tid];
 
+        /* --meth-context cpg: the 7-code matrices on the CpG-labelled windows _pre
+         * staged (meth_model_mat's matrices for hyp 1 / 0); the kernels' Cpg arm. */
+        const bool cpg = meth_cpg_on(opt) != 0;
         auto pwsw_ot = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                  opt->a, -1*opt->b, nthreads,
-                                 maxRefLen, maxQerLen, opt->mat_ot);
+                                 maxRefLen, maxQerLen, cpg ? opt->mat7_ot : opt->mat_ot, cpg);
         auto pwsw_ob = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                  opt->a, -1*opt->b, nthreads,
-                                 maxRefLen, maxQerLen, opt->mat_ob);
+                                 maxRefLen, maxQerLen, cpg ? opt->mat7_ob : opt->mat_ob, cpg);
         // The batched kernel expresses exactly the matrices mem_opt_fill_meth_mat
         // produces: GENOMIC (one freed cell to +a), NEUTRAL (one freed cell to 0),
         // and COLLAPSED (the conversion cell PLUS its mirror — a symmetric
-        // (i,j)/(j,i) pair). The freed-less x86 tiers never reach here —
+        // (i,j)/(j,i) pair) — plus, under --meth-context cpg, the 7-code mat7_ot /
+        // mat7_ob (one freed cell on the C5 / G6 row, gated per row by the CpG
+        // label; kswv::init_meth_cpg). The freed-less x86 tiers never reach here —
         // meth_scoring_batched_expressible() gates this branch on the running
         // tier — so needsScalar() is always false. Guard it at RUNTIME rather
         // than with a bare assert(): under NDEBUG assert is a no-op, which would
         // let a future unsupported matrix run the batched kernel and silently
         // mis-score. Fail loudly instead — this can only fire on a programming
-        // error in mem_opt_fill_meth_mat (a matrix that is neither a single freed
-        // cell nor a mirror pair) or a tier gate that drifted out of lockstep
+        // error in mem_opt_fill_meth_mat / meth_model_fill_mats (a matrix that is
+        // neither a single freed cell nor a mirror pair, or a cpg matrix that is not
+        // one gated CpG cell) or a tier gate that drifted out of lockstep
         // with the kswv mat-aware ctor.
         if (pwsw_ot->needsScalar() || pwsw_ob->needsScalar())
             err_fatal(__func__,
@@ -1604,8 +1695,8 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         // enqueued pair. A pair tagged with a hypothesis outside {0,1} would be
         // skipped by both groups, leaving its aln[] entry uninitialized for
         // mem_matesw_batch_post to read. The assert in mem_matesw_batch_pre
-        // catches this in debug; fail loud under NDEBUG too rather than emit a
-        // silently mis-scored rescue.
+        // catches this in normal builds; fail loud under an -DNDEBUG opt-out
+        // too rather than emit a silently mis-scored rescue.
         if (scored != pcnt)
             err_fatal(__func__,
                       "batched meth rescue partition missed %ld of %ld pairs "
@@ -1754,19 +1845,51 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
              * a[!i]. Until then the anchor's skip set is the one _pre recorded
              * (BWA3_RESCUE_SKIP_REUSE=0 scans instead). */
             bool ma_unchanged = rescue_skip_reuse_enabled();
+            /* Once a call has changed a[!i], the later anchors' skip sets come from a sorted copy
+             * of a[!i]'s rb values (rescue_rb_index.h) instead of a scan, when enough anchors are
+             * left against a long enough list (POST_RB_INDEX_MIN_*). The copy is built after the
+             * first nonzero return and brought up to date after every later call: the rb values the
+             * call pushed are added, and when the call's dedup also dropped a region the copy is
+             * discarded and the remaining anchors scan. BWA3_RESCUE_POST_RB_INDEX=0 always scans. */
+            const size_t n_anchor = std::min((size_t)b[i].n, (size_t)std::max(opt->max_matesw, 0));
+            static thread_local rescue_rb_index post_rb;
+            post_rb.drop();
+            const bool st = g_rescue_prune_stats.on;
+            mem_rescue_pushed_rb_t pushed_rb;
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
                 /* D3 (--meth, PR-6, B3): see MATE_SORT branch above. */
                 const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
                 const int8_t *rmat    = opt->meth_mode
                     ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
-                const int known_skip = ma_unchanged && (gcnt >> 2) < mmc->rescue_skip_set_cap[tid]
-                                     ? (int)mmc->rescue_skip_set[tid][gcnt >> 2] : -1;
+                int known_skip = ma_unchanged && (gcnt >> 2) < mmc->rescue_skip_set_cap[tid]
+                               ? (int)mmc->rescue_skip_set[tid][gcnt >> 2] : -1;
+                if (post_rb.live) {
+                    mem_matesw_skip_query_t q;
+                    mem_matesw_skip_query_init(bns->l_pac, b[i].a[j].rb, pes, &q);
+                    known_skip = (int)post_rb.probe(&q);
+                    if (st) ++t_rescue_prune_stats.post_rb_probes;
+                }
+                const size_t n_before = a[!i].n;
                 int val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                 &a[!i], myaln, gcnt, gar, mmc, tid,
                                                 ms_orig, rmat, opt->meth_mode ? i : -1,
-                                                &ma_dedup_state, known_skip);
-                if (val) ma_unchanged = false;
+                                                &ma_dedup_state, known_skip, &pushed_rb);
+                if (post_rb.live) {
+                    if (!post_rb.update(n_before, a[!i].n, pushed_rb) && st)
+                        ++t_rescue_prune_stats.post_rb_drops;
+                } else if (val && ma_unchanged) {
+                    ma_unchanged = false;
+                    if (n_anchor - (size_t)j - 1 >= POST_RB_INDEX_MIN_ANCHORS
+                        && a[!i].n >= POST_RB_INDEX_MIN_REGS && post_rb_index_enabled()) {
+                        post_rb.build(a[!i].a, a[!i].n);
+                        if (st) ++t_rescue_prune_stats.post_rb_builds;
+                    }
+                }
+#ifdef BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK
+                xassert(!post_rb.live || post_rb.matches(a[!i].a, a[!i].n),
+                        "rescue _post rb index disagrees with the mate list");
+#endif
                 n += val;
                 gcnt += 4;
             }
@@ -1881,10 +2004,6 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           kswr_t **myaln, mem_cache *mmc,
                           int32_t &gcnt, int tid)
 {
-    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                              const mem_alnreg_v *a, int l_query, const char *query,
-                              int **out_hn, const char *meth_orig_query);
-
     int i, j, z[2], n_pri[2], n_aa[2], q_se[2], extra_flag, paired;
     kstring_t str;
     mem_aln_t h[2], g[2], aa[2][2];
@@ -1908,9 +2027,13 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     if (paired) {
         char **XA[2];
         int *HN[2] = { 0, 0 };
+        /* Each end's emitted ALT record (-1: none). Only two XA strings of an end are
+         * read below, the pair's primary z[i] and alt[i]: build just those. */
+        const int alt[2] = { mem_pe_alt_slot(opt, &a[0], n_pri[0]), mem_pe_alt_slot(opt, &a[1], n_pri[1]) };
         if (!(opt->flag & MEM_F_ALL)) {
             for (i = 0; i < 2; ++i)
-                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i], s[i].meth_orig_seq);
+                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i], s[i].meth_orig_seq,
+                                    z[i], alt[i]);
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
@@ -1921,13 +2044,12 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             h[i].XA = XA[i]? XA[i][z[i]] : 0;
             h[i].HN = HN[i]? HN[i][z[i]] : -1;
             aa[i][n_aa[i]++] = h[i];
-            if (n_pri[i] < a[i].n) { // the read has ALT hits
-                mem_alnreg_t *p = &a[i].a[n_pri[i]];
-                if (p->score < opt->T || p->secondary >= 0 || !p->is_alt) continue;
+            if (alt[i] >= 0) { // the read has an emitted ALT hit
+                mem_alnreg_t *p = &a[i].a[alt[i]];
                 g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p, s[i].meth_orig_seq);
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
-                g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
-                g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
+                g[i].XA = XA[i]? XA[i][alt[i]] : 0;
+                g[i].HN = HN[i]? HN[i][alt[i]] : -1;
                 if (opt->supp_rep_hard_cap > 0 && p->chain_n_hits >= opt->supp_rep_hard_cap)
                     g[i].mapq = 0; // fg-labs: force repetitive-supp MAPQ to 0
                 aa[i][n_aa[i]++] = g[i];
@@ -2018,7 +2140,9 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
  * largest high over usable orientations. Those windows are random DRAM misses
  * (bns_get_seq_into's hottest instructions are its first pac loads), so hint
  * them a couple of pairs ahead. Only a[0] is covered; secondary anchors within
- * pen_unpaired are rare. Pure hints: byte-identical. */
+ * pen_unpaired are rare. A window's lowest SIMD piece can start up to 4 bytes
+ * below its lowest pac byte, so a window at the low edge of the span may also
+ * touch the line below it, which is not hinted. Pure hints: byte-identical. */
 void mem_prefetch_rescue_pac(const bntseq_t *bns, const uint8_t *pac,
                              const mem_pestat_t pes[4],
                              const bseq1_t *seqs, const mem_alnreg_v *regs)
@@ -2119,6 +2243,14 @@ unsigned mem_matesw_skip_probe(const mem_matesw_skip_query_t *q, const int64_t *
  * mate already lies at a distance inside pes[r]'s window in orientation r (mem_infer_dir).
  * Returns whether all four are set. The interval form as one call; _pre and _post go through
  * matesw_skip_bits, which also takes a known skip set. */
+void mem_matesw_kmer_anchor_counts(const mem_opt_t *opt, const uint8_t *ref, int M, const uint8_t *ms,
+                                   int l_ms, int is_rev, int collapse, int *best_v, int *n_kmer)
+{
+    const matesw_anchor_t anc = matesw_kmer_anchor(opt, ref, M, ms, l_ms, is_rev, collapse);
+    *best_v = anc.scanned ? anc.best_v : -1;
+    *n_kmer = anc.scanned ? anc.n_kmer : -1;
+}
+
 bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const mem_pestat_t pes[4],
                      int skip[4])
 {
@@ -2130,7 +2262,8 @@ bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const me
 }
 
 /* The skip set of the region at rb against the mate list ma: known_skip when the caller has it
- * (0..15: _pre's sorted index, or the set _pre recorded for this anchor and this unchanged ma),
+ * (0..15: _pre's sorted copy of ma's rb values, the set _pre recorded for this anchor and this
+ * unchanged ma, or _post's sorted copy kept up to date once ma has changed; rescue_rb_index.h),
  * else a scan of ma. */
 static unsigned matesw_skip_bits(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma,
                                  const mem_pestat_t pes[4], int known_skip)
@@ -2302,6 +2435,13 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * is reachable via BWAMEM3_METH_BATCHED_RESCUE=0 (escape hatch) or on
              * a freed-less SIMD tier (sse41/sse42/avx), where the kswv kernel has
              * no freed-cell override and every scoring mode must score scalar. */
+            /* --meth-context cpg takes this route only where the batched path does not
+             * run (the escape hatch, or a tier without the freed-cell kernels); _post
+             * then re-fetches the window into a private copy, labels it and scores it
+             * at m = 7. On the batched path the window is labelled where it is staged
+             * below; the k-mer anchor scan and --rescue-kmer narrowing before that read
+             * the plain window, and rescue pruning never runs under cpg
+             * (rescue_prune_runs). */
             if (opt->meth_mode && (!meth_batched_rescue_enabled()
                     || !meth_scoring_batched_expressible(opt))) {
                 // Escape hatch (env=0) or freed-less tier: keep the legacy scalar
@@ -2345,7 +2485,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             //kswr_t aln;
             //mem_alnreg_t b;
             int u8_shift = matesw_u8_shift_for(opt, opt->mat);
-            int xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
+            int u8_qmax = matesw_u8_qmax_for(opt, opt->mat);
+            int xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, u8_qmax, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             /* Exact rescue pruning (rescue_prune.h), decided before anything is staged: a proven
              * failure is not enqueued at all (MATESW_GAR_PROVEN_FAIL), and a narrowed window moves
@@ -2561,6 +2702,17 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                  * The per-byte loop is kept as memcpy (same bytes, matches the
                  * _post ref_rw memcpy), which is byte-identical. */
                 memcpy(rs, ref, (size_t)sp.len1);
+                /* --meth-context cpg: label the staged copy (this pair's own bytes in the
+                 * thread's seqBufRef, never the fetch scratch or a loaded reference) in
+                 * its fetch frame, from its own start rb. That is where any narrowing
+                 * (--rescue-kmer) left rb, and it is exactly the labelling of the full
+                 * window narrowed afterwards: meth_label_cpg reads an edge base's
+                 * neighbour beyond the window from pac, in the same frame and contig.
+                 * The kernels' Cpg arm reads the labels (mem_sam_pe_batch builds the
+                 * kswv objects on mat7_ot / mat7_ob); the between-phase reversal keeps
+                 * them, as ksw_align2's does on the scalar path. */
+                if (meth_cpg_on(opt))   // rs is this pair's private staged copy, never a loaded image
+                    meth_label_window(rs, sp.len1, rb, rid, bns, pac, NULL);
                 /* Query: stage the mate bases directly from $ms (no `rev`
                  * scratch). For is_rev, reverse-complement into qs; this is
                  * byte-identical to the removed two-step (build rev, then
@@ -2614,7 +2766,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
                           int32_t *gar, mem_cache *mmc, int32_t tid, const char *ms_orig,
                           const int8_t *mat, int mate_meth_ot,
-                          mem_rescue_dedup_state_t *dedup_state, int known_skip)
+                          mem_rescue_dedup_state_t *dedup_state, int known_skip,
+                          mem_rescue_pushed_rb_t *pushed_rb)
 {
     extern int mem_sort_dedup_patch_rev(const mem_opt_t *opt, const bntseq_t *bns,
                                         const uint8_t *pac, uint8_t *query, int n,
@@ -2642,6 +2795,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     
     int64_t l_pac = bns->l_pac;
     int i, r, skip[4], n = 0, rid = -1;
+    if (pushed_rb) pushed_rb->n = 0;
 
     /* D3 (--meth): point the mate query at the ORIGINAL bases (ASCII
      * meth_orig_seq, same orientation as `ms`/seq); the per-orientation RC below
@@ -2655,7 +2809,9 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     uint8_t *ms2 = NULL;
 
     /* known_skip, when given, is the skip set mem_matesw_batch_pre recorded for this anchor, valid
-     * while ma is still the list _pre scanned (see mem_pair_resolve_batch_post). */
+     * while ma is still the list _pre scanned, or, once ma has changed, the set probed from the
+     * sorted copy of ma's rb values the caller keeps up to date (see mem_pair_resolve_batch_post,
+     * rescue_rb_index.h). */
     const unsigned skip_bits = matesw_skip_bits(l_pac, a->rb, ma, pes, known_skip);
     for (r = 0; r < 4; ++r) skip[r] = (int)((skip_bits >> r) & 1u);
     if (skip_bits == 15u) {
@@ -2714,7 +2870,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             // hypothesis b.meth_hypothesis records (see where b is filled in below).
             int meth_won_hyp = -1;
             int u8_shift = matesw_u8_shift_for(opt, opt->mat);
-            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
+            int u8_qmax = matesw_u8_qmax_for(opt, opt->mat);
+            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, u8_qmax, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             //aln = **myaln;
             //(*myaln)++;
@@ -2780,8 +2937,14 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                      * (Replaces the old both-matrices keep-max, which cost 2x SW to
                      * rediscover this same matrix.) */
                     meth_won_hyp = (mate_meth_ot ^ is_rev) & 1;
-                    const int8_t *mm = mem_opt_meth_mat(opt, meth_won_hyp);
-                    aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5, mm,
+                    /* --meth-context cpg: the 7-code matrix on the window
+                     * labelled in its fetch frame (ref_rw is this job's private
+                     * copy; ksw_align2's in-place reversal keeps the labels). */
+                    int mm_m;
+                    const int8_t *mm = meth_model_mat(opt, meth_won_hyp, &mm_m);
+                    if (mm_m == METH_M)
+                        meth_label_window(ref_rw, ref_len, rb, rid, bns, pac, NULL);
+                    aln = ksw_align2(l_ms, seq, ref_len, ref_rw, mm_m, mm,
                                      opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, xtra, 0);
                 } else {
                     aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5,
@@ -2834,6 +2997,10 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 b.chain_n_hits = 1; // mate-rescue has no SMEM evidence; treat as unique anchor
 
                 kv_push(mem_alnreg_t, *ma, b); // make room for a new element
+                if (pushed_rb) {
+                    xassert(pushed_rb->n < 4, "mate rescue pushed more than one region per orientation");
+                    pushed_rb->rb[pushed_rb->n++] = b.rb;
+                }
 
                 #if !MATE_SORT
 

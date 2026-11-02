@@ -39,6 +39,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <sstream>
 #include <getopt.h>
 #include <cmath>      /* std::isfinite: reject non-finite -I insert-size values */
+#include <sys/stat.h> /* stat(): the pre-load input existence check */
 #include <errno.h>    /* errno/ERANGE: strtoll validation of the INT options */
 #include <unistd.h>   /* access(): --compat's "you passed a file" diagnostic */
 #ifdef BWA_MEM3_DEBUG_RESCUE_STATS
@@ -50,7 +51,8 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "FMI_search.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
-#include "meth_xm.h"   /* meth_chem_t for --meth=emseq|taps */
+#include "meth_opts.h"
+#include "meth_xm.h"   /* meth_chem_t for --meth=emseq|taps|5base */
 #include "stage_prof.h"
 #include "seed_order.h"
 #include "kstring.h"   /* kstring_t/kputs: the --compat divergence-guard flag list */
@@ -286,9 +288,9 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
     xassert(opt != NULL, "opt must not be NULL");
     assert(nreads >= 0);
     assert(nthreads > 0);
-    /* The assert above compiles out under NDEBUG, and the chaining scratch is
-     * now sized FROM nthreads rather than from nreads -- so a release build
-     * given nthreads <= 0 would allocate a zero-entry scratch that kt_for then
+    /* The assert above compiles out of an EXTRA_CXXFLAGS=-DNDEBUG opt-out
+     * build, and the chaining scratch is sized FROM nthreads, not nreads -- so
+     * such a build given nthreads <= 0 would allocate a zero-entry scratch that kt_for then
      * writes into, because kt_for makes the same input safe by clamping
      * (`if (n_threads < 1) n_threads = 1`, kthread.cpp) instead of refusing.
      * Clamp identically so the two agree on how many windows exist. */
@@ -464,6 +466,8 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         w.mmc.smem_sort_scratch[l].cntCap = 0;
         w.mmc.smem_sort_scratch[l].tmp    = NULL;
         w.mmc.smem_sort_scratch[l].tmpCap = 0;
+        w.mmc.smem_sort_scratch[l].pairs    = NULL;
+        w.mmc.smem_sort_scratch[l].pairsCap = 0;
     }
 
     allocMem = nthreads * (BATCH_SIZE + 32) * sizeof(int32_t);
@@ -518,6 +522,7 @@ void worker_free(worker_t &w, int32_t nthreads)
 
         _mm_free(w.mmc.smem_sort_scratch[l].cnt);
         _mm_free(w.mmc.smem_sort_scratch[l].tmp);
+        _mm_free(w.mmc.smem_sort_scratch[l].pairs);
     }
 }
 
@@ -575,6 +580,22 @@ static void write_sam_text(FILE *fp, bseq1_t *s)
         bam_writer_free((struct bam1_t *)s->bams[j]);
 }
 
+/* The write step's per-record calls for (non---meth) --bam output, shared with
+ * stream_emit_prefix so an early-written record goes through exactly the same
+ * calls. */
+static void write_bam_records(struct bam_writer_s *bw, bseq1_t *s)
+{
+    for (int j = 0; j < s->n_bams; ++j) {
+#ifndef DISABLE_OUTPUT
+        if (bam_writer_write(bw, (struct bam1_t *)s->bams[j]) < 0)
+            err_fatal(__func__, "failed to write BAM record");
+#else
+        (void) bw;
+#endif
+        bam_writer_free((struct bam1_t *)s->bams[j]);
+    }
+}
+
 /* Free one written record's per-read allocations. PIPE-F6: name/seq/qual are
  * carved from the item's read_arena, which the write step frees once -- do NOT
  * free them here. comment stays heap-owned (see the reader / --meth notes), and
@@ -588,7 +609,8 @@ static void release_read_record(bseq1_t *s)
     free(s->meth_orig_seq);
 }
 
-/* Output streaming. Without it an item's records are all written by its write
+/* Output streaming (SAM text: every item; --bam=0: the last item only, see
+ * stream_item). Without it an item's records are all written by its write
  * step, after the process step's last kt_for pass (worker_sam) has finished
  * every read. Earlier items' writes overlap the next item's compute, but the
  * last item's write overlaps nothing, so every run ends with one item's worth
@@ -598,8 +620,8 @@ static void release_read_record(bseq1_t *s)
  * work item's records as soon as that item and every earlier one are done
  * (kt_for_prefix), and the write step writes the rest.
  *
- * Output is byte-identical: the same strings go to the same FILE in the same
- * order. Records leave in read order (kt_for_prefix offers items in order and
+ * Output is byte-identical: the same strings go to the same FILE (the same
+ * bam1_t to the same BAM writer) in the same order. Records leave in read order (kt_for_prefix offers items in order and
  * items tile the reads in order); none is written before the previous
  * pipeline item's write step has returned (items_written == seq, an
  * acquire-load of the write step's release-store); the write step resumes at
@@ -631,19 +653,28 @@ static int stream_emit_prefix(void *ctx_, int st, int ed)
         c->turn = 1;
     }
     xassert(st == c->ret->n_streamed, "stream_emit_prefix: reads offered out of order");
+    struct bam_writer_s *const bw = c->aux->bam_writer;
     for (int i = st; i < ed; ++i) {
-        write_sam_text(c->aux->fp, &c->seqs[i]);
+        if (bw != NULL) write_bam_records(bw, &c->seqs[i]);
+        else            write_sam_text(c->aux->fp, &c->seqs[i]);
         release_read_record(&c->seqs[i]);
     }
     c->ret->n_streamed = ed;
     return 1;
 }
 
+/* Does this item stream? SAM text: every item (stream_output). --bam=0: only
+ * the item whose read hit end of input (stream_bam_last, input_ended). */
+static inline int stream_item(const ktp_aux_t *aux, const ktp_data_t *ret)
+{
+    return aux->stream_output || (aux->stream_bam_last && ret->input_ended);
+}
+
 /* Arm streaming on w for a worker_sam pass over `seqs` (the process step's
  * cohort array, which becomes ret->seqs), or leave it off. */
 static void stream_arm(worker_t &w, stream_ctx_t *c, ktp_aux_t *aux, ktp_data_t *ret, bseq1_t *seqs)
 {
-    if (!aux->stream_output) return;
+    if (!stream_item(aux, ret)) return;
     c->aux = aux; c->ret = ret; c->seqs = seqs; c->turn = 0;
     w.emit_prefix = stream_emit_prefix;
     w.emit_prefix_ctx = c;
@@ -803,9 +834,14 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
          * items, and cohort_n belongs to step 1. Captured before the bookkeeping
          * below resets it. */
         const int mid_cohort = (aux->cohort_slice > 0);
-        ret->cohort_complete = (sz < slice_target) ||
-                               (aux->cohort_bases >= aux->task_size) ||
-                               (ret->seqs == NULL) || (ret->n_seqs == 0);
+        /* The input ran out during (or before) this read. Not set when the
+         * input ends exactly where a read is satisfied: that read is full, and
+         * EOF only shows on the next, empty read. For an unsliced cohort that
+         * empty read is dropped, so its last batch is not marked (and, at
+         * --bam=0, not streamed); a sliced cohort is flushed by an empty item,
+         * which is marked. */
+        ret->input_ended = (sz < slice_target) || (ret->seqs == NULL) || (ret->n_seqs == 0);
+        ret->cohort_complete = ret->input_ended || (aux->cohort_bases >= aux->task_size);
         if (ret->cohort_complete) {
             aux->cohort_bases = 0;
             aux->cohort_slice = 0;
@@ -1032,9 +1068,9 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         {
             fprintf(stderr, "[0000] Reallocating initial memory allocations!!\n");
             /* Into a temporary, and err_fatal rather than assert, for the same
-             * reason as the seed-scratch check below: assert compiles out under
-             * NDEBUG, so in a release build a failed realloc would null the live
-             * pointer, drop the previous allocation, and let the align phase
+             * reason as the seed-scratch check below: assert compiles out of an
+             * EXTRA_CXXFLAGS=-DNDEBUG opt-out build, where a failed realloc would
+             * null the live pointer, drop the previous allocation, and let the align phase
              * dereference NULL a few lines later. */
             mem_alnreg_v *regs_tmp = (mem_alnreg_v *) realloc(w.regs,
                                               (size_t) regs_want * sizeof(mem_alnreg_v));
@@ -1366,15 +1402,8 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                     free(group);
                 }
             } else if (out_bam_bw != NULL) {
-                for (int k = 0; k < group_size; ++k) {
-                    for (int j = 0; j < ret->seqs[i+k].n_bams; ++j) {
-#ifndef DISABLE_OUTPUT
-                        if (bam_writer_write(out_bam_bw, (struct bam1_t *)ret->seqs[i+k].bams[j]) < 0)
-                            err_fatal(__func__, "failed to write BAM record");
-#endif
-                        bam_writer_free((struct bam1_t *)ret->seqs[i+k].bams[j]);
-                    }
-                }
+                for (int k = 0; k < group_size; ++k)
+                    write_bam_records(out_bam_bw, &ret->seqs[i+k]);
             } else {
                 for (int k = 0; k < group_size; ++k)
                     write_sam_text(aux->fp, &ret->seqs[i+k]);
@@ -1387,8 +1416,9 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             i += group_size;
         }
         /* BWA_MEM3_STREAM_STATS=1 only, so a test can tell that streaming
-         * engaged; measurement only, stderr only. */
-        if (aux->stream_stats && aux->stream_output && ret->n_seqs > 0)
+         * engaged: one line per item that was armed to stream (every item for
+         * SAM text, the last one at --bam=0); measurement only, stderr only. */
+        if (aux->stream_stats && stream_item(aux, ret) && ret->n_seqs > 0)
             fprintf(stderr, "[0000] stream_output: %d of %d reads written early\n",
                     ret->n_streamed, ret->n_seqs);
         /* Every record of this item is out: let the next item write early. */
@@ -1533,8 +1563,9 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     int p_nt = pipe_threads; // 2;
     int n_steps = 3;
 
-    /* Output streaming (stream_emit_prefix). SAM text only: the BAM and --meth
-     * writers and -p (whose two passes move the records afterwards) keep
+    /* Output streaming (stream_emit_prefix). SAM text streams every item;
+     * --bam=0 streams only the last item (stream_bam_last); compressed --bam,
+     * --meth and -p (whose two passes move the records afterwards) keep
      * writing in step 2 alone. Needs a second pipeline thread, so -t 1 and
      * single-threaded I/O keep their thread use. BWA_MEM3_STREAM_OUTPUT=0
      * turns it off (A/B runs); the output is the same either way. Only 0 and
@@ -1555,6 +1586,15 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
         aux->stream_output = !so_off && p_nt > 1 && aux->bam_writer == NULL
                              && !opt->meth_mode && !(opt->flag & MEM_F_SMARTPE);
 #endif
+        /* --bam: the last item only (stream_bam_last); earlier items' writes
+         * already overlap the next item's compute. Level 0 only (the level,
+         * not --bam-threads, gates it):
+         * at --bam>=1 the deflate pool is still busy with the previous batch for
+         * the whole last pass (m8g.16xlarge -t64 --bam=6: no wall change, 2x
+         * involuntary context switches). */
+        aux->stream_bam_last = !so_off && p_nt > 1 && aux->bam_writer != NULL
+                               && opt->bam_level == 0
+                               && !opt->meth_mode && !(opt->flag & MEM_F_SMARTPE);
         (void) so_off;
         const char *ss_env = getenv("BWA_MEM3_STREAM_STATS");
         aux->stream_stats = ss_env && *ss_env && strcmp(ss_env, "0") != 0;
@@ -1587,9 +1627,9 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     aux_.shared = aux;
     aux_.index = 0;
     int pthread_ret = pthread_mutex_init(&aux_.mutex, 0);
-    assert(pthread_ret == 0);
+    if (pthread_ret != 0) err_fatal(__func__, "pthread_mutex_init failed: %s", strerror(pthread_ret));
     pthread_ret = pthread_cond_init(&aux_.cv, 0);
-    assert(pthread_ret == 0);
+    if (pthread_ret != 0) err_fatal(__func__, "pthread_cond_init failed: %s", strerror(pthread_ret));
 
     fprintf(stderr, "* No. of pipeline threads: %d\n\n", p_nt);
     aux_.workers = (ktp_worker_t*) malloc(p_nt * sizeof(ktp_worker_t));
@@ -1607,12 +1647,29 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     pthread_t *ptid = (pthread_t *) calloc(p_nt, sizeof(pthread_t));
     xassert(ptid != NULL, "out of memory: ptid");
 
-    for (int i = 0; i < p_nt; ++i)
-        pthread_create(&ptid[i], 0, ktp_worker, (void*) &aux_.workers[i]);
+    /* A create or join failure can leave workers running, so bail out with
+     * _exit, not err_fatal's exit(): exit() would run atexit handlers and
+     * static destructors against live threads (see pread_chunk_fail). */
+    for (int i = 0; i < p_nt; ++i) {
+        pthread_ret = pthread_create(&ptid[i], 0, ktp_worker, (void*) &aux_.workers[i]);
+        if (pthread_ret != 0) {
+            fprintf(stderr, "[%s] pthread_create failed: %s\n", __func__, strerror(pthread_ret));
+            fflush(stderr);
+            _exit(EXIT_FAILURE);
+        }
+    }
 
-    for (int i = 0; i < p_nt; ++i)
-        pthread_join(ptid[i], 0);
+    for (int i = 0; i < p_nt; ++i) {
+        pthread_ret = pthread_join(ptid[i], 0);
+        if (pthread_ret != 0) {
+            fprintf(stderr, "[%s] pthread_join failed: %s\n", __func__, strerror(pthread_ret));
+            fflush(stderr);
+            _exit(EXIT_FAILURE);
+        }
+    }
 
+    /* Every worker has been joined and the handles are valid, so a destroy
+     * failure (EBUSY, EINVAL) can only be a program bug: assert, not an error. */
     pthread_ret = pthread_mutex_destroy(&aux_.mutex);
     assert(pthread_ret == 0);
     pthread_ret = pthread_cond_destroy(&aux_.cv);
@@ -1634,6 +1691,14 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     return 0;
 }
 
+/* -A scales every score-derived option the command line leaves unset. The
+ * products cannot overflow int: -A is held to 1..127 at parse, and only the
+ * small built-in defaults are scaled (a user-set value is never multiplied), so
+ * the largest product is 127 * 100 (the default -d). Because -A is positive, the
+ * scaling cannot change a sign either: gap penalties, z-drop and the unpaired
+ * penalty keep the ranges their own parse checks give them. What it can do is
+ * push the mismatch penalty above 128, which check_effective_scoring() below
+ * rejects. */
 static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
 {
     if (opt0->a) { // matching score is changed
@@ -1648,6 +1713,49 @@ static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
         if (!opt0->pen_clip3) opt->pen_clip3 *= opt->a;
         if (!opt0->pen_unpaired) opt->pen_unpaired *= opt->a;
     }
+}
+
+/* Reject a scoring the aligner cannot carry, after -A scaling and the -x
+ * presets, so that a scaled default is checked exactly like a value the user typed.
+ * Run after update_a() and again after the --meth defaults, which scale -B
+ * and -U by -A as well.
+ * Each message reports the EFFECTIVE value (as the --meth -B check does), since
+ * -A can produce it without the user passing the option it names. Returns 0 if
+ * the scoring is usable, else prints one ERROR: line and returns -1.
+ *   - b: must lie in 0..128. bwa_fill_scmat and the kswv constructor store -b in
+ *     int8_t (mat[], w_mismatch), so a larger b wraps. A negative b scores a
+ *     mismatch above the match score's floor of zero: the 8-bit admission tests
+ *     (bsw8_envelope_ok, matesw_use_u8, the kswv saturation guard) take -A as the
+ *     largest per-base score and stop holding, and mem_approx_mapq_se's identity
+ *     term divides by a + b and leaves [0, 1]. With a >= 1 (parse) and b >= 0,
+ *     that divisor is at least 1.
+ *   - o + e: cells outside ksw_global2's band hold MINUS_INF (-2^30), and a gap
+ *     state derived from one subtracts o + e twice more before it is discarded,
+ *     so -2^30 - 2 * (o + e) must stay in int: o + e <= 2^29 - 1.
+ * The sign constraints need no check here: -O >= 0, -E >= 1, -d >= 0 and
+ * -U >= 0 hold at parse, the -x presets and --meth defaults set positive
+ * values, and update_a() only multiplies by a positive -A. */
+static int check_effective_scoring(const mem_opt_t *opt)
+{
+    const int64_t oe_max = (INT64_C(1) << 29) - 1;
+    if (opt->b < 0 || opt->b > -INT8_MIN) {
+        fprintf(stderr, "ERROR: the effective mismatch penalty is %d, outside 0..%d: a negative "
+                        "penalty scores a mismatch above zero, which the 8-bit alignment kernels "
+                        "and the mapping-quality model do not allow, and the kernels store its "
+                        "negation in 8 bits (check -B and -A; -A scales the default -B unless -B "
+                        "is given)\n",
+                opt->b, -INT8_MIN);
+        return -1;
+    }
+    if ((int64_t)opt->o_del + opt->e_del > oe_max || (int64_t)opt->o_ins + opt->e_ins > oe_max) {
+        fprintf(stderr, "ERROR: the effective gap open plus extension penalty is %lld for "
+                        "deletions and %lld for insertions; each must be at most %lld so the "
+                        "alignment kernels' gap scores stay in range (check -O, -E and -A)\n",
+                (long long)opt->o_del + opt->e_del, (long long)opt->o_ins + opt->e_ins,
+                (long long)oe_max);
+        return -1;
+    }
+    return 0;
 }
 
 /* True if `p` names something on disk, or is the base of a bwa index (the
@@ -1669,49 +1777,45 @@ static int path_exists(const char *p)
 /* If `s` is a value that belongs to one of the --meth family's options rather
  * than a path, return the flag it belongs to; else NULL. Deliberately narrow:
  * every token here is a closed-vocabulary keyword no one would name a reference
- * after, and the caller additionally requires that no such path exists. */
-static const char *stray_option_value_flag(const char *s)
+ * after, and the caller additionally requires that no such path exists. The
+ * match ignores case, so `--meth TAPS` is caught too; when `canon` is non-NULL
+ * it receives the vocabulary's own spelling (the parsers are case-sensitive),
+ * or NULL for the `^` form, which has none. The --meth family's vocabulary
+ * lives in meth_opts.cpp; --rescue-skip's is the only one local to `mem`. */
+static const char *stray_option_value_flag(const char *s, const char **canon)
 {
-    static const struct { const char *value, *flag; } known[] = {
-        { "taps",      "--meth"         }, { "emseq",     "--meth" },
-        { "em-seq",    "--meth"         }, { "bisulfite", "--meth" },
-        { "collapsed", "--meth-scoring" }, { "genomic",   "--meth-scoring" },
-        { "neutral",   "--meth-scoring" },
-        { "XR",        "--meth-tags"    }, { "XG",        "--meth-tags" },
-        { "XM",        "--meth-tags"    }, { "all",       "--meth-tags" },
-        { "none",      "--meth-tags"    },
-        { "spec30",    "--meth-seed-prune" }, { "baseline",  "--meth-seed-prune" },
-        { "off",       "--meth-seed-prune" },
-        { "true",      "--rescue-skip"  }, { "false",     "--rescue-skip" },
-    };
-    if (s == NULL) return NULL;
-    /* A `^`-prefixed exclusion can only have come from --meth-tags. Its `-XM`
-     * synonym needs no case here: `X` takes an argument in the short optstring,
-     * so getopt binds `-XM` as `-X M` and it never reaches a positional slot. */
-    if (s[0] == '^') return "--meth-tags";
-    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); ++i)
-        if (strcasecmp(s, known[i].value) == 0) return known[i].flag;
+    const char *flag = meth_opts_stray_flag(s, canon);
+    if (flag != NULL) return flag;
+    if (s != NULL && (strcasecmp(s, "true") == 0 || strcasecmp(s, "false") == 0)) {
+        if (canon != NULL) *canon = strcasecmp(s, "true") == 0 ? "true" : "false";
+        return "--rescue-skip";
+    }
     return NULL;
 }
 
-/* The corrective spelling for a stray value, tailored to how it got orphaned. */
+/* The corrective spelling for a stray value, tailored to how it got orphaned
+ * and naming the value the user meant in the vocabulary's own spelling, so the
+ * advice never names a different value (for --meth, a different chemistry and
+ * so the opposite call polarity) nor a casing the parser rejects. Formatted
+ * advice lives in a static buffer, valid until the next call. */
 static const char *stray_option_value_advice(const char *s)
 {
-    const char *flag = stray_option_value_flag(s);
+    static char buf[256];
+    const char *canon = NULL;
+    const char *flag = stray_option_value_flag(s, &canon);
     if (flag == NULL) return "";
-    if (strcmp(flag, "--meth") == 0)
-        return "       --meth takes an OPTIONAL argument, which getopt only binds with '=':\n"
-               "       write --meth=taps, not --meth taps.";
     if (strcmp(flag, "--meth-tags") == 0)
         return "       --meth-tags takes ONE comma-separated list, not a space-separated one:\n"
                "       write --meth-tags XR,XG (or --meth-tags '^XM'), not --meth-tags XR XG.";
-    if (strcmp(flag, "--meth-seed-prune") == 0)
-        return "       --meth-seed-prune takes an OPTIONAL argument, which getopt only binds with '=':\n"
-               "       write --meth-seed-prune=baseline, not --meth-seed-prune baseline.";
-    if (strcmp(flag, "--rescue-skip") == 0)
-        return "       --rescue-skip takes an OPTIONAL argument, which getopt only binds with '=':\n"
-               "       write --rescue-skip=false, not --rescue-skip false.";
-    return "       Pass it as the argument to that flag, e.g. --meth-scoring genomic.";
+    if (strcmp(flag, "--meth-scoring") == 0 || strcmp(flag, "--meth-context") == 0) {
+        snprintf(buf, sizeof(buf), "       Pass it as the argument to that flag: %s %s.", flag, canon);
+    } else {
+        /* --meth, --meth-seed-prune and --rescue-skip take an OPTIONAL argument. */
+        snprintf(buf, sizeof(buf),
+                 "       %s takes an OPTIONAL argument, which getopt only binds with '=':\n"
+                 "       write %s=%s, not %s %s.", flag, flag, canon, flag, canon);
+    }
+    return buf;
 }
 
 static void usage(const mem_opt_t *opt)
@@ -1728,8 +1832,8 @@ static void usage(const mem_opt_t *opt)
                      "                  clamped to %d [%d]\n",
             MAX_THREADS, MAX_THREADS, MAX_THREADS, opt->n_threads);
     fprintf(stderr, "    -k INT        minimum seed length [%d]\n", opt->min_seed_len);
-    fprintf(stderr, "    -w INT        band width for banded alignment [%d]\n", opt->w);
-    fprintf(stderr, "    -d INT        off-diagonal X-dropoff [%d]\n", opt->zdrop);
+    fprintf(stderr, "    -w INT        band width for banded alignment, 0..%d [%d]\n", INT_MAX >> 2, opt->w);
+    fprintf(stderr, "    -d INT        off-diagonal X-dropoff, non-negative [%d]\n", opt->zdrop);
     fprintf(stderr, "    -r FLOAT      look for internal seeds inside a seed longer than {-k} * FLOAT [%g]\n", opt->split_factor);
     fprintf(stderr, "    -y INT        seed occurrence for the 3rd round seeding [%ld]\n", (long)opt->max_mem_intv);
     fprintf(stderr, "    -c INT        skip seeds with more than INT occurrences [%d]\n", opt->max_occ);
@@ -1738,7 +1842,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
     fprintf(stderr, "    --ks-dedup STR  cross-read SA-interval dedup: 'off', 'on' (resolve each distinct (k,s) suffix-array interval once per SA-resolve chunk and copy the coordinates to the reads that repeat it), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode [auto]\n");
     fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
-    fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth and --compat, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries. The skip stays off on its own under a negative -A, the one scoring outside its proof [%s]\n", opt->skip_contained_ext? "off":"on");
+    fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth and --compat, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries [%s]\n", opt->skip_contained_ext? "off":"on");
     fprintf(stderr, "    --skip-contained-ext  DEPRECATED, accepted no-op: contained-seed skipping is now the default; pass --keep-contained-ext to opt out\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT are not practical at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
@@ -1806,12 +1910,12 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  then NOT byte-identical to the target. Does not relax --fast/--meth\n");
     fprintf(stderr, "                  (category errors, not divergences). No effect without --compat. [off]\n");
     fprintf(stderr, "Scoring options:\n");
-    fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
-    fprintf(stderr, "   -B INT        penalty for a mismatch [%d]\n", opt->b);
+    fprintf(stderr, "   -A INT        score for a sequence match, 1..127, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
+    fprintf(stderr, "   -B INT        penalty for a mismatch, 0..128 after -A scaling [%d]\n", opt->b);
     fprintf(stderr, "   -O INT[,INT]  gap open penalties for deletions and insertions [%d,%d]\n", opt->o_del, opt->o_ins);
     fprintf(stderr, "   -E INT[,INT]  gap extension penalty (must be positive); a gap of size k cost '{-O} + {-E}*k' [%d,%d]\n", opt->e_del, opt->e_ins);
     fprintf(stderr, "   -L INT[,INT]  penalty for 5'- and 3'-end clipping [%d,%d]\n", opt->pen_clip5, opt->pen_clip3);
-    fprintf(stderr, "   -U INT        penalty for an unpaired read pair [%d]\n", opt->pen_unpaired);
+    fprintf(stderr, "   -U INT        penalty for an unpaired read pair, non-negative [%d]\n", opt->pen_unpaired);
 //  fprintf(stderr, "   -x STR        read type. Setting -x changes multiple parameters unless overriden [null]\n");
 //  fprintf(stderr, "                 pacbio: -k17 -W40 -r10 -A1 -B1 -O1 -E1 -L0  (PacBio reads to ref)\n");
 //  fprintf(stderr, "                 ont2d: -k14 -W20 -r10 -A1 -B1 -O1 -E1 -L0  (Oxford Nanopore 2D-reads to ref)\n");
@@ -1871,59 +1975,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 Sets the FR distribution only and skips inference, so FF/RF/RR get none:\n");
     fprintf(stderr, "                 no proper-pair flag or mate rescue there. As in bwa/bwa-mem2. [inferred]\n");
     fprintf(stderr, "Methylation (--meth) options:\n");
-    fprintf(stderr, "   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware\n");
-    fprintf(stderr, "                 record emission (XM:Z/XG:Z/XR:Z). Output is SAM text by default,\n");
-    fprintf(stderr, "                 as without --meth; add --bam for BAM. Requires the reference to\n");
-    fprintf(stderr, "                 have been built with `bwa-mem3 index --meth` (emits the original\n");
-    fprintf(stderr, "                 index plus a ref.fa.meth.* converted seed index).\n");
-    fprintf(stderr, "                 CHEM selects the chemistry and thus the XM:Z call polarity:\n");
-    fprintf(stderr, "                   emseq  bisulfite/EM-seq, UNmethylated C converts [default]\n");
-    fprintf(stderr, "                          (aliases: em-seq, bisulfite)\n");
-    fprintf(stderr, "                   taps   TET-assisted pyridine borane, METHYLATED C converts;\n");
-    fprintf(stderr, "                          also defaults --meth-scoring to neutral\n");
-    fprintf(stderr, "                 NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS\n");
-    fprintf(stderr, "                 data without =taps inverts every methylation call.\n");
-    fprintf(stderr, "   --meth-scoring collapsed|genomic|neutral\n");
-    fprintf(stderr, "                 scoring mode. Default depends on chemistry: collapsed for\n");
-    fprintf(stderr, "                 --meth/--meth=emseq, neutral for --meth=taps (TAPS conversions\n");
-    fprintf(stderr, "                 are sparse, so collapsing costs specificity it can't repay).\n");
-    fprintf(stderr, "                 collapsed: C/T (and G/A) interchangeable, bwameth-compatible\n");
-    fprintf(stderr, "                 placement (sets -B 2).\n");
-    fprintf(stderr, "                 genomic: free only the conversion direction, scored as a full\n");
-    fprintf(stderr, "                 match, keep variants as mismatches (variant-aware: variants\n");
-    fprintf(stderr, "                 outside the conversion direction counted in NM; -B 4).\n");
-    fprintf(stderr, "                 neutral: free only the conversion direction but score it 0\n");
-    fprintf(stderr, "                 (tolerated, not rewarded); best for TAPS (variant-aware:\n");
-    fprintf(stderr, "                 variants counted in NM as in genomic; -B 4).\n");
-    fprintf(stderr, "                 In genomic/neutral a real variant in the conversion direction\n");
-    fprintf(stderr, "                 itself (C->T at a reference C) is indistinguishable from a\n");
-    fprintf(stderr, "                 conversion and is not counted in NM.\n");
-    fprintf(stderr, "   --meth-seed-prune[=spec30|baseline|off]\n");
-    fprintf(stderr, "                 prune the 3-letter alphabet's short, repetitive spurious SMEMs\n");
-    fprintf(stderr, "                 before SA resolution: ~30%% faster --meth at ~0 accuracy cost\n");
-    fprintf(stderr, "                 vs truth (measured WGS/WES/em-seq, mapq>=20 accuracy identical).\n");
-    fprintf(stderr, "                 ON by default under --meth (spec30) -- --meth is bwa-mem3-native,\n");
-    fprintf(stderr, "                 so there is no upstream reference output to preserve. spec30:\n");
-    fprintf(stderr, "                 per-read two-regime rule; baseline: drop len<25 & SA-count>1;\n");
-    fprintf(stderr, "                 off: restore the un-pruned seeding (byte-identical). NOT\n");
-    fprintf(stderr, "                 byte-identical vs off. Env BWAMEM3_METH_SEED_PRUNE (off|spec30|\n");
-    fprintf(stderr, "                 baseline) overrides this flag for A/B testing.\n");
-    fprintf(stderr, "   --meth-tags SPEC\n");
-    fprintf(stderr, "                 which Bismark tags to emit: 'all' (default), 'none', a\n");
-    fprintf(stderr, "                 comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).\n");
-    fprintf(stderr, "                 Comma-separated, NOT space-separated (a second word becomes\n");
-    fprintf(stderr, "                 the reference). An exclusion may be written ^XM or -XM; prefer\n");
-    fprintf(stderr, "                 -XM in scripts (bare ^ is a negated glob in zsh EXTENDED_GLOB).\n");
-    fprintf(stderr, "                 Unselected tags are not computed. XM:Z is a read-length string\n");
-    fprintf(stderr, "                 and dominates the BAM's aux payload; '^XM' drops it for callers\n");
-    fprintf(stderr, "                 that recompute from the reference (MethylDackel, biscuit).\n");
-    fprintf(stderr, "                 Keep XM for Bismark-family tools (bismark_methylation_extractor,\n");
-    fprintf(stderr, "                 methylKit, methtuple, DMRfinder, epialleleR).\n");
-    fprintf(stderr, "   --set-as-failed f|r\n");
-    fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
-    fprintf(stderr, "   --chimera-qc\n");
-    fprintf(stderr, "                 enable the bwameth.py-style longest-match <44%% chimera heuristic\n");
-    fprintf(stderr, "                 (sets 0x200, clears 0x2, caps MAPQ at 1). Off by default; not in Bismark.\n");
+    meth_opts_usage_shared(stderr);
+    meth_opts_usage_mem_only(stderr);
     fprintf(stderr, "Supplementary MAPQ rescoring (fg-labs extension):\n");
     fprintf(stderr, "   --supp-rep-hard-cap INT\n");
     fprintf(stderr, "                 force MAPQ=0 for supplementary alignments whose chain contains any seed\n");
@@ -2165,6 +2218,8 @@ int main_mem(int argc, char *argv[])
     aux.fp = stdout;
     aux.opt = opt = mem_opt_init();
     memset(&opt0, 0, sizeof(mem_opt_t));
+    meth_cli_t meth_cli;
+    memset(&meth_cli, 0, sizeof(meth_cli));
 
     /* Parse input arguments */
     // comment: added option '5' in the list
@@ -2179,12 +2234,6 @@ int main_mem(int argc, char *argv[])
     enum {
         OPT_BAM = 1000,
         OPT_BAM_THREADS,
-        OPT_METH,
-        OPT_METH_SCORING,
-        OPT_METH_SEED_PRUNE,
-        OPT_METH_TAGS,
-        OPT_METH_SET_AS_FAILED,
-        OPT_METH_CHIMERA_QC,
         OPT_SUPP_REP_HARD_CAP,
         OPT_PROPER_PAIR_FROM_EMITTED,
         OPT_LEGACY_READER,
@@ -2248,12 +2297,8 @@ int main_mem(int argc, char *argv[])
         {"extend-tie-frac",          required_argument, 0, OPT_EXTEND_TIE_FRAC},
         {"extend-tie-floor",         required_argument, 0, OPT_EXTEND_TIE_FLOOR},
         {"extend-csub",              no_argument,       0, OPT_EXTEND_CSUB},
-        {"meth",                     optional_argument, 0, OPT_METH},
-        {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
-        {"meth-seed-prune",          optional_argument, 0, OPT_METH_SEED_PRUNE},
-        {"meth-tags",                required_argument, 0, OPT_METH_TAGS},
-        {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
-        {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
+        METH_LONG_OPTIONS_SHARED
+        METH_LONG_OPTIONS_MEM_ONLY
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {"proper-pair-from-emitted", no_argument,       0, OPT_PROPER_PAIR_FROM_EMITTED},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
@@ -2312,12 +2357,94 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == '1') no_mt_io = 1;
         else if (c == 'x') mode = optarg;
-        else if (c == 'w') opt->w = atoi(optarg), opt0.w = 1;
-        else if (c == 'A') opt->a = atoi(optarg), opt0.a = 1, assert(opt->a >= INT_MIN && opt->a <= INT_MAX);
-        else if (c == 'B') opt->b = atoi(optarg), opt0.b = 1, assert(opt->b >= INT_MIN && opt->b <= INT_MAX);
-        else if (c == 'T') opt->T = atoi(optarg), opt0.T = 1, assert(opt->T >= INT_MIN && opt->T <= INT_MAX);
-        else if (c == 'U')
-            opt->pen_unpaired = atoi(optarg), opt0.pen_unpaired = 1, assert(opt->pen_unpaired >= INT_MIN && opt->pen_unpaired <= INT_MAX);
+        else if (c == 'w') {
+            /* -w is the extension band width. atoi() accepted a negative band,
+             * which turns cal_max_gap's `opt->w << 1` cap negative: -w -1
+             * inverts the reference window and aborts in the fetch's range
+             * assert, and -w -50 on 100 bp reads lets the banded kernels store
+             * past the rows they own (a silent heap overrun that still exits
+             * 0). The widest w-scaled int is `opt->w << 2` (mem_patch_reg and
+             * the global-alignment widening loop), defined up to INT_MAX >> 2,
+             * so that is the top of the range. -w 0 is a valid zero band. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, 0, INT_MAX >> 2, &v) != 0) {
+                fprintf(stderr, "ERROR: -w band width must be an integer in 0..%d (got %s)\n",
+                        INT_MAX >> 2, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->w = (int)v;
+            opt0.w = 1;
+        }
+        else if (c == 'A') {
+            /* The match score is stored in int8_t by bwa_fill_scmat, the kswv
+             * constructor and the --meth matrices, so a larger value wraps: -A 128
+             * becomes -128, and -A 256 becomes 0, which zeroes kswv's maximum
+             * substitution score and its score2 window divides by it. A zero or
+             * negative -A is refused too: no alignment can score above zero, so
+             * kswv's score2 window divides by a zero maximum (SIGFPE on x86), and
+             * the mapping-quality formula (raw_mapq) divides by the match score,
+             * so a zero -A takes the int conversion of an infinity, which is
+             * undefined and differs by architecture. The bound also keeps
+             * update_a()'s scaled defaults inside int and their signs unchanged. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, 1, INT8_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -A match score must be an integer in 1..%d (got %s): "
+                                "a score of 0 or less leaves nothing to align, and the alignment "
+                                "kernels store it in 8 bits\n",
+                        INT8_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->a = (int)v;
+            opt0.a = 1;
+        }
+        else if (c == 'B') {
+            /* atoi() maps garbage to 0 and wraps out-of-range tokens; take a
+             * complete int here. The 8-bit range is checked on the effective
+             * value (check_effective_scoring), because -A scales the default. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, INT_MIN, INT_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -B mismatch penalty must be an integer (got %s)\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->b = (int)v;
+            opt0.b = 1;
+        }
+        else if (c == 'T') {
+            /* atoi() maps garbage to 0 and wraps out-of-range tokens; take a
+             * complete int here. A negative threshold is valid (it disables
+             * the output filter), so the full int range is accepted. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, INT_MIN, INT_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -T minimum score to output must be an integer in %d..%d (got %s)\n",
+                        INT_MIN, INT_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->T = (int)v;
+            opt0.T = 1;
+        }
+        else if (c == 'U') {
+            /* Paired-end scoring computes `score - pen_unpaired`
+             * (bwamem_pair.cpp), which overflows for a penalty near INT_MIN, and a
+             * negative penalty rewards leaving a pair unpaired. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, 0, INT_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -U unpaired penalty must be a non-negative integer in 0..%d (got %s)\n",
+                        INT_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->pen_unpaired = (int)v;
+            opt0.pen_unpaired = 1;
+        }
         else if (c == 't') {
             /* atoi() silently maps unparseable input to 0 and ignores
              * trailing garbage (e.g. "-t nope" -> 0, "-t 300oops" -> 300), so
@@ -2387,7 +2514,20 @@ int main_mem(int argc, char *argv[])
             opt->max_occ = (int)v;
             opt0.max_occ = 1;
         }
-        else if (c == 'd') opt->zdrop = atoi(optarg), opt0.zdrop = 1;
+        else if (c == 'd') {
+            /* The 8-bit banded extension asserts zdrop >= 0 (bandedSWA.cpp), live
+             * in every build, so a negative -d aborts the run. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, 0, INT_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -d z-drop must be a non-negative integer in 0..%d (got %s)\n",
+                        INT_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->zdrop = (int)v;
+            opt0.zdrop = 1;
+        }
         else if (c == 'v') bwa_verbose = atoi(optarg);
         else if (c == 'j') ignore_alt = 1;
         else if (c == 'r')
@@ -2560,97 +2700,8 @@ int main_mem(int argc, char *argv[])
             profile_path = optarg;
         }
 #endif
-        else if (c == OPT_METH) {
-            opt->meth_mode = 1;
-            /* --meth selects bisulfite ALIGNMENT semantics only; the output
-             * container is --bam's job here exactly as it is without --meth.
-             * (Through 0.7.x this set bam_mode=1, which made text SAM
-             * unreachable under --meth — there was no flag that undid it.) */
-            /* Optional chemistry argument. getopt_long's optional_argument only
-             * accepts the `--meth=taps` form (a separate word is treated as a
-             * positional), so a bare `--meth` leaves optarg NULL => em-seq. */
-            if (optarg != NULL) {
-                if (strcmp(optarg, "emseq") == 0 || strcmp(optarg, "em-seq") == 0
-                        || strcmp(optarg, "bisulfite") == 0) {
-                    opt->meth_chem = METH_CHEM_EMSEQ;
-                } else if (strcmp(optarg, "taps") == 0) {
-                    opt->meth_chem = METH_CHEM_TAPS;
-                } else {
-                    fprintf(stderr, "ERROR: --meth accepts 'emseq' (default) or 'taps', got '%s'\n"
-                                    "       note: use --meth=taps, not --meth taps\n", optarg);
-                    free(opt);
-                    if (out_opened) fclose(aux.fp);
-                    return 1;
-                }
-            }
-        }
-        else if (c == OPT_METH_SCORING) {
-            if (optarg != NULL && strcmp(optarg, "collapsed") == 0) {
-                opt->meth_scoring = MEM_METH_SCORING_COLLAPSED;
-                opt0.meth_scoring = 1;
-            } else if (optarg != NULL && strcmp(optarg, "genomic") == 0) {
-                opt->meth_scoring = MEM_METH_SCORING_GENOMIC;
-                opt0.meth_scoring = 1;
-            } else if (optarg != NULL && strcmp(optarg, "neutral") == 0) {
-                opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
-                opt0.meth_scoring = 1;
-            } else {
-                fprintf(stderr, "ERROR: --meth-scoring requires 'collapsed', 'genomic', or 'neutral'\n");
-                free(opt);
-                if (out_opened) fclose(aux.fp);
-                return 1;
-            }
-        }
-        else if (c == OPT_METH_SEED_PRUNE) {
-            /* --meth-seed-prune[=spec30|baseline|off]: prune the 3-letter
-             * over-seeding before SA resolution (~30% faster --meth at ~0 truth
-             * accuracy cost; NOT byte-identical). ON by default under --meth
-             * (SPEC30, set in the meth-default block below); pass =off to restore
-             * byte-identical seeding. getopt_long's optional_argument only binds
-             * with '=' (a bare word is a positional), so a plain --meth-seed-prune
-             * leaves optarg NULL => spec30 (the recommended rule). */
-            if (optarg == NULL || strcmp(optarg, "spec30") == 0) {
-                opt->meth_seed_prune = MEM_METH_PRUNE_SPEC30;
-            } else if (strcmp(optarg, "baseline") == 0) {
-                opt->meth_seed_prune = MEM_METH_PRUNE_BASELINE;
-            } else if (strcmp(optarg, "off") == 0) {
-                opt->meth_seed_prune = MEM_METH_PRUNE_OFF;
-            } else {
-                /* optarg is non-NULL here (NULL took the spec30 branch), so the
-                 * value was bound with '=' -- the orphaned-space case cannot
-                 * reach this branch, and a "use =, not a space" note would
-                 * misdirect. Just name the accepted vocabulary. */
-                fprintf(stderr, "ERROR: --meth-seed-prune accepts 'spec30' (default), 'baseline', or 'off'\n");
-                free(opt);
-                if (out_opened) fclose(aux.fp);
-                return 1;
-            }
-            opt0.meth_seed_prune = 1;   /* explicit: wins over the --meth spec30 default below */
-        }
-        else if (c == OPT_METH_TAGS) {
-            const char *tag_err = NULL;
-            if (mem_opt_parse_meth_tags(optarg, &opt->meth_tags, &tag_err) != 0) {
-                fprintf(stderr, "ERROR: --meth-tags '%s': %s\n"
-                                "       expected 'all', 'none', a comma-separated list "
-                                "(e.g. XR,XG), or ^-prefixed exclusions (e.g. ^XM)\n",
-                        optarg != NULL ? optarg : "", tag_err);
-                free(opt);
-                if (out_opened) fclose(aux.fp);
-                return 1;
-            }
-            opt0.meth_tags = 1;
-        }
-        else if (c == OPT_METH_SET_AS_FAILED) {
-            if (optarg == NULL || !(optarg[0] == 'f' || optarg[0] == 'r') || optarg[1] != '\0') {
-                fprintf(stderr, "ERROR: --set-as-failed requires 'f' or 'r'\n");
-                free(opt);
-                if (out_opened) fclose(aux.fp);
-                return 1;
-            }
-            opt->meth_set_as_failed = optarg[0];
-        }
-        else if (c == OPT_METH_CHIMERA_QC) {
-            opt->meth_chimera_qc = 1;
+        else if (meth_opts_parse(c, optarg, opt, &meth_cli)) {
+            /* The --meth family: parsed and range-checked in meth_opts.cpp. */
         }
         else if (c == OPT_SUPP_REP_HARD_CAP) {
             char *end = NULL;
@@ -3042,7 +3093,7 @@ int main_mem(int argc, char *argv[])
      * path. Diagnose it here, before any index work, whenever a positional
      * matches a known option-value vocabulary and is not an actual path. */
     for (int pos = optind; pos < argc; ++pos) {
-        const char *flag = stray_option_value_flag(argv[pos]);
+        const char *flag = stray_option_value_flag(argv[pos], NULL);
         if (flag == NULL || path_exists(argv[pos])) continue;
         fprintf(stderr,
                 "ERROR: '%s' was taken as a positional argument (%s), but it looks like\n"
@@ -3139,6 +3190,14 @@ int main_mem(int argc, char *argv[])
             return 1;
         }
     } else update_a(opt, &opt0);
+
+    /* Checked here, before the warnings below, which are meant to follow every
+     * rejection; --meth re-checks after its own defaults (see there). */
+    if (check_effective_scoring(opt) != 0) {
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
 
     /* --fast: one-flag shorthand for the characterized speed levers
      *   -m 10  -y 0  --min-ext-len 30  --smem-dedup
@@ -3318,7 +3377,9 @@ int main_mem(int argc, char *argv[])
      * is never load-bearing for soundness. Report that fallback once, so a run
      * record explains why the skip is not in force. The flag is left set: the
      * driver's own guard (two_wave) is what disables it. Read after every
-     * rejection above and before the --fast preset, like the audit lines. */
+     * rejection above and before the --fast preset, like the audit lines.
+     * -A is now held to 1..127 at parse, so this cannot fire from the command
+     * line; it stays as a cheap report should that bound ever loosen. */
     if (opt->skip_contained_ext && !mem_skip_contained_ext_sound(opt))
         fprintf(stderr, "[W::%s] contained-seed extension skip disabled: -A %d is negative, "
                 "outside the scoring its byte-identity proof covers; running the "
@@ -3448,7 +3509,7 @@ int main_mem(int argc, char *argv[])
      *     A/B with the asymmetric matrix showed b=4 places better and is better
      *     MAPQ-calibrated than b=2 (placement 92.6 vs 92.5, discordant MAPQ
      *     1.8 vs 2.1).
-     *   NEUTRAL (variant-aware, the --meth=taps default): also keeps -B 4. It
+     *   NEUTRAL (variant-aware, the --meth=taps|5base default): also keeps -B 4. It
      *     differs from GENOMIC only in the freed cell's VALUE (0 vs +a), not in
      *     the leniency gate, so the same b=4 argument applies unchanged.
      * pen_unpaired is only consulted for paired-end rescue, so setting it
@@ -3457,37 +3518,11 @@ int main_mem(int argc, char *argv[])
      * NB: those constants are quoted at bwameth's match score (a == 1) and are
      * scaled by opt->a inside mem_opt_apply_meth_defaults — see bwamem.h. Before
      * that, they were applied flat and silently discarded -A. */
+    /* Cross-option checks and the chemistry defaults (TAPS -> neutral scoring,
+     * spec30 seed pruning); runs before the scored defaults below read the
+     * resolved scoring mode. */
+    meth_opts_finalize(opt, &meth_cli);
     if (opt->meth_mode) {
-        /* TAPS defaults to NEUTRAL scoring. TAPS converts only the METHYLATED
-         * cytosines, so conversions are ~20-30x rarer than under em-seq (measured:
-         * 3.2% of C vs 94.6% on chr22 @ 12x). The collapsed 3-letter alphabet buys
-         * little at that density and costs specificity. NEUTRAL goes one step
-         * further: it scores the conversion cell as 0 rather than a full match,
-         * so a sparse TAPS conversion is tolerated without over-crediting spurious
-         * C->T alignments. Measured on 4.07M simulated TAPS reads vs full hg38,
-         * across three methylation loads: NEUTRAL placed 95.95-96.01% (essentially
-         * the 96.02% unconverted ceiling) vs GENOMIC 95.68-95.73% and COLLAPSED
-         * 95.37-95.43% -- a robust +0.24-0.28 pp over genomic -- with IDENTICAL
-         * MAPQ calibration (60+ bin 99.99% both) and NM (1.966 vs 1.969), so the
-         * gain is not bought with over-confidence or inflated edit distance.
-         * NEUTRAL's freed cell is not rank-1, but the generalized kswv freed-cell
-         * blend scores it to its matrix value, so mate rescue stays on the batched
-         * kernel on the freed-capable tiers (NEON/AVX2/AVX512BW) and falls back to
-         * scalar ksw_align2 only on the freed-less x86 tiers (sse41/sse42/avx),
-         * exactly as GENOMIC and COLLAPSED do. An explicit --meth-scoring still wins.
-         * Set before mem_opt_apply_meth_defaults so its COLLAPSED -B 2 branch keys
-         * off the resolved scoring mode. */
-        if (opt->meth_chem == METH_CHEM_TAPS && !opt0.meth_scoring)
-            opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
-        /* --meth-seed-prune defaults to spec30 under --meth. Unlike non-meth, --meth
-         * is a bwa-mem3-native feature -- bwa/bwa-mem2 never had a bisulfite mode, so
-         * there is no upstream reference output to stay byte-identical to. spec30 is
-         * ~30% faster on em-seq at ~0 truth-based accuracy cost (mapq>=20 accuracy
-         * identical; 8x fewer newly-unmapped than the `baseline` rule). An explicit
-         * --meth-seed-prune=off|baseline (or the BWAMEM3_METH_SEED_PRUNE env) still
-         * wins; no effect outside --meth (the prune is gated on the meth remap). */
-        if (!opt0.meth_seed_prune)
-            opt->meth_seed_prune = MEM_METH_PRUNE_SPEC30;
         /* Scored defaults live in mem_opt_apply_meth_defaults so they scale with
          * -A (bwameth's constants assume a==1) and can be unit-tested. */
         mem_opt_apply_meth_defaults(opt, &opt0);
@@ -3501,17 +3536,25 @@ int main_mem(int argc, char *argv[])
         opt->band_cert = 0;
     }
 
+    /* The --meth defaults just applied scale -B (collapsed: 2 * -A, so -A 65
+     * gives 130) and -U by -A as well, so check the effective scoring again
+     * now that every score-derived default is final. */
+    if (opt->meth_mode && check_effective_scoring(opt) != 0) {
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
+
     /* Under --meth, NM is derived from the scoring matrix (an aligned column
      * is an edit iff the matrix penalizes it; indels always count), so a
      * non-positive -B makes every substitution cell non-negative and silently
      * collapses NM to 0 -- hiding real variants, not just conversions. Refuse
      * it rather than emit output that looks clean because scoring is degenerate.
-     * The bound is `<= 0`, not `== 0`: bwa_fill_scmat stores -b, so a NEGATIVE
-     * -B turns every substitution into a positive reward, which hides real
-     * variants at least as thoroughly as -B 0 does.
-     * The message reports the EFFECTIVE penalty rather than echoing "-B":
-     * update_a() scales b by -A when -B was not given, so `-A 0` reaches b == 0
-     * without the user ever passing -B, and naming -B there would misdirect.
+     * check_effective_scoring() has already refused a negative penalty on every
+     * path, so only -B 0 reaches this; the bound stays `<= 0` so the guard does
+     * not depend on that order (a NEGATIVE -B would reward every substitution,
+     * which hides real variants at least as thoroughly as -B 0 does).
+     * The message reports the EFFECTIVE penalty, like the other scoring checks.
      * The non-meth path keeps the literal comparison and is unaffected. */
     if (opt->meth_mode && opt->b <= 0) {
         fprintf(stderr, "ERROR: --meth requires a positive mismatch penalty, but the "
@@ -3592,31 +3635,6 @@ int main_mem(int argc, char *argv[])
         }
     }
 
-    /* D3: fail fast with an actionable message if the `.meth` seed index is
-     * absent — distinguishing a never-built index from a stale D1 `.bwameth.c2t`
-     * index (the format changed; the user must re-run `index --meth`). */
-    if (opt->meth_mode) {
-        char probe[PATH_MAX];
-        snprintf(probe, sizeof(probe), "%s%s", ref_prefix, ".bwt.2bit.64");
-        if (access(probe, F_OK) != 0) {
-            const char *orig = (meth_orig_ref_prefix != NULL) ? meth_orig_ref_prefix
-                                                              : argv[optind];
-            char old_probe[PATH_MAX];
-            snprintf(old_probe, sizeof(old_probe), "%s.bwameth.c2t.bwt.2bit.64", orig);
-            if (access(old_probe, F_OK) == 0)
-                fprintf(stderr,
-                        "ERROR: --meth found a legacy '.bwameth.c2t' index, but the "
-                        "format changed. Re-run: bwa-mem3 index --meth %s\n", orig);
-            else
-                fprintf(stderr,
-                        "ERROR: --meth seed index '%s.*' not found. Run: "
-                        "bwa-mem3 index --meth %s\n", ref_prefix, orig);
-            free(opt);
-            if (out_opened) fclose(aux.fp);
-            return 1;
-        }
-    }
-
     if (opt->seed_emit_order != SEED_ORDER_OFF)
         fprintf(stderr, "[M::%s] seed order: %s\n", __func__, seed_order_to_str(opt->seed_emit_order));
     if (fast) {
@@ -3674,6 +3692,70 @@ int main_mem(int argc, char *argv[])
         free(opt);
         if (out_opened) fclose(aux.fp);
         return 1;
+    }
+
+    /* Report an input that cannot be read before the index load, which can take
+     * minutes on a large reference, rather than after it. Any stat() failure
+     * counts (a missing file, but also ENOTDIR, ENAMETOOLONG, or EACCES on a
+     * parent directory), and so does a directory. Only names kopen() opens as
+     * paths are checked: "-", a `<cmd`, http:// and ftp:// are left to it, and
+     * under -p the second positional is ignored as before. The check opens
+     * nothing -- the real open and the reader's format sniff stay after the
+     * load, so stdin, a `<cmd` or a FIFO that is slow to start never holds the
+     * load up -- and a file that exists but cannot be opened (permissions) is
+     * still reported after the load.
+     *
+     * The messages and exit status are the ones the opens below use, so for a
+     * missing or unreachable path only the timing changes, and with it which
+     * error can appear first: an input error now precedes an index error; if
+     * R1 exists but cannot be opened and R2 is missing, R2 is reported first;
+     * and an input created while the index loads, which used to be found, is
+     * now rejected (one removed while it loads still fails at the open after
+     * the load, and one replaced is read as it is at that open). A directory is the exception: it used to fail after
+     * the load with the reader's error ("read failed", or "[gzread] Is a
+     * directory" under --legacy-reader) and now gets "fail to open file"
+     * ("failed to open file" as R2) before it. */
+    {
+        int n_in = (optind + 2 < argc && !(opt->flag & MEM_F_PE)) ? 2 : 1;
+        for (int k = 1; k <= n_in; ++k) {
+            const char *fn = argv[optind + k];
+            struct stat st;
+            if (!kopen_is_local_path(fn)) continue;
+            if (stat(fn, &st) != 0 || S_ISDIR(st.st_mode)) {
+                fprintf(stderr, "[E::%s] %s to open file `%s'.\n", __func__,
+                        k == 1 ? "fail" : "failed", fn);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
+    }
+
+    /* D3: fail fast with an actionable message if the `.meth` seed index is
+     * absent — distinguishing a never-built index from a stale D1 `.bwameth.c2t`
+     * index (the format changed; the user must re-run `index --meth`). It runs
+     * after the input check above, so a missing input is reported before a
+     * missing seed index, as it is before any other index error. */
+    if (opt->meth_mode) {
+        char probe[PATH_MAX];
+        snprintf(probe, sizeof(probe), "%s%s", ref_prefix, ".bwt.2bit.64");
+        if (access(probe, F_OK) != 0) {
+            const char *orig = (meth_orig_ref_prefix != NULL) ? meth_orig_ref_prefix
+                                                              : argv[optind];
+            char old_probe[PATH_MAX];
+            snprintf(old_probe, sizeof(old_probe), "%s.bwameth.c2t.bwt.2bit.64", orig);
+            if (access(old_probe, F_OK) == 0)
+                fprintf(stderr,
+                        "ERROR: --meth found a legacy '.bwameth.c2t' index, but the "
+                        "format changed. Re-run: bwa-mem3 index --meth %s\n", orig);
+            else
+                fprintf(stderr,
+                        "ERROR: --meth seed index '%s.*' not found. Run: "
+                        "bwa-mem3 index --meth %s\n", ref_prefix, orig);
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            return 1;
+        }
     }
 
     /* Load bwt2/FMI index */
@@ -3853,6 +3935,15 @@ int main_mem(int argc, char *argv[])
     // fp = gzopen(argv[optind + 1], "r");
     if (aux.legacy_reader) {
         fp = gzdopen(fd, "r");
+        if (fp == NULL) {
+            fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 1]);
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            delete aux.fmi;
+            close(fd);   // gzdopen failed, so nothing else owns fd; kclose does not close it
+            kclose(ko);
+            return 1;
+        }
         aux.ks = kseq_init(fp);
     } else {
         const char *fr_err = NULL;
@@ -3895,8 +3986,17 @@ int main_mem(int argc, char *argv[])
             }
             if (aux.legacy_reader) {
                 fp2 = gzdopen(fd2, "r");
+                if (fp2 == NULL) {
+                    fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 2]);
+                    free(opt);
+                    err_gzclose(fp); kseq_destroy(aux.ks);
+                    if (out_opened) fclose(aux.fp);
+                    delete aux.fmi; kclose(ko);
+                    close(fd2);   // gzdopen failed, so nothing else owns fd2; kclose does not close it
+                    kclose(ko2);
+                    return 1;
+                }
                 aux.ks2 = kseq_init(fp2);
-                assert(aux.ks2 != 0);
             } else {
                 const char *fr_err2 = NULL;
                 aux.fr2 = fast_reader_dopen(fd2, &fr_err2);

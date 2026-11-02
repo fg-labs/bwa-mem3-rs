@@ -13,10 +13,13 @@
  * (rid, m, n) are equal on `l`; entries differing on (rid, m, n) already differ
  * before `l` would be reached — so comparing `l` never changes the result. This
  * also lets the pure-backward SMEM phase skip maintaining the (dead) l-chain
- * (see backwardExt_konly in FMI_search.h).
+ * (see backwardExt_konly in FMI_search.h), and the lockstep driver's
+ * unique-match text compare (ls_s1_compare in FMI_search.cpp) leave `l` at its
+ * last forward-step value, which the third-pass seed the lockstep bwtSeed
+ * driver takes from a BsdFirstWalk record then carries too.
  *
  * Precondition: identical SMEMs are adjacent in the array (guaranteed after
- * sortSMEMs + per-read ks_introsort(mem_intv1) in mem_collect_smem). */
+ * smem_sort_rid_mn's rid + (m, n) sort in mem_collect_smem). */
 int64_t smem_dedup_inplace(SMEM *a, int64_t n)
 {
     if (n <= 1) return n;

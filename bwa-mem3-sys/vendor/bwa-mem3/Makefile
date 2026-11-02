@@ -332,6 +332,41 @@ ifeq ($(strip $(STAGE_PROF)),1)
     CPPFLAGS += -DSTAGE_PROF=1
 endif
 
+# Drop any optimization level (-O0/-O1/-O2/-O3/-Os/-Og/-Ofast) and -DNDEBUG from
+# CPPFLAGS.
+# The aligner's own compile rules (.cpp.o, .c.o, the per-tier kernel rules) and
+# the bwa-mem3 link put $(CPPFLAGS) after $(CXXFLAGS), $(BASE_CXXFLAGS) or
+# $(SRC_CFLAGS), and the compiler takes the last -O it sees, so an -O in CPPFLAGS
+# would replace the -O3 those set (and the sanitizers' -O1 and COVERAGE_OPT), on
+# the compile lines and, with LTO, on the link line that drives LTO code
+# generation. conda-forge's compiler activation exports
+# CPPFLAGS="-DNDEBUG -D_FORTIFY_SOURCE=2 -O2", so a conda/bioconda build would
+# otherwise compile the aligner, including the SIMD kernels, at -O2. An -O level
+# is not a preprocessor flag; to change the optimization level, use
+# EXTRA_CXXFLAGS (C++) or EXTRA_CFLAGS (the C reader), which come after -O3.
+# -DNDEBUG is removed too (only the single-token spellings -DNDEBUG and
+# -DNDEBUG=<v>; a two-token `-D NDEBUG` is not matched): conda's CPPFLAGS
+# defines it, which would compile every plain assert() out of a packaged build.
+# No target here defines NDEBUG, and the sources rely on plain asserts being
+# live in every build without an explicit -DNDEBUG opt-out (see
+# test/regression/ndebug_gate_lint.sh). To build
+# bwa-mem3's own sources without them deliberately, pass
+# `make EXTRA_CXXFLAGS=-DNDEBUG` (and EXTRA_CFLAGS=-DNDEBUG for the C reader),
+# which this filter does not touch and the PGO/LTO targets forward.
+# The filter runs unconditionally, after the last `CPPFLAGS +=` above. A
+# command-line CPPFLAGS needs `override` to be rewritten (and then, as before,
+# replaces every `CPPFLAGS +=` above), and `export` so the recursive makes still
+# get it: the override drops the export a command-line variable otherwise has,
+# and lto-build clears MAKEFLAGS / MAKEOVERRIDES, which leaves the environment
+# as its sub-make's only source. An environment or makefile value is rewritten
+# in place and stays exported to the recursive makes.
+ifeq ($(origin CPPFLAGS),command line)
+    override CPPFLAGS := $(filter-out -O% -DNDEBUG -DNDEBUG=%,$(CPPFLAGS))
+    export CPPFLAGS
+else
+    CPPFLAGS := $(filter-out -O% -DNDEBUG -DNDEBUG=%,$(CPPFLAGS))
+endif
+
 # Version string for `bwa-mem3 version` and the @PG VN: field. The single
 # source of truth is `version.txt` (rewritten by release-please on each
 # release). The logic of "base version + optional git-describe dev suffix"
@@ -476,7 +511,7 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/compat_target.o \
 			src/FMI_search.o src/fmi_seed_api.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
-			src/meth_xm.o \
+			src/meth_xm.o src/meth_opts.o src/meth_model.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
 			src/bwa_shm.o src/bwa_hugepages.o src/bwa_thp.o src/simd_dispatch.o \
@@ -505,6 +540,7 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    bandedswa_high_h0_zdrop_test bandedswa_negative_h0_test \
                    shm_section_find_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
+                   shm_thp_advise_test \
                    kt_for_pool_test bns_zero_calloc_test \
                    err_fgets_eof_test \
                    kernel_padded_lane_uninit_test bam_rec_scratch_test \
@@ -516,9 +552,10 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    pwrite_all_status_test x86_soa_pack_test
 STANDALONE_TEST_OBJS = $(STANDALONE_TESTS:%=test/%.o)
 
-# shm_pack_round_trip_test is excluded from `test:` because it runs via
-# test/shm_pack_round_trip_test.sh, which has to build a phiX index first.
-STANDALONE_TESTS_IN_TEST_TARGET = $(filter-out shm_pack_round_trip_test,$(STANDALONE_TESTS))
+# shm_pack_round_trip_test and shm_thp_advise_test are excluded from `test:`
+# because they need a phiX index: test/run_unit_tests.sh runs them after
+# test/shm_pack_round_trip_test.sh has built it.
+STANDALONE_TESTS_IN_TEST_TARGET = $(filter-out shm_pack_round_trip_test shm_thp_advise_test,$(STANDALONE_TESTS))
 
 # Architecture-specific builds (x86 only, ARM uses default from above)
 ifeq ($(IS_ARM),)
@@ -681,16 +718,25 @@ else
 endif
 
 # COVERAGE=1 augments CXXFLAGS/BASE_CXXFLAGS/LDFLAGS with --coverage and
-# overrides -O3 with -O0 so gcov line numbers correspond 1:1 with source.
-# Consumed by the CI `coverage` job; not part of any shipped binary.
+# overrides -O3 with $(COVERAGE_OPT). Not part of any shipped binary.
+#
+# COVERAGE_OPT defaults to -O0, so gcov line numbers correspond 1:1 with source
+# (the usual choice when reading a local report line by line). The CI `coverage`
+# job sets COVERAGE_OPT=-O1, which runs the instrumented tests faster; gcc
+# supports --coverage at any -O level. The cost is attribution detail, not
+# correctness: -O1 inlines static functions called once
+# (-finline-functions-called-once) and merges or drops some lines, so a few
+# lines and small functions are reported under their caller or not at all.
+# test/Makefile reads the same knob.
 #
 # BASE_CXXFLAGS has to be augmented too, not just CXXFLAGS: the per-tier kernel
 # objects ($(KERNEL_TIER_OBJS) — bandedSWA/kswv/ksw/sam_encode at every tier),
 # the native kernel objects and the standalone test objects all compile with
 # BASE_CXXFLAGS, so with CXXFLAGS alone the SW kernels report no coverage at
-# all. -O0/--coverage are not -m... ISA flags, so the per-tier rules can still
-# append their own.
-COVERAGE_FLAGS = -O0 --coverage
+# all. $(COVERAGE_OPT)/--coverage are not -m... ISA flags, so the per-tier
+# rules can still append their own.
+COVERAGE_OPT ?= -O0
+COVERAGE_FLAGS = $(COVERAGE_OPT) --coverage
 ifneq ($(COVERAGE),)
     CXXFLAGS      += $(COVERAGE_FLAGS)
     BASE_CXXFLAGS += $(COVERAGE_FLAGS)
@@ -1055,8 +1101,8 @@ bandedswa_highzdrop_seed_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test
 
 # Negative-h0 regression: an 8-bit lane whose seed score is negative (--meth
 # rescores seeds in original space) must score the same alone as in any group.
-bandedswa_negative_h0_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_negative_h0_test.o
-	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_negative_h0_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
+bandedswa_negative_h0_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) src/bandedSWA.native.o test/bandedswa_negative_h0_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_negative_h0_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
 # High-h0 / small-zdrop z-drop regression: getScores8 vs scalar with the seed
 # score h0 above zdrop+1 at small zdrop (the region a relaxed 8-bit routing
@@ -1077,9 +1123,11 @@ bandedswa_high_h0_zdrop_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/
 # callers that skip the bwa-mem3 binary build (which builds it as a
 # side-effect of $(EXE) deps) link-fail.
 test-binaries: $(BWA_LIB) $(HTS_LIB) $(ROWALT_KERNEL_OBJ)
-	$(MAKE) -C test framework unit integration \
+	$(MAKE) -C test framework unit integration tools \
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
+	    COVERAGE_OPT='$(COVERAGE_OPT)' \
+	    ASAN=$(ASAN) \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
 	    ARM_CPU='$(ARM_CPU)' \
 	    ARM_TUNE='$(ARM_TUNE)' \
@@ -1098,6 +1146,9 @@ shm_pack_round_trip_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_ro
 
 shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_lock_destroy_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
+shm_thp_advise_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_thp_advise_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_thp_advise_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
 kt_for_pool_test: $(BWA_LIB) $(HTS_LIB) test/kt_for_pool_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/kt_for_pool_test.o $(BWA_LIB) $(LIBS) -o $@
@@ -1253,7 +1304,7 @@ src/fr_fastq.o: src/fr_fastq.c
 # Standalone stage_prof helper unit test (stats + clocks + NaN init). Links only
 # pthread + libm, so it needs no bwa-mem3/htslib build. Built with -DSTAGE_PROF
 # so the real implementation (not the no-op inlines) is exercised.
-stage_prof_test: src/stage_prof.cpp src/stage_prof.h test/stage_prof_test.cpp
+stage_prof_test: src/stage_prof.cpp src/stage_prof.h test/stage_prof_test.cpp test/framework/temp_dir.h test/framework/temp_path.h
 	$(CXX) -O2 -std=gnu++14 -DSTAGE_PROF=1 -Isrc src/stage_prof.cpp test/stage_prof_test.cpp -lpthread -lm -o $@
 
 # Standalone fast_reader correctness self-test (plain/gzip/multi-member/BGZF
@@ -1279,14 +1330,14 @@ ifeq ($(UNAME_S),Darwin)
         FAST_READER_TEST_LIB += -L$(ZLIBNG_PREFIX)/lib
     endif
 endif
-fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c test/gz_test_util.h $(FAST_READER_TEST_DEP)
+fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c test/gz_test_util.h test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fast_reader_selftest.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Differential test: fr_fastq vs kseq, byte-identical record parsing. Links only
 # zlib + zlib-ng + libdeflate (kseq.h is header-only), so it needs no bwa-mem3 build.
 # Built with $(SRC_CFLAGS), the flags the aligner's reader TUs get, so it checks
 # the parser at the shipped optimization level and ISA flags.
-fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $(FAST_READER_TEST_DEP) $(FLAGS_STAMP)
+fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c test/framework/temp_path.h $(FAST_READER_TEST_DEP) $(FLAGS_STAMP)
 	$(CC) $(SRC_CFLAGS) -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Read+parse microbenchmark: kseq vs fr_fastq on a real FASTQ (no index/align).
@@ -1299,13 +1350,13 @@ fr_fastq_bench: src/fr_fastq.c src/fast_reader.c test/fr_fastq_bench.c $(FAST_RE
 # but capacity is checked once). Always built with ASan so the overflowing write
 # aborts on regression; links only the reader TUs (no bwa-mem3 build), like
 # fr_fastq_diff_test. Built and run per-row by the CI matrix (ci.yml).
-bseq_read_pe_oob_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_pe_oob_test.c $(FAST_READER_TEST_DEP)
+bseq_read_pe_oob_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_pe_oob_test.c test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O1 -g -fsanitize=address -fno-omit-frame-pointer -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_pe_oob_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Coverage for bseq_read_fast's copy_comment/-C gate (bseq1_t.comment set only
 # when the caller asked AND the record had a comment), across SE/PE. The parser
 # is covered by fr_fastq_diff_test; this drives the adapter. Reader TUs only.
-bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_comment_copy_test.c $(FAST_READER_TEST_DEP)
+bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_comment_copy_test.c test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_comment_copy_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Regression: bseq_read_fast must abort (err_fatal), not swallow a truncated
@@ -1313,7 +1364,7 @@ bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bs
 # bseq_read_fast chain over a mid-member-truncated .fq.gz; the forked child must
 # die by SIGABRT rather than reach a clean n==0 EOF. Reader TUs only (no
 # bwa-mem3 build), like bseq_read_comment_copy_test. Built and run in ci.yml.
-bseq_read_truncated_gzip_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_truncated_gzip_test.c test/gz_test_util.h $(FAST_READER_TEST_DEP)
+bseq_read_truncated_gzip_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_truncated_gzip_test.c test/gz_test_util.h test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_truncated_gzip_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 # kvec_alloc_fail_test -- forces the backing realloc to fail and asserts kvec.h's
 # growth macros abort loudly (SIGABRT + an out-of-memory diagnostic) instead of
@@ -1354,6 +1405,7 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib_alloc_fail_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
+	MEM_SYNTH_REF=./test/mem_synth_ref ./test/regression/mem_synth_ref_check.sh
 	for t in $(STANDALONE_TESTS_IN_TEST_TARGET); do echo "./$$t"; ./$$t || exit 1; done
 	./kvec_alloc_fail_test
 	./klib_alloc_fail_test
@@ -1361,6 +1413,11 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/thp_check_smoke.sh
+	./test/regression/mem_cli_selftest.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_cli_basics.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_io_cli.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_seed_cli.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_extend_cli.sh
 	./test/regression/ndebug_gate_lint_selftest.sh
 	./test/regression/ndebug_gate_lint.sh
 	./test/regression/calloc_interpose_flag_lint_selftest.sh
@@ -1448,6 +1505,9 @@ test/detect_sa_compx_test.o: test/detect_sa_compx_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/shm_thp_advise_test.o: test/shm_thp_advise_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/kt_for_pool_test.o: test/kt_for_pool_test.cpp
@@ -1713,13 +1773,13 @@ endif
 
 pgo-generate:
 	rm -f src/*.o $(BWA_LIB)
-	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="-fprofile-generate=$(PGO_PROFILE_DIR)" CXX="$(CXX)" all
+	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -fprofile-generate=$(PGO_PROFILE_DIR)" CXX="$(CXX)" all
 	@echo "PGO instrumented binary built: $(PGO_INSTR_EXE) (arch=$(PGO_ARCH), profile dir=$(PGO_PROFILE_DIR))"
 	@echo "Run training workload with $(PGO_INSTR_EXE), then: make pgo-use PGO_ARCH=$(PGO_ARCH) PGO_PROFILE_DIR=$(PGO_PROFILE_DIR)"
 
 pgo-use:
 	rm -f src/*.o $(BWA_LIB)
-	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="-fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX="$(CXX)" all
+	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX="$(CXX)" all
 	@echo "PGO optimized binary built: $(PGO_FINAL_EXE) (arch=$(PGO_ARCH))"
 
 pgo-clean:
@@ -1826,7 +1886,7 @@ lto-build:
 	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto=$$LTO_JOBS ;; esac; \
 	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH), lto-jobs: $$LTO_JOBS)"; \
 	  MAKEFLAGS= MAKEOVERRIDES= \
-	    $(MAKE) -j1 arch=$(LTO_ARCH) EXE=bwa-mem3.lto BWA_LTO_MODE=off EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
+	    $(MAKE) -j1 arch=$(LTO_ARCH) EXE=bwa-mem3.lto BWA_LTO_MODE=off EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" EXTRA_CFLAGS="$(EXTRA_CFLAGS)" CXX="$(CXX)" all
 	@echo "LTO binary: bwa-mem3.lto (arch=$(LTO_ARCH))"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -flto / -fno-semantic-interposition

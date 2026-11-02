@@ -38,8 +38,10 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "ksw.h"
 #include "utils.h"
 #include "kstring.h"
+#include "meth_model.h"  /* METH_M, meth_code_base, meth_label_window: the cpg alphabet in bwa_gen_cigar4 */
 #include "kvec.h"
 #include "u8vec_scratch.h"
+#include "seq_reverse.h"
 #include <string>
 
 int bwa_verbose = 3;
@@ -353,11 +355,21 @@ void bwa_fill_scmat(int a, int b, int8_t mat[25])
  *
  * Returns kc (at least |d|), or -1 when the bound does not apply (amax + e_ins + e_del <= 0, a
  * negative gap open, or an empty sequence). */
-int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins,
-                         int qlen, const uint8_t *query, int tlen, const uint8_t *rseq)
+/* The plain base of reference code r for an alphabet of size M: r itself for
+ * M = 5, meth_code_base(r) for the --meth-context cpg alphabet (M = 7), whose
+ * labels C5/G6 read as C/G. */
+template <int M> static inline uint8_t bwa_ref_base(uint8_t r)
+{
+    return M == 5 ? r : meth_code_base(r);
+}
+
+/* bwa_global_cert_band over a matrix of alphabet size M (row stride M). */
+template <int M>
+static int bwa_global_cert_band_m(const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins,
+                                  int qlen, const uint8_t *query, int tlen, const uint8_t *rseq)
 {
     int amax = mat[0];
-    for (int k = 1; k < 25; ++k) amax = mat[k] > amax ? mat[k] : amax;
+    for (int k = 1; k < M * M; ++k) amax = mat[k] > amax ? mat[k] : amax;
     const int64_t slope = (int64_t) amax + e_ins + e_del;
     if (slope <= 0 || o_ins < 0 || o_del < 0 || qlen <= 0 || tlen <= 0) return -1;
     const int64_t d = (int64_t) tlen - qlen, ad = d < 0 ? -d : d;
@@ -365,14 +377,14 @@ int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     // column score of the lower-bound alignment
     int64_t cols = 0;
     if (d == 0) {   // ungapped
-        for (int k = 0; k < L; ++k) cols += mat[rseq[k] * 5 + query[k]];
+        for (int k = 0; k < L; ++k) cols += mat[rseq[k] * M + query[k]];
     } else {
         // diagonal 0 before the gap (s0), the end diagonal after it (s1); the best gap
         // position maximises the prefix sum of s0 - s1
         const uint8_t *r1 = d > 0 ? rseq + d : rseq, *q1 = d < 0 ? query - d : query;
         int64_t run = 0, best = 0;
         for (int k = 0; k < L; ++k) {
-            const int s0 = mat[rseq[k] * 5 + query[k]], s1 = mat[r1[k] * 5 + q1[k]];
+            const int s0 = mat[rseq[k] * M + query[k]], s1 = mat[r1[k] * M + q1[k]];
             cols += s1;
             run += s0 - s1;
             best = run > best ? run : best;
@@ -386,13 +398,180 @@ int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     return kc > INT32_MAX ? INT32_MAX : (int) kc;
 }
 
-/* Whether an aligned column (reference base r, query base q) is an edit for NM:
- * a literal difference, and with `nm_from_mat` only one the matrix penalises (see
- * bwa_gen_cigar4). The single definition of the rule for both the MD-building
- * and the MD-free walks, so an XA hit's NM cannot drift from its primary's. */
-static inline int bwa_nm_edit(const int8_t mat[25], uint8_t r, uint8_t q, int nm_from_mat)
+int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins,
+                         int qlen, const uint8_t *query, int tlen, const uint8_t *rseq)
 {
-    return r != q && (!nm_from_mat || mat[r * 5 + q] < 0);
+    return bwa_global_cert_band_m<5>(mat, o_del, e_del, o_ins, e_ins, qlen, query, tlen, rseq);
+}
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+
+/* bwa_gen_cigar4's loops over an M op, 32 columns at a time (x86 at the avx2 baseline; without
+ * __AVX2__, NEON included, the scalar loops run). Bit-identical to the scalar loops: the score
+ * is the integer sum of the same mat[r*5 + q] values, the mismatches are found by the same
+ * `query != rseq` test and visited in ascending column order, so MD gets the same bytes, and NM
+ * counts the columns bwa_nm_edit counts (through cig_nm_edits, its lane-mask form). */
+
+/* mat[r*5 + q] for 32 columns by pshufb: `lo` holds mat[0..15], `hi` mat[16..24], and bit 4 of
+ * idx = r*5 + q picks the table. In the op's columns, and in the bytes before the op that
+ * cig_blocks' backward remainder load covers, bases are 0..4 (rseq from the 2-bit pac, the
+ * query by nst_nt4_table), so idx <= 24. The lanes past the op in its forward remainder load
+ * can hold any byte (the reference headroom past rlen holds zeros from the scratch's growth, an
+ * earlier call's bases, or the unit test's fill), and the 16-bit r << 2 can carry such a byte's
+ * top bits into the next-higher lane only. Those lanes are past the op too and masked
+ * off, so no kept lane's idx changes. */
+struct cig_lut_t { __m256i lo, hi; };
+
+static inline cig_lut_t cig_lut_make(const int8_t mat[25])
+{
+    const __m128i lo = _mm_loadu_si128((const __m128i *) mat);
+    const __m128i hi = _mm_srli_si128(_mm_loadu_si128((const __m128i *) (mat + 9)), 7); // mat[16..24], then 0s
+    return cig_lut_t{ _mm256_broadcastsi128_si256(lo), _mm256_broadcastsi128_si256(hi) };
+}
+
+static inline __m256i cig_lut_get(const cig_lut_t &t, __m256i r, __m256i q)
+{
+    const __m256i idx = _mm256_add_epi8(_mm256_add_epi8(_mm256_slli_epi16(r, 2), r), q);
+    // blendv reads bit 7 of each byte, which the 16-bit shift fills from bit 4 of the same byte
+    return _mm256_blendv_epi8(_mm256_shuffle_epi8(t.lo, idx), _mm256_shuffle_epi8(t.hi, idx),
+                              _mm256_slli_epi16(idx, 3));
+}
+
+// acc (8 int32 lanes) += the 32 signed bytes of v
+static inline __m256i cig_acc(__m256i acc, __m256i v)
+{
+    const __m256i s16 = _mm256_maddubs_epi16(_mm256_set1_epi8(1), v); // byte pairs, |sum| <= 256
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(s16, _mm256_set1_epi16(1)));
+}
+
+static inline int cig_hsum(__m256i acc)
+{
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4e));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xb1));
+    return _mm_cvtsi128_si32(s);
+}
+
+// columns whose query and reference bytes differ, as a lane mask
+static inline uint32_t cig_mismatch(__m256i q, __m256i r)
+{
+    return ~(uint32_t) _mm256_movemask_epi8(_mm256_cmpeq_epi8(q, r));
+}
+#endif
+
+/* Whether an aligned column (reference code r, query base q) is an edit for NM: a literal
+ * difference (of r's plain base), and with `nm_from_mat` only one the matrix penalises (see
+ * bwa_gen_cigar4), read at r's own row, so under --meth-context cpg a conversion at a CpG
+ * (C5/G6) is free and one at a plain C/G is not. The rule has two forms, which must change
+ * together, or an XA hit's NM drifts from its primary's:
+ *   - bwa_nm_edit, per column: the MD-building walk, the scalar remainder loops of the MD-free
+ *     walks, and the whole of every walk on a target without __AVX2__ or at M = 7;
+ *   - cig_nm_edits, its lane-mask form for 32 columns: the vector blocks of the MD-free walks
+ *     (the fused ungapped score/NM loop and the NM-only walk) under __AVX2__, at M = 5 only (it
+ *     compares raw bytes and reads a 25-entry matrix).
+ * test/unit/test_gen_cigar_no_md.cpp checks NM from both walks against a naive walk of the
+ * CIGAR; the lane-mask form is compiled, and so checked, only on an __AVX2__ build. */
+template <int M>
+static inline int bwa_nm_edit(const int8_t *mat, uint8_t r, uint8_t q, int nm_from_mat)
+{
+    return bwa_ref_base<M>(r) != q && (!nm_from_mat || mat[r * M + q] < 0);
+}
+
+#if defined(__AVX2__)
+/* bwa_nm_edit over the lanes in `keep`, as a lane mask: the lanes whose bytes differ and, with
+ * `nm_from_mat`, whose mat[r*5 + q] is negative. mat_v() returns those 32 matrix values
+ * (cig_lut_get); it is called only under nm_from_mat, so a walk that has not built the table
+ * need not. */
+template <class V>
+static inline uint32_t cig_nm_edits(__m256i qv, __m256i rv, uint32_t keep, int nm_from_mat, V &&mat_v)
+{
+    uint32_t ed = cig_mismatch(qv, rv) & keep;
+    if (nm_from_mat) ed &= (uint32_t) _mm256_movemask_epi8(mat_v()); // mat[r*5 + q] < 0
+    return ed;
+}
+#endif
+
+/* Bytes bwa_gen_cigar4's reference scratch keeps past rlen. Never written by the reference
+ * fetch; zeroed when the scratch grows, so every byte is initialised, and otherwise holding
+ * whatever an earlier call left. cig_blocks' forward remainder load reads up to 31 of them
+ * (static_assert below). */
+static constexpr int GEN_CIGAR_RSEQ_HEADROOM = 64;
+
+#if defined(__AVX2__)
+/* Calls f(qv, rv, keep, keepv, base) over columns [0, len) of an M op whose query starts at q
+ * (q_before bytes of the query before it, q_after from it to the query's end) and whose reference
+ * starts at r (r_before bytes before it). Lane j of a call is column base + j; keep (a lane mask)
+ * holds the lanes that are columns of the op not visited before. Full blocks of 32 come first;
+ * the last len % 32 columns are one load ending at len when both sides have the bytes before it,
+ * else one load from the remainder's start when the query has 32 bytes from there (the reference
+ * always has: its end is at most rlen, and bwa_gen_cigar4 keeps GEN_CIGAR_RSEQ_HEADROOM bytes
+ * past rlen). keepv is keep as 0xff bytes for the full blocks and the load ending at len; the
+ * forward load passes it as zero, since no f that reads keepv reaches that load: the ungapped
+ * score walks pass q_before = r_before = 0 and q_after = len, so a remainder there is either
+ * after a full block (the load ending at len) or the whole of a short op (q_after < 32). Returns
+ * the columns visited, len unless a short op near the buffers' ends leaves the rest to a scalar
+ * loop. */
+template <class F>
+static inline int cig_blocks(const uint8_t *q, const uint8_t *r, int len, int q_before, int q_after, int r_before, F &&f)
+{
+    const __m256i all = _mm256_set1_epi8(-1);
+    int i = 0;
+    for (; i + 32 <= len; i += 32)
+        f(_mm256_loadu_si256((const __m256i *) (q + i)), _mm256_loadu_si256((const __m256i *) (r + i)), 0xffffffffu, all, i);
+    const int rem = len - i;
+    if (rem == 0) return len;
+    if (q_before + len >= 32 && r_before + len >= 32) { // lanes 32 - rem .. 31 are new
+        const __m256i iota = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                                              16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
+        const int b = len - 32;
+        f(_mm256_loadu_si256((const __m256i *) (q + b)), _mm256_loadu_si256((const __m256i *) (r + b)),
+          ~0u << (32 - rem), _mm256_cmpgt_epi8(iota, _mm256_set1_epi8((char) (31 - rem))), b);
+        return len;
+    }
+    if (q_after - i >= 32) { // lanes 0 .. rem - 1; the reference load reads up to 31 bytes past r + len
+        f(_mm256_loadu_si256((const __m256i *) (q + i)), _mm256_loadu_si256((const __m256i *) (r + i)),
+          (1u << rem) - 1, _mm256_setzero_si256(), i);
+        return len;
+    }
+    return i;
+}
+static_assert(GEN_CIGAR_RSEQ_HEADROOM >= 31,
+              "cig_blocks' forward remainder load reads up to 31 bytes past an M op ending at rlen");
+#endif
+
+/* bwa_gen_cigar4's reference window scratch, one per thread. */
+static inline u8vec_scratch_t &bwa_gen_cigar_rseq_scratch()
+{
+    static thread_local u8vec_scratch_t t_rseq;
+    return t_rseq;
+}
+
+/* The scratch, grown to at least `want` bytes. Bytes added by a growth are zeroed (once per
+ * growth, not per call), so the headroom past rlen that the reference fetch never writes is
+ * still initialised memory when cig_blocks' masked-off lanes read it. */
+static inline uint8_t *bwa_gen_cigar_rseq_reserve(size_t want)
+{
+    u8vec_t &v = bwa_gen_cigar_rseq_scratch().v;
+    if (v.m < want) {
+        const size_t old = v.m;
+        kv_resize(uint8_t, v, want);
+        memset(v.a + old, 0, want - old);
+    }
+    return v.a;
+}
+
+/* Test-only: grows this thread's scratch to at least `min_size` bytes and fills all of it with
+ * `byte`. A following bwa_gen_cigar4 call on the thread whose window needs no more than that
+ * overwrites only [0, rlen), so its headroom holds `byte`; the unit test puts bytes with the
+ * high bits set there to pin that the vector walks mask every lane past the op. Not called on
+ * any production path, which pays nothing for it. */
+extern "C" void bwa_gen_cigar_fill_rseq_scratch(size_t min_size, int byte)
+{
+    xassert(byte >= 0 && byte <= 255, "bwa_gen_cigar_fill_rseq_scratch: byte must be 0..255");
+    bwa_gen_cigar_rseq_reserve(min_size);
+    u8vec_t &v = bwa_gen_cigar_rseq_scratch().v;
+    memset(v.a, byte, v.m);
 }
 
 /* Generate CIGAR when the alignment end points are known.
@@ -414,13 +593,14 @@ static inline int bwa_nm_edit(const int8_t mat[25], uint8_t r, uint8_t q, int nm
  * hypothesis to match, so `mat` indexes the same way in both passes.
  *
  * `want_md` 0 skips the MD string: NM is counted over the same CIGAR ops with the
- * same rule (bwa_nm_edit), but nothing is appended to the CIGAR buffer, which then holds just
- * the n_cigar ops (no trailing NUL). For callers that never read MD (the XA hits
- * in mem_gen_alt). */
-uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat, int want_md)
+ * same rule (bwa_nm_edit per column, cig_nm_edits for the vector blocks under __AVX2__), but
+ * nothing is appended to the CIGAR buffer, which then holds just the n_cigar ops (no trailing
+ * NUL). For callers that never read MD (the XA hits in mem_gen_alt). */
+template <int M>
+static uint32_t *bwa_gen_cigar4_m(const int8_t *mat, const bntseq_t *bns, int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat, int want_md)
 {
     uint32_t *cigar = 0;
-    uint8_t tmp, *rseq;
+    uint8_t *rseq;
     int i;
     int64_t rlen;
     kstring_t str;
@@ -429,19 +609,22 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     if (n_cigar) *n_cigar = 0;
     if (NM) *NM = -1;
     if (l_query <= 0 || rb >= re || (rb < l_pac && re > l_pac)) return 0; // reject if negative length or bridging the forward and reverse strand
-    {
-        static thread_local u8vec_scratch_t t_rseq;
-        size_t want = (size_t)((re - rb) + 64);  // +64 keeps the "+64" headroom the old malloc had
-        if (t_rseq.v.m < want) kv_resize(uint8_t, t_rseq.v, want);
-        bns_get_seq_into(l_pac, pac, rb, re, t_rseq.v.a, &rlen);
-        rseq = t_rseq.v.a;
-    }
+    // GEN_CIGAR_RSEQ_HEADROOM bytes past rlen for cig_blocks' forward remainder load
+    rseq = bwa_gen_cigar_rseq_reserve((size_t)(re - rb) + GEN_CIGAR_RSEQ_HEADROOM);
+    bns_get_seq_into(l_pac, pac, rb, re, rseq, &rlen);
     if (re - rb != rlen) goto ret_gen_cigar; // possible if out of range
+    if (M == METH_M) {
+        /* --meth-context cpg: label the window in its fetch frame, before the
+         * reversal below (labels are per base, so they survive it). Its
+         * contig is that of the window's first base. */
+        int is_rev_w;
+        const int rid_w = bns_pos2rid(bns, bns_depos(bns, rb, &is_rev_w));
+        meth_label_window(rseq, rlen, rb, rid_w, bns, pac, NULL);
+    }
     if (rb >= l_pac) { // then reverse both query and rseq; this is to ensure indels to be placed at the leftmost position
-        for (i = 0; i < l_query>>1; ++i)
-            tmp = query[i], query[i] = query[l_query - 1 - i], query[l_query - 1 - i] = tmp;
-        for (i = 0; i < rlen>>1; ++i)
-            tmp = rseq[i], rseq[i] = rseq[rlen - 1 - i], rseq[rlen - 1 - i] = tmp;
+        // vector blocks from both ends (seq_reverse.h); clang 19 leaves the swap loops scalar
+        seq_reverse_inplace(query, l_query);
+        seq_reverse_inplace(rseq, (int)rlen);
     }
     /* No gap, so no DP: an equal-length region whose band is 0 (below), or one whose
      * certified band is 0 (bwa_global_cert_band: every gapped path scores below the
@@ -466,7 +649,7 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             // there the certificate can only help when w is above it. kc is at least
             // |rlen - l_query|, so kc == 0 (no DP) only happens at equal lengths.
             if (rlen == l_query || w > min_w) {
-                const int kc = bwa_global_cert_band(mat, o_del, e_del, o_ins, e_ins, l_query, query, (int)rlen, rseq);
+                const int kc = bwa_global_cert_band_m<M>(mat, o_del, e_del, o_ins, e_ins, l_query, query, (int)rlen, rseq);
                 if (kc == 0) ungapped = 1;
                 else if (kc > 0 && kc < w) w = rlen == l_query || kc > min_w? kc : min_w;
             }
@@ -487,33 +670,77 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             }
             if (!want_md && NM && n_cigar) {
                 // the NM walk below over the one M op, fused into the score loop
-                int n_mm = 0;
-                for (i = 0, *score = 0; i < l_query; ++i) {
-                    *score += mat[rseq[i]*5 + query[i]];
-                    n_mm += bwa_nm_edit(mat, rseq[i], query[i], nm_from_mat);
+                int n_mm = 0, sc = 0;
+                i = 0;
+#if defined(__AVX2__)
+                if (M == 5) {
+                    const cig_lut_t lut = cig_lut_make(mat);
+                    __m256i acc = _mm256_setzero_si256();
+                    i = cig_blocks(query, rseq, l_query, 0, l_query, 0,
+                                   [&](__m256i qv, __m256i rv, uint32_t keep, __m256i keepv, int) {
+                        const __m256i v = cig_lut_get(lut, rv, qv);
+                        acc = cig_acc(acc, _mm256_and_si256(v, keepv));
+                        n_mm += __builtin_popcount(cig_nm_edits(qv, rv, keep, nm_from_mat, [&] { return v; }));
+                    });
+                    sc = cig_hsum(acc);
                 }
+#endif
+                for (; i < l_query; ++i) {
+                    sc += mat[rseq[i]*M + query[i]];
+                    n_mm += bwa_nm_edit<M>(mat, rseq[i], query[i], nm_from_mat);
+                }
+                *score = sc;
                 *NM = n_mm;
                 goto reverse_back;
             }
-            for (i = 0, *score = 0; i < l_query; ++i)
-                *score += mat[rseq[i]*5 + query[i]];
+            {
+                int sc = 0;
+                i = 0;
+#if defined(__AVX2__)
+                if (M == 5) {
+                    const cig_lut_t lut = cig_lut_make(mat);
+                    __m256i acc = _mm256_setzero_si256();
+                    i = cig_blocks(query, rseq, l_query, 0, l_query, 0,
+                                   [&](__m256i qv, __m256i rv, uint32_t, __m256i keepv, int) {
+                        acc = cig_acc(acc, _mm256_and_si256(cig_lut_get(lut, rv, qv), keepv));
+                    });
+                    sc = cig_hsum(acc);
+                }
+#endif
+                for (; i < l_query; ++i)
+                    sc += mat[rseq[i]*M + query[i]];
+                *score = sc;
+            }
         } else {
             // NW alignment
             if (bwa_verbose >= 4) {
                 fprintf(stderr, "* Global bandwidth: %d\n", w);
-                fprintf(stderr, "* Global ref:   "); for (i = 0; i < rlen; ++i) fputc("ACGTN"[(int)rseq[i]], stderr); fputc('\n', stderr);
+                fprintf(stderr, "* Global ref:   "); for (i = 0; i < rlen; ++i) fputc("ACGTN"[(int)bwa_ref_base<M>(rseq[i])], stderr); fputc('\n', stderr);
                 fprintf(stderr, "* Global query: "); for (i = 0; i < l_query; ++i) fputc("ACGTN"[(int)query[i]], stderr); fputc('\n', stderr);
             }
-            *score = ksw_global2(l_query, query, rlen, rseq, 5, mat, o_del, e_del, o_ins, e_ins, w, n_cigar, &cigar);
+            *score = ksw_global2(l_query, query, rlen, rseq, M, mat, o_del, e_del, o_ins, e_ins, w, n_cigar, &cigar);
         }
     } // ungapped / NW block
     if (NM && n_cigar && !want_md) { // compute NM only: the MD walk below without the appends
         int k, x, y, n_mm = 0, n_gap = 0;
+#if defined(__AVX2__)
+        cig_lut_t lut = {};
+        if (M == 5 && nm_from_mat) lut = cig_lut_make(mat); // read only under nm_from_mat, at M = 5
+#endif
         for (k = 0, x = y = 0; k < *n_cigar; ++k) {
             int op = cigar[k]&0xf, len = cigar[k]>>4;
             if (op == 0) { // match
-                for (i = 0; i < len; ++i)
-                    n_mm += bwa_nm_edit(mat, rseq[y + i], query[x + i], nm_from_mat);
+                i = 0;
+#if defined(__AVX2__)
+                if (M == 5)
+                i = cig_blocks(query + x, rseq + y, len, x, l_query - x, y,
+                               [&](__m256i qv, __m256i rv, uint32_t keep, __m256i, int) {
+                    n_mm += __builtin_popcount(cig_nm_edits(qv, rv, keep, nm_from_mat,
+                                                            [&] { return cig_lut_get(lut, rv, qv); }));
+                });
+#endif
+                for (; i < len; ++i)
+                    n_mm += bwa_nm_edit<M>(mat, rseq[y + i], query[x + i], nm_from_mat);
                 x += len; y += len;
             } else if (op == 2) { // deletion
                 if (k > 0 && k < *n_cigar - 1) n_gap += len; // not if D is the first or the last CIGAR
@@ -530,21 +757,34 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             cigar = (uint32_t*)str.s;
             op  = cigar[k]&0xf, len = cigar[k]>>4;
             if (op == 0) { // match
-                for (i = 0; i < len; ++i) {
-                    if (query[x + i] != rseq[y + i]) {
-                        kputw(u, &str);
-                        kputc(int2base[rseq[y+i]], &str);
-                        u = 0;
-                        /* NM increment; see the nm_from_mat contract above */
-                        n_mm += bwa_nm_edit(mat, rseq[y + i], query[x + i], nm_from_mat);
-                    } else ++u;
-                }
+                // each mismatch p: the u matches since the last edit, then its reference base
+                int last = 0; // the op's columns before `last` are in u or already written
+                auto put_mismatch = [&](int p) {
+                    u += p - last;
+                    kputw(u, &str);
+                    kputc(int2base[bwa_ref_base<M>(rseq[y + p])], &str);
+                    u = 0; last = p + 1;
+                    /* NM increment; see the nm_from_mat contract above */
+                    n_mm += bwa_nm_edit<M>(mat, rseq[y + p], query[x + p], nm_from_mat);
+                };
+                i = 0;
+#if defined(__AVX2__)
+                if (M == 5)
+                i = cig_blocks(query + x, rseq + y, len, x, l_query - x, y,
+                               [&](__m256i qv, __m256i rv, uint32_t keep, __m256i, int base) {
+                    for (uint32_t m = cig_mismatch(qv, rv) & keep; m; m &= m - 1)
+                        put_mismatch(base + __builtin_ctz(m));
+                });
+#endif
+                for (; i < len; ++i)
+                    if (query[x + i] != bwa_ref_base<M>(rseq[y + i])) put_mismatch(i);
+                u += len - last;
                 x += len; y += len;
             } else if (op == 2) { // deletion
                 if (k > 0 && k < *n_cigar - 1) { // don't do the following if D is the first or the last CIGAR
                     kputw(u, &str); kputc('^', &str);
                     for (i = 0; i < len; ++i)
-                        kputc(int2base[rseq[y+i]], &str);
+                        kputc(int2base[bwa_ref_base<M>(rseq[y+i])], &str);
                     u = 0; n_gap += len;
                 }
                 y += len;
@@ -556,17 +796,27 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     }
 reverse_back:
     if (rb >= l_pac) // reverse back query
-        for (i = 0; i < l_query>>1; ++i)
-            tmp = query[i], query[i] = query[l_query - 1 - i], query[l_query - 1 - i] = tmp;
+        seq_reverse_inplace(query, l_query);
 
 ret_gen_cigar:
-    /* rseq aliases thread-local kvec scratch in this function; do not free. */
+    /* rseq aliases the thread-local scratch (bwa_gen_cigar_rseq_scratch); do not free. */
     return cigar;
+}
+
+uint32_t *bwa_gen_cigar4(const int8_t *mat, int m, const bntseq_t *bns, int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat, int want_md)
+{
+    if (m == METH_M) {
+        xassert(bns != NULL && bns->l_pac == l_pac,
+                "bwa_gen_cigar4: the 7-code alphabet needs the reference's bns to label the window");
+        return bwa_gen_cigar4_m<METH_M>(mat, bns, o_del, e_del, o_ins, e_ins, w_, l_pac, pac, l_query, query, rb, re, score, n_cigar, NM, nm_from_mat, want_md);
+    }
+    xassert(m == 5, "bwa_gen_cigar4: alphabet size must be 5 or 7");
+    return bwa_gen_cigar4_m<5>(mat, bns, o_del, e_del, o_ins, e_ins, w_, l_pac, pac, l_query, query, rb, re, score, n_cigar, NM, nm_from_mat, want_md);
 }
 
 uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat)
 {
-    return bwa_gen_cigar4(mat, o_del, e_del, o_ins, e_ins, w_, l_pac, pac, l_query, query, rb, re, score, n_cigar, NM, nm_from_mat, 1);
+    return bwa_gen_cigar4(mat, 5, NULL, o_del, e_del, o_ins, e_ins, w_, l_pac, pac, l_query, query, rb, re, score, n_cigar, NM, nm_from_mat, 1);
 }
 
 uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM)

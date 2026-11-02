@@ -126,13 +126,16 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 // it returns true only for an asymmetric matrix (bisulfite OT/OB), which pays
 // the heavier generic prepass. N cells are handled separately, so only the
 // ACGT submatrix is inspected. w_mismatch is the kernel's stored (negated)
-// penalty, matching how mat off-diagonals are encoded.
-static inline bool bsw_generic_matrix(const int8_t *mat, int8_t w_match, int8_t w_mismatch)
+// penalty, matching how mat off-diagonals are encoded. `m` is the matrix's
+// alphabet size (row stride): 5, or 7 for a --meth-context cpg matrix, whose
+// ACGT submatrix is read the same way (its CpG rows 5/6 are not inspected).
+static inline bool bsw_generic_matrix(const int8_t *mat, int8_t w_match, int8_t w_mismatch,
+                                      int m = 5)
 {
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
             int8_t expect = (i == j) ? w_match : w_mismatch;
-            if (mat[i * 5 + j] != expect) return true;
+            if (mat[i * m + j] != expect) return true;
         }
     return false;
 }
@@ -172,7 +175,7 @@ static inline bool bsw_force_generic_matrix()
 // freed to 0), which is single but not rank1.
 struct BswFreedCell { bool rank1; bool single; int8_t ref; int8_t read; int8_t value; };
 static inline BswFreedCell bsw_freed_cell(const int8_t *mat, int8_t w_match,
-                                          int8_t w_mismatch, bool forced)
+                                          int8_t w_mismatch, bool forced, int m = 5)
 {
     int n_freed = 0;
     int8_t fr_ref = 0, fr_read = 0, fr_val = w_match;
@@ -180,10 +183,10 @@ static inline BswFreedCell bsw_freed_cell(const int8_t *mat, int8_t w_match,
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
             int8_t expect = (i == j) ? w_match : w_mismatch;
-            if (mat[i * 5 + j] == expect) continue;
+            if (mat[i * m + j] == expect) continue;
             if (i != j) {                                // off-diagonal freed (any value)
                 n_freed++; fr_ref = (int8_t)i; fr_read = (int8_t)j;
-                fr_val = mat[i * 5 + j];
+                fr_val = mat[i * m + j];
             } else {
                 ok = false;                              // diagonal change: not expressible
             }
@@ -208,7 +211,7 @@ static inline BswFreedCell bsw_freed_cell(const int8_t *mat, int8_t w_match,
 // (refA,readA) is the primary cell, (refB,readB) its mirror.
 struct BswFreedPair { bool supported; int8_t refA, readA, refB, readB; };
 static inline BswFreedPair bsw_freed_pair(const int8_t *mat, int8_t w_match,
-                                          int8_t w_mismatch)
+                                          int8_t w_mismatch, int m = 5)
 {
     int n_freed = 0;
     int8_t r[2] = {0, 0}, c[2] = {0, 0};
@@ -216,8 +219,8 @@ static inline BswFreedPair bsw_freed_pair(const int8_t *mat, int8_t w_match,
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
             int8_t expect = (i == j) ? w_match : w_mismatch;
-            if (mat[i * 5 + j] == expect) continue;
-            if (i != j && mat[i * 5 + j] == w_match) {   // off-diagonal freed to match
+            if (mat[i * m + j] == expect) continue;
+            if (i != j && mat[i * m + j] == w_match) {   // off-diagonal freed to match
                 if (n_freed < 2) { r[n_freed] = (int8_t)i; c[n_freed] = (int8_t)j; }
                 n_freed++;
             } else {
@@ -301,6 +304,34 @@ typedef struct {
 struct BswCompactCounts {
     uint64_t superblocks = 0, moves = 0, retired = 0;
 };
+
+/* Running totals of the 8-bit extension batches one kernel object ran in each score domain
+ * (bsw8_score_domain_counts()): a batch is one group of the tier's lane count through the
+ * plain wrapper, or one group's superblock entry through the compaction driver. Only the
+ * AVX-512BW tier has two domains (see bsw8_gap_bytes_fit_int8); the other tiers leave both
+ * at zero. One increment per batch, for the tests that pin which instantiation a scoring
+ * takes. Never reset. */
+struct BswScoreDomainCounts {
+    uint64_t signed_batches = 0, unsigned_batches = 0;
+};
+
+/* --meth-context cpg reference codes in the kernels' reference stream (the
+ * values of METH_C5 / METH_G6 in meth_model.h; test_bandedswa_cpg.cpp checks
+ * they agree). See "CpG arm" in bandedSWA.cpp. */
+#define BSW_CPG_C5 5
+#define BSW_CPG_G6 6
+
+/* Function alignment of the smithWaterman*_8 / _16 extension kernels. Their
+ * cell loops are sensitive to where they fall relative to 64-byte boundaries:
+ * as template instantiations each is a COMDAT section with the default
+ * 16-byte alignment, so its 64-byte phase depends on link order, and one such
+ * shift measured -3.5% on the AVX2 16-bit kernel (clang 19, Sapphire Rapids)
+ * with byte-identical instructions. At 64 bytes every tier's kernel measured
+ * within noise of the pre-template build. The 8-bit lane-compaction drivers
+ * keep the default: at 64 bytes the AVX2 one measured 1-2% slower. On the
+ * declarations: clang does not apply the attribute from an out-of-class
+ * template definition alone. */
+#define BSW_KERNEL_ALIGN __attribute__((aligned(64)))
 
 #include "kernel_dispatch.h"  /* must come before BandedPairWiseSW class so per-tier compiles see the renamed symbol */
 
@@ -413,6 +444,19 @@ public:
      * before any (possibly multi-threaded) getScores call. */
     virtual void set_guard_overshoot(bool on) = 0;
 
+    /* --meth-context cpg: switch getScores8/16 to the CpG arm. The object must
+     * be built on a 7-code matrix (m = 7, meth_model.h) whose ACGT block is the
+     * plain symmetric matrix and whose only other difference from it is one
+     * cell: reference code fr_ref_base + 4 (C5 or G6) x read fr_read, worth
+     * fr_val, which must not exceed w_match (the band clamp and the 8-bit
+     * envelope bound a cell by w_match). The targets it scores are
+     * CpG-labelled windows (codes 0..3, 5, 6).
+     * Every result equals scalarBandedSWA's on the same object. OT passes
+     * (METH_C, METH_T, mat7_ot's C5 x T cell), OB (METH_G, METH_A, mat7_ob's
+     * G6 x A cell). Set once at setup, before any getScores call; there is no
+     * way back. */
+    virtual void set_meth_cpg(int fr_ref_base, int fr_read, int fr_val) = 0;
+
     /* Same-row lane compaction in getScores8 (NEON, AVX2 and AVX-512BW tiers; a no-op on the
      * others). A batch runs in superblocks of `groups` lane groups in row lockstep, and the
      * live lanes of a group are moved into dead lanes of the others once they fit, so finished
@@ -429,14 +473,35 @@ public:
 
     /* This object's compaction totals since construction (all zero on tiers without it). */
     virtual BswCompactCounts lane_compaction_counts() const = 0;
+
+    /* This object's 8-bit extension batches per score domain since construction (both zero
+     * on tiers with a single domain). */
+    virtual BswScoreDomainCounts bsw8_score_domain_counts() const = 0;
 };
 
 /* Factory: returns a per-tier concrete BandedPairWiseSW. Construction
- * arguments mirror the BandedPairWiseSW ctor exactly. */
+ * arguments mirror the BandedPairWiseSW ctor exactly. `m` is the alphabet size
+ * of `mat` (its row stride, target-major mat[ref*m + read]): 5, or 7 for a
+ * --meth-context cpg matrix (meth_model.h). The SIMD kernels read the ACGT
+ * submatrix at stride m; an m = 7 object scores CpG-labelled targets in its
+ * SIMD kernels only after set_meth_cpg (scalarBandedSWA scores them at any
+ * time). */
 std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
     int o_del, int e_del, int o_ins, int e_ins, int zdrop,
     int end_bonus, const int8_t *mat,
-    int8_t w_match, int8_t w_mismatch, int numThreads);
+    int8_t w_match, int8_t w_mismatch, int numThreads, int m = 5);
+
+/* The x86 8-bit extension kernels broadcast each gap penalty as the byte of its int value
+ * ((uint8_t)(o + e) and (uint8_t) e, as _mm512_set1_epi8 / _mm256_set1_epi8 truncate). The
+ * AVX-512BW kernel's signed-domain form (smithWaterman512_8Impl<true>, which carries every
+ * score byte as score ^ 0x80) subtracts those bytes with int8 saturation, which is exact only
+ * when every one of them is at most 127; for any larger byte the unsigned-domain form runs.
+ * Decided once per batch; the wrappers seed H in the matching domain. */
+static inline bool bsw8_gap_bytes_fit_int8(int o_del, int e_del, int o_ins, int e_ins)
+{
+    return (uint8_t) (o_del + e_del) <= 127 && (uint8_t) e_del <= 127 &&
+           (uint8_t) (o_ins + e_ins) <= 127 && (uint8_t) e_ins <= 127;
+}
 
 /* Per-tier factory function forward declarations.
  * Defined in bandedSWA.<tier>.o (each kernel TU compile).
@@ -444,6 +509,17 @@ std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
  * class without exposing the class layout to the dispatcher TU (which
  * previously caused an ODR size mismatch / heap corruption). */
 #if defined(__x86_64__) || defined(__i386__)
+/* As make_bsw_kernel_<tier>, plus the matrix's alphabet size `m` (the ctor's). */
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m_sse41(int, int, int, int, int, int,
+                                                      const int8_t*, int8_t, int8_t, int, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m_sse42(int, int, int, int, int, int,
+                                                      const int8_t*, int8_t, int8_t, int, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m_avx(int, int, int, int, int, int,
+                                                    const int8_t*, int8_t, int8_t, int, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m_avx2(int, int, int, int, int, int,
+                                                     const int8_t*, int8_t, int8_t, int, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m_avx512bw(int, int, int, int, int, int,
+                                                         const int8_t*, int8_t, int8_t, int, int);
 extern "C" IBandedPairWiseSW *make_bsw_kernel_sse41(int, int, int, int, int, int,
                                                     const int8_t*, int8_t, int8_t, int);
 extern "C" IBandedPairWiseSW *make_bsw_kernel_sse42(int, int, int, int, int, int,
@@ -462,10 +538,12 @@ class BandedPairWiseSW final : public IBandedPairWiseSW {
 public:
     uint64_t SW_cells;
 
+    /* `m_` is the alphabet size of `mat_` (see make_banded_pair_wise_sw). */
     BandedPairWiseSW(const int o_del, const int e_del, const int o_ins,
                      const int e_ins, const int zdrop,
                      const int end_bonus, const int8_t *mat_,
-                     const int8_t w_match, const int8_t w_mismatch, int numThreads);
+                     const int8_t w_match, const int8_t w_mismatch, int numThreads,
+                     int m_ = 5);
     ~BandedPairWiseSW();
 
     // Owns dp_slab_ via raw pointer; copying or moving would alias the
@@ -483,6 +561,8 @@ public:
     bool guard_overshoot_ = false;
     void set_guard_overshoot(bool on) override { guard_overshoot_ = on; }
 
+    void set_meth_cpg(int fr_ref_base, int fr_read, int fr_val) override;
+
     // Same-row lane compaction settings, read by getScores8 on the NEON, AVX2 and AVX-512BW tiers
     // (unused elsewhere). The constructor sets the tier's default; see set_lane_compaction.
     int compact_groups_ = 0;
@@ -492,6 +572,7 @@ public:
         compact_min_w_  = min_w;
     }
     BswCompactCounts lane_compaction_counts() const override { return compact_counts_; }
+    BswScoreDomainCounts bsw8_score_domain_counts() const override { return domain_counts_; }
 
     // Scalar code section
     int scalarBandedSWA(int qlen, const uint8_t *query, int tlen,
@@ -523,6 +604,7 @@ public:
                     uint16_t numThreads,
                     int32_t w) override;
 
+    template <bool CPG>
     void smithWatermanBatchWrapper8(SeqPair *pairArray,
                                    uint8_t *seqBufRef,
                                    uint8_t *seqBufQer,
@@ -530,6 +612,8 @@ public:
                                    uint16_t numThreads,
                                    int32_t w);
 
+    template <bool CPG>
+    BSW_KERNEL_ALIGN
     void smithWaterman128_8(uint8_t seq1SoA[],
                             uint8_t seq2SoA[],
                             int nrow,
@@ -544,6 +628,7 @@ public:
 #if defined(__aarch64__)
     // Same-row lane compaction: superblocks of K 16-lane groups in row lockstep; see
     // bandedSWA_compact.inc and set_lane_compaction.
+    template <bool CPG>
     void smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                                            uint8_t *seqBufRef,
                                            uint8_t *seqBufQer,
@@ -559,6 +644,7 @@ public:
                      uint16_t numThreads,
                      int32_t w) override;
 
+    template <bool CPG>
     void smithWatermanBatchWrapper16(SeqPair *pairArray,
                                      uint8_t *seqBufRef,
                                      uint8_t *seqBufQer,
@@ -566,6 +652,8 @@ public:
                                      uint16_t numThreads,
                                      int32_t w);
 
+    template <bool CPG>
+    BSW_KERNEL_ALIGN
     void smithWaterman128_16(uint16_t seq1SoA[],
                              uint16_t seq2SoA[],
                              uint16_t nrow,
@@ -592,6 +680,7 @@ public:
                     uint16_t numThreads,
                     int32_t w) override;
 
+    template <bool CPG>
     void smithWatermanBatchWrapper8(SeqPair *pairArray,
                                    uint8_t *seqBufRef,
                                    uint8_t *seqBufQer,
@@ -599,6 +688,8 @@ public:
                                    uint16_t numThreads,
                                    int32_t w);
 
+    template <bool CPG>
+    BSW_KERNEL_ALIGN
     void smithWaterman256_8(uint8_t seq1SoA[],
                             uint8_t seq2SoA[],
                             int nrow,
@@ -612,6 +703,7 @@ public:
                             uint8_t myband[]);
     // Same-row lane compaction: superblocks of K 32-lane groups in row lockstep; see
     // bandedSWA_compact256.inc and set_lane_compaction.
+    template <bool CPG>
     void smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                                            uint8_t *seqBufRef,
                                            uint8_t *seqBufQer,
@@ -626,6 +718,7 @@ public:
                      uint16_t numThreads,
                      int32_t w) override;
 
+    template <bool CPG>
     void smithWatermanBatchWrapper16(SeqPair *pairArray,
                                      uint8_t *seqBufRef,
                                      uint8_t *seqBufQer,
@@ -633,6 +726,8 @@ public:
                                      uint16_t numThreads,
                                      int32_t w);
 
+    template <bool CPG>
+    BSW_KERNEL_ALIGN
     void smithWaterman256_16(uint16_t seq1SoA[],
                              uint16_t seq2SoA[],
                              uint16_t nrow,
@@ -666,17 +761,10 @@ public:
                                    uint16_t numThreads,
                                    int32_t w);
 
-    void smithWaterman512_8(uint8_t seq1SoA[],
-                            uint8_t seq2SoA[],
-                            int nrow,
-                            int ncol,
-                            SeqPair *p,
-                            uint8_t h0[],
-                            uint16_t tid,
-                            int32_t numPairs,
-                            int zdrop,
-                            int32_t w,
-                            uint8_t myband[]);
+    // The 8-bit kernel (smithWaterman512_8Impl, private) carries its H/E/F bytes either as the
+    // unsigned score or as the score ^ 0x80 when every gap penalty byte fits an int8; this
+    // wrapper and the compaction one below decide that once per call and seed H to match. See
+    // the score-domain note above MAIN_CODE8_CORE in bandedSWA.cpp.
     // Same-row lane compaction: superblocks of K 64-lane groups in row lockstep; see
     // bandedSWA_compact512.inc and set_lane_compaction.
     void smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
@@ -694,6 +782,7 @@ public:
                      uint16_t numThreads,
                      int32_t w) override;
 
+    template <bool CPG>
     void smithWatermanBatchWrapper16(SeqPair *pairArray,
                                      uint8_t *seqBufRef,
                                      uint8_t *seqBufQer,
@@ -701,6 +790,8 @@ public:
                                      uint16_t numThreads,
                                      int32_t w);
     
+    template <bool CPG>
+    BSW_KERNEL_ALIGN
     void smithWaterman512_16(uint16_t seq1SoA[],
                              uint16_t seq2SoA[],
                              uint16_t nrow,
@@ -720,7 +811,43 @@ public:
     
 private:
     BswCompactCounts compact_counts_;   // see lane_compaction_counts
-    int m;
+    BswScoreDomainCounts domain_counts_;   // see bsw8_score_domain_counts
+#if __AVX512BW__
+    // The AVX-512BW 8-bit extension in one score domain (SIGNED8: every H/E/F byte is the
+    // score ^ 0x80; else the unsigned score). Private: each instantiation requires H to be
+    // seeded in its domain, which only the public wrappers above guarantee, deciding the domain
+    // once per call from the gap penalty bytes (bsw8_gap_bytes_fit_int8). See the score-domain
+    // note above MAIN_CODE8_CORE in bandedSWA.cpp. CPG selects the CpG arm (set_meth_cpg; the
+    // wrappers pass cpg_), as on every tier's kernel templates.
+    template <bool SIGNED8, bool CPG>
+    void smithWatermanBatchWrapper8Impl(SeqPair *pairArray,
+                                        uint8_t *seqBufRef,
+                                        uint8_t *seqBufQer,
+                                        int32_t numPairs,
+                                        uint16_t numThreads,
+                                        int32_t w);
+    template <bool SIGNED8, bool CPG>
+    BSW_KERNEL_ALIGN
+    void smithWaterman512_8Impl(uint8_t seq1SoA[],
+                                uint8_t seq2SoA[],
+                                int nrow,
+                                int ncol,
+                                SeqPair *p,
+                                uint8_t h0[],
+                                uint16_t tid,
+                                int32_t numPairs,
+                                int zdrop,
+                                int32_t w,
+                                uint8_t myband[]);
+    template <bool SIGNED8, bool CPG>
+    void smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
+                                               uint8_t *seqBufRef,
+                                               uint8_t *seqBufQer,
+                                               int32_t numPairs,
+                                               int32_t w,
+                                               int K);
+#endif
+    int m;            // alphabet size of mat (its row stride): 5, or 7 under --meth-context cpg
     int end_bonus, zdrop;
     int o_del, o_ins, e_del, e_ins;
     const int8_t *mat;
@@ -780,6 +907,13 @@ private:
     int8_t  *sbt8_;
     int16_t *sbt16_;
     void *dp_slab_;
+
+    // The CpG arm (set_meth_cpg): when cpg_ is set the wrappers run the kernels'
+    // CPG = true instantiations, which score the one gated cell
+    // (row code cpg_ref_code_ x read cpg_read_ -> cpg_val_). Read-only during scoring.
+    // Last in the class, so the non-cpg fields keep their offsets.
+    bool cpg_ = false;
+    int8_t cpg_ref_code_ = 0, cpg_read_ = 0, cpg_val_ = 0;
 
     int64_t sort1Ticks;
     int64_t setupTicks;
