@@ -332,6 +332,41 @@ ifeq ($(strip $(STAGE_PROF)),1)
     CPPFLAGS += -DSTAGE_PROF=1
 endif
 
+# Drop any optimization level (-O0/-O1/-O2/-O3/-Os/-Og/-Ofast) and -DNDEBUG from
+# CPPFLAGS.
+# The aligner's own compile rules (.cpp.o, .c.o, the per-tier kernel rules) and
+# the bwa-mem3 link put $(CPPFLAGS) after $(CXXFLAGS), $(BASE_CXXFLAGS) or
+# $(SRC_CFLAGS), and the compiler takes the last -O it sees, so an -O in CPPFLAGS
+# would replace the -O3 those set (and the sanitizers' -O1 and COVERAGE_OPT), on
+# the compile lines and, with LTO, on the link line that drives LTO code
+# generation. conda-forge's compiler activation exports
+# CPPFLAGS="-DNDEBUG -D_FORTIFY_SOURCE=2 -O2", so a conda/bioconda build would
+# otherwise compile the aligner, including the SIMD kernels, at -O2. An -O level
+# is not a preprocessor flag; to change the optimization level, use
+# EXTRA_CXXFLAGS (C++) or EXTRA_CFLAGS (the C reader), which come after -O3.
+# -DNDEBUG is removed too (only the single-token spellings -DNDEBUG and
+# -DNDEBUG=<v>; a two-token `-D NDEBUG` is not matched): conda's CPPFLAGS
+# defines it, which would compile every plain assert() out of a packaged build.
+# No target here defines NDEBUG, and the sources rely on plain asserts being
+# live in every build without an explicit -DNDEBUG opt-out (see
+# test/regression/ndebug_gate_lint.sh). To build
+# bwa-mem3's own sources without them deliberately, pass
+# `make EXTRA_CXXFLAGS=-DNDEBUG` (and EXTRA_CFLAGS=-DNDEBUG for the C reader),
+# which this filter does not touch and the PGO/LTO targets forward.
+# The filter runs unconditionally, after the last `CPPFLAGS +=` above. A
+# command-line CPPFLAGS needs `override` to be rewritten (and then, as before,
+# replaces every `CPPFLAGS +=` above), and `export` so the recursive makes still
+# get it: the override drops the export a command-line variable otherwise has,
+# and lto-build clears MAKEFLAGS / MAKEOVERRIDES, which leaves the environment
+# as its sub-make's only source. An environment or makefile value is rewritten
+# in place and stays exported to the recursive makes.
+ifeq ($(origin CPPFLAGS),command line)
+    override CPPFLAGS := $(filter-out -O% -DNDEBUG -DNDEBUG=%,$(CPPFLAGS))
+    export CPPFLAGS
+else
+    CPPFLAGS := $(filter-out -O% -DNDEBUG -DNDEBUG=%,$(CPPFLAGS))
+endif
+
 # Version string for `bwa-mem3 version` and the @PG VN: field. The single
 # source of truth is `version.txt` (rewritten by release-please on each
 # release). The logic of "base version + optional git-describe dev suffix"
@@ -476,7 +511,7 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/compat_target.o \
 			src/FMI_search.o src/fmi_seed_api.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
-			src/meth_xm.o \
+			src/meth_xm.o src/meth_opts.o src/meth_model.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
 			src/bwa_shm.o src/bwa_hugepages.o src/bwa_thp.o src/simd_dispatch.o \
@@ -505,6 +540,7 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    bandedswa_high_h0_zdrop_test bandedswa_negative_h0_test \
                    shm_section_find_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
+                   shm_stage_test shm_thp_advise_test \
                    kt_for_pool_test bns_zero_calloc_test \
                    err_fgets_eof_test \
                    kernel_padded_lane_uninit_test bam_rec_scratch_test \
@@ -516,9 +552,10 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    pwrite_all_status_test x86_soa_pack_test
 STANDALONE_TEST_OBJS = $(STANDALONE_TESTS:%=test/%.o)
 
-# shm_pack_round_trip_test is excluded from `test:` because it runs via
-# test/shm_pack_round_trip_test.sh, which has to build a phiX index first.
-STANDALONE_TESTS_IN_TEST_TARGET = $(filter-out shm_pack_round_trip_test,$(STANDALONE_TESTS))
+# shm_pack_round_trip_test, shm_stage_test and shm_thp_advise_test are excluded
+# from `test:` because they need a phiX index: test/run_unit_tests.sh runs them
+# after test/shm_pack_round_trip_test.sh has built it.
+STANDALONE_TESTS_IN_TEST_TARGET = $(filter-out shm_pack_round_trip_test shm_stage_test shm_thp_advise_test,$(STANDALONE_TESTS))
 
 # Architecture-specific builds (x86 only, ARM uses default from above)
 ifeq ($(IS_ARM),)
@@ -592,8 +629,13 @@ endif
 # named avx2/avx512bw branches are known-good and the default build floors its
 # non-kernel TUs via BASELINE_ARCH, so probe only these two escape hatches:
 # refuse any selected ARCH_FLAGS that does not define __AVX2__.
+# Probe from a plain x86-64 baseline, as KERNEL_FLAGS_* do: some toolchains
+# (e.g. Ubuntu 26.04's gcc) default to x86-64-v3, and -m flags only add to that
+# default, so `-msse4.1` alone would still define __AVX2__ and slip past the
+# guard. The last -march wins, so arch=native and a raw -march=... still select
+# their own ISA.
 ifeq ($(ARCH_CHECK_AVX2),1)
-    ARCH_DEFINES_AVX2 := $(shell $(CXX) $(ARCH_FLAGS) -dM -E -x c++ /dev/null 2>/dev/null | grep -c '__AVX2__')
+    ARCH_DEFINES_AVX2 := $(shell $(CXX) -march=x86-64 $(ARCH_FLAGS) -dM -E -x c++ /dev/null 2>/dev/null | grep -c '__AVX2__')
     ifneq ($(ARCH_DEFINES_AVX2),1)
         $(error arch=$(arch) does not enable AVX2: batched mate-rescue needs AVX2+ (the pre-AVX2 scalar path was removed); build with arch=avx2 [default], avx512bw, arm64, or a custom flag that enables AVX2)
     endif
@@ -657,12 +699,13 @@ BASE_CXXFLAGS = -g -O3 -std=gnu++14 -fpermissive $(ASAN_FLAGS) $(LIBSAIS_OPENMP_
 # though its legacy per-binary rules still carry a hand-maintained list.
 DEPFLAGS = -MMD -MP
 
-# Per-tier ISA flag groups for kernel multi-tier compilation (x86_64 only).
-KERNEL_FLAGS_sse41    = -msse4.1
-KERNEL_FLAGS_sse42    = -msse4.2 -mpopcnt
-KERNEL_FLAGS_avx      = -mavx -mpopcnt
-KERNEL_FLAGS_avx2     = -mavx -mavx2 -mpopcnt
-KERNEL_FLAGS_avx512bw = -mavx -mavx2 -mavx512f -mavx512bw -mpopcnt
+# Reset the compiler's default ISA before enabling each tier. Some toolchains
+# default to x86-64-v3; -msse4.1 alone does not disable that baseline's AVX2.
+KERNEL_FLAGS_sse41    = -march=x86-64 -msse4.1
+KERNEL_FLAGS_sse42    = -march=x86-64 -msse4.2 -mpopcnt
+KERNEL_FLAGS_avx      = -march=x86-64 -mavx -mpopcnt
+KERNEL_FLAGS_avx2     = -march=x86-64 -mavx -mavx2 -mpopcnt
+KERNEL_FLAGS_avx512bw = -march=x86-64 -mavx -mavx2 -mavx512f -mavx512bw -mpopcnt
 
 # Source files compiled at every tier on x86_64.
 KERNEL_SRCS = src/bandedSWA.cpp src/kswv.cpp src/ksw.cpp src/sam_encode.cpp
@@ -681,16 +724,25 @@ else
 endif
 
 # COVERAGE=1 augments CXXFLAGS/BASE_CXXFLAGS/LDFLAGS with --coverage and
-# overrides -O3 with -O0 so gcov line numbers correspond 1:1 with source.
-# Consumed by the CI `coverage` job; not part of any shipped binary.
+# overrides -O3 with $(COVERAGE_OPT). Not part of any shipped binary.
+#
+# COVERAGE_OPT defaults to -O0, so gcov line numbers correspond 1:1 with source
+# (the usual choice when reading a local report line by line). The CI `coverage`
+# job sets COVERAGE_OPT=-O1, which runs the instrumented tests faster; gcc
+# supports --coverage at any -O level. The cost is attribution detail, not
+# correctness: -O1 inlines static functions called once
+# (-finline-functions-called-once) and merges or drops some lines, so a few
+# lines and small functions are reported under their caller or not at all.
+# test/Makefile reads the same knob.
 #
 # BASE_CXXFLAGS has to be augmented too, not just CXXFLAGS: the per-tier kernel
 # objects ($(KERNEL_TIER_OBJS) — bandedSWA/kswv/ksw/sam_encode at every tier),
 # the native kernel objects and the standalone test objects all compile with
 # BASE_CXXFLAGS, so with CXXFLAGS alone the SW kernels report no coverage at
-# all. -O0/--coverage are not -m... ISA flags, so the per-tier rules can still
-# append their own.
-COVERAGE_FLAGS = -O0 --coverage
+# all. $(COVERAGE_OPT)/--coverage are not -m... ISA flags, so the per-tier
+# rules can still append their own.
+COVERAGE_OPT ?= -O0
+COVERAGE_FLAGS = $(COVERAGE_OPT) --coverage
 ifneq ($(COVERAGE),)
     CXXFLAGS      += $(COVERAGE_FLAGS)
     BASE_CXXFLAGS += $(COVERAGE_FLAGS)
@@ -712,20 +764,28 @@ endif
 # code plus the bitcode the LTO link reads. So libbwa.a stays an ordinary static
 # archive for every other consumer (the standalone tests below, the doctest
 # suites in test/Makefile, out-of-tree harnesses that link it): their ordinary
-# links just use the native code, GNU ar indexes it without an LTO plugin, and
-# no test binary pays for an LTO link.
+# links just use the native code, and no test binary pays for an LTO link.
+# The probe checks that AR (default: ar) preserves this contract: an installed
+# binutils LTO plugin can be incompatible with the compiler's bitcode. Override
+# AR with a compatible archiver when necessary.
 #
 # LTO=auto turns LTO on only where it is known to work, and builds without it
 # otherwise, so a toolchain without LTO support still builds:
-#   - $(CXX) and $(CC) are clang on an ELF target, and a probe compile + link
-#     with -flto=full -ffat-lto-objects -fuse-ld=lld succeeds (clang >= 18 and
+#   - $(CXX) and $(CC) are clang on an ELF target, and a probe compiles C/C++
+#     fat objects, archives them with AR, and links both an ordinary consumer
+#     and one with -flto=full -ffat-lto-objects -fuse-ld=lld (clang >= 18 and
 #     ld.lld installed). The probe links the system libraries the real link
 #     uses (-lpthread -lm -lz -ldeflate, OpenMP, htslib's static deps once
 #     htslib is configured), because lld, unlike ld.bfd, has no built-in
-#     search path: a library only ld.bfd would find (e.g. one under /usr/local
-#     without LIBRARY_PATH set) fails the probe instead of the real link. A
-#     clang whose probe fails, or a clang CXX with a non-clang CC, gets a NOTE
-#     on stderr and a non-LTO build.
+#     search path: a library only ld.bfd would find (e.g. libdeflate built
+#     from source into /usr/local/lib64 on Amazon Linux 2023) would otherwise
+#     fail the real link. When the probe link fails, it is retried with
+#     ld.bfd's own search directories (SEARCH_DIR in `ld.bfd --verbose`)
+#     passed as -Wl,-L<dir>, which the driver places after every other -L,
+#     so they are searched last, as ld.bfd searches them. If that link
+#     succeeds, LTO stays on and the LTO link gets the same flags
+#     (BWA_LTO_LIBDIRS). A clang whose probe fails both ways, or a clang CXX
+#     with a non-clang CC, gets a NOTE on stderr and a non-LTO build.
 #   - GCC: off. Clang is the shipping compiler and GCC LTO is not measured here.
 #   - macOS: off. Apple clang has no -ffat-lto-objects for Mach-O.
 #   - ASAN=1, MSAN=1, COVERAGE=1: off (instrumented, non-shipping builds).
@@ -733,11 +793,14 @@ endif
 # had. LTO=off builds without it. Like the compiler floor, this resolves only
 # for goals that build: a clean-only goal leaves LTO off.
 #
-# The top-level make resolves the mode and exports it as BWA_LTO_MODE so the
-# recursive makes (single, arm64, all-single) reuse it instead of probing again;
-# a BWA_LTO_MODE inherited from the environment at the top level is ignored.
+# The top-level make resolves the mode and exports it as BWA_LTO_MODE (and the
+# -L flags the lld link needs as BWA_LTO_LIBDIRS) so the recursive makes
+# (single, arm64, all-single) reuse it instead of probing again; a BWA_LTO_MODE
+# or BWA_LTO_LIBDIRS inherited from the environment at the top level is ignored
+# (and BWA_LTO_LIBDIRS is dropped whenever BWA_LTO_MODE is on the command line).
 # lto-build sets it on its inner make's command line to turn this off.
 LTO ?= auto
+comma := ,
 # Exactly one word, and one of the four: a multi-word value ("auto off") would
 # otherwise pass a bare $(filter).
 LTO_VALID := $(if $(filter 1,$(words $(LTO))),$(filter auto thin full off,$(LTO)))
@@ -751,6 +814,11 @@ ifeq ($(LTO_VALID),)
 endif
 ifeq ($(origin BWA_LTO_MODE),command line)
     BWA_LTO_RESOLVE :=
+    # The mode is given, not resolved: an inherited BWA_LTO_LIBDIRS belongs to
+    # some other build (lto-build passes BWA_LTO_MODE=off), so drop it.
+    ifneq ($(origin BWA_LTO_LIBDIRS),command line)
+        BWA_LTO_LIBDIRS :=
+    endif
 else ifeq ($(MAKELEVEL),0)
     BWA_LTO_RESOLVE := 1
 else ifndef BWA_LTO_MODE
@@ -760,6 +828,7 @@ else
 endif
 ifeq ($(BWA_LTO_RESOLVE),1)
     BWA_LTO_MODE := off
+    BWA_LTO_LIBDIRS :=
     ifneq ($(strip $(ASAN)$(MSAN)$(COVERAGE)),)
         ifneq ($(filter thin full,$(LTO)),)
             $(warning NOTE: LTO=$(LTO) ignored: ASAN, MSAN and COVERAGE builds link without LTO.)
@@ -774,23 +843,62 @@ ifeq ($(BWA_LTO_RESOLVE),1)
                 $(error LTO=$(LTO) is not supported on macOS (Apple clang has no -ffat-lto-objects); build with LTO=off)
             endif
         else ifeq ($(BWA_LTO_CXX_CLANG)$(BWA_LTO_CC_CLANG),clangclang)
-            # Compile a C and a C++ TU as fat LTO objects and link them with lld
-            # against the system libraries the real link uses.
+            # Both archive members must be extractable by ordinary consumers
+            # and the LTO binary link, using the selected archiver. Match the
+            # production compile flags: optimized bitcode can use attributes
+            # that an older archive plugin accepts at O0 but rejects at O3.
             BWA_LTO_PROBE_LIBS := -lpthread -lm -lz -ldeflate $(LIBSAIS_OPENMP_LIBS) $(LIBS_EXTRA) \
                 $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),,-lz-ng) $(HTSLIB_static_LIBS)
+            # Prints `ok` if the plain lld link works. Otherwise, lld may only be
+            # missing a library that ld.bfd finds on its built-in path, so the
+            # link is retried with ld.bfd's search directories (SEARCH_DIR in
+            # `ld.bfd --verbose`, falling back to `ld --verbose`; entries whose
+            # path exists and contains only letters, digits or _./+=:-) as
+            # `-Wl,-L<dir>`, and `ok` is
+            # printed followed by those flags if that works; `retried` if it was
+            # tried and failed. `-Wl,-L` rather than `-L`: the clang driver puts
+            # it after its own toolchain directories and after the link's own
+            # -L flags (-Lext/htslib), so these directories are searched last,
+            # as ld.bfd searches them, and never shadow the vendored libraries.
+            # A leading `=` is kept: lld resolves it against the sysroot, so a
+            # sysroot toolchain searches its own tree, not the build host's.
             BWA_LTO_PROBE := $(shell d=$$(mktemp -d 2>/dev/null) || exit 0; \
-                printf 'int lto_probe_c(void){return 0;}\n' > "$$d/a.c"; \
-                printf 'extern "C" int lto_probe_c(void);\nint main(){return lto_probe_c();}\n' > "$$d/m.cpp"; \
-                $(CC) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/a.c" -o "$$d/a.o" >/dev/null 2>&1 && \
-                $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/m.cpp" -o "$$d/m.o" >/dev/null 2>&1 && \
-                $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -fuse-ld=lld $(LDFLAGS) "$$d/m.o" "$$d/a.o" $(BWA_LTO_PROBE_LIBS) -o "$$d/x" >/dev/null 2>&1 && \
-                echo ok; rm -rf "$$d")
-            ifeq ($(BWA_LTO_PROBE),ok)
+                LC_ALL=C; export LC_ALL; \
+                trap 'rm -rf "$$d"' EXIT; \
+                printf 'int lto_probe_c(void){return 3;}\n' > "$$d/a.c"; \
+                printf 'int lto_probe_cpp(){return 4;}\n' > "$$d/b.cpp"; \
+                printf 'extern "C" int lto_probe_c(void);\nint lto_probe_cpp();\nint main(){return lto_probe_c()+lto_probe_cpp()-7;}\n' > "$$d/m.cpp"; \
+                link() { $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -fuse-ld=lld $(LDFLAGS) "$$@" "$$d/m.o" "$$d/libprobe.a" $(BWA_LTO_PROBE_LIBS) -o "$$d/lto" >/dev/null 2>&1; }; \
+                if $(CC) $(CFLAGS) $(SRC_CFLAGS) $(CPPFLAGS) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/a.c" -o "$$d/a.o" >/dev/null 2>&1 && \
+                   $(CXX) $(CXXFLAGS) $(CPPFLAGS) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/b.cpp" -o "$$d/b.o" >/dev/null 2>&1 && \
+                   $(CXX) -c "$$d/m.cpp" -o "$$d/m.o" >/dev/null 2>&1 && \
+                   $(AR) rcs "$$d/libprobe.a" "$$d/a.o" "$$d/b.o" >/dev/null && \
+                   $(CXX) $(LDFLAGS) "$$d/m.o" "$$d/libprobe.a" $(BWA_LTO_PROBE_LIBS) -o "$$d/native" >/dev/null 2>&1; then \
+                    if link; then echo ok; else \
+                        sysroot=$$($(CXX) -fuse-ld=lld -\#\#\# $(LDFLAGS) "$$d/m.o" -o "$$d/lto" 2>&1 | \
+                            sed -n 's/.*"--sysroot=\([^"]*\)".*/\1/p' | tail -n 1); \
+                        dirs=$$({ ld.bfd --verbose || ld --verbose; } 2>/dev/null | \
+                            grep -o 'SEARCH_DIR("[^"]*")' | sed -e 's/^SEARCH_DIR("//' -e 's/")$$//' | \
+                            while IFS= read -r e; do \
+                                case "$$e" in (*[!A-Za-z0-9_./+=:-]*) continue ;; esac; \
+                                path=$$e; \
+                                case "$$e" in (=*) path="$$sysroot$$(printf '%s' "$$e" | cut -c 2-)" ;; esac; \
+                                [ -d "$$path" ] && printf -- '-Wl,-L%s ' "$$e"; \
+                            done); \
+                        if [ -n "$$dirs" ]; then \
+                            if link $$dirs; then echo "ok $$dirs"; else echo retried; fi; \
+                        fi; \
+                    fi; \
+                fi)
+            # Said in the NOTE/error only when the retry ran.
+            BWA_LTO_RETRIED := $(if $(filter ok retried,$(firstword $(BWA_LTO_PROBE))),$(comma) even with ld.bfd's search directories added)
+            ifeq ($(firstword $(BWA_LTO_PROBE)),ok)
                 BWA_LTO_MODE := $(BWA_LTO_WANT)
+                BWA_LTO_LIBDIRS := $(wordlist 2,$(words $(BWA_LTO_PROBE)),$(BWA_LTO_PROBE))
             else ifeq ($(LTO),auto)
-                $(warning NOTE: building without LTO: $(CXX) could not link a -flto=$(BWA_LTO_WANT) -ffat-lto-objects test with -fuse-ld=lld (install lld, or set LTO=off to silence this).)
+                $(warning NOTE: building without LTO: the fat-object archive probe with CXX=$(CXX) CC=$(CC) AR=$(AR) failed to compile, archive, or link native/LTO consumers$(BWA_LTO_RETRIED). Use a compatible AR and clang/lld toolchain; add missing library directories to LIBRARY_PATH or LDFLAGS=-L...; or set LTO=off.)
             else
-                $(error LTO=$(LTO) needs clang with -ffat-lto-objects and ld.lld; the test link failed. Install lld or build with LTO=off)
+                $(error LTO=$(LTO) needs clang with -ffat-lto-objects and ld.lld plus an archive compatible with native/LTO consumers; the probe failed$(BWA_LTO_RETRIED) (CXX=$(CXX) CC=$(CC) AR=$(AR)). Set AR to a compatible archiver, install lld, add missing library directories to LIBRARY_PATH or LDFLAGS=-L..., or build with LTO=off)
             endif
         else ifneq ($(BWA_LTO_CXX_CLANG),)
             ifeq ($(LTO),auto)
@@ -803,11 +911,11 @@ ifeq ($(BWA_LTO_RESOLVE),1)
         endif
     endif
     endif
-    export BWA_LTO_MODE
+    export BWA_LTO_MODE BWA_LTO_LIBDIRS
 endif
 ifneq ($(BWA_LTO_MODE),off)
     LTO_CFLAGS  = -flto=$(BWA_LTO_MODE) -ffat-lto-objects
-    LTO_LDFLAGS = -flto=$(BWA_LTO_MODE) -ffat-lto-objects -fuse-ld=lld
+    LTO_LDFLAGS = -flto=$(BWA_LTO_MODE) -ffat-lto-objects -fuse-ld=lld $(BWA_LTO_LIBDIRS)
 else
     LTO_CFLAGS  =
     LTO_LDFLAGS =
@@ -1055,8 +1163,8 @@ bandedswa_highzdrop_seed_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test
 
 # Negative-h0 regression: an 8-bit lane whose seed score is negative (--meth
 # rescores seeds in original space) must score the same alone as in any group.
-bandedswa_negative_h0_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_negative_h0_test.o
-	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_negative_h0_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
+bandedswa_negative_h0_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) src/bandedSWA.native.o test/bandedswa_negative_h0_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_negative_h0_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
 # High-h0 / small-zdrop z-drop regression: getScores8 vs scalar with the seed
 # score h0 above zdrop+1 at small zdrop (the region a relaxed 8-bit routing
@@ -1077,9 +1185,11 @@ bandedswa_high_h0_zdrop_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/
 # callers that skip the bwa-mem3 binary build (which builds it as a
 # side-effect of $(EXE) deps) link-fail.
 test-binaries: $(BWA_LIB) $(HTS_LIB) $(ROWALT_KERNEL_OBJ)
-	$(MAKE) -C test framework unit integration \
+	$(MAKE) -C test framework unit integration tools \
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
+	    COVERAGE_OPT='$(COVERAGE_OPT)' \
+	    ASAN=$(ASAN) \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
 	    ARM_CPU='$(ARM_CPU)' \
 	    ARM_TUNE='$(ARM_TUNE)' \
@@ -1098,6 +1208,12 @@ shm_pack_round_trip_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_ro
 
 shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_lock_destroy_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
+shm_stage_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_stage_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_stage_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
+shm_thp_advise_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_thp_advise_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_thp_advise_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
 kt_for_pool_test: $(BWA_LIB) $(HTS_LIB) test/kt_for_pool_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/kt_for_pool_test.o $(BWA_LIB) $(LIBS) -o $@
@@ -1253,7 +1369,7 @@ src/fr_fastq.o: src/fr_fastq.c
 # Standalone stage_prof helper unit test (stats + clocks + NaN init). Links only
 # pthread + libm, so it needs no bwa-mem3/htslib build. Built with -DSTAGE_PROF
 # so the real implementation (not the no-op inlines) is exercised.
-stage_prof_test: src/stage_prof.cpp src/stage_prof.h test/stage_prof_test.cpp
+stage_prof_test: src/stage_prof.cpp src/stage_prof.h test/stage_prof_test.cpp test/framework/temp_dir.h test/framework/temp_path.h
 	$(CXX) -O2 -std=gnu++14 -DSTAGE_PROF=1 -Isrc src/stage_prof.cpp test/stage_prof_test.cpp -lpthread -lm -o $@
 
 # Standalone fast_reader correctness self-test (plain/gzip/multi-member/BGZF
@@ -1279,15 +1395,15 @@ ifeq ($(UNAME_S),Darwin)
         FAST_READER_TEST_LIB += -L$(ZLIBNG_PREFIX)/lib
     endif
 endif
-fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c test/gz_test_util.h $(FAST_READER_TEST_DEP)
+fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c test/gz_test_util.h test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fast_reader_selftest.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Differential test: fr_fastq vs kseq, byte-identical record parsing. Links only
 # zlib + zlib-ng + libdeflate (kseq.h is header-only), so it needs no bwa-mem3 build.
 # Built with $(SRC_CFLAGS), the flags the aligner's reader TUs get, so it checks
 # the parser at the shipped optimization level and ISA flags.
-fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $(FAST_READER_TEST_DEP) $(FLAGS_STAMP)
-	$(CC) $(SRC_CFLAGS) -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c test/framework/temp_path.h $(FAST_READER_TEST_DEP) $(FLAGS_STAMP)
+	$(CC) $(CFLAGS) $(SRC_CFLAGS) $(CPPFLAGS) -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Read+parse microbenchmark: kseq vs fr_fastq on a real FASTQ (no index/align).
 # Usage: ./fr_fastq_bench {kseq|frfastq} reads.fq[.gz] [reps]
@@ -1299,13 +1415,13 @@ fr_fastq_bench: src/fr_fastq.c src/fast_reader.c test/fr_fastq_bench.c $(FAST_RE
 # but capacity is checked once). Always built with ASan so the overflowing write
 # aborts on regression; links only the reader TUs (no bwa-mem3 build), like
 # fr_fastq_diff_test. Built and run per-row by the CI matrix (ci.yml).
-bseq_read_pe_oob_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_pe_oob_test.c $(FAST_READER_TEST_DEP)
+bseq_read_pe_oob_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_pe_oob_test.c test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O1 -g -fsanitize=address -fno-omit-frame-pointer -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_pe_oob_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Coverage for bseq_read_fast's copy_comment/-C gate (bseq1_t.comment set only
 # when the caller asked AND the record had a comment), across SE/PE. The parser
 # is covered by fr_fastq_diff_test; this drives the adapter. Reader TUs only.
-bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_comment_copy_test.c $(FAST_READER_TEST_DEP)
+bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_comment_copy_test.c test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_comment_copy_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Regression: bseq_read_fast must abort (err_fatal), not swallow a truncated
@@ -1313,7 +1429,7 @@ bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bs
 # bseq_read_fast chain over a mid-member-truncated .fq.gz; the forked child must
 # die by SIGABRT rather than reach a clean n==0 EOF. Reader TUs only (no
 # bwa-mem3 build), like bseq_read_comment_copy_test. Built and run in ci.yml.
-bseq_read_truncated_gzip_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_truncated_gzip_test.c test/gz_test_util.h $(FAST_READER_TEST_DEP)
+bseq_read_truncated_gzip_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_truncated_gzip_test.c test/gz_test_util.h test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_truncated_gzip_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 # kvec_alloc_fail_test -- forces the backing realloc to fail and asserts kvec.h's
 # growth macros abort loudly (SIGABRT + an out-of-memory diagnostic) instead of
@@ -1354,6 +1470,7 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib_alloc_fail_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
+	MEM_SYNTH_REF=./test/mem_synth_ref ./test/regression/mem_synth_ref_check.sh
 	for t in $(STANDALONE_TESTS_IN_TEST_TARGET); do echo "./$$t"; ./$$t || exit 1; done
 	./kvec_alloc_fail_test
 	./klib_alloc_fail_test
@@ -1361,6 +1478,12 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/thp_check_smoke.sh
+	./test/regression/mem_cli_selftest.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_cli_basics.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_io_cli.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_seed_cli.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_extend_cli.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_pair_cli.sh
 	./test/regression/ndebug_gate_lint_selftest.sh
 	./test/regression/ndebug_gate_lint.sh
 	./test/regression/calloc_interpose_flag_lint_selftest.sh
@@ -1417,7 +1540,7 @@ test/kswv_freed_cell_test.o: test/kswv_freed_cell_test.cpp
 # binary records the skip. Carries -Iext for doctest like kswv_freed_cell_test.
 x86_soa_pack_test: test/x86_soa_pack_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/x86_soa_pack_test.o -o $@
-test/x86_soa_pack_test.o: test/x86_soa_pack_test.cpp
+test/x86_soa_pack_test.o: test/x86_soa_pack_test.cpp test/guarded_seq_test_util.h
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) -Iext $(DEPFLAGS) $< -o $@
 
 test/bandedswa_padding_test.o: test/bandedswa_padding_test.cpp
@@ -1448,6 +1571,12 @@ test/detect_sa_compx_test.o: test/detect_sa_compx_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/shm_stage_test.o: test/shm_stage_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/shm_thp_advise_test.o: test/shm_thp_advise_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/kt_for_pool_test.o: test/kt_for_pool_test.cpp
@@ -1488,7 +1617,7 @@ test/err_fgets_eof_test.o: test/err_fgets_eof_test.cpp
 # sam_encode_*_<tier>. Dropping per-tier objects from libbwa.a breaks those
 # matrix rows. On arm64 $(KERNEL_TIER_OBJS) is empty.
 $(BWA_LIB):$(OBJS) $(KERNEL_TIER_OBJS)
-	ar rcs $(BWA_LIB) $(OBJS) $(KERNEL_TIER_OBJS)
+	$(AR) rcs $(BWA_LIB) $(OBJS) $(KERNEL_TIER_OBJS)
 
 # htslib: minimal configure (no lzma/bz2/curl/S3/GCS/plugins), zlib only.
 # Guard on config.mk (only created by ./configure) rather than Makefile, which
@@ -1713,13 +1842,13 @@ endif
 
 pgo-generate:
 	rm -f src/*.o $(BWA_LIB)
-	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="-fprofile-generate=$(PGO_PROFILE_DIR)" CXX="$(CXX)" all
+	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -fprofile-generate=$(PGO_PROFILE_DIR)" CXX="$(CXX)" all
 	@echo "PGO instrumented binary built: $(PGO_INSTR_EXE) (arch=$(PGO_ARCH), profile dir=$(PGO_PROFILE_DIR))"
 	@echo "Run training workload with $(PGO_INSTR_EXE), then: make pgo-use PGO_ARCH=$(PGO_ARCH) PGO_PROFILE_DIR=$(PGO_PROFILE_DIR)"
 
 pgo-use:
 	rm -f src/*.o $(BWA_LIB)
-	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="-fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX="$(CXX)" all
+	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX="$(CXX)" all
 	@echo "PGO optimized binary built: $(PGO_FINAL_EXE) (arch=$(PGO_ARCH))"
 
 pgo-clean:
@@ -1826,7 +1955,7 @@ lto-build:
 	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto=$$LTO_JOBS ;; esac; \
 	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH), lto-jobs: $$LTO_JOBS)"; \
 	  MAKEFLAGS= MAKEOVERRIDES= \
-	    $(MAKE) -j1 arch=$(LTO_ARCH) EXE=bwa-mem3.lto BWA_LTO_MODE=off EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
+	    $(MAKE) -j1 arch=$(LTO_ARCH) EXE=bwa-mem3.lto BWA_LTO_MODE=off EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" EXTRA_CFLAGS="$(EXTRA_CFLAGS)" CXX="$(CXX)" all
 	@echo "LTO binary: bwa-mem3.lto (arch=$(LTO_ARCH))"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -flto / -fno-semantic-interposition

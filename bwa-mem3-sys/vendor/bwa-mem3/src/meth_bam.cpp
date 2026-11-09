@@ -9,6 +9,7 @@
 #include "bam_rec_scratch.h"
 #include "bam_writer.h"
 #include "cigar_util.h"
+#include "hts_periodic_sync.h"
 #include "meth_xm.h"
 #include "version.h"
 
@@ -20,6 +21,7 @@
 struct meth_bam_writer_s {
     htsFile   *fp;
     sam_hdr_t *hdr;
+    hts_periodic_sync_t sync; /* see hts_periodic_sync.h */
 };
 
 /* Declared in src/bwa.h (without extern "C"); match that linkage here. */
@@ -164,6 +166,7 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
     else     snprintf(mode, sizeof(mode), "w");
     w->fp = hts_open(path_or_dash, mode);
     if (w->fp == NULL) { free(w); return NULL; }
+    hts_periodic_sync_init(&w->sync);
     /* BGZF compression thread pool (BAM container only; the text path does not
      * deflate). Ordered tpool -> byte-identical compressed stream vs serial.
      * Non-fatal if it fails; the writer stays serial, but warn so the user
@@ -288,7 +291,8 @@ fail:
 int meth_bam_writer_write(meth_bam_writer_t *w, bam1_t *b)
 {
     if (w == NULL || b == NULL) return -1;
-    return sam_write1(w->fp, w->hdr, b);
+    if (sam_write1(w->fp, w->hdr, b) < 0) return -1;
+    return hts_periodic_sync(&w->sync, w->fp);
 }
 
 int meth_bam_writer_close(meth_bam_writer_t *w)
@@ -433,16 +437,9 @@ int meth_mem_aln_to_bam(bam1_t *b,
         }
     }
 
-    /* Restore pre-c2t bases so MethylDackel sees real C/Ts. CodeRabbit: prefer
-     * the first-class meth_orig_seq field (native-alphabet output no longer
-     * depends on comment preservation); fall back to the YS:Z comment only when
-     * meth_orig_seq is unavailable. FASTQ ingest builds comments as
-     * "YS:Z:<l_seq bytes>\tYC:Z:XX" starting at offset 0 — rely on that. */
+    /* Restore pre-c2t bases so MethylDackel sees real C/Ts, from the
+     * first-class meth_orig_seq field (set by ingest for every --meth read). */
     const char *orig_seq = s->meth_orig_seq;
-    if (orig_seq == NULL && s->comment && s->l_seq > 0
-        && s->comment[0] == 'Y' && s->comment[1] == 'S' && s->comment[2] == ':') {
-        orig_seq = s->comment + 5;
-    }
 
     int emit_seq = !(p.flag & 0x100);
     size_t l_emit = 0;
@@ -462,16 +459,15 @@ int meth_mem_aln_to_bam(bam1_t *b,
             } else {
                 for (size_t i = 0; i < l_emit; ++i) {
                     unsigned char c = (unsigned char)orig_seq[qe - 1 - (int)i];
-                    /* nst_nt4_table maps '-' to 5, which indexes the literal's
-                     * NUL terminator (in bounds, but emits '\0' into SEQ --
-                     * corrupt output, not an OOB read); clamp anything >=4 to N.
-                     * Byte-identical for A/C/G/T/N. */
+                    /* nst_nt4_table maps every non-ACGT byte to 4 ('-' once
+                     * mapped to 5 and emitted the literal's NUL terminator into
+                     * SEQ); the clamp keeps any code >= 4 on N regardless. */
                     int bi = nst_nt4_table[c];
                     seq_text[i] = "TGCAN"[bi < 4 ? bi : 4];
                 }
             }
         } else if (!p.is_rev) {
-            /* Fallback: YS:Z (orig_seq) was missing. s->seq holds ASCII
+            /* Fallback: meth_orig_seq was missing. s->seq holds ASCII
              * (post-c2t in meth mode); map ASCII → 0..4 via nst_nt4_table. */
             for (size_t i = 0; i < l_emit; ++i) {
                 unsigned char c = (unsigned char)s->seq[qb + (int)i];
@@ -571,8 +567,10 @@ int meth_mem_aln_to_bam(bam1_t *b,
     if (p.n_cigar > 0) {
         int32_t nm = (int32_t)p.NM;
         if (bam_aux_append(b, "NM", 'i', sizeof(nm), (const uint8_t *)&nm) < 0) return -1;
-        const char *md = (const char *)(p.cigar + p.n_cigar);
-        if (bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md) < 0) return -1;
+        if (opt->md_mode != MEM_MD_NONE) { // --md none: no MD after the CIGAR
+            const char *md = (const char *)(p.cigar + p.n_cigar);
+            if (bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md) < 0) return -1;
+        }
     }
     if (mp && mp->n_cigar > 0) {
         /* Reused thread-local kstring, grown as needed. */
@@ -670,9 +668,10 @@ int meth_mem_aln_to_bam(bam1_t *b,
     }
     /* XA:Z — D3 (PR-5): p.XA is produced by mem_gen_alt against the ORIGINAL
      * bns, so its `name,+/-pos,cigar,NM;` entries already carry original contig
-     * names. No f/r prefix stripping or chrom rewrite is needed; emit verbatim. */
+     * names. No f/r prefix stripping or chrom rewrite is needed; emit verbatim.
+     * Named XB under -u, as in the other writers. */
     if (p.XA != NULL) {
-        if (bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;
+        if (bam_aux_append(b, (opt->flag & MEM_F_XB) ? "XB" : "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;
     }
     /* HN:i — the same mem_gen_alt call that fills p.XA fills p.HN, so this
      * counts the hits XA enumerates. Like XA above it is already stated against
@@ -687,21 +686,12 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * mapped records. Each is additionally gated on its --meth-tags bit, and
      * the gate wraps the value's derivation rather than just the append, so a
      * deselected tag costs nothing to compute -- the contract --help and the
-     * methylation docs state. The YC:Z payload in s->comment carries the (CT|GA)
-     * value (the comment buffer is "YS:Z:<seq>\tYC:Z:<dir>", see
-     * src/fastmap.cpp:415-425). Locate it with a marker search rather
-     * than l_seq arithmetic so any future YS framing change (alternate
-     * prefix length, prior FASTQ comments folded in) stays detectable. */
+     * methylation docs state. */
     if (opt->meth_tags & MEM_METH_TAG_XR) {
-        const char *xr = NULL;
-        if (s->comment != NULL) {
-            const char *yc = strstr(s->comment, "\tYC:Z:");
-            if (yc != NULL) {
-                const char *p2 = yc + 6;  /* skip "\tYC:Z:" */
-                if      (p2[0] == 'C' && p2[1] == 'T') xr = "CT";
-                else if (p2[0] == 'G' && p2[1] == 'A') xr = "GA";
-            }
-        }
+        /* XR:Z is the read's conversion: R1 (meth_base_ot 1, OT) is C->T, R2
+         * (0, OB) is G->A. -1 marks a non---meth read, which gets no XR. */
+        const char *xr = s->meth_base_ot == 1 ? "CT"
+                       : s->meth_base_ot == 0 ? "GA" : NULL;
         if (xr != NULL) {
             if (bam_aux_append(b, "XR", 'Z', 3, (const uint8_t *)xr) < 0) return -1;
         }

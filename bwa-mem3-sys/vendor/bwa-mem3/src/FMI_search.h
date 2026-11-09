@@ -49,6 +49,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "io_utils.h"       /* parallel index-array read family (fmi_pread_*, index_load_threads) */
 #include "lockstep_width.h"  /* SMEM_LOCKSTEP_N (+ _MAX), runtime width + probe */
 #include "fmi_seed_api.h"
+#include "bwa_hugepages.h"  /* bwamem_hugetlb_buf_t (--huge-pages occurrence table) */
 
 #define DUMMY_CHAR 6
 
@@ -64,21 +65,71 @@ GET_OCC(pp, c, occ_id_pp, y_pp, occ_pp, one_hot_bwt_str_c_pp, match_mask_pp) \
                 uint64_t match_mask_pp = one_hot_bwt_str_c_pp & one_hot_mask_array[y_pp]; \
                 occ_pp += _mm_countbits_64(match_mask_pp);
 
-/* Reusable scratch for FMI_search::sortSMEMs' rid counting sort. Hoisted out of
- * the per-batch malloc/free + memcpy (audit SEED-15): the caller owns one of
- * these per worker thread (see mem_cache in bwamem.h) and passes it in on every
- * batch, so the count/offset array (`cnt`) and the stable-scatter buffer (`tmp`)
- * are allocated once and grown on demand instead of allocated and freed per
- * call. Zero-initialize the struct before first use (all-NULL, zero caps); the
- * owner frees `cnt`/`tmp` with _mm_free at teardown (both NULL-safe). One
- * instance is single-threaded scratch — never share it across threads. */
+/* (sort key, source index) pair used only inside smem_sort_rid_mn; the full
+ * definition is private to FMI_search.cpp. */
+typedef struct smem_key_idx SmemKeyIdx;
+
+/* Reusable, single-threaded scratch for the SMEM rid counting sort. The caller
+ * owns one per worker thread (see mem_cache in bwamem.h) and passes it in on
+ * every batch (audit SEED-15), so the buffers are allocated once and grown on
+ * demand instead of allocated and freed per call:
+ *   - cnt:   rid count/offset array, sized to the batch's rid range
+ *            (smem_sort_rid_mn and FMI_search::sortSMEMs);
+ *   - tmp:   SMEM staging buffer, sized to the SMEM count -- the rid scatter
+ *            target in sortSMEMs, the gather target in smem_sort_rid_mn;
+ *   - pairs: (key, idx) buffer, sized to the SMEM count (smem_sort_rid_mn only).
+ * Buffers are never shrunk, so per thread the peak is 48 B (tmp) + 16 B (pairs)
+ * per SMEM of the largest batch, plus 8 B per rid of its rid range.
+ * Zero-initialize before first use (all NULL, zero caps); the owner frees
+ * cnt/tmp/pairs with _mm_free at teardown (all NULL-safe). Never share one
+ * instance across threads. */
 typedef struct smem_sort_scratch
 {
-    int64_t *cnt;     /* counting-sort count/offset array; >= observed rid range */
+    int64_t *cnt;     /* rid count/offset array; >= observed rid range          */
     int64_t  cntCap;  /* allocated capacity of cnt, in int64_t entries           */
-    SMEM    *tmp;     /* stable-scatter output buffer; >= observed SMEM count     */
+    SMEM    *tmp;     /* SMEM staging (scatter or gather) buffer; >= SMEM count  */
     int64_t  tmpCap;  /* allocated capacity of tmp, in SMEM entries              */
+    SmemKeyIdx *pairs;    /* smem_sort_rid_mn's (key, idx) buffer; >= SMEM count  */
+    int64_t     pairsCap; /* allocated capacity of pairs, in entries             */
 }SmemSortScratch;
+
+/* Sort n SMEMs into the order mem_collect_smem needs: ascending rid, and within
+ * one rid by (m << 32 | n) with exactly the permutation that FMI_search::sortSMEMs
+ * (stable counting sort by rid) followed by a per-rid ks_introsort(mem_intv1)
+ * produces -- ties on (rid, m, n) included. The rid scatter and the per-rid
+ * sort run on 16-byte (key, index) pairs with the same introsort and the same
+ * comparisons, so the 48-byte SMEMs are not shifted by the sort; each is moved
+ * twice (gathered into scratch, then copied back). scratch is single-threaded,
+ * caller-owned, grown on demand. */
+void smem_sort_rid_mn(SMEM *a, int64_t n, SmemSortScratch &scratch);
+
+/* The bwtSeed pass's first walk on a read (from x = 0), recorded by the SMEM
+ * pass's first forward walk on it. Both start at read base 0 and step every
+ * base with the same forward extension, so the bwtSeed walk is a prefix of the
+ * SMEM walk (min_intv 1), which goes on while s >= 1: the SMEM walk notes the
+ * step at which the bwtSeed walk stops (s < max_intv and n + 1 >= min_len), or
+ * where it would end when the SMEM walk stops first, and the bwtSeed pass
+ * emits that seed and starts the read at x instead of walking it again.
+ * mem_collect_smem fills `rec` (one entry per read, indexed by rid) through
+ * getSMEMsAllPosOneThread, which first sets x = -1 for every rid it is given,
+ * and reads it back in bwtSeedStrategyAllPosOneThread_lockstep, whose read i
+ * must be rid i. A direct getSMEMsOnePosOneThread_lockstep caller must set
+ * those x to -1 itself. */
+typedef struct bsd_first_walk
+{
+    int64_t k, l, s;  /* the walk's last interval, emitted as its seed when s > 0;
+                       * l is stale (frozen at the unique-match step) when the
+                       * SMEM walk ended in its text compare (ls_s1_compare) */
+    int32_t n;        /* the seed's last base (m = 0)                          */
+    int32_t x;        /* where the bwtSeed pass goes on; < 0: not recorded     */
+}BsdFirstWalk;
+
+typedef struct bsd_first_walk_hint
+{
+    BsdFirstWalk *rec;     /* one per read, indexed by rid                     */
+    int32_t       max_intv;/* the bwtSeed pass's max_intv (>= 1, every read)    */
+    int32_t       min_len; /* the bwtSeed pass's minSeedLen                     */
+}BsdFirstWalkHint;
 
 #define SAL_PFD 16
 
@@ -189,12 +240,24 @@ class FMI_search: public indexEle
      * (for the seed->original remap) but never the seed pac — extension/scoring
      * runs against the ORIGINAL pac (meth_orig_pac). Saves ~1.6 GB on hg38. */
     /* n_threads: worker count for the big-array disk reads (capped internally,
-     * overridable via BWA3_LOAD_THREADS). Default 1 preserves prior behavior. */
-    void load_index(bool load_pac = true, int n_threads = 1);
+     * overridable via BWA3_LOAD_THREADS). Default 1 preserves prior behavior.
+     * build_seed_jump=false skips the seed jump table (seed_jump stays NULL,
+     * seed_jump_depth 0, as under BWA3_BWTSEED_JUMP=0): for a loader that never
+     * runs the lockstep seeding drivers, such as the fmi_seed_api facade. The
+     * table is built on both the disk and the shm-attach path.
+     * huge_pages: BWAMEM_HUGETLB_ON (main_mem's --huge-pages) maps the
+     * occurrence table on 1 GB pages where it can, falling back to the default
+     * allocation when it cannot; the SA samples always use the default
+     * allocation. Disk path only (an shm attach prints that it has no effect).
+     * Production callers pass OFF or ON; the other values are unit-test seams.
+     * See bwa_hugepages.h. */
+    void load_index(bool load_pac = true, int n_threads = 1, bool build_seed_jump = true,
+                    bwamem_hugetlb_mode_t huge_pages = BWAMEM_HUGETLB_OFF);
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
-     * destructor munmaps `base` and leaves the aliased buffers untouched. */
+     * destructor munmaps `base` and leaves the aliased buffers untouched.
+     * Builds no seed jump table: load_index builds it after the attach. */
     void load_index_from_shm(uint8_t *base, size_t len);
 
     /* Densify the SA sample table on the fly: given an existing FM-index's
@@ -258,7 +321,12 @@ class FMI_search: public indexEle
      * read finishes; finished reads are emitted in input order through a
      * per-thread parked list (smem_parked.h), so matchArray is written in the
      * same (read, smem) order as the scalar path.
-     * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
+     * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized).
+     * With bsd_hint, a walk from query position 0 at min_intv 1 records the
+     * bwtSeed pass's first walk on its read (BsdFirstWalk). The caller must
+     * first set bsd_hint->rec[rid].x = -1 for every rid it passes, as
+     * getSMEMsAllPosOneThread does; a read whose walk records nothing keeps
+     * that mark. */
     void getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                                           int32_t *query_pos_array,
                                           int32_t *min_intv_array,
@@ -270,9 +338,13 @@ class FMI_search: public indexEle
                                           int32_t  max_readlength,
                                           int32_t minSeedLen,
                                           SMEM *matchArray,
-                                          int64_t *__numTotalSmem);
+                                          int64_t *__numTotalSmem,
+                                          BsdFirstWalkHint *bsd_hint = nullptr);
 
-    /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
+    /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized).
+     * bsd_hint (first round only, lockstep build) as in
+     * getSMEMsOnePosOneThread_lockstep; this call sets x = -1 in every rid's
+     * record itself. */
     void getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                  int32_t *min_intv_array,
                                  int32_t *rid_array,
@@ -283,7 +355,8 @@ class FMI_search: public indexEle
                                  int32_t max_readlength,
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
-                                 int64_t *__numTotalSmem);
+                                 int64_t *__numTotalSmem,
+                                 BsdFirstWalkHint *bsd_hint = nullptr);
 
 
     /* matchArray must hold at least numReads * (longest l_seq in seq_) SMEMs;
@@ -301,7 +374,14 @@ class FMI_search: public indexEle
      * order so the CP_OCC cache-line misses from independent reads issue
      * concurrently. Same SMEM emission order as the scalar (reads in input
      * order; within a read, outer-x ascending). matchArray must hold at
-     * least numReads * max_readlength SMEMs. */
+     * least numReads * max_readlength SMEMs. With bsd_hint (filled by the
+     * SMEM pass, BsdFirstWalk), a read whose first walk was recorded emits
+     * that walk's seed and starts at its x; a hint whose min_len or max_intv
+     * differs from this call's is not used. rec is indexed by read index,
+     * which must equal the rid the SMEM pass recorded it under, and any
+     * record with x > 0 is trusted as this batch's. A seed taken from a
+     * record may carry a stale l (frozen at the SMEM walk's unique-match
+     * step), so it matches the scalar driver's seed in (rid, m, n, k, s). */
     int64_t bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
                                                     int32_t *max_intv_array,
                                                     int32_t numReads,
@@ -309,8 +389,12 @@ class FMI_search: public indexEle
                                                     int32_t *query_cum_len_ar,
                                                     int32_t minSeedLen,
                                                     SMEM *matchArray,
-                                                    int32_t max_readlength);
-        
+                                                    int32_t max_readlength,
+                                                    const BsdFirstWalkHint *bsd_hint = nullptr);
+
+    /* No production caller: mem_collect_smem uses smem_sort_rid_mn. Kept for the
+     * integration tests (smem2_test, bwt_seed_strategy_test, fmi_test); the
+     * smem_sort_rid_mn unit test also pins it to a stable sort by rid. */
     void sortSMEMs(SMEM *matchArray,
                    int64_t numTotalSmem[],
                    int32_t numReads,
@@ -353,11 +437,36 @@ class FMI_search: public indexEle
      * --compat=bwa-mem2; see compat_target_t::sa_sentinel_drop_offset). */
     int64_t call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset,
                           int drop_sentinel_offset = 0);
+    /* trust_s1_tag: smemArray comes from bwa-mem3's seeding path
+     * (mem_collect_smem), so an s == 1 SMEM carrying the lockstep driver's
+     * text-position tag in info is written from it without an LF walk
+     * (FMI_search.cpp, ls_s1_sa_tag); used only at drop_sentinel_offset 0.
+     * External callers (the fmi_seed_sa_prefetch facade) leave it false. */
     void get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                                  int64_t *coordCountArray, int64_t count,
                                  const int32_t max_occ, int tid, int64_t &id_,
-                                 int drop_sentinel_offset = 0);
-    
+                                 int drop_sentinel_offset = 0,
+                                 bool trust_s1_tag = false);
+    /* One read's SMEMs a[0..n), sorted by (m, n) as mem_collect_smem sorts
+     * them: an untagged s == 1 SMEM that lies inside a tagged one gives it the
+     * same tag (FMI_search.cpp, ls_s1_sa_tag), so get_sa_entries_prefetch
+     * writes its coordinate without an LF walk too. */
+    static void s1_tag_contained(SMEM *a, int64_t n);
+    /* s1_tag_contained over each read's run of a[0..n), an array sorted by rid
+     * and then (m, n), as mem_collect_smem sorts it (and calls this). */
+    static inline void s1_tag_contained_reads(SMEM *a, int64_t n)
+    {
+        for (int64_t b0 = 0, b1; b0 < n; b0 = b1) {
+            for (b1 = b0 + 1; b1 < n && a[b1].rid == a[b0].rid; b1++) {}
+            if (b1 - b0 > 1)
+                s1_tag_contained(&a[b0], b1 - b0);
+        }
+    }
+    /* True when the lockstep SMEM driver compares unique matches with the
+     * reference text and so can tag SMEMs (the index's pac is loaded and
+     * matches the BWT text length). When false no SMEM carries a tag. */
+    bool s1_text_available() const;
+
     int64_t reference_seq_len;
     int64_t sentinel_index;
     int64_t sa_compx;        // SA sample shift; sample rate 1/(1<<sa_compx). Loaded per-index.
@@ -376,6 +485,41 @@ private:
          * shm-backed buffers. */
         uint8_t *shm_base;
         size_t   shm_len;
+
+        /* --huge-pages: when mapped, cp_occ is cp_occ_huge.base and the
+         * destructor unmaps it instead of calling _mm_free. Unmapped (base
+         * NULL) on every other path. The suffix-array samples are always on the
+         * default allocation. */
+        bwamem_hugetlb_buf_t cp_occ_huge;
+
+        /* Seed jump table: the bidirectional interval (k, l, s) of every
+         * string of length 1..seed_jump_depth, level L at offset
+         * seed_jump_level_off(L), indexed within a level by the string's
+         * 2-bit code, first base most significant. Built once per index load by
+         * build_seed_jump_table after cp_occ, count[] and sentinel_index are in
+         * (load_index, after the disk load or the shm attach); NULL (seed_jump_depth 0) when
+         * BWA3_BWTSEED_JUMP=0, the loader passed build_seed_jump=false, or
+         * the table could not be allocated.
+         * Level 1 is bsd_init_slot's 1-base interval and every child is the
+         * walk's own forward step (backwardExt on the k<->l-swapped parent with
+         * 3 - c, swapped back), so an entry is exactly the interval a bwtSeed
+         * walk reaches by stepping, s == 0 strings included. A walk cannot
+         * leave before length minSeedLen except at an N or the read end, so
+         * bwtSeedStrategyAllPosOneThread_lockstep jumps from its first base
+         * straight to length min(depth, minSeedLen - 1) when the read has
+         * that many ACGT bases there. The SMEM lockstep driver's forward walks
+         * step the same way, so a walk's first visit takes its steps to depths
+         * 2..min(depth, ACGT bases left) from the table, each with the forward
+         * step's own s < min_intv exit (ls_advance_forward_table). Owned
+         * (_mm_malloc), also on the shm path. */
+        struct SeedJumpEntry { int64_t k, l, s; };
+        SeedJumpEntry *seed_jump;
+        int32_t        seed_jump_depth;
+        static int64_t seed_jump_level_off(int L) { return (((int64_t)1 << (2 * L)) - 4) / 3; }
+        static inline void seed_jump_prefetch(const SeedJumpEntry *e);
+        void build_seed_jump_table(int n_threads);
+        void seed_jump_children(int L, int64_t first, int64_t n);
+        static void *seed_jump_worker(void *arg);
 
         /* Defined inline so all hot callers (getSMEMs* and ls_advance_*)
          * fully absorb the body and pay no struct-by-value pass / return
@@ -476,8 +620,10 @@ private:
          * in the parity harness (test/smem_lockstep_parity_test.cpp); both have
          * been updated to drop `l`, so an emitted seed's identity is (rid,m,n,k,s).
          * NOTE this means the l this phase emits is intentionally stale (frozen at
-         * its forward-phase value); it must never be resurrected as an observable
-         * field without also restoring the l-chain here. Dropping the l-chain
+         * its forward-phase value); so is the l of every seed the forward phase's
+         * unique-match text compare finishes (ls_s1_compare in FMI_search.cpp
+         * never steps l). It must never be resurrected as an observable field
+         * without also restoring the l-chain here and in that compare. Dropping the l-chain
          * removes the sentinel test, the l cumulation, and (on x86) six of eight
          * popcounts — same two cache lines read, far fewer instructions.
          * Byte-identical in observable (SAM) output.
@@ -495,13 +641,23 @@ private:
         __attribute__((always_inline)) inline
         SMEM backwardExt_konly(SMEM smem, uint8_t a) const
         {
+            return backwardExt_konly_cp(cp_occ, count[a], smem, a);
+        }
+
+        /* backwardExt_konly on a caller-held cp_occ pointer and count[a], so the
+         * general loops of ls_advance_backward_step keep both in registers across
+         * their prev[] stores. Same arithmetic and same contract: k is left stale
+         * on the s'->0 exit, so the caller must discard any s' < min_intv. */
+        __attribute__((always_inline)) static inline
+        SMEM backwardExt_konly_cp(const CP_OCC *cpo, int64_t count_a, SMEM smem, uint8_t a)
+        {
             const int64_t sp = (int64_t)smem.k;
             if (smem.s == 1) {
-                const CP_OCC &blk = cp_occ[sp >> CP_SHIFT];
+                const CP_OCC &blk = cpo[sp >> CP_SHIFT];
                 const int pos = (int)(sp & CP_MASK);
                 const uint64_t oh = blk.one_hot_bwt_str[a];
                 if ((oh >> (CP_MASK - pos)) & 1ULL) {  /* BWT[sp] == a  => s' = 1 */
-                    smem.k = count[a] + blk.cp_count[a] +
+                    smem.k = count_a + blk.cp_count[a] +
                              occ_popcount64(&blk.one_hot_bwt_str[a], &one_hot_mask_array[pos]);
                     smem.s = 1;
                 } else {                               /* s' = 0; new k is dead */
@@ -510,13 +666,13 @@ private:
                 return smem;
             }
             const int64_t ep = sp + (int64_t)smem.s;
-            const CP_OCC &blk_sp = cp_occ[sp >> CP_SHIFT];
-            const CP_OCC &blk_ep = cp_occ[ep >> CP_SHIFT];
+            const CP_OCC &blk_sp = cpo[sp >> CP_SHIFT];
+            const CP_OCC &blk_ep = cpo[ep >> CP_SHIFT];
             const int64_t occ_s = blk_sp.cp_count[a] +
                 occ_popcount64(&blk_sp.one_hot_bwt_str[a], &one_hot_mask_array[(sp & CP_MASK)]);
             const int64_t occ_e = blk_ep.cp_count[a] +
                 occ_popcount64(&blk_ep.one_hot_bwt_str[a], &one_hot_mask_array[(ep & CP_MASK)]);
-            smem.k = count[a] + occ_s;
+            smem.k = count_a + occ_s;
             smem.s = occ_e - occ_s;
             return smem;
         }
@@ -532,10 +688,19 @@ private:
                       const int32_t *rid_array,
                       const bseq1_t *seq_,
                       const int32_t *query_cum_len_ar,
-                      const uint8_t *enc_qdb);
+                      const uint8_t *enc_qdb,
+                      BsdFirstWalkHint *bsd_hint);
     void ls_prefetch_cp_occ(const BatchSlot *s);
-    void ls_prefetch_cp_occ_t1(const BatchSlot *s);
-    void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb);
+    inline void ls_bsd_note(BatchSlot *s, int64_t k, int64_t l, int64_t sz);
+    void ls_bsd_resolve(BatchSlot *s, const uint8_t *enc_qdb, int32_t p);
+    void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
+                                 bool s1_text);
+    inline void ls_prefetch_sa_row(int64_t p) const;
+    void ls_s1_lf_step(BatchSlot *s, const uint8_t *pac, int64_t l_pac);
+    void ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
+                       const uint8_t *pac, int64_t l_pac);
+    void ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
+                                  bool s1_text);
     void ls_prepare_backward(BatchSlot *s);
     void ls_advance_backward_step(BatchSlot *s,
                                   const uint8_t *enc_qdb,
@@ -548,12 +713,17 @@ private:
                        const int32_t *max_intv_array,
                        const bseq1_t *seq_,
                        const int32_t *query_cum_len_ar,
-                       const uint8_t *enc_qdb);
+                       const uint8_t *enc_qdb,
+                       const SeedJumpEntry *jlev, int32_t jd,
+                       int32_t minSeedLen,
+                       const BsdFirstWalkHint *bsd_hint);
     void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
-    void bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s);
+    void bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
+                       const SeedJumpEntry *jlev, int32_t jd);
     void bsd_advance_step(BwtSeedSlot *s,
                           const uint8_t *enc_qdb,
-                          int32_t minSeedLen);
+                          int32_t minSeedLen,
+                          const SeedJumpEntry *jlev, int32_t jd);
 };
 
 #endif
