@@ -58,7 +58,10 @@ static const uint64_t one_hot_mask_array[64] = {
  * sizes between mismatched builds. */
 typedef struct smem_struct
 {
-    uint64_t info; // for debug
+    uint64_t info; // reserved for bwa-mem3's own seeding, which may record an
+                   // SMEM's already-resolved SA position here (bit 63 set) for
+                   // its internal SA resolution; fmi_seed_sa_prefetch ignores
+                   // info, so external callers may leave it 0
     uint32_t rid;
     uint32_t m, n;
     int64_t k, l, s;
@@ -77,7 +80,7 @@ typedef struct FmiSeed FmiSeed;               /* lets C consumers name the type 
 extern "C" {
 #endif
 
-FmiSeed       *fmi_seed_open(const char *prefix);            /* new FMI_search + load_index(load_pac=false) */
+FmiSeed       *fmi_seed_open(const char *prefix);            /* new FMI_search + load_index(load_pac=false, no seed jump table) */
 void           fmi_seed_close(FmiSeed *h);                   /* delete */
 const CP_OCC  *fmi_seed_cp_occ(const FmiSeed *h);             /* cp_occ_data() */
 const int64_t *fmi_seed_count(const FmiSeed *h);              /* count_data() */

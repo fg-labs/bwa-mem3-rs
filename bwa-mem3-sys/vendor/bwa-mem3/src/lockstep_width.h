@@ -20,7 +20,7 @@
 /* Upper bound on the runtime width. Sizes the driver's on-stack slot array
  * (BatchSlot slots[SMEM_LOCKSTEP_N_MAX]) and caps the value the startup
  * memory-level-parallelism probe may select. Raise only in step with the
- * stack-array cost (~80 B per slot). */
+ * stack-array cost (168 B per slot). */
 #ifndef SMEM_LOCKSTEP_N_MAX
 #define SMEM_LOCKSTEP_N_MAX 64
 #endif
@@ -32,12 +32,12 @@
  * out of bounds, so reject it at compile time rather than miscompile.
  *
  * The upper bound is a STORAGE-safe cap, not merely INT32_MAX: both the
- * driver's BatchSlot slots[SMEM_LOCKSTEP_N_MAX] (~100 B/slot, FMI_search.cpp)
+ * driver's BatchSlot slots[SMEM_LOCKSTEP_N_MAX] (168 B/slot, FMI_search.cpp)
  * and the probe's uint64_t cur[SMEM_LOCKSTEP_N_MAX] (8 B/slot, lockstep_width.cpp)
  * are fixed-size STACK arrays sized by this bound. An INT32_MAX bound is
  * representable in int32_t but would demand a multi-gigabyte stack frame and
  * crash before the probe ever runs. Cap the override at a width whose
- * worst-case frame (~28 KB at 256) is safe on any thread stack, while still
+ * worst-case frame (~45 KB at 256) is safe on any thread stack, while still
  * leaving 4x headroom over the shipped default 64. */
 #define SMEM_LOCKSTEP_N_MAX_CAP 256
 #if !(SMEM_LOCKSTEP_N >= 1 && SMEM_LOCKSTEP_N <= SMEM_LOCKSTEP_N_MAX && SMEM_LOCKSTEP_N_MAX <= SMEM_LOCKSTEP_N_MAX_CAP)
@@ -249,8 +249,11 @@ void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
  * there rests on the driver's SMEM-order parity design (pinned by the parity
  * harness and the driver-identity regression), not on a measurement there.
  *
- * Output is byte-identical either way (same SMEM emission order; the lockstep
- * parity harness pins it) -- this is a scheduling choice, never a result one. */
+ * Output is byte-identical either way: both drivers emit the same
+ * (rid, m, n, k, s) stream in the same order (the lockstep parity harness pins
+ * it), and the SAM output matches. The one field that can differ is l of a
+ * lockstep seed taken from a BsdFirstWalk record (m = 0), which may be stale
+ * and is never read. This is a scheduling choice, never a result one. */
 
 /* Runtime switch read by mem_collect_smem: nonzero selects the lockstep driver,
  * zero the scalar one. Initialized to the compiled default (on) so a binary that

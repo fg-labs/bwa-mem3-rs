@@ -1,7 +1,9 @@
 /* ungapped_ext.h -- the ungapped diagonal fast path in front of the banded-SW
  * extension ladder (bwamem.cpp): the mismatch scan, the diagonal walk that
- * reproduces the extension kernel's diagonal, and ungapped_analyze, which
- * decides HIT (skip the DP), TIGHT (carry a band bound) or FALLBACK.
+ * reproduces the extension kernel's diagonal, and ungapped_analyze_pb, which
+ * decides HIT (skip the DP), TIGHT (carry a band bound) or FALLBACK and also
+ * returns the certified probe rung's band (ungapped_analyze is the same
+ * decision without it).
  *
  * Header-only so test/unit/test_ungapped_fastpath.cpp can run it
  * differentially against the scalar extension kernels. Only bwamem.cpp
@@ -18,6 +20,7 @@
     #include "simd_compat.h"
 #elif (__AVX512BW__ || __AVX2__)
     #include <immintrin.h>
+    #include "x86_soa_pack.h"   /* x86_soa_tail16: the analyzer's < 16-base tail */
 #else
     #include <smmintrin.h>  // for SSE4.1
 #endif
@@ -32,20 +35,28 @@
 //                        and uses sp.score/qle/gscore/gtle directly.
 //
 //   FP_STATUS_TIGHT    — fast-path fails (too many mismatches) but the
-//                        ungapped score bounds the useful SW band:
-//                          tight_band = ceil((min(len1,len2)·a - ungapped_score)
-//                                            / (o_min + e_min))
-//                        The certified probe rung (bsw_tb_probe_rung)
-//                        uses it to pick a narrow probe width; the
-//                        --adaptive-band ladder uses it to stop early
-//                        (the bound is an upper bound on any gapped
-//                        score). The exact ladders do NOT stop on it
-//                        -- see ACCEPT_PAIR.
+//                        floored ungapped walk score max_sc bounds the
+//                        useful SW band:
+//                          tight_band = ceil((N·a + h0 - max_sc - o_min) / e_min)
+//                        (N = min(len1,len2) = len2; the caller gates
+//                        len1 >= len2.) A gapped path at diagonal offset
+//                        d pays at least one open plus d extensions,
+//                        o_min + d·e_min, and gains at most N·a, so every
+//                        cell at offset >= tight_band scores <= max_sc and
+//                        every cell at offset > tight_band scores < max_sc.
+//                        A numerator <= 0, or a band wider than default_w
+//                        (opt->w at every call site), emits the 0 sentinel
+//                        ("no usable bound"); e_min <= 0 emits default_w.
+//                        The --adaptive-band ladder uses it to stop early
+//                        at w >= tight_band. The certified probe rung reads
+//                        the separate probe band ungapped_analyze_pb returns
+//                        alongside it (see FP_TIGHT_MAX). The exact ladders
+//                        do NOT stop on tight_band -- see ACCEPT_PAIR.
 //
 //   FP_STATUS_FALLBACK — ambig base, out-of-range length, the fast path off
-//                        (x_threshold < 0), or a HIT candidate whose
-//                        b*total_mis exceeds a positive zdrop (E2). Caller
-//                        uses opt->w with the full retry loop.
+//                        (x_threshold < 0), a non-HIT pair longer than
+//                        FP_TIGHT_MAX, or a HIT candidate whose b*total_mis
+//                        exceeds a positive zdrop (E2). Caller uses opt->w.
 //
 // HIT envelope -- why a HIT commits exactly what the full-width retry ladder
 // over the extension kernel (ksw_extend2 semantics: scalarBandedSWA and the
@@ -98,22 +109,30 @@
 //   in test/unit/test_ungapped_fastpath.cpp and end to end against bwa in
 //   test/ungapped_hit_parity_test.sh.
 //
-// Derivation of tight_band: for any alignment with band offset B from
-// diagonal, min B gaps are required; cost ≥ B · (o_min + e_min). Max
-// alignment score (all matches) ≤ min(len1, len2) · a. For any gapped
-// alignment to beat the observed ungapped max score S:
-//   min_len·a - B·(o_min+e_min) > S
-//   B < (min_len·a - S) / (o_min + e_min)
-// So any band ≥ tight_band is sufficient; narrower bands suffice too
-// when the gapped alternative score is < min_len·a. Starting SW at
-// tight_band is strictly correct and avoids over-banded DP work.
+// Derivation of tight_band: an alignment reaching diagonal offset B needs at
+// least B gap units in total and at least one gap open, so it pays
+// >= o_min + B·e_min across its gap runs, and it gains at most
+// min(len1, len2)·a over the h0 it starts from. With S = max_sc - h0 the
+// ungapped walk's gain, a gapped alignment at offset B can beat the walk only if
+//   h0 + min_len·a - o_min - B·e_min > h0 + S
+//   B < (min_len·a - S - o_min) / e_min
+// so tight_band = ceil((min_len·a - S - o_min) / e_min) is the smallest offset
+// no gapped alternative can beat from (it may still tie there), and a band
+// w >= tight_band keeps every tying-or-better cell inside the DP. S must be the
+// FLOORED walk score so that the in-band DP provably reaches it.
 #define FP_N_MAX 512
 /* Length cap for emitting a tight_band at all (longer pairs HIT or FALLBACK).
- * tight_band feeds the certified probe rung (bsw_tb_probe_rung), which finalizes on
- * band_cert_ok at its probe width -- not on tb -- inside the
- * mem_band_cert_params_safe_w envelope, and the --adaptive-band ladder's narrowing-tier
- * stop. The exact ladders never stop on it (see ACCEPT_PAIR). Keep this <= the old
- * scanner cap so the set of pairs that carry a tight_band is unchanged. */
+ * tight_band feeds the --adaptive-band ladder's narrowing-tier stop. The exact ladders
+ * never stop on it (see ACCEPT_PAIR). Keep this <= the old scanner cap so the set of
+ * pairs that carry a tight_band is unchanged.
+ *
+ * The certified probe rung (bsw_tb_probe_rung) reads the separate probe band instead
+ * (ungapped_analyze_pb's out_probe_band, SeqPair::probe_band), which every pair with
+ * 0 < N <= FP_N_MAX, no ambiguous base, the fast path on (x_threshold >= 0) and too many
+ * mismatches for a HIT (total_mis > x_threshold) carries, computed exactly as tight_band
+ * is. The rung uses it only to pick a bucket width: it finalizes on band_cert_ok at that
+ * width -- not on the band -- inside the mem_band_cert_params_safe_w envelope, and
+ * neither depends on N, so the longer pairs it admits cannot change output. */
 #define FP_TIGHT_MAX 128
 /* Words in the per-pair mismatch bitmap. Sized to FP_N_MAX so every scanned
  * position 0..FP_N_MAX-1 has a bit; a shift by the in-word offset (< 64) can
@@ -123,6 +142,17 @@
 #define FP_STATUS_FALLBACK  0
 #define FP_STATUS_HIT       1
 #define FP_STATUS_TIGHT     2
+
+/* Probe band of a non-HIT pair whose band numerator (N*a + h0 - S_ug - o_min, see
+ * ungapped_analyze_pb) is <= 0. Such a pair's tight_band stays at the 0 sentinel (the
+ * --adaptive-band stop does not act on it), but it is the easiest pair the certified
+ * probe rung sees: the DP score S at any width is >= the floored ungapped score S_ug
+ * (the diagonal is always in band), so band_cert_ok(S - pen_clip, ...) has a numerator
+ * <= pen_clip and holds at any width >= ceil(pen_clip / e_min), the rung's clip slack.
+ * The rung reads this negative marker as tb = 0, i.e. w_need = clip slack (bucket 8 at
+ * default scoring). As for every probe band, it only picks the bucket: the rung still
+ * certifies at the bucket width, and an uncertified pair falls through to the ladder. */
+#define FP_PROBE_BAND_NUM0 (-1)
 
 /* The per-call fast-path threshold: the largest mismatch count X for which a HIT is
  * sound (X*(a+b) < o_min + e_min, the HIT envelope's Bound), or -1 -- fast path off
@@ -218,30 +248,39 @@ static inline void ungapped_walk_mis(const uint64_t *mis, int N, int h0, int a, 
         return;
     }
     int cur = h0, max_sc = h0, max_i = 0;
-    int j = 0;
-    while (j < N) {
-        /* m = first mismatch at or after j, or N if none (no bit is set past N) */
-        int m = N;
-        for (int w = j >> 6; w < FP_MIS_NWORDS && (w << 6) < N; ++w) {
-            uint64_t bits = mis[w];
-            if (w == (j >> 6)) bits &= ~0ULL << (j & 63);
-            if (bits) { m = (w << 6) + __builtin_ctzll(bits); break; }
+    int j = 0;   /* first position of the current run of matches */
+    /* The words holding a position < N, capped at the bitmap's size. Mismatches
+     * are visited in increasing order by walking each word's set bits: m is the
+     * lowest set bit, then bits &= bits - 1 clears it, and the next word is
+     * loaded only when this one has none left (no bit is set past N). */
+    const int nw = N <= 0 ? 0 : (N > FP_MIS_NWORDS * 64 ? FP_MIS_NWORDS : (N + 63) >> 6);
+    for (int w = 0; w < nw; ++w) {
+        for (uint64_t bits = mis[w]; bits; bits &= bits - 1) {
+            const int m = (w << 6) + __builtin_ctzll(bits);
+            /* No `m > j` guard: for an empty run (m == j) cur is unchanged and
+             * the record test is false (cur <= max_sc holds on entry: it starts
+             * at h0 == max_sc and only a mismatch step, which never raises cur,
+             * precedes a run). Dropping the data-dependent guard lets the record
+             * update be a pair of conditional moves. */
+            cur += (m - j) * a;
+            const bool rec = cur > max_sc;
+            max_sc = rec ? cur : max_sc;
+            max_i  = rec ? m : max_i;
+            cur -= b;
+            if (cur < 0) cur = 0;
+            if (cur == 0) goto walked;
+            j = m + 1;
         }
-        /* No `m > j` guard: for an empty run (m == j) cur is unchanged and the
-         * record test is false (cur <= max_sc holds on entry: it starts at h0 ==
-         * max_sc and only a mismatch step, which never raises cur, precedes a
-         * run). Dropping the data-dependent guard lets the record update be a
-         * pair of conditional moves. */
-        cur += (m - j) * a;
+    }
+    /* The run after the last mismatch (from 0 if there is none) up to N. It is
+     * empty, and skipped, when the last mismatch is at N - 1. */
+    if (j < N) {
+        cur += (N - j) * a;
         const bool rec = cur > max_sc;
         max_sc = rec ? cur : max_sc;
-        max_i  = rec ? m : max_i;
-        if (m >= N) break;
-        cur -= b;
-        if (cur < 0) cur = 0;
-        if (cur == 0) break;
-        j = m + 1;
+        max_i  = rec ? N : max_i;
     }
+walked:
 #ifdef BWA_MEM3_DEBUG_UNGAPPED_XCHECK
     {   /* cross-check the run form against the per-base walk it replaces */
         int rmax, rmi, rc;
@@ -265,26 +304,36 @@ static inline int ungapped_walk_score_mis(const uint64_t *mis, int N, int h0, in
     return max_sc;
 }
 
-static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
-                                    int h0, int a, int b,
-                                    int o_min, int e_min,
-                                    int x_threshold, int default_w, int zdrop,
-                                    int *out_score, int *out_qle,
-                                    int *out_gscore, int *out_gtle,
-                                    int *out_tight_band)
+/* ungapped_analyze plus the probe band: *out_probe_band is the band bound computed
+ * exactly as the TIGHT branch computes tight_band, for every pair with the fast path on
+ * (x_threshold >= 0), too many mismatches for a HIT (total_mis > x_threshold),
+ * 0 < N <= FP_N_MAX and no ambiguous base, and 0 for every other pair; a non-HIT pair
+ * whose band numerator is <= 0 gets the marker FP_PROBE_BAND_NUM0 instead of
+ * tight_band's 0 sentinel. For N <= FP_TIGHT_MAX it otherwise equals the TIGHT result's
+ * tight_band; for FP_TIGHT_MAX < N <= FP_N_MAX the status stays FP_STATUS_FALLBACK
+ * (tight_band is not written), so only a caller that reads the probe band sees it. The
+ * certified probe rung is its only consumer (see FP_TIGHT_MAX). */
+static inline int ungapped_analyze_pb(const uint8_t *qs, const uint8_t *rs, int N,
+                                      int h0, int a, int b,
+                                      int o_min, int e_min,
+                                      int x_threshold, int default_w, int zdrop,
+                                      int *out_score, int *out_qle,
+                                      int *out_gscore, int *out_gtle,
+                                      int *out_tight_band, int *out_probe_band)
 {
+    *out_probe_band = 0;
     if (N <= 0 || N > FP_N_MAX || x_threshold < 0) return FP_STATUS_FALLBACK;
 
-    const __m128i v3 = _mm_set1_epi8(3);
+    const __m128i base_mask = _mm_set1_epi8(3);
     uint64_t mis[FP_MIS_NWORDS] = {0};
     int total_mis = 0;
     int i = 0;
     for (; i + 16 <= N; i += 16) {
         __m128i qv = _mm_loadu_si128((const __m128i *)(qs + i));
         __m128i rv = _mm_loadu_si128((const __m128i *)(rs + i));
-        // AMBIG (code >= 4) detected via max > 3. ACGT = 0..3.
-        __m128i mxv = _mm_max_epu8(qv, rv);
-        if ((unsigned)_mm_movemask_epi8(_mm_cmpgt_epi8(mxv, v3)))
+        // ACGT = 0..3; any higher bit marks ambiguity, including codes >= 128.
+        const __m128i hi = _mm_andnot_si128(base_mask, _mm_or_si128(qv, rv));
+        if ((unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(hi, _mm_setzero_si128())) != 0xFFFFu)
             return FP_STATUS_FALLBACK;  // ambig: give up on both paths
         __m128i eqv = _mm_cmpeq_epi8(qv, rv);
         unsigned mism_mask = (~(unsigned)_mm_movemask_epi8(eqv)) & 0xFFFFu;
@@ -294,6 +343,27 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
          * never straddles a 64-bit boundary. */
         mis[i >> 6] |= ((uint64_t)mism_mask) << (i & 63);
     }
+#if defined(__AVX2__)
+    /* Tail (r = N - i, 1..15 bases) in one 16-byte step. x86_soa_tail16 puts
+     * positions [i, N) in bytes [0, r) without reading outside [qs, qs + N) or
+     * [rs, rs + N) (rs holds len1 >= N bases); bytes [r, 16) are unspecified,
+     * so both tests keep only the r valid lanes. The ambiguity test is the
+     * same as the full blocks and the #else branch's scalar one (any bit
+     * outside 0x03, including codes >= 128). As in the loop above, i is
+     * 16-aligned, so the mask lands within one bitmap word. */
+    if (i < N) {
+        const int r = N - i;
+        const unsigned valid = (1u << r) - 1u;
+        const __m128i qv = x86_soa_tail16(qs, N, i);
+        const __m128i rv = x86_soa_tail16(rs, N, i);
+        const __m128i hi = _mm_and_si128(_mm_or_si128(qv, rv), _mm_set1_epi8((char)0xFC));
+        const unsigned clean = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(hi, _mm_setzero_si128()));
+        if (~clean & valid) return FP_STATUS_FALLBACK;
+        const unsigned mism_mask = ~(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(qv, rv)) & valid;
+        total_mis += __builtin_popcount(mism_mask);
+        mis[i >> 6] |= ((uint64_t)mism_mask) << (i & 63);
+    }
+#else
     /* Tail (< 16 bases): branch-free. The per-base mismatch test is data
      * dependent and mispredicted often as a branch; accumulate it, and the
      * ambiguity test, arithmetically and decide once. Returning FALLBACK after
@@ -308,11 +378,9 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         mis[i >> 6] |= ((uint64_t)ne) << (i & 63);
     }
     if (tail_ambig) return FP_STATUS_FALLBACK;
+#endif
 
     if (total_mis > x_threshold) {
-        /* Only a pair within FP_TIGHT_MAX carries a tight_band (see the define);
-         * a longer pair that is not a HIT falls back with tight_band = 0. */
-        if (N > FP_TIGHT_MAX) return FP_STATUS_FALLBACK;
         // S in the band proof must be REALIZABLE by an actual offset-0 extension.
         // The tight_band derivation shows every out-of-band alignment (band
         // offset B >= tb) scores <= S, so a band >= tb is sufficient ONLY IF the
@@ -327,9 +395,8 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         // feeding that larger S shrinks tb below what is sound, so the certified
         // probe rung or the --adaptive-band stop could skip the wider band a gapped
         // alignment in (default_w, wider] genuinely needs -- a CIGAR/coordinate
-        // divergence. The walk is O(N) and runs only on the
-        // TIGHT branch after the FP_TIGHT_MAX gate above (N <= 128), so its cost
-        // is negligible.
+        // divergence. The run walk costs one step per run of matches and runs
+        // only on this non-HIT branch, so its cost is negligible.
         //
         // Band derivation (see comment above):
         //     B < (min_len·a − S − o_min) / e_min        with S = max_sc − h0
@@ -346,6 +413,7 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         if (numerator <= 0) {
             // Ungapped-optimal (same "tight_band = 0 sentinel" semantic as
             // walk-derived numerator ≤ 0: let SW run with fallback width).
+            // The probe band gets its own marker instead (FP_PROBE_BAND_NUM0).
             band = 0;
         } else if (e_min <= 0) {
             band = default_w;
@@ -360,6 +428,11 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
             // so no tight_band consumer acts on the unproven band.
             if (band > default_w) band = 0;
         }
+        *out_probe_band = (numerator <= 0) ? FP_PROBE_BAND_NUM0 : band;
+        /* Only a pair within FP_TIGHT_MAX carries a tight_band (see the define);
+         * a longer pair that is not a HIT falls back with tight_band unwritten and
+         * only the probe band set. */
+        if (N > FP_TIGHT_MAX) return FP_STATUS_FALLBACK;
         *out_tight_band = band;
         // Outputs unused on TIGHT; set sane values for any future caller.
         *out_score  = max_sc_proof;
@@ -420,6 +493,22 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     *out_gtle       = N;
     *out_tight_band = 0;   // unused on HIT (SW skipped)
     return FP_STATUS_HIT;
+}
+
+/* The HIT / TIGHT / FALLBACK analysis without the probe band (unchanged contract:
+ * a non-HIT pair longer than FP_TIGHT_MAX is FP_STATUS_FALLBACK). */
+static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
+                                    int h0, int a, int b,
+                                    int o_min, int e_min,
+                                    int x_threshold, int default_w, int zdrop,
+                                    int *out_score, int *out_qle,
+                                    int *out_gscore, int *out_gtle,
+                                    int *out_tight_band)
+{
+    int probe_band;
+    return ungapped_analyze_pb(qs, rs, N, h0, a, b, o_min, e_min, x_threshold, default_w,
+                               zdrop, out_score, out_qle, out_gscore, out_gtle,
+                               out_tight_band, &probe_band);
 }
 
 #endif /* BWA_MEM3_UNGAPPED_EXT_H */
