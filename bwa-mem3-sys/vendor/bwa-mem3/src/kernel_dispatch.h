@@ -64,6 +64,7 @@
 #  define ksw_g2_wave16_wmin  BWAMEM3_PASTE(ksw_g2_wave16_wmin,  KERNEL_VARIANT)
 #  define ksw_g2_wave_wmin    BWAMEM3_PASTE(ksw_g2_wave_wmin,    KERNEL_VARIANT)
 #  define ksw_g2_wave_zr_capacity BWAMEM3_PASTE(ksw_g2_wave_zr_capacity, KERNEL_VARIANT)
+#  define ksw_g2_wave_set_zr_poison BWAMEM3_PASTE(ksw_g2_wave_set_zr_poison, KERNEL_VARIANT)
 #  define ksw_extend          BWAMEM3_PASTE(ksw_extend,          KERNEL_VARIANT)
 #  define ksw_global          BWAMEM3_PASTE(ksw_global,          KERNEL_VARIANT)
 #  define ksw_align2          BWAMEM3_PASTE(ksw_align2,          KERNEL_VARIANT)
@@ -79,6 +80,7 @@
     * the right per-tier concrete class without needing the class layout
     * visible at the dispatcher's translation unit. */
 #  define make_bsw_kernel    BWAMEM3_PASTE(make_bsw_kernel,    KERNEL_VARIANT)
+#  define make_bsw_kernel_m  BWAMEM3_PASTE(make_bsw_kernel_m,  KERNEL_VARIANT)
    /* Test-only: the BSW8_ROW_LEAN setting a bandedSWA.cpp copy was built with,
     * so test/unit/test_bandedswa_row_lean.cpp (which declares it) can tell its
     * two aarch64 copies apart. */

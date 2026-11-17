@@ -102,7 +102,7 @@ shared list).
 `fast_reader` FASTQ path (libdeflate + zlib-ng), `numa`, and htslib — none of
 which this crate vendors — so it is excluded again. We instead carry verbatim
 file-local copies of just `worker_alloc` / `worker_free` in
-`shim/bwa_shim_align.cpp`; **keep them in sync** (v0.14.0 added the per-thread `mem_cache::rescue_narrow_off` / `rescue_narrow_cap` / `rescue_band` mate-rescue buffers, which `worker_alloc` NULLs and `worker_free` releases via `free` / `rescue_band_batch_free` — a missed field is an uninitialized pointer that `mem_matesw_batch_pre` grows from; v0.15.1 added `rescue_skip_set` / `rescue_skip_set_cap` on the same terms, plus `worker_t::emit_prefix` / `emit_prefix_ctx`, which `worker_alloc` NULLs) with upstream's `fastmap.cpp`
+`shim/bwa_shim_align.cpp`; **keep them in sync** (v0.14.0 added the per-thread `mem_cache::rescue_narrow_off` / `rescue_narrow_cap` / `rescue_band` mate-rescue buffers, which `worker_alloc` NULLs and `worker_free` releases via `free` / `rescue_band_batch_free` — a missed field is an uninitialized pointer that `mem_matesw_batch_pre` grows from; v0.15.1 added `rescue_skip_set` / `rescue_skip_set_cap` on the same terms, plus `worker_t::emit_prefix` / `emit_prefix_ctx`, which `worker_alloc` NULLs; v0.16.0 added `smem_sort_scratch[].pairs` / `pairsCap` (#648), NULLed and `_mm_free`d alongside `cnt` / `tmp`) with upstream's `fastmap.cpp`
 on every vendor refresh (the buffer set must match what `mem_kernel1_core` /
 `mem_kernel2_core` expect).
 
@@ -110,10 +110,14 @@ on every vendor refresh (the buffer set must match what `mem_kernel1_core` /
 `seed_scratch` (renamed from `chain_ar` / `seedBuf`) as `nthreads * BATCH_SIZE`
 and indexes them by `tid`, because it fused its two `kt_for` passes into
 `worker_bwt_aln` so chains no longer outlive a work item. This crate's public
-API **is** that barrier — `seed_batch` → `extend_batch` — so our copy keeps the
-pre-0.9.0 `nreads` sizing and `seq_id` indexing. The kernels take both arrays as
-parameters and index them `[0, nseq)`, and `tid` selects only `mmc`, so a
-caller-owned per-read array stays valid. Upstream renamed the fields precisely
+API used to **be** that barrier — `seed_batch` → `extend_batch` — so our copy
+long kept the pre-0.9.0 `nreads` sizing and `seq_id` indexing. It no longer
+does: `seed_extend_reads` now fuses seeding and extension per `BATCH_SIZE`
+chunk, so a chain is dead once its chunk's `mem_kernel2_core` returns, and our
+`worker_alloc` sizes both arrays as one `BATCH_SIZE` chunk-local window (one
+thread's slice of upstream's `nthreads * BATCH_SIZE`; the shim's worker is
+always `nthreads = 1`, selected by its `tid` slot). The kernels take both arrays
+as parameters and index them `[0, nseq)` with `nseq <= BATCH_SIZE`. Upstream renamed the fields precisely
 so out-of-tree callers would fail to compile here rather than silently run off
 the end; do **not** take the compiler's `auxSeedBuf` did-you-mean, which is a
 vestigial member nothing allocates.
@@ -215,11 +219,21 @@ related rules both writers share and the shim follows: a raw-`0x100`
 (`reg2bin(pos, pos + max(rlen, 1))`, so a placed-unmapped read is not 4680).
 
 **`--meth` is more than `mem_opt_apply_meth_defaults`.** `main_mem`'s
-`opt->meth_mode` block (`fastmap.cpp`) sets three knobs *around* that helper,
-and the shim mirrors them in `shim_opts_apply_meth_defaults` because upstream
-has no function to call: TAPS (`meth_chem`) defaults `meth_scoring` to NEUTRAL
-(before the helper, whose `-B` branch keys off the mode), `meth_seed_prune`
-defaults to SPEC30, and `band_cert` goes off. SPEC30 changes **output** — it
+`opt->meth_mode` block (`fastmap.cpp`) sets three knobs *around* that helper:
+TAPS (`meth_chem`) defaults `meth_scoring` to NEUTRAL (before the helper, whose
+`-B` branch keys off the mode), `meth_seed_prune` defaults to SPEC30, and
+`band_cert` goes off. The shim used to mirror all three in
+`shim_opts_apply_meth_defaults`. v0.16.0 moved the first two into
+`meth_opts_finalize` (`meth_opts.cpp`), and the shim now calls it in
+`main_mem`'s order: finalize, then (only under `meth_mode`, as upstream) the
+bundle and `band_cert = 0`. So `set_meth(true)` must precede
+`apply_meth_defaults`. `meth_opts_finalize` also runs the CLI's cross-option
+checks: em-seq with an explicit NEUTRAL prints a warning to stderr, and
+`--meth-context cpg` with em-seq or COLLAPSED `exit(1)`s. Those exits are
+unreachable while `MemOpts` cannot set `meth_context`, so expose it only with a
+validating setter. The em-seq scoring default is set by neither helper: it
+comes from `mem_opt_init` (GENOMIC as of v0.17.0, #756; COLLAPSED before),
+which the shim inherits. SPEC30 changes **output** — it
 decides which SMEMs reach SA resolution. Until it was mirrored, `bwa-rs mem
 --meth` differed from `bwa-mem3 mem --meth` on ~half the records of an hg38
 chr22 EM-seq simulation while every PhiX parity test stayed green, because on
@@ -234,30 +248,40 @@ defaults.
 ### 12. `emit_resolved_pair` folds secondaries into `XA:Z` like `mem_reg2sam`
 
 The shim emits records from the per-read alnreg list itself rather than calling
-upstream's `mem_reg2sam`, so it must reproduce that function's output policy:
-after `mem_pair_resolve_batch_post` (which runs `mem_mark_primary_se`),
-`emit_resolved_pair` calls `mem_gen_alt` to build each read's `XA:Z` string and then, per alnreg,
-**skips** any region that is secondary (`ar->secondary >= 0`, folded into the
-primary's `XA:Z`), below `opt->T`, or below `drop_ratio` — emitting only
-primaries + supplementaries (2nd+ emitted region gets `0x800` and its MAPQ
-lowered to the primary's). Without this the shim emitted every surviving
-region, so multi-mapping reads got a record per hit instead of one record with
-an `XA:Z` tag — harmless for unique mappers but a large divergence on
-repetitive reads and on `--meth` (whose collapsed C/T scoring surfaces extra
-weak hits). `lists[k]` stays 1:1 with `a[k]` so the pairing indices (`z[k]`)
-and mate/SA logic are unaffected; a parallel `emit[k]` mask gates the append.
+upstream's `mem_reg2sam`, so it must reproduce that function's output policy.
+After `mem_pair_resolve_batch_post` (which runs `mem_mark_primary_se`), the
+no-pairing and single-end paths call `mem_gen_alt` to build each read's `XA:Z`
+string and then, per alnreg, **skip** any region that is secondary
+(`ar->secondary >= 0`, folded into the primary's `XA:Z`), below `opt->T`, or
+below `drop_ratio`. That is upstream's own `mem_reg2sam_emits_region`
+predicate, which the shim calls (v0.17.0) rather than replicating. By default
+they emit only primaries + supplementaries. The 2nd+ emitted region gets
+`0x800`, or `0x100` under `MEM_F_NO_MULTI` (`-M`, which `--meth` sets). Its
+MAPQ is lowered to the primary's unless `MEM_F_KEEP_SUPP_MAPQ` (`-5`/`-q`) is
+set or the region is on an ALT contig, and `supp_rep_hard_cap` can zero it.
+A raw `mem_opt_t` caller that sets `MEM_F_ALL` (`-a`) also gets the non-ALT
+secondaries that pass the score filters, as `0x100` records with no `XA:Z`
+(`mem_gen_alt` builds it only for primaries). Without this the shim emitted
+every surviving region, so multi-mapping reads got a record per hit instead of
+one record with an `XA:Z` tag — harmless for unique mappers but a large divergence on
+repetitive reads and on `--meth` (whose COLLAPSED scoring, the default before
+v0.17.0, surfaces extra weak hits). `lists[k]` stays 1:1 with `a[k]` so the
+pairing indices and mate/SA logic are unaffected; a parallel `emit[k]` mask
+gates the append.
 
-One paired-branch subtlety the unified emission must reproduce: when
+The paired branch has its own emission path, and one subtlety it must reproduce: when
 `mem_pair` selects a non-top region (`z[k] != 0`), `mem_pair_resolve_batch_post` promotes
 `a[k].a[z[k]]` (sets its `secondary` to `-2`) and runs the `secondary_all`
 switch, which reassigns the old SE-primary (region 0) into `z[k]`'s group —
 leaving it with `secondary < 0` but `secondary_all >= 0`. `mem_gen_alt` folds
 that region into `z[k]`'s `XA:Z`, and upstream `mem_sam_pe`'s paired block emits
-**only** `z[k]` as primary, never the switched-away region. Because our emit
-filter keys off `secondary` alone, the filter also drops any region with
-`secondary < 0 && secondary_all >= 0` on the paired branch; without it the shim
-would surface the old primary as an extra record and demote the `z[k]`
-pair-primary to a `0x800` supplementary. `cli_parity_pair_select.rs` pins this
+**only** `z[k]` as primary, never the switched-away region. The shim matches
+this structurally: `emit_resolved_pair`'s paired branch returns early and emits
+only `a[k].a[z[k]]` plus at most one ALT supplementary (`mem_pe_alt_slot`),
+never running the per-region `emit[k]` loop. Routing the paired case through
+that loop instead -- which keys off `secondary` alone -- would surface the old
+primary as an extra record and demote the `z[k]` pair-primary to a `0x800`
+supplementary. `cli_parity_pair_select.rs` pins this
 (two near-identical motif copies + a mate that anchors R1 to the lower-scoring
 copy, so `z[0] != 0`).
 
@@ -268,10 +292,16 @@ upstream keeps adding them:
 
 | function | defaulted param(s) |
 |---|---|
-| `mem_gen_alt` | `meth_orig_query` |
-| `mem_reg2aln` | `meth_orig_query` |
+| `mem_gen_alt` | `meth_orig_query`, `want0`, `want1`, `emitted_only` |
+| `mem_reg2aln` | `meth_orig_query`, `want_md`, `reuse`, `made`, `made_NM` |
 | `mem_kernel1_core` / `mem_kernel2_core` | `meth_orig_bns`, `meth_orig_pac` |
-| `mem_matesw` / `mem_matesw_batch_post` | `ms_orig`, `mat`, `mate_meth_ot` |
+| `mem_matesw_batch_pre` | `mate_meth_ot`, `known_skip` |
+| `mem_matesw_batch_post` | `ms_orig`, `mat`, `mate_meth_ot`, `dedup_state`, `known_skip`, `pushed_rb` |
+
+(The scalar `mem_matesw` is gone — gotcha #18. The shim reaches both
+`mem_matesw_batch_*` only through `mem_sam_pe_batch_pre` /
+`mem_pair_resolve_batch_post`, so their defaults are upstream's to fill; they
+stay listed because a new one there can still change rescue output.)
 
 A new one **compiles clean at every existing call site** and silently selects
 the legacy path. The same hazard applies to new `bseq1_t` / `mem_opt_t` fields
@@ -283,9 +313,11 @@ seed discarded), `mem_gen_alt`'s `meth_orig_query` (unset ⇒ every `XA:Z`
 sub-entry's NM counted bisulfite conversions), and the `HN` compat switch. None
 produced a warning, and the non-meth suite stayed green throughout.
 
-**On every refresh**, grep `bwamem.h` for `= NULL)` / `= -1)` / `= NULL,` /
-`= -1,` and check each against the shim's call sites, then diff `bwa.h`'s
-`bseq1_t` for new fields. Where upstream exposes a helper that encapsulates the
+**On every refresh**, diff the full declarations of every `bwamem.h` function
+the shim calls (any parameter with a default, not just the `= NULL` / `= -1`
+ones: `mem_gen_alt`'s `emitted_only` is `bool ... = false`) and check each
+change against the shim's call sites, then diff `bwa.h`'s `bseq1_t` for new
+fields. Where upstream exposes a helper that encapsulates the
 policy (`mem_proper_pair_extra_flag`, `mem_opt_apply_meth_defaults`,
 `mem_aln_ref_string`), prefer calling it over replicating it — a replicated
 policy is a twin that drifts, and upstream factors these out precisely because
@@ -338,7 +370,7 @@ Consequences:
   comparator plus pdqsort. It is unrelated to the above and still not a parity
   option: it yields a different, non-bwa-mem2-compatible surviving set.
 
-### 15. `compat_target_t` has five switches; this crate honors four
+### 15. `compat_target_t` switches: which this crate honors
 
 v0.9.0 moved output shaping into a data table (`vendor/bwa-mem3/src/compat_target.h`,
 `compat_target.cpp`). Every consumer reads a field off `opt->compat` instead of
@@ -348,7 +380,9 @@ everywhere.
 
 `mem_opt_init` always sets `opt->compat`, and this crate exposes no `--compat`
 selector, so the only reachable row is `COMPAT_TARGET_OFF` — which turns
-**everything on**: `emit_hd=1`, `read_sidecar=1`, `emit_mq=1`, `emit_hn=1`.
+**everything on**: `emit_hd=1`, `read_sidecar=1`, `emit_mq=1`, `emit_hn=1`,
+`has_xb=1` (and leaves the two bwa-mem2 emulation switches,
+`chain_flt_resurrect_empty` and `sa_sentinel_drop_offset`, at 0).
 "Default target" does not mean "nothing to do".
 
 | field | honored | where |
@@ -357,6 +391,10 @@ selector, so the only reachable row is `COMPAT_TARGET_OFF` — which turns
 | `emit_mq` | yes | `compute_record_fields` |
 | `emit_hn` | yes | `compute_record_fields` |
 | `read_sidecar` | **no — deliberate** | see below |
+| `chain_flt_resurrect_empty` | inherited | read inside upstream's kernels (`bwamem.cpp`); nothing for the shim to do |
+| `sa_sentinel_drop_offset` | inherited | ditto (`bwamem.cpp`) |
+| `has_xb` (v0.17.0) | n/a | read only by the CLI's `--compat` divergence guard (`fastmap.cpp`), which refuses `-u` on a target without it. The `XA`/`XB` tag name and entry shape key off `MEM_F_XB` itself, and the shim's packed-BAM writer names the tag from that flag (`serialize_record`). `MemOpts` cannot set `MEM_F_XB`; only a raw `mem_opt_t` caller can. |
+| *(not a compat field)* `md_mode` (v0.17.0 `--md`) | yes | `compute_record_fields` omits MD under `MEM_MD_NONE` (`mem_reg2aln` builds none); `MEM_MD_SHORT` is emitted as built. `MemOpts` does not expose it; the default is `MEM_MD_FULL`. |
 
 `emit_hd` was a live bug until it was wired up: `write_bam_header` hardcoded
 `@HD VN:1.6 SO:unknown` while the CLI emitted `@HD VN:1.5 SO:unsorted GO:query`
@@ -417,7 +455,7 @@ kernel (the CLI parity suites + `batched_rescue_spanning_multiple_chunks_*`).
 
 ### 19. The read-pair memo converts duplicate reads outside kernel1
 
-`ResidentCohort::seed_extend_with_reps` does not seed pairs marked as duplicates, so kernel1 never converts their bases to 2-bit (gotcha #7); the shim converts them itself (`seed_chunk_reps`, a port of upstream's `worker_bwt_memo`), and `resolve_memo` compares 2-bit bases before copying a representative's regions. To check the memo against the CLI, run `bwa-mem3 mem --dedup-reads on --cohort-slices 0`: the CLI reads its first batch in slices by default, and the slice path disarms its memo (`mem_align_cohort_slice`), which would make "on == off" hold vacuously. `BWAMEM3_DEDUP_READS_STATS=1` prints the CLI's duplicate count to compare with `MemoStats::dup_pairs`. The shim converts only the duplicate reads, and restores `-` before its fallback re-seeds a pair, because a second conversion turns `-` (2-bit 5) into `N` (4). As of v0.14.0 (fg-labs/bwa-mem3#534) upstream's `worker_bwt_memo` does the same: `read_memo_convert_non_reps` converts every read except the representatives, which kernel1 converts, so each read is converted exactly once on both sides. (Before v0.14.0 the CLI double-converted representatives, turning `-` into `N` — output-neutral, since every consumer treats 2-bit codes >= 4 alike.) The shim cannot call `read_memo_convert_non_reps` itself: that helper reads upstream's `read_memo_state::role`, and the shim keeps its own representative mask. The parity fixtures contain no `-`.
+`ResidentCohort::seed_extend_with_reps` does not seed pairs marked as duplicates, so kernel1 never converts their bases to 2-bit (gotcha #7); the shim converts them itself (`seed_chunk_reps`, a port of upstream's `worker_bwt_memo`), and `resolve_memo` compares 2-bit bases before copying a representative's regions. To check the memo against the CLI, run `bwa-mem3 mem --dedup-reads on --cohort-slices 0`: the CLI reads its first batch in slices by default, and the slice path disarms its memo (`mem_align_cohort_slice`), which would make "on == off" hold vacuously. `BWAMEM3_DEDUP_READS_STATS=1` prints the CLI's duplicate count to compare with `MemoStats::dup_pairs`. The shim converts only the duplicate reads. Its fallback re-seeds a pair whose bases are already 2-bit, which is a no-op conversion: as of v0.16.0 (fg-labs/bwa-mem3#639) `nst_nt4_table` maps `-` straight to 4 rather than to 5, so no code changes on a second pass (the shim's old `restore_dashes` step, which undid 5 → `-` before re-seeding, was removed with the v0.17.0 refresh; `pair_memo.rs::fallback_keeps_a_dash_base` still pins memo-on == memo-off for a `-` read). As of v0.14.0 (fg-labs/bwa-mem3#534) upstream's `worker_bwt_memo` does the same: `read_memo_convert_non_reps` converts every read except the representatives, which kernel1 converts, so each read is converted exactly once on both sides. (Before v0.14.0 the CLI double-converted representatives, turning `-` into `N` — output-neutral, since every consumer treats 2-bit codes >= 4 alike.) The shim cannot call `read_memo_convert_non_reps` itself: that helper reads upstream's `read_memo_state::role`, and the shim keeps its own representative mask. The parity fixtures contain no `-`.
 
 ## Commit / PR conventions
 

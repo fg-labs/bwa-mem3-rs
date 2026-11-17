@@ -99,7 +99,8 @@ void bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts);
 /* Apply what `bwa-mem3 mem --meth` sets for bisulfite alignment, so `--meth`
  * output matches the CLI's, then refill the scoring matrices (the bundle can
  * change `b` and the TAPS default changes `meth_scoring`, so they would
- * otherwise be stale). That is upstream's bwameth-compatibility bundle plus the
+ * otherwise be stale). Requires `meth_mode` already set: as in `main_mem`,
+ * every default below is skipped when it is 0, and only the refill runs. That is upstream's bwameth-compatibility bundle plus the
  * knobs main_mem sets around it (fastmap.cpp, the `opt->meth_mode` block):
  *   - TAPS chemistry (`meth_chem`) defaults `meth_scoring` to NEUTRAL, unless
  *     BWA_SHIM_METH_SET_SCORING. Applied first, because the bundle's `-B`

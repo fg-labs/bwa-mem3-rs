@@ -81,6 +81,9 @@ pub struct AlignedFields<'a> {
     pub sa: Option<&'a [u8]>,
     /// pa:f.
     pub pa: Option<f32>,
+    /// XA:Z. Under `MEM_F_XB` (bwa's `-u`, settable only on the raw
+    /// `mem_opt_t`) this holds the XB:Z list instead, which the packed-BAM
+    /// sink writes under the `XB` tag.
     pub xa: Option<&'a [u8]>,
     pub hn: Option<i32>,
     /// D3 (`--meth`) Bismark tags; `None` outside meth mode.

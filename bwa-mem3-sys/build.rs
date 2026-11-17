@@ -445,6 +445,18 @@ const DEFINES_DELIBERATELY_OMITTED: &[(&str, &str)] = &[
          setting it",
     ),
     (
+        "NDEBUG",
+        "never defined upstream: the v0.16.0 Makefile only names it to `filter-out` an \
+         injected -DNDEBUG from CPPFLAGS, because the sources rely on plain asserts being \
+         live in every build. build.rs likewise never sets it",
+    ),
+    (
+        "BSW8_ROW_LEAN_INVERT",
+        "test-only: set solely on the arm64 `bandedSWA.rowalt.o` object upstream's unit \
+         binary links (Makefile ROWALT_KERNEL_OBJ) to exercise the opposite 8-bit row \
+         setting; never part of the aligner build",
+    ),
+    (
         "STAGE_PROF",
         "opt-in profiling instrumentation (`make STAGE_PROF=1`); the default upstream \
          build, which build.rs mirrors, leaves it unset so the hooks compile to no-ops",

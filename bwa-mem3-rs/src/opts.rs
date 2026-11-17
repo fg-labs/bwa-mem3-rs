@@ -64,11 +64,12 @@ impl TryFrom<i32> for SeedOrder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethScoring {
     /// C↔T and G↔A interchangeable (both matrix cells freed) — reproduces
-    /// bwameth. This is bwa-mem3's default.
+    /// bwameth. bwa-mem3's default through v0.16.0; select it explicitly to
+    /// keep that output.
     Collapsed = 0,
     /// Only the bisulfite-conversion cell is freed; the mirror stays a
     /// mismatch, so genuine variants still score as mismatches (variant-aware,
-    /// truthful NM/MD).
+    /// truthful NM/MD). bwa-mem3's default as of v0.17.0.
     Genomic = 1,
     /// Like [`Genomic`](Self::Genomic), but the conversion cell scores `0` —
     /// tolerated rather than rewarded. Added in bwa-mem3 v0.9.0 and made the
@@ -114,7 +115,7 @@ impl TryFrom<i32> for MethScoring {
 ///
 /// That flips the `XM:Z` methylation call. TAPS also changes one default that
 /// [`MemOpts::apply_meth_defaults`] applies: [`MethScoring::Neutral`] instead
-/// of [`MethScoring::Collapsed`] (TAPS conversions are ~20-30× rarer, so a
+/// of [`MethScoring::Genomic`] (TAPS conversions are ~20-30× rarer, so a
 /// full match over-credits spurious C→T alignments). The SPEC30 seed-pruning
 /// default applies to both chemistries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +259,8 @@ impl MemOpts {
     /// directions:
     ///
     /// **Set before** — these are *inputs*:
+    /// - [`set_meth(true)`](Self::set_meth): as in `bwa-mem3 mem`, every
+    ///   default here is skipped when `--meth` is off;
     /// - [`set_match_score`](Self::set_match_score), since every constant is
     ///   expressed in units of it;
     /// - [`set_meth_chem`](Self::set_meth_chem), since TAPS picks the scoring
@@ -692,6 +695,9 @@ impl MemOpts {
 
     /// Bisulfite scoring mode (`--meth-scoring`); only meaningful under
     /// [`set_meth(true)`](Self::set_meth). Rebuilds the scoring matrices.
+    /// Defaults to [`MethScoring::Genomic`] (bwa-mem3 v0.17.0+;
+    /// [`MethScoring::Collapsed`] before), so pass `Collapsed` to keep the
+    /// pre-v0.17.0 `--meth` output.
     ///
     /// An explicit mode wins over the [`MethChem::Taps`] default that
     /// [`apply_meth_defaults`](Self::apply_meth_defaults) would otherwise pick.
@@ -704,7 +710,8 @@ impl MemOpts {
         self
     }
     /// Bisulfite scoring mode (`--meth-scoring`); only meaningful under
-    /// [`set_meth(true)`](Self::set_meth).
+    /// [`set_meth(true)`](Self::set_meth). Defaults to
+    /// [`MethScoring::Genomic`] (bwa-mem3 v0.17.0+).
     ///
     /// # Errors
     ///
@@ -1043,18 +1050,18 @@ mod tests {
     #[test]
     fn meth_knobs_roundtrip() {
         let mut o = MemOpts::new().unwrap();
-        // Defaults: meth off, collapsed scoring.
+        // Defaults: meth off, genomic scoring (bwa-mem3 v0.17.0, #756).
         assert!(!o.meth());
-        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Genomic);
         assert!(!o.meth_chimera_qc());
         o.set_meth(true)
-            .set_meth_scoring(MethScoring::Genomic)
+            .set_meth_scoring(MethScoring::Collapsed)
             .set_meth_chimera_qc(true);
         assert!(o.meth());
-        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Genomic);
-        assert!(o.meth_chimera_qc());
-        o.set_meth_scoring(MethScoring::Collapsed);
         assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
+        assert!(o.meth_chimera_qc());
+        o.set_meth_scoring(MethScoring::Genomic);
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Genomic);
         o.set_meth(false);
         assert!(!o.meth());
     }
@@ -1237,8 +1244,26 @@ mod tests {
         );
         o.apply_meth_defaults();
         assert_eq!(o.meth_chem().unwrap(), MethChem::EmSeq);
-        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
+        assert_eq!(
+            o.meth_scoring().unwrap(),
+            MethScoring::Genomic,
+            "em-seq scores GENOMIC by default as of bwa-mem3 v0.17.0"
+        );
         assert_eq!(o.meth_seed_prune().unwrap(), MethSeedPrune::Spec30);
+        assert_eq!(
+            o.mismatch_penalty(),
+            default_b,
+            "GENOMIC is variant-aware: no -B 2"
+        );
+    }
+
+    #[test]
+    fn explicit_collapsed_scoring_takes_bwameths_mismatch_penalty() {
+        let mut o = meth_opts(MethChem::EmSeq);
+        let default_b = o.mismatch_penalty();
+        o.set_meth_scoring(MethScoring::Collapsed);
+        o.apply_meth_defaults();
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
         assert_eq!(o.mismatch_penalty(), 2, "COLLAPSED takes bwameth's -B 2");
         assert_ne!(default_b, 2, "the -B check above must not hold vacuously");
     }

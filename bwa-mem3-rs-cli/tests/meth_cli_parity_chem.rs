@@ -11,10 +11,15 @@
 //! CLI's output, and each test first proves that before comparing.
 //!
 //! `--meth=taps` flips which base `XM:Z` calls methylated and defaults the
-//! scoring to NEUTRAL; it is checked the same way.
+//! scoring to NEUTRAL; it is checked the same way, as are its `5base` /
+//! `5-base` spellings. The em-seq scoring default (GENOMIC as of bwa-mem3
+//! v0.17.0, COLLAPSED before) is pinned too: the 8%-diverged repeat copies give
+//! reads real mismatches, which COLLAPSED's `-B 2` and GENOMIC's `-B 4` score
+//! differently.
 //!
-//! The comparison adds `XS:i` and `HN:i` to [`record_key_fields`], since most of
-//! the records pruning changes differ only in `XS`.
+//! The comparison adds `AS:i`, `XS:i` and `HN:i` to [`record_key_fields`], since
+//! most of the records pruning changes differ only in `XS`, and a scoring change
+//! shows first in `AS`.
 //!
 //! Requires `bwa-mem3` (for `index --meth` + the reference aligner) and
 //! `samtools`; set `BWA_MEM3_BIN` if not on PATH. Skips gracefully otherwise.
@@ -178,7 +183,7 @@ fn run_rs(fx: &Fixture, args: &[&str]) -> Vec<String> {
     samtools_view(&bam)
 }
 
-/// [`record_key_fields`] plus the `XS:i` and `HN:i` values.
+/// [`record_key_fields`] plus the `AS:i`, `XS:i` and `HN:i` values.
 fn key(sam_line: &str) -> String {
     let tag = |name: &str| {
         sam_line
@@ -189,8 +194,9 @@ fn key(sam_line: &str) -> String {
             .to_string()
     };
     format!(
-        "{}\tXS:{}\tHN:{}",
+        "{}\tAS:{}\tXS:{}\tHN:{}",
         record_key_fields(sam_line),
+        tag("AS:i:"),
         tag("XS:i:"),
         tag("HN:i:")
     )
@@ -262,6 +268,51 @@ fn taps_chemistry_matches_cli() {
     );
 
     assert_parity(&run_rs(&fx, &[Chem::Taps.meth_arg()]), &cli, "--meth=taps");
+}
+
+/// bwa-mem3 v0.16.0 added `--meth=5base` (Illumina 5-base, which is TAPS
+/// chemistry as far as the aligner is concerned) with a `5-base` alias. Each
+/// spelling matches both `bwa-rs mem --meth=taps` and the CLI's own `5base`.
+#[test]
+fn five_base_spellings_match_taps() {
+    let Some(bwa) = skip_without_tools() else {
+        return;
+    };
+    let fx = fixture(&bwa, Chem::Taps, 0x5eed_0004);
+    let taps = run_rs(&fx, &[Chem::Taps.meth_arg()]);
+    for spelling in ["--meth=5base", "--meth=5-base"] {
+        assert_eq!(keys(&run_rs(&fx, &[spelling])), keys(&taps), "{spelling}");
+    }
+    let cli = run_cli(&bwa, &fx, &["--meth=5base"], &[], "5base");
+    assert_parity(&taps, &cli, "--meth=5base");
+}
+
+/// bwa-mem3 v0.17.0 (#756) made GENOMIC the em-seq `--meth` scoring default in
+/// place of COLLAPSED. `bwa-rs mem --meth` inherits it from `mem_opt_init`; this
+/// pins that both tools agree on a fixture where the two modes differ.
+#[test]
+fn emseq_scoring_default_matches_cli() {
+    let Some(bwa) = skip_without_tools() else {
+        return;
+    };
+    let fx = fixture(&bwa, Chem::EmSeq, 0x5eed_0005);
+    let cli = run_cli(&bwa, &fx, &["--meth"], &[], "default");
+
+    // Non-vacuous: on this fixture COLLAPSED scoring changes the CLI's output,
+    // so a crate still defaulting to it could not pass the parity check below.
+    let collapsed = run_cli(
+        &bwa,
+        &fx,
+        &["--meth", "--meth-scoring", "collapsed"],
+        &[],
+        "collapsed",
+    );
+    assert!(
+        differing(&cli, &collapsed) > 0,
+        "--meth-scoring collapsed changed no CLI record; the fixture no longer tests the default"
+    );
+
+    assert_parity(&run_rs(&fx, &["--meth"]), &cli, "--meth (scoring default)");
 }
 
 /// The CLI accepts upstream's other spellings of the default chemistry.

@@ -46,8 +46,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define BWA_IDX_PAC 0x4
 #define BWA_IDX_ALL 0x7
 
-#define BWA_CTL_SIZE 0x10000
-
 /* Buffer size for bwa_format_pa_value(). The widest "%.3f" of an int/int
  * ratio is "-2147483648.000" (15 chars + NUL), so this cannot truncate. */
 #define BWA_PA_TEXT_MAX 20
@@ -149,9 +147,19 @@ extern "C" {
 							 int *n_cigar, int *NM, int nm_from_mat);
 
 	/* As bwa_gen_cigar3, plus `want_md`: 0 builds no MD string, so the returned
-	 * buffer holds only the n_cigar ops (no MD, no NUL after them). NM is the same
-	 * value either way. */
-	uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del,
+	 * buffer holds only the n_cigar ops (no MD, no NUL after them); 1 builds the
+	 * literal MD; 2 builds a short MD that lists only the mismatches NM counts
+	 * (the same as 1 when `nm_from_mat` is 0). NM is the same value in all three.
+	 *
+	 * `m` is the alphabet size of `mat` (target-major mat[ref*m + read]): 5, as
+	 * for bwa_gen_cigar3, or 7 for a --meth-context cpg matrix (meth_model.h).
+	 * With m = 7 the fetched window is CpG-labelled in its fetch frame
+	 * (meth_label_cpg) before the DP, so the CpG rows of `mat` apply; `bns` must
+	 * then be the original reference's (the one `pac` belongs to). NM reads the
+	 * matrix at the labelled code; MD compares and prints plain bases. `bns` is
+	 * not read for m = 5 and may be NULL. */
+	uint32_t *bwa_gen_cigar4(const int8_t *mat, int m, const bntseq_t *bns,
+							 int o_del, int e_del,
 							 int o_ins, int e_ins, int w_, int64_t l_pac,
 							 const uint8_t *pac, int l_query, uint8_t *query,
 							 int64_t rb, int64_t re, int *score,
@@ -181,6 +189,13 @@ extern "C" {
 	void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
 	                        const char *hdr_line, FILE *fp,
 	                        const compat_target_t *compat);
+	/* Append the complete output header that bwa_print_sam_hdr2 prints -- the
+	 * one definition the SAM-text and --bam writers share -- to `out`, ending
+	 * with `pg` (the @PG text; NULL for none). Precedence and the verbatim @SQ
+	 * rule are documented at the definition (bwa.cpp). Returns 0, or -1 if
+	 * `out` could not be grown. */
+	int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_lines,
+	                      const char *hdr_line, const char *pg, const compat_target_t *compat);
 	/* Append the generated @SQ record for `ann` (SN, LN, and AH:* when the
 	 * contig is ALT) to `out`, without a trailing newline. The single
 	 * definition shared by the SAM-text, --bam and --meth writers. Returns 0,

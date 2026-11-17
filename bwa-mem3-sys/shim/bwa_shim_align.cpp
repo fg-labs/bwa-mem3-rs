@@ -27,6 +27,7 @@
 #include "utils.h"          /* xassert — survives NDEBUG, unlike assert */
 #include "FMI_search.h"
 #include "meth_xm.h"   /* meth_build_xm — D3 (--meth) XM:Z tag */
+#include "meth_opts.h" /* meth_opts_finalize, meth_cli_t — the --meth defaults */
 #include "kswv.h"      /* kswr_t / SIMD_WIDTH8 — batched mate-rescue path below */
 #include "rescue_band.h" /* rescue_band_batch_free — worker_free's per-thread band plans */
 #include "bwa_shim_fields.h"  /* BwaAlignedFields — the structured-fields sink */
@@ -207,6 +208,8 @@ static void worker_alloc(worker_t &w, int tid)
         w.mmc.smem_sort_scratch[l].cntCap = 0;
         w.mmc.smem_sort_scratch[l].tmp    = NULL;
         w.mmc.smem_sort_scratch[l].tmpCap = 0;
+        w.mmc.smem_sort_scratch[l].pairs    = NULL;
+        w.mmc.smem_sort_scratch[l].pairsCap = 0;
     }
 }
 
@@ -253,6 +256,7 @@ static void worker_free(worker_t &w, int tid)
 
         _mm_free(w.mmc.smem_sort_scratch[l].cnt);
         _mm_free(w.mmc.smem_sort_scratch[l].tmp);
+        _mm_free(w.mmc.smem_sort_scratch[l].pairs);
     }
 }
 
@@ -533,13 +537,17 @@ const char *shim_compat_hd_line(const mem_opt_t *opt) {
  * discarded it. Gotcha #13 exists for this class of drift: where upstream
  * factors a policy out, call it.
  *
- * The three knobs main_mem sets OUTSIDE that helper have no upstream function
- * to call, so they are mirrored here, in upstream's order, and must be
- * re-checked against main_mem on every vendor refresh:
+ * main_mem sets three knobs OUTSIDE that helper. As of v0.16.0 the first two
+ * live in upstream's meth_opts_finalize (meth_opts.cpp), which this calls in
+ * main_mem's order -- finalize, then (under meth_mode only) the bundle and
+ * band_cert -- with a meth_cli_t built from `explicit_mask`. The main_mem
+ * block must still be re-checked on every vendor refresh for knobs set
+ * outside both helpers (band_cert is one):
  *
  *   - TAPS chemistry defaults meth_scoring to NEUTRAL unless the user chose a
  *     scoring mode. It comes first because the bundle's -B branch keys off the
- *     resolved mode.
+ *     resolved mode. (The em-seq default -- GENOMIC as of v0.17.0 -- is not
+ *     set here: it comes from mem_opt_init.)
  *   - meth_seed_prune defaults to SPEC30 unless the user chose one. This one
  *     changes OUTPUT: it decides which SMEMs survive to SA resolution. Without
  *     it this crate seeded every SMEM, so `bwa-rs mem --meth` differed from the
@@ -548,6 +556,13 @@ const char *shim_compat_hd_line(const mem_opt_t *opt) {
  *     unique, so nothing is pruned) stayed byte-identical.
  *   - band_cert is turned off. Byte-identical either way; upstream keeps the
  *     exact full-width ladder under --meth, and so do we.
+ *
+ * meth_opts_finalize is a no-op unless opt->meth_mode is set, exactly as in
+ * main_mem, so set meth_mode FIRST. It also runs the CLI's cross-option checks:
+ * an em-seq + explicit NEUTRAL scoring prints upstream's warning to stderr, and
+ * `--meth-context cpg` with em-seq chemistry or COLLAPSED scoring exit(1)s.
+ * MemOpts cannot set meth_context, so those exits are unreachable from the
+ * safe API; a raw-FFI caller that sets it must validate first.
  *
  * `opt0` is upstream's "did the user set this explicitly" mask (non-zero field
  * == user supplied). Only the two bits above are expressible; every other
@@ -570,15 +585,22 @@ void shim_opts_apply_meth_defaults(mem_opt_t *opt, unsigned explicit_mask) {
     if (opt == NULL) return;
     mem_opt_t opt0;
     memset(&opt0, 0, sizeof(opt0));
-    if (explicit_mask & BWA_SHIM_METH_SET_SCORING)    opt0.meth_scoring = 1;
-    if (explicit_mask & BWA_SHIM_METH_SET_SEED_PRUNE) opt0.meth_seed_prune = 1;
+    meth_cli_t cli;
+    memset(&cli, 0, sizeof(cli));
+    if (explicit_mask & BWA_SHIM_METH_SET_SCORING) {
+        opt0.meth_scoring = 1;
+        cli.set_scoring = 1;
+    }
+    if (explicit_mask & BWA_SHIM_METH_SET_SEED_PRUNE) {
+        opt0.meth_seed_prune = 1;
+        cli.set_seed_prune = 1;
+    }
 
-    if (opt->meth_chem == METH_CHEM_TAPS && !opt0.meth_scoring)
-        opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
-    if (!opt0.meth_seed_prune)
-        opt->meth_seed_prune = MEM_METH_PRUNE_SPEC30;
-    mem_opt_apply_meth_defaults(opt, &opt0);
-    opt->band_cert = 0;
+    meth_opts_finalize(opt, &cli);   /* TAPS -> NEUTRAL, SPEC30 (fastmap.cpp main_mem) */
+    if (opt->meth_mode) {
+        mem_opt_apply_meth_defaults(opt, &opt0);
+        opt->band_cert = 0;
+    }
 
     bwa_fill_scmat(opt->a, opt->b, opt->mat);
     mem_opt_fill_meth_mat(opt);
@@ -1173,8 +1195,14 @@ static void compute_record_fields(ShimScratch *sc, BwaAlignedFields *f,
     size_t mc_off = SIZE_MAX, sa_off = SIZE_MAX, rg_off = SIZE_MAX, xm_off = SIZE_MAX;
     if (p->n_cigar) {
         f->has_nm = 1; f->nm = p->NM;
-        /* MD string is stored right after the CIGAR array in p->cigar. */
-        f->md = (const char *)(p->cigar + p->n_cigar);
+        /* MD string is stored right after the CIGAR array in p->cigar -- unless
+         * opt->md_mode is MEM_MD_NONE (v0.17.0 `--md none`): mem_reg2aln then
+         * builds no MD, the buffer ends at the last CIGAR op, and upstream's
+         * writers skip MD:Z on the same test (bam_writer.cpp and meth_bam.cpp,
+         * `opt->md_mode != MEM_MD_NONE`; mem_aln2sam for SAM text). Under
+         * MEM_MD_SHORT the buffer holds the short form, emitted as-is. */
+        if (opt->md_mode != MEM_MD_NONE)
+            f->md = (const char *)(p->cigar + p->n_cigar);
     }
     if (m && m->n_cigar) {
         mc_off = txt_len;
@@ -1298,9 +1326,12 @@ static void compute_record_fields(ShimScratch *sc, BwaAlignedFields *f,
 
 /* Serialize `f` into the packed BAM record BODY (no u32 block_size prefix) for
  * read `s`, in the scratch's reusable record buffer, and hand it to the packed
- * sink. Pure formatting: every decision was made by compute_record_fields. */
+ * sink. Pure formatting: every decision was made by compute_record_fields.
+ * `xb` names the alternative-hit list XB:Z instead of XA:Z: set under MEM_F_XB
+ * (`-u`), where mem_gen_alt builds the XB-shaped list (each hit's AS and MAPQ
+ * appended) and upstream's writers name it XB as of v0.17.0 (#690). */
 static void serialize_record(ShimEmit *e, size_t origin_idx, const bseq1_t *s,
-                             const BwaAlignedFields *f)
+                             const BwaAlignedFields *f, int xb)
 {
     int l_read_name = (int) strlen(s->name) + 1;
     int n_cigar = (int) f->n_cigar;
@@ -1321,7 +1352,7 @@ static void serialize_record(ShimEmit *e, size_t origin_idx, const bseq1_t *s,
     if (f->rg)     aux_put_Z(&aux, &aux_len, &aux_cap, "RG", f->rg);
     if (f->sa)     aux_put_Z(&aux, &aux_len, &aux_cap, "SA", f->sa);
     if (f->has_pa) aux_put_f(&aux, &aux_len, &aux_cap, "pa", f->pa);
-    if (f->xa)     aux_put_Z(&aux, &aux_len, &aux_cap, "XA", f->xa);
+    if (f->xa)     aux_put_Z(&aux, &aux_len, &aux_cap, xb ? "XB" : "XA", f->xa);
     if (f->has_hn) aux_put_i(&aux, &aux_len, &aux_cap, "HN", f->hn);
     if (f->xr)     aux_put_Z(&aux, &aux_len, &aux_cap, "XR", f->xr);
     if (f->xg)     aux_put_Z(&aux, &aux_len, &aux_cap, "XG", f->xg);
@@ -1433,7 +1464,7 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     if (e->field_sink)
         e->field_sink(e->ctx, e->origin_kind, origin_idx, (uint8_t) is_r2, which == 0, &f);
     else
-        serialize_record(e, origin_idx, s, &f);
+        serialize_record(e, origin_idx, s, &f, (opt->flag & MEM_F_XB) != 0);
 }
 
 /* ------------------ Phase 1: scratch + fused seed+extend ------------------ */
@@ -1506,8 +1537,10 @@ void shim_regs_free(ShimRegs *r) {
  * slot touched once) and re-stamped with the chunk-local seqid kernel2 asserts.
  * Duplicate slots get empty chains, so kernel2 gives them empty regs, which
  * shim_resident_resolve_memo later fills. KEEP IN SYNC with worker_bwt_memo on
- * every vendor refresh; unlike it, this converts only the duplicate reads, since
- * kernel1 converts the rest and a second conversion turns '-' into N. */
+ * every vendor refresh. Like it (v0.14.0+), this converts only the duplicate
+ * reads, since kernel1 converts the rest; a second conversion would be harmless
+ * anyway, as nst_nt4_table maps every 2-bit code to itself and, as of v0.16.0
+ * (#639), '-' straight to 4. */
 static void seed_chunk_reps(ShimScratch *sc, BwaShimIndex *idx, const mem_opt_t *opt,
                             bseq1_t *chunk, int bs, int chunk_first, const int64_t *reps)
 {
@@ -1911,10 +1944,16 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
     if (paired) {
         char **XA[2] = { nullptr, nullptr };
         int   *HN[2] = { nullptr, nullptr };
+        /* Each end's emitted ALT supplementary (-1: none), via upstream's own
+         * predicate (mem_pe_alt_slot, bwamem.h). Only XA[k][z[k]] and
+         * XA[k][alt[k]] are read below, so -- as mem_sam_pe_batch_post does --
+         * ask mem_gen_alt for just those two; the rest stay NULL. */
+        const int alt[2] = { mem_pe_alt_slot(opt, &a[0], n_pri[0]),
+                             mem_pe_alt_slot(opt, &a[1], n_pri[1]) };
         if (!(opt->flag & MEM_F_ALL)) {
             for (int k = 0; k < 2; ++k)
                 XA[k] = mem_gen_alt(opt, bns, pac, &a[k], s[k].l_seq, s[k].seq,
-                                    &HN[k], s[k].meth_orig_seq);
+                                    &HN[k], s[k].meth_orig_seq, z[k], alt[k]);
         }
         mem_aln_t h[2]; memset(h, 0, sizeof(h));
         mem_aln_t g[2]; memset(g, 0, sizeof(g));
@@ -1929,14 +1968,13 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
             h[k].XA = XA[k] ? XA[k][z[k]] : nullptr;
             h[k].HN = HN[k] ? HN[k][z[k]] : -1;
             aa[k][n_aa[k]++] = h[k];
-            if (n_pri[k] < (int) a[k].n) {   /* the read has ALT hits */
-                mem_alnreg_t *p = &a[k].a[n_pri[k]];
-                if (p->score < opt->T || p->secondary >= 0 || !p->is_alt) continue;
+            if (alt[k] >= 0) {   /* the read has an emitted ALT hit */
+                mem_alnreg_t *p = &a[k].a[alt[k]];
                 g[k] = mem_reg2aln(opt, bns, pac, s[k].l_seq, s[k].seq, p,
                                    s[k].meth_orig_seq);
                 g[k].flag |= 0x800 | (0x40 << k) | extra_flag;   /* supplementary */
-                g[k].XA = XA[k] ? XA[k][n_pri[k]] : nullptr;
-                g[k].HN = HN[k] ? HN[k][n_pri[k]] : -1;
+                g[k].XA = XA[k] ? XA[k][alt[k]] : nullptr;
+                g[k].HN = HN[k] ? HN[k][alt[k]] : -1;
                 if (opt->supp_rep_hard_cap > 0 && p->chain_n_hits >= opt->supp_rep_hard_cap)
                     g[k].mapq = 0;   /* fg-labs: force repetitive-supp MAPQ to 0 */
                 aa[k][n_aa[k]++] = g[k];
@@ -2031,8 +2069,9 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
      * requires the mem_mark_primary_se that mem_pair_resolve_batch_post ran) rather than
      * emitted as their own records, and sub-threshold regions are dropped.
      * Without this the shim emits every surviving alnreg — over-emitting
-     * secondaries on multi-mapping reads (including --meth's collapsed-scoring
-     * hits) that the CLI folds into XA. `lists[k]` stays 1:1 with `a[k]` so the
+     * secondaries on multi-mapping reads (including the extra weak hits of
+     * --meth's COLLAPSED scoring, the default before v0.17.0) that the CLI
+     * folds into XA. `lists[k]` stays 1:1 with `a[k]` so the
      * pairing indices (z[k]) and mate/SA logic below are unaffected; `emit[k]`
      * gates the final append. */
     mem_aln_t *lists[2] = {nullptr, nullptr};
@@ -2052,7 +2091,12 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
             continue;
         }
         if (!(opt->flag & MEM_F_ALL))
-            /* v0.9.0 added the trailing `meth_orig_query`, which mem_gen_alt
+            /* v0.17.0: `emitted_only` (upstream's mem_reg2sam passes it, #740)
+             * builds XA only for primaries mem_reg2sam_emits_region keeps --
+             * exactly the regions `emit[k]` selects below, which are the only
+             * ones whose XA is read. The strings that are built are unchanged.
+             *
+             * v0.9.0 added the trailing `meth_orig_query`, which mem_gen_alt
              * forwards to mem_reg2aln for every XA sub-entry so they regenerate
              * under the same NM/MD policy as the primary record. It DEFAULTS TO
              * NULL, so omitting it compiles and silently keeps the legacy
@@ -2063,7 +2107,7 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
              * s[k].meth_orig_seq is NULL outside --meth, which selects the same
              * legacy behavior the non-meth path always had. */
             XA[k] = mem_gen_alt(opt, bns, pac, &a[k], s[k].l_seq, s[k].seq, &HN[k],
-                                s[k].meth_orig_seq);
+                                s[k].meth_orig_seq, -1, -1, /*emitted_only=*/true);
         lists[k] = (mem_aln_t *) calloc(a[k].n, sizeof(mem_aln_t));
         xassert(lists[k] != NULL, "out of memory: lists[k]");
         emit[k] = (bool *) malloc(a[k].n * sizeof(bool));
@@ -2072,13 +2116,8 @@ static void emit_resolved_pair(ShimEmit *e, size_t origin_idx,
         int n_emit = 0;
         for (int j = 0; j < (int)a[k].n; ++j) {
             const mem_alnreg_t *ar = &a[k].a[j];
-            /* mem_reg2sam emit filter. */
-            bool e = ar->score >= opt->T;
-            if (e && ar->secondary >= 0 && (ar->is_alt || !(opt->flag & MEM_F_ALL)))
-                e = false;
-            if (e && ar->secondary >= 0 && ar->secondary < INT_MAX
-                && ar->score < a[k].a[ar->secondary].score * opt->drop_ratio)
-                e = false;
+            /* mem_reg2sam emit filter: upstream's own predicate (v0.17.0). */
+            const bool e = mem_reg2sam_emits_region(opt, &a[k], j) != 0;
             /* Convert a region only when something reads it: an emitted
              * record, region 0 (the mate-flag loop below reads lists[!k][0]),
              * or which[k] (h_rid and the mate anchor). mem_reg2aln regenerates
@@ -2280,7 +2319,8 @@ static void single_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
 #endif
     char **XA = nullptr; int *HN = nullptr;
     if (!(opt->flag & MEM_F_ALL))
-        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq, &HN, s->meth_orig_seq);
+        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq, &HN, s->meth_orig_seq,
+                         -1, -1, /*emitted_only=*/true);   /* as mem_reg2sam_anchored */
 
     /* Compact emitted list `aa`, exactly mem_reg2sam's loop. */
     mem_aln_t *aa = (mem_aln_t *) calloc(a->n ? a->n : 1, sizeof(mem_aln_t));
@@ -2288,10 +2328,7 @@ static void single_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
     int l = 0;
     for (int k = 0; k < (int)a->n; ++k) {
         const mem_alnreg_t *p = &a->a[k];
-        if (p->score < opt->T) continue;
-        if (p->secondary >= 0 && (p->is_alt || !(opt->flag & MEM_F_ALL))) continue;
-        if (p->secondary >= 0 && p->secondary < INT_MAX
-            && p->score < a->a[p->secondary].score * opt->drop_ratio) continue;
+        if (!mem_reg2sam_emits_region(opt, a, k)) continue;
         mem_aln_t q = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, p, s->meth_orig_seq);
         q.XA = XA ? XA[k] : nullptr;
         q.HN = HN ? HN[k] : -1;
@@ -2790,14 +2827,6 @@ static int same_bases(const bseq1_t *a, const bseq1_t *b) {
     return a->l_seq == b->l_seq && memcmp(a->seq, b->seq, (size_t) a->l_seq) == 0;
 }
 
-/* Put back the one byte a second 2-bit conversion would change: nst_nt4_table
- * maps '-' to 5, and kernel1 re-converts 5 to 4 (N), so a read converted once
- * must hold '-' again before it is seeded again. */
-static void restore_dashes(bseq1_t *s) {
-    for (int i = 0; i < s->l_seq; ++i)
-        if (s->seq[i] == 5) s->seq[i] = '-';
-}
-
 /* Deep-copy one read's regs from its representative: upstream's
  * read_memo_copy_regs (bwamem.cpp:3793), including the --extend-csub capped_w
  * side channel. mem_alnreg_t is POD for this purpose (->c is NULL'd at kernel2
@@ -2862,12 +2891,11 @@ int shim_resident_resolve_memo(void *idx_opaque, const mem_opt_t *opts, ShimScra
                 /* kernel2 already kv_init'ed the empty regs; release them, then
                  * align the two reads as a batch of one pair (kernel1's mate cap
                  * reads l^1 < nseq, which a two-read view satisfies). Their
-                 * bases are already 2-bit and kernel1 converts them again, so
-                 * restore the '-' bytes that pass would change first. */
+                 * bases are already 2-bit and kernel1 converts them again,
+                 * which is a no-op: nst_nt4_table maps 0-4 to themselves and,
+                 * since v0.16.0 (#639), '-' straight to 4, so no code changes. */
                 release_regs(&sg->regs[2 * p]);
                 release_regs(&sg->regs[2 * p + 1]);
-                restore_dashes(&sg->seqs[2 * p]);
-                restore_dashes(&sg->seqs[2 * p + 1]);
                 seed_extend_reads(sc, idx, &opt, sg->seqs + 2 * p, sg->regs + 2 * p, 2, nullptr);
                 ++st.fallback_aligned;
             }

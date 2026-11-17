@@ -60,7 +60,7 @@ enum Cmd {
         /// Minimum seed length (`-k`).
         #[arg(short = 'k', long)]
         min_seed_len: Option<i32>,
-        /// Bisulfite (BS-seq) alignment (`--meth[=emseq|taps]`). Requires a
+        /// Bisulfite (BS-seq) alignment (`--meth[=emseq|taps|5base]`). Requires a
         /// dual index built with `bwa-mem3 index --meth`: `<prefix>` is the
         /// original reference and `<prefix>.meth` the converted seed index.
         /// Emits Bismark `XR`/`XG`/`XM` tags. The chemistry decides which base
@@ -89,7 +89,9 @@ enum MethChemArg {
     /// Bisulfite or EM-seq: unmethylated C converts to T.
     #[value(alias = "em-seq", alias = "bisulfite")]
     Emseq,
-    /// TAPS: methylated C converts to T.
+    /// TAPS: methylated C converts to T. Illumina 5-base (`5base`, bwa-mem3
+    /// v0.16.0+) is the same chemistry as far as the aligner is concerned.
+    #[value(alias = "5base", alias = "5-base")]
     Taps,
 }
 
@@ -318,10 +320,11 @@ fn open_fastq(path: &std::path::Path) -> Result<Box<dyn BufRead>> {
 ///
 /// # Compat-target coverage
 ///
-/// `compat_target_t` (bwa-mem3 v0.9.0) has five output-shaping switches. This
-/// writer honors `emit_hd` / `hd_line` via [`MemOpts::compat_hd_line`]; the
-/// record emitter honors `emit_mq` and `emit_hn`. The fifth, `read_sidecar`,
-/// is **deliberately not implemented**: it makes bwa-mem3 load an optional
+/// `compat_target_t` (bwa-mem3 v0.9.0) carries the output-shaping switches;
+/// CLAUDE.md gotcha #15 tabulates each one. This writer honors `emit_hd` /
+/// `hd_line` via [`MemOpts::compat_hd_line`]; the record emitter honors
+/// `emit_mq` and `emit_hn`. `read_sidecar` is **deliberately not
+/// implemented**: it makes bwa-mem3 load an optional
 /// `<prefix>.hdr` / `<baseprefix>.dict` alongside the index and merge its
 /// richer `@SQ` (`M5`/`AS`/`UR`/`SP`) plus any `@CO`/`@RG` into the header
 /// (`bwa_load_hdr_from_index`, bwa.cpp:987). That is header *provenance*
@@ -399,9 +402,15 @@ mod tests {
         assert_eq!(opts.unpaired_penalty(), 100, "bwameth -U 100");
         assert!(opts.mark_split_secondary(), "-M");
         assert_eq!(
+            opts.meth_scoring().unwrap(),
+            MethScoring::Genomic,
+            "em-seq --meth scores GENOMIC by default (bwa-mem3 v0.17.0)"
+        );
+        assert_eq!(
             opts.mismatch_penalty(),
-            2,
-            "bwameth -B 2 under the default COLLAPSED scoring"
+            4,
+            "the default GENOMIC scoring (bwa-mem3 v0.17.0) keeps bwa's -B 4; \
+             bwameth's -B 2 is COLLAPSED-only"
         );
     }
 
@@ -422,6 +431,9 @@ mod tests {
     fn meth_defaults_scale_with_the_match_score() {
         let mut opts = MemOpts::new().unwrap();
         opts.set_meth(true);
+        // COLLAPSED explicitly: it is the one mode that moves `b`, and no
+        // longer the default (bwa-mem3 v0.17.0 made GENOMIC the default).
+        opts.set_meth_scoring(MethScoring::Collapsed);
         // Before the call: `a` is an input the constants are scaled by.
         opts.set_match_score(3);
         opts.apply_meth_defaults();
@@ -514,9 +526,11 @@ mod tests {
             );
         }
 
-        // COLLAPSED (the default) overwrites it with bwameth's 2 * a.
+        // COLLAPSED (no longer the default; see bwa-mem3 v0.17.0) overwrites
+        // it with bwameth's 2 * a.
         let mut opts = MemOpts::new().unwrap();
         opts.set_meth(true);
+        opts.set_meth_scoring(MethScoring::Collapsed);
         opts.set_mismatch_penalty(7);
         opts.apply_meth_defaults();
         assert_eq!(
