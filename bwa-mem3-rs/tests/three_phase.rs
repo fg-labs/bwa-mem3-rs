@@ -18,9 +18,10 @@
 use std::sync::Arc;
 
 use bwa_mem3_rs::{
-    align_batch, build_info, pair_emit, seed_extend, version, AlignScratch, AlignedFields,
-    AlignedFieldsSink, AlnRegs, BwaIndex, IdBases, Mate, MemOpts, MemPeStat, ReadBatch, ReadPair,
-    RecordOrigin, RecordSink, RecordVec, ResidentCohort, ResidentRange, SingleRead,
+    align_batch, build_info, extend_batch, pair_emit, seed_batch, seed_extend, version,
+    AlignScratch, AlignedFields, AlignedFieldsSink, AlnRegs, BwaIndex, IdBases, Mate, MemOpts,
+    MemPeStat, ReadBatch, ReadPair, RecordOrigin, RecordSink, RecordVec, ResidentCohort,
+    ResidentRange, SingleRead,
 };
 use rstest::rstest;
 
@@ -333,7 +334,10 @@ fn load_meth_with_threads_matches_load_meth() {
         })
         .collect();
     let mut opts = MemOpts::new().unwrap();
-    opts.set_pe(true).set_meth(true).apply_meth_defaults();
+    opts.set_pe(true)
+        .set_meth(true)
+        .apply_meth_defaults()
+        .unwrap();
     let records = |idx: &BwaIndex| -> Vec<(usize, Vec<u8>)> {
         let (batch, _) = align_batch(idx, &opts, &pv, None).unwrap();
         batch
@@ -344,6 +348,846 @@ fn load_meth_with_threads_matches_load_meth() {
     let single = records(&meth.idx);
     assert!(!single.is_empty(), "the meth fixture produced no records");
     assert_eq!(records(&threaded), single);
+}
+
+/// A `--meth-context cpg` combination `bwa-mem3 mem` refuses fails at
+/// alignment too, not only in `apply_meth_defaults`: here em-seq is set after
+/// the defaults validated a TAPS + CpG combination.
+#[test]
+fn align_rejects_a_cpg_context_set_out_of_order() {
+    let Some(meth) = phix_meth() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX meth index");
+        return;
+    };
+    let fixture = field_fixture();
+    let (r1, r2) = &fixture.pairs[0];
+    let pv = [ReadPair {
+        name_r1: &r1.name,
+        seq_r1: &r1.seq,
+        qual_r1: r1.qual.as_deref(),
+        name_r2: &r2.name,
+        seq_r2: &r2.seq,
+        qual_r2: r2.qual.as_deref(),
+    }];
+    let mut opts = MemOpts::new().unwrap();
+    opts.set_pe(true)
+        .set_meth(true)
+        .set_meth_chem(bwa_mem3_rs::MethChem::Taps)
+        .set_meth_context(bwa_mem3_rs::MethContext::Cpg)
+        .apply_meth_defaults()
+        .unwrap();
+    assert!(align_batch(&meth.idx, &opts, &pv, None).is_ok());
+    opts.set_meth_chem(bwa_mem3_rs::MethChem::EmSeq);
+    let Err(err) = align_batch(&meth.idx, &opts, &pv, None) else {
+        panic!("em-seq + cpg aligned");
+    };
+    assert!(
+        matches!(&err, bwa_mem3_rs::Error::InvalidOpts(m) if m.contains("requires --meth=taps")),
+        "{err}"
+    );
+}
+
+/// A mismatch penalty the 8-bit kernels cannot store (`bwa-mem3 mem`
+/// refuses anything outside `0..=128`) fails at alignment rather than wrapping
+/// to a free mismatch.
+#[test]
+fn align_rejects_a_mismatch_penalty_the_kernels_cannot_store() {
+    let Some(idx) = shared_idx() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().take(4).map(as_read_pair).collect();
+    let mut opts = MemOpts::new().unwrap();
+    opts.set_mismatch_penalty(128);
+    assert!(align_batch(&idx, &opts, &pv, None).is_ok());
+    opts.set_mismatch_penalty(256);
+    let Err(err) = align_batch(&idx, &opts, &pv, None) else {
+        panic!("a mismatch penalty of 256 aligned");
+    };
+    assert!(
+        matches!(&err, bwa_mem3_rs::Error::InvalidOpts(m) if m.contains("outside 0..128")),
+        "{err}"
+    );
+}
+
+/// The seeding entry points have no earlier snapshot to compare against, so
+/// their own option check is all that keeps a penalty the kernels cannot store
+/// (`-B 256` wraps to a free mismatch in 8 bits) from reaching them. Each one
+/// refuses it, and a refused resident seed binds nothing.
+#[test]
+fn seeding_entry_points_reject_options_the_kernels_cannot_take() {
+    let Some(idx) = shared_idx() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().take(4).map(as_read_pair).collect();
+    let batch = ReadBatch {
+        pairs: &pv,
+        singles: &[],
+    };
+    let mut bad = MemOpts::new().unwrap();
+    bad.set_mismatch_penalty(256);
+    let good = MemOpts::new().unwrap();
+    let mut sc = AlignScratch::new().unwrap();
+    let refused = |what: &str, err: Option<bwa_mem3_rs::Error>| match err {
+        Some(bwa_mem3_rs::Error::InvalidOpts(m)) => {
+            assert!(m.contains("outside 0..128"), "{what}: {m}");
+        }
+        other => panic!("{what}: expected InvalidOpts, got {other:?}"),
+    };
+
+    refused("seed_batch", seed_batch(&idx, &bad, &pv).err());
+    refused(
+        "seed_extend",
+        seed_extend(&idx, &bad, &mut sc, &batch).err(),
+    );
+    refused(
+        "estimate_pestat",
+        bwa_mem3_rs::estimate_pestat(&idx, &bad, &pv).err(),
+    );
+
+    let cohort = ResidentCohort::new(false).unwrap();
+    let mut range = cohort.reserve_pairs(pv.len()).unwrap();
+    cohort.write_pairs(&mut range, &pv).unwrap();
+    refused(
+        "resident seed_extend",
+        cohort.seed_extend(&idx, &bad, &mut sc, &mut range).err(),
+    );
+    let first_pair = (range.first() / 2) as u64;
+    let marked = [None, Some(first_pair), None, None];
+    refused(
+        "seed_extend_with_reps",
+        cohort
+            .seed_extend_with_reps(&idx, &bad, &mut sc, &mut range, &marked)
+            .err(),
+    );
+    // Neither refusal bound `bad`.
+    cohort
+        .seed_extend(&idx, &good, &mut sc, &mut range)
+        .unwrap();
+}
+
+/// `Seeds` and `AlnRegs` hold coordinates into the index they were seeded
+/// against; a later phase given another index is refused rather than reading
+/// that index's reference out of bounds (it used to abort the process).
+#[test]
+fn split_phases_reject_a_different_index() {
+    let (Some(idx), Some(other)) = (shared_idx(), alt_reference().map(|r| r.idx.clone())) else {
+        eprintln!("skip: bwa-mem3 not available to build the PhiX and ALT indexes");
+        return;
+    };
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().take(4).map(as_read_pair).collect();
+    let batch = ReadBatch {
+        pairs: &pv,
+        singles: &[],
+    };
+    let opts = MemOpts::new().unwrap();
+    let mut sc = AlignScratch::new().unwrap();
+    let needle = "seeded against a different BwaIndex";
+
+    let seeds = seed_batch(&idx, &opts, &pv).unwrap();
+    assert_invalid(
+        extend_batch(&other, &opts, seeds, &pv, None).map(|_| ()),
+        needle,
+        "extend_batch",
+    );
+
+    let regs = seed_extend(&idx, &opts, &mut sc, &batch).unwrap();
+    assert_invalid(
+        MemPeStat::infer_cohort(&other, &opts, std::slice::from_ref(&regs)).map(|_| ()),
+        needle,
+        "infer_cohort",
+    );
+    let pestat = MemPeStat::infer_cohort(&idx, &opts, std::slice::from_ref(&regs)).unwrap();
+    assert_invalid(
+        pair_emit(
+            &other,
+            &opts,
+            &mut sc,
+            regs,
+            Some(&pestat),
+            IdBases::default(),
+            &mut RecordVec::default(),
+        ),
+        needle,
+        "pair_emit",
+    );
+}
+
+/// A `resolve_memo` refused for options that differ from the cohort's leaves
+/// the memo open and the marks in place, so a later range can still add a
+/// mark, a retry under the cohort's own options resolves every mark, and the
+/// cohort emits normally.
+#[test]
+fn resolve_memo_refused_for_changed_options_can_be_retried() {
+    let Some(idx) = shared_idx() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().take(8).map(as_read_pair).collect();
+    let opts = MemOpts::new().unwrap();
+    let mut other = MemOpts::new().unwrap();
+    other.set_mismatch_penalty(5);
+    let mut sc = AlignScratch::new().unwrap();
+
+    let cohort = ResidentCohort::new(false).unwrap();
+    let mut first = cohort.reserve_pairs(4).unwrap();
+    cohort.write_pairs(&mut first, &pv[..4]).unwrap();
+    cohort
+        .seed_extend(&idx, &opts, &mut sc, &mut first)
+        .unwrap();
+    // The second range repeats the first range's first pair and marks it so.
+    let repeat = [pv[0], pv[5], pv[6], pv[7]];
+    let mut second = cohort.reserve_pairs(4).unwrap();
+    cohort.write_pairs(&mut second, &repeat).unwrap();
+    let rep_of = (first.first() / 2) as u64;
+    cohort
+        .seed_extend_with_reps(
+            &idx,
+            &opts,
+            &mut sc,
+            &mut second,
+            &[Some(rep_of), None, None, None],
+        )
+        .unwrap();
+
+    let Err(err) = cohort.resolve_memo(&idx, &other, &mut sc) else {
+        panic!("resolve_memo accepted options that differ from the cohort's");
+    };
+    assert!(
+        matches!(&err, bwa_mem3_rs::Error::InvalidOpts(m)
+            if m.starts_with("resolve_memo: the options differ")),
+        "{err}"
+    );
+    // The refusal left the memo open: a later range can still add a mark.
+    let mut third = cohort.reserve_pairs(2).unwrap();
+    cohort.write_pairs(&mut third, &[pv[1], pv[2]]).unwrap();
+    cohort
+        .seed_extend_with_reps(&idx, &opts, &mut sc, &mut third, &[Some(rep_of + 1), None])
+        .unwrap();
+    let stats = cohort.resolve_memo(&idx, &opts, &mut sc).unwrap();
+    // Both the mark made before the refusal and the one made after it resolve.
+    assert_eq!(stats.dup_pairs, 2, "{stats:?}");
+    assert_eq!(stats.copied, 2, "{stats:?}");
+    let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+    for (p0, mut r) in [(0, first), (4, second), (8, third)] {
+        let records = emit_range(&cohort, &idx, &opts, &mut sc, &mut r, &pestat, p0);
+        assert!(!records.is_empty(), "range at pair {p0} emitted nothing");
+    }
+}
+
+/// An empty pair range emitted early blocks neither the memo nor the cohort
+/// pestat: it holds no pairs to copy into or to model, so a mark added after
+/// it still resolves, and `infer_cohort` still runs.
+#[test]
+fn an_emitted_empty_pair_range_blocks_neither_the_memo_nor_the_pestat() {
+    let Some(idx) = shared_idx() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().take(6).map(as_read_pair).collect();
+    let opts = MemOpts::new().unwrap();
+    let mut sc = AlignScratch::new().unwrap();
+
+    let cohort = ResidentCohort::new(false).unwrap();
+    let mut empty = cohort.reserve_pairs(0).unwrap();
+    cohort
+        .seed_extend(&idx, &opts, &mut sc, &mut empty)
+        .unwrap();
+    let mut records = RecordVec::default();
+    cohort
+        .pair_emit(
+            &idx,
+            &opts,
+            &mut sc,
+            &mut empty,
+            None,
+            IdBases::default(),
+            0,
+            &mut records,
+        )
+        .unwrap();
+    assert!(records.records.is_empty());
+
+    let mut first = cohort.reserve_pairs(4).unwrap();
+    cohort.write_pairs(&mut first, &pv[..4]).unwrap();
+    cohort
+        .seed_extend(&idx, &opts, &mut sc, &mut first)
+        .unwrap();
+    let mut second = cohort.reserve_pairs(2).unwrap();
+    cohort.write_pairs(&mut second, &[pv[0], pv[5]]).unwrap();
+    let rep_of = (first.first() / 2) as u64;
+    cohort
+        .seed_extend_with_reps(&idx, &opts, &mut sc, &mut second, &[Some(rep_of), None])
+        .unwrap();
+
+    let stats = cohort.resolve_memo(&idx, &opts, &mut sc).unwrap();
+    assert_eq!(stats.dup_pairs, 1, "{stats:?}");
+    assert_eq!(stats.copied, 1, "{stats:?}");
+    let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+    for (p0, mut r) in [(0, first), (4, second)] {
+        let records = emit_range(&cohort, &idx, &opts, &mut sc, &mut r, &pestat, p0);
+        assert!(!records.is_empty(), "range at pair {p0} emitted nothing");
+    }
+}
+
+/// `infer_cohort` with no marks: an empty pair range emitted before it does
+/// not count as an emitted range the model would have to include.
+#[test]
+fn infer_cohort_runs_after_an_empty_pair_range_is_emitted() {
+    let Some(idx) = shared_idx() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().take(4).map(as_read_pair).collect();
+    let opts = MemOpts::new().unwrap();
+    let mut sc = AlignScratch::new().unwrap();
+
+    let cohort = ResidentCohort::new(false).unwrap();
+    let mut range = cohort.reserve_pairs(4).unwrap();
+    cohort.write_pairs(&mut range, &pv).unwrap();
+    cohort
+        .seed_extend(&idx, &opts, &mut sc, &mut range)
+        .unwrap();
+    let mut empty = cohort.reserve_pairs(0).unwrap();
+    cohort
+        .seed_extend(&idx, &opts, &mut sc, &mut empty)
+        .unwrap();
+    let mut records = RecordVec::default();
+    cohort
+        .pair_emit(
+            &idx,
+            &opts,
+            &mut sc,
+            &mut empty,
+            None,
+            IdBases::default(),
+            0,
+            &mut records,
+        )
+        .unwrap();
+    let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+    let records = emit_range(&cohort, &idx, &opts, &mut sc, &mut range, &pestat, 0);
+    assert!(!records.is_empty());
+}
+
+/// `BwaIndex::bam_header` lays out the magic, the caller's text, and the
+/// index's contigs in index order (the order records' `tid` indexes).
+#[test]
+fn bam_header_encodes_the_text_and_the_index_contigs() {
+    let Some(r) = alt_reference() else {
+        eprintln!("skip: bwa-mem3 not available to build the ALT index");
+        return;
+    };
+    let text = "@HD\tVN:1.5\n@PG\tID:t\n";
+    let b = r.idx.bam_header(text).unwrap();
+    let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+    assert_eq!(&b[..4], b"BAM\x01");
+    assert_eq!(u32_at(4), text.len());
+    assert_eq!(&b[8..8 + text.len()], text.as_bytes());
+    let mut o = 8 + text.len();
+    assert_eq!(u32_at(o), r.contigs.len());
+    o += 4;
+    for (name, bases) in &r.contigs {
+        let l_name = u32_at(o);
+        assert_eq!(&b[o + 4..o + 4 + l_name], format!("{name}\0").as_bytes());
+        o += 4 + l_name;
+        assert_eq!(u32_at(o), bases.len(), "{name}");
+        o += 4;
+    }
+    assert_eq!(o, b.len(), "trailing bytes after the reference list");
+}
+
+/// A contig name that is not UTF-8 reads back from `contig_name` as `""`, so
+/// `bam_header` must refuse it rather than write an empty reference name.
+#[test]
+fn bam_header_refuses_a_contig_name_that_is_not_utf8() {
+    let Some(bwa) = find_bwa_mem3() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fa = dir.path().join("ref.fa");
+    let mut body = b">chr\xff1\n".to_vec();
+    for chunk in phix_bases()[..2000].chunks(72) {
+        body.extend_from_slice(chunk);
+        body.push(b'\n');
+    }
+    std::fs::write(&fa, body).unwrap();
+    let status = std::process::Command::new(bwa)
+        .arg("index")
+        .arg(&fa)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "bwa-mem3 index failed");
+    let idx = BwaIndex::load(&fa).unwrap();
+    assert_eq!(idx.contig_name(0), "", "fixture name decoded as UTF-8");
+    let Err(err) = idx.bam_header("@HD\tVN:1.5\n") else {
+        panic!("bam_header wrote a contig name that is not UTF-8");
+    };
+    assert!(
+        err.to_string()
+            .contains("bam_header: contig 0's name is not UTF-8"),
+        "{err}"
+    );
+}
+
+/// The split-phase entry points re-check the options too: `Seeds`, `AlnRegs`
+/// and a resident range do not borrow `MemOpts`, so a caller can change them
+/// between phases. Em-seq set after a valid TAPS + CpG seeding must fail every
+/// later phase with `InvalidOpts` (and, for a resident range, leave the range
+/// emittable once the options are put back).
+#[test]
+fn split_phases_reject_a_cpg_context_set_between_phases() {
+    let Some(meth) = phix_meth() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX meth index");
+        return;
+    };
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().take(8).map(as_read_pair).collect();
+    let taps_cpg = || {
+        let mut o = MemOpts::new().unwrap();
+        o.set_pe(true)
+            .set_meth(true)
+            .set_meth_chem(bwa_mem3_rs::MethChem::Taps)
+            .set_meth_context(bwa_mem3_rs::MethContext::Cpg)
+            .apply_meth_defaults()
+            .unwrap();
+        o
+    };
+    let valid = taps_cpg();
+    let mut invalid = taps_cpg();
+    invalid.set_meth_chem(bwa_mem3_rs::MethChem::EmSeq);
+    let is_cpg_err = |err: &bwa_mem3_rs::Error| matches!(err, bwa_mem3_rs::Error::InvalidOpts(m) if m.contains("requires --meth=taps"));
+    let batch = ReadBatch {
+        pairs: &pv,
+        singles: &[],
+    };
+
+    // seed_batch -> extend_batch.
+    let seeds = seed_batch(&meth.idx, &valid, &pv).unwrap();
+    let Err(err) = extend_batch(&meth.idx, &invalid, seeds, &pv, None) else {
+        panic!("extend_batch accepted em-seq + cpg");
+    };
+    assert!(is_cpg_err(&err), "{err}");
+    let seeds = seed_batch(&meth.idx, &valid, &pv).unwrap();
+    assert!(extend_batch(&meth.idx, &valid, seeds, &pv, None).is_ok());
+
+    // seed_extend -> infer_cohort -> pair_emit.
+    let mut sc = AlignScratch::new().unwrap();
+    let regs = seed_extend(&meth.idx, &valid, &mut sc, &batch).unwrap();
+    let Err(err) = MemPeStat::infer_cohort(&meth.idx, &invalid, std::slice::from_ref(&regs)) else {
+        panic!("infer_cohort accepted em-seq + cpg");
+    };
+    assert!(is_cpg_err(&err), "{err}");
+    let pestat = MemPeStat::infer_cohort(&meth.idx, &valid, std::slice::from_ref(&regs)).unwrap();
+    let Err(err) = pair_emit(
+        &meth.idx,
+        &invalid,
+        &mut sc,
+        regs,
+        Some(&pestat),
+        IdBases::default(),
+        &mut RecordVec::default(),
+    ) else {
+        panic!("pair_emit accepted em-seq + cpg");
+    };
+    assert!(is_cpg_err(&err), "{err}");
+
+    // Resident cohort: infer_cohort and pair_emit, and the range survives.
+    let cohort = ResidentCohort::new(true).unwrap();
+    let mut range = cohort.reserve_pairs(pv.len()).unwrap();
+    cohort.write_pairs(&mut range, &pv).unwrap();
+    cohort
+        .seed_extend(&meth.idx, &valid, &mut sc, &mut range)
+        .unwrap();
+    let Err(err) = cohort.infer_cohort(&meth.idx, &invalid) else {
+        panic!("resident infer_cohort accepted em-seq + cpg");
+    };
+    assert!(is_cpg_err(&err), "{err}");
+    let pestat = cohort.infer_cohort(&meth.idx, &valid).unwrap();
+    let Err(err) = cohort.pair_emit(
+        &meth.idx,
+        &invalid,
+        &mut sc,
+        &mut range,
+        Some(&pestat),
+        IdBases::default(),
+        0,
+        &mut RecordVec::default(),
+    ) else {
+        panic!("resident pair_emit accepted em-seq + cpg");
+    };
+    assert!(is_cpg_err(&err), "{err}");
+    let mut sink = RecordVec::default();
+    cohort
+        .pair_emit(
+            &meth.idx,
+            &valid,
+            &mut sc,
+            &mut range,
+            Some(&pestat),
+            IdBases::default(),
+            0,
+            &mut sink,
+        )
+        .unwrap();
+    assert!(
+        !sink.records.is_empty(),
+        "the meth fixture produced no records"
+    );
+}
+
+/// A *valid* option change between phases is rejected too: regions seeded
+/// under `--meth-context all` must not be paired, rescued or emitted under
+/// `cpg` (CodeRabbit's All -> Cpg case), since the records would mix the two
+/// scorings. The MD mode, which only shapes the tags written, may change.
+#[test]
+fn split_phases_reject_options_changed_between_phases() {
+    let Some(meth) = phix_meth() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX meth index");
+        return;
+    };
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().take(8).map(as_read_pair).collect();
+    let taps = |ctx: bwa_mem3_rs::MethContext| {
+        let mut o = MemOpts::new().unwrap();
+        o.set_pe(true)
+            .set_meth(true)
+            .set_meth_chem(bwa_mem3_rs::MethChem::Taps)
+            .set_meth_context(ctx)
+            .apply_meth_defaults()
+            .unwrap();
+        o
+    };
+    let all = taps(bwa_mem3_rs::MethContext::All);
+    let cpg = taps(bwa_mem3_rs::MethContext::Cpg);
+    let mut all_md_none = taps(bwa_mem3_rs::MethContext::All);
+    all_md_none.set_md_mode(bwa_mem3_rs::MdMode::None);
+    let changed = |err: &bwa_mem3_rs::Error, what: &str| {
+        matches!(err, bwa_mem3_rs::Error::InvalidOpts(m)
+            if m.starts_with(&format!("{what}: the options differ")))
+    };
+    // The MD mode really does reach the records: every mapped record carries
+    // MD:Z under FULL, and no record of any kind carries MD under NONE.
+    let assert_md = |bodies: &[&[u8]], want: bool, what: &str| {
+        let mapped: Vec<&&[u8]> = bodies.iter().filter(|b| has_cigar(b)).collect();
+        assert!(!mapped.is_empty(), "{what}: no mapped record");
+        if want {
+            assert!(
+                mapped.iter().all(|b| aux_type(b, b"MD") == Some(b'Z')),
+                "{what}: expected MD:Z on every mapped record"
+            );
+        } else {
+            assert!(
+                bodies.iter().all(|b| aux_type(b, b"MD").is_none()),
+                "{what}: expected no MD tag on any record"
+            );
+        }
+    };
+    let batch = ReadBatch {
+        pairs: &pv,
+        singles: &[],
+    };
+
+    // seed_batch -> extend_batch.
+    let seeds = seed_batch(&meth.idx, &all, &pv).unwrap();
+    let Err(err) = extend_batch(&meth.idx, &cpg, seeds, &pv, None) else {
+        panic!("extend_batch accepted all -> cpg");
+    };
+    assert!(changed(&err, "extend_batch"), "{err}");
+    for (opts, want) in [(&all, true), (&all_md_none, false)] {
+        let seeds = seed_batch(&meth.idx, &all, &pv).unwrap();
+        let (out, _) = extend_batch(&meth.idx, opts, seeds, &pv, None).unwrap();
+        let bodies: Vec<&[u8]> = out.iter().map(|r| &r.bytes[4..]).collect();
+        assert_md(&bodies, want, "extend_batch");
+    }
+
+    // seed_extend -> infer_cohort -> pair_emit.
+    let mut sc = AlignScratch::new().unwrap();
+    let regs = seed_extend(&meth.idx, &all, &mut sc, &batch).unwrap();
+    let Err(err) = MemPeStat::infer_cohort(&meth.idx, &cpg, std::slice::from_ref(&regs)) else {
+        panic!("infer_cohort accepted all -> cpg");
+    };
+    assert!(changed(&err, "infer_cohort"), "{err}");
+    let pestat = MemPeStat::infer_cohort(&meth.idx, &all, std::slice::from_ref(&regs)).unwrap();
+    let Err(err) = pair_emit(
+        &meth.idx,
+        &cpg,
+        &mut sc,
+        regs,
+        Some(&pestat),
+        IdBases::default(),
+        &mut RecordVec::default(),
+    ) else {
+        panic!("pair_emit accepted all -> cpg");
+    };
+    assert!(changed(&err, "pair_emit"), "{err}");
+    for (opts, want) in [(&all, true), (&all_md_none, false)] {
+        let regs = seed_extend(&meth.idx, &all, &mut sc, &batch).unwrap();
+        let mut sink = RecordVec::default();
+        pair_emit(
+            &meth.idx,
+            opts,
+            &mut sc,
+            regs,
+            Some(&pestat),
+            IdBases::default(),
+            &mut sink,
+        )
+        .unwrap();
+        let bodies: Vec<&[u8]> = sink.records.iter().map(|(_, b)| b.as_slice()).collect();
+        assert_md(&bodies, want, "pair_emit");
+    }
+
+    // Resident cohort: the first seed_extend binds the options.
+    let cohort = ResidentCohort::new(true).unwrap();
+    let mut ranges: Vec<ResidentRange> = pv
+        .chunks(4)
+        .map(|c| {
+            let mut r = cohort.reserve_pairs(c.len()).unwrap();
+            cohort.write_pairs(&mut r, c).unwrap();
+            r
+        })
+        .collect();
+    cohort
+        .seed_extend(&meth.idx, &all, &mut sc, &mut ranges[0])
+        .unwrap();
+    let Err(err) = cohort.seed_extend(&meth.idx, &cpg, &mut sc, &mut ranges[1]) else {
+        panic!("resident seed_extend accepted all -> cpg on a second range");
+    };
+    assert!(changed(&err, "seed_extend"), "{err}");
+    cohort
+        .seed_extend(&meth.idx, &all, &mut sc, &mut ranges[1])
+        .unwrap();
+    for (what, res) in [
+        (
+            "resolve_memo",
+            cohort.resolve_memo(&meth.idx, &cpg, &mut sc).map(|_| ()),
+        ),
+        (
+            "infer_cohort",
+            cohort.infer_cohort(&meth.idx, &cpg).map(|_| ()),
+        ),
+    ] {
+        let Err(err) = res else {
+            panic!("resident {what} accepted all -> cpg");
+        };
+        assert!(changed(&err, what), "{err}");
+    }
+    let pestat = cohort.infer_cohort(&meth.idx, &all).unwrap();
+    let Err(err) = cohort.pair_emit(
+        &meth.idx,
+        &cpg,
+        &mut sc,
+        &mut ranges[0],
+        Some(&pestat),
+        IdBases::default(),
+        0,
+        &mut RecordVec::default(),
+    ) else {
+        panic!("resident pair_emit accepted all -> cpg");
+    };
+    assert!(changed(&err, "pair_emit"), "{err}");
+    // One range under FULL, the other under NONE: the MD mode may change.
+    assert_eq!(ranges.len(), 2, "the zip below needs one range per MD mode");
+    for (range, (opts, want)) in ranges.iter_mut().zip([(&all, true), (&all_md_none, false)]) {
+        let mut sink = RecordVec::default();
+        cohort
+            .pair_emit(
+                &meth.idx,
+                opts,
+                &mut sc,
+                range,
+                Some(&pestat),
+                IdBases::default(),
+                0,
+                &mut sink,
+            )
+            .unwrap();
+        let bodies: Vec<&[u8]> = sink.records.iter().map(|(_, b)| b.as_slice()).collect();
+        assert_md(&bodies, want, "resident pair_emit");
+    }
+}
+
+/// A seed-extend that fails binds no options: a native failure (an unwritten
+/// range) after the tentative binding, through `seed_extend` and through
+/// `seed_extend_with_reps` (with a valid mark, so every input check passes and
+/// the call reaches the binding and the marks), keeps no later seed under
+/// other options out, and the failed marked seed leaves no mark counted. And
+/// `set_pe`, which the shim overrides per read group in every phase, may
+/// differ between phases.
+#[test]
+fn failed_seeds_bind_no_options_and_pe_may_differ() {
+    let Some(idx) = shared_idx() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().take(8).map(as_read_pair).collect();
+    let mut other = MemOpts::new().unwrap();
+    other.set_mismatch_penalty(5);
+    let opts = MemOpts::new().unwrap();
+    let mut sc = AlignScratch::new().unwrap();
+
+    let cohort = ResidentCohort::new(false).unwrap();
+    let mut unwritten = cohort.reserve_pairs(4).unwrap();
+    let Err(err) = cohort.seed_extend(&idx, &other, &mut sc, &mut unwritten) else {
+        panic!("seeding an unwritten range succeeded");
+    };
+    // The native call's refusal, reached after the tentative binding.
+    assert!(
+        err.to_string()
+            .contains("resident_seed_extend: resident range lifecycle violated"),
+        "{err}"
+    );
+    let mut unwritten_marked = cohort.reserve_pairs(4).unwrap();
+    let first_pair = (unwritten_marked.first() / 2) as u64;
+    let marked = [None, Some(first_pair), None, None];
+    let Err(err) =
+        cohort.seed_extend_with_reps(&idx, &other, &mut sc, &mut unwritten_marked, &marked)
+    else {
+        panic!("seeding an unwritten marked range succeeded");
+    };
+    assert!(
+        err.to_string()
+            .contains("resident_seed_extend_reps: resident range lifecycle violated"),
+        "{err}"
+    );
+    // Neither failure bound `other`, so the default options seed fine.
+    let mut range = cohort.reserve_pairs(4).unwrap();
+    cohort.write_pairs(&mut range, &pv[..4]).unwrap();
+    cohort
+        .seed_extend(&idx, &opts, &mut sc, &mut range)
+        .unwrap();
+    // The failed marked seed took its mark back: with none counted,
+    // `resolve_memo` stays out of the native path, which would refuse the two
+    // unextended ranges.
+    let stats = cohort.resolve_memo(&idx, &opts, &mut sc).unwrap();
+    assert_eq!(stats.dup_pairs, 0, "{stats:?}");
+
+    let mut se = MemOpts::new().unwrap();
+    se.set_pe(false);
+    let mut pe = MemOpts::new().unwrap();
+    pe.set_pe(true);
+    let seeds = seed_batch(&idx, &se, &pv).unwrap();
+    extend_batch(&idx, &pe, seeds, &pv, None).unwrap();
+}
+
+/// An empty range seeds and emits nothing, so it binds no options either way:
+/// seeding it neither fixes the cohort's options for later ranges nor is held
+/// to options an earlier range bound, and emitting it is not held to them
+/// either.
+#[test]
+fn empty_range_seeds_bind_no_options() {
+    let Some(idx) = shared_idx() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX index");
+        return;
+    };
+    let fixture = field_fixture();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().take(4).map(as_read_pair).collect();
+    let mut other = MemOpts::new().unwrap();
+    other.set_mismatch_penalty(5);
+    let opts = MemOpts::new().unwrap();
+    let mut sc = AlignScratch::new().unwrap();
+
+    let cohort = ResidentCohort::new(false).unwrap();
+    let mut empty = cohort.reserve_pairs(0).unwrap();
+    cohort
+        .seed_extend(&idx, &other, &mut sc, &mut empty)
+        .unwrap();
+    let mut range = cohort.reserve_pairs(4).unwrap();
+    cohort.write_pairs(&mut range, &pv).unwrap();
+    cohort
+        .seed_extend(&idx, &opts, &mut sc, &mut range)
+        .unwrap();
+    // `opts` is now bound, and an empty range under `other` still seeds.
+    let mut empty_after = cohort.reserve_singles(0).unwrap();
+    cohort
+        .seed_extend(&idx, &other, &mut sc, &mut empty_after)
+        .unwrap();
+    // Both empty ranges emit under `other`, through both sinks; the bound
+    // range is still refused under it, and emits under `opts`.
+    let pestat = cohort.infer_cohort(&idx, &opts).unwrap();
+    let mut records = RecordVec::default();
+    cohort
+        .pair_emit(
+            &idx,
+            &other,
+            &mut sc,
+            &mut empty,
+            Some(&pestat),
+            IdBases::default(),
+            0,
+            &mut records,
+        )
+        .unwrap();
+    let mut fields = CountingFieldSink::default();
+    cohort
+        .pair_emit_fields(
+            &idx,
+            &other,
+            &mut sc,
+            &mut empty_after,
+            None,
+            IdBases::default(),
+            0,
+            &mut fields,
+        )
+        .unwrap();
+    assert!(records.records.is_empty());
+    assert_eq!(fields.0, 0, "an empty range emitted structured records");
+    let Err(err) = cohort.pair_emit(
+        &idx,
+        &other,
+        &mut sc,
+        &mut range,
+        Some(&pestat),
+        IdBases::default(),
+        0,
+        &mut records,
+    ) else {
+        panic!("a range emitted under options other than the cohort's");
+    };
+    assert!(
+        err.to_string().contains("pair_emit: the options differ"),
+        "{err}"
+    );
+    assert!(
+        records.records.is_empty(),
+        "a rejected pair_emit wrote records"
+    );
+    cohort
+        .pair_emit(
+            &idx,
+            &opts,
+            &mut sc,
+            &mut range,
+            Some(&pestat),
+            IdBases::default(),
+            0,
+            &mut records,
+        )
+        .unwrap();
+    assert!(!records.records.is_empty());
+
+    // A non-empty range under `other` is still refused.
+    let mut refused = cohort.reserve_pairs(4).unwrap();
+    cohort.write_pairs(&mut refused, &pv).unwrap();
+    let Err(err) = cohort.seed_extend(&idx, &other, &mut sc, &mut refused) else {
+        panic!("a range seeded under options other than the cohort's");
+    };
+    assert!(
+        err.to_string().contains("seed_extend: the options differ"),
+        "{err}"
+    );
 }
 
 /// A sink whose `emit` panics on its first call. Used to prove that a panic

@@ -906,6 +906,7 @@ pub struct BwaAlignedFields {
     pub has_pa: u8,
     pub pa: f32,
     pub xa: *const ::std::os::raw::c_char,
+    pub xa_is_xb: u8,
     pub has_hn: u8,
     pub hn: i32,
     pub xr: *const ::std::os::raw::c_char,
@@ -1197,8 +1198,18 @@ fn bindgen_test_layout_BwaAlignedFields() {
         )
     );
     assert_eq!(
-        unsafe { ::std::ptr::addr_of!((*ptr).has_hn) as usize - ptr as usize },
+        unsafe { ::std::ptr::addr_of!((*ptr).xa_is_xb) as usize - ptr as usize },
         136usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(BwaAlignedFields),
+            "::",
+            stringify!(xa_is_xb)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).has_hn) as usize - ptr as usize },
+        137usize,
         concat!(
             "Offset of field: ",
             stringify!(BwaAlignedFields),
@@ -1617,13 +1628,18 @@ extern "C" {
     pub fn bwa_shim_compat_hd_line(opts: *const mem_opt_t) -> *const ::std::os::raw::c_char;
 }
 extern "C" {
-    pub fn bwa_shim_opts_apply_meth_defaults(opts: *mut mem_opt_t);
+    pub fn bwa_shim_opts_apply_meth_defaults(opts: *mut mem_opt_t) -> ::std::os::raw::c_int;
 }
 extern "C" {
     pub fn bwa_shim_opts_apply_meth_defaults_masked(
         opts: *mut mem_opt_t,
         explicit_mask: ::std::os::raw::c_uint,
-    );
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn bwa_shim_opts_meth_context_error(
+        opts: *const mem_opt_t,
+    ) -> *const ::std::os::raw::c_char;
 }
 extern "C" {
     pub fn bwa_shim_pestat_zero() -> *mut mem_pestat_t;
@@ -1670,6 +1686,15 @@ extern "C" {
 }
 extern "C" {
     pub fn bwa_shim_idx_contig_len(idx: *const BwaIndex, i: usize) -> i64;
+}
+extern "C" {
+    pub fn bwa_shim_header_text(
+        idx: *const BwaIndex,
+        opts: *const mem_opt_t,
+    ) -> *mut ::std::os::raw::c_char;
+}
+extern "C" {
+    pub fn bwa_shim_header_text_free(text: *mut ::std::os::raw::c_char);
 }
 extern "C" {
     pub fn bwa_shim_seed_batch(

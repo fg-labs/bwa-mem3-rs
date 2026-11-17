@@ -15,84 +15,13 @@
 mod common;
 
 use bwa_mem3_sys as sys;
+use bwa_mem3_test_util::AuxTag;
 use std::ffi::CString;
 
-/// One aux tag: its key, its type byte, and its raw value bytes (for `Z`/`H`,
-/// without the trailing NUL).
-struct AuxTag<'a> {
-    key: [u8; 2],
-    ty: u8,
-    value: &'a [u8],
-}
-
-/// The aux tags of one `[u32 block_size][body]` record, in order. Panics on a
-/// tag whose value runs past the end of the record, rather than reporting a
-/// truncated tag as present.
+/// The aux tags of one `[u32 block_size][body]` record, in order (the shared
+/// decoder, which panics on a truncated tag rather than reporting it present).
 fn aux_tags(rec: &[u8]) -> Vec<AuxTag<'_>> {
-    let body = &rec[4..];
-    assert!(
-        body.len() >= 32,
-        "record body shorter than its fixed fields"
-    );
-    let u16_at = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]) as usize;
-    let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap()) as usize;
-    let l_read_name = body[8] as usize;
-    let n_cigar = u16_at(12);
-    let l_seq = u32_at(16);
-    // Where the aux tags start. A body shorter than its declared fields is
-    // truncated, not a record without tags (`o == len` is a complete record
-    // with none).
-    let mut o = [l_read_name, 4 * n_cigar, l_seq.div_ceil(2), l_seq]
-        .into_iter()
-        .try_fold(32usize, usize::checked_add)
-        .expect("record field lengths overflow usize");
-    assert!(
-        o <= body.len(),
-        "record truncated: its fields need {o} bytes but the body has {}",
-        body.len()
-    );
-    let mut tags = Vec::new();
-    while o < body.len() {
-        assert!(o + 3 <= body.len(), "aux tag header truncated at byte {o}");
-        let (key, ty) = ([body[o], body[o + 1]], body[o + 2]);
-        o += 3;
-        let rest = &body[o..];
-        let (value_len, skip) = match ty {
-            b'A' | b'c' | b'C' => (1, 1),
-            b's' | b'S' => (2, 2),
-            b'i' | b'I' | b'f' => (4, 4),
-            b'Z' | b'H' => {
-                let nul = rest
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or_else(|| panic!("{key:?}: string value has no NUL"));
-                (nul, nul + 1)
-            }
-            b'B' => {
-                assert!(rest.len() >= 5, "{key:?}: B-array header truncated");
-                let width = match rest[0] {
-                    b'c' | b'C' => 1,
-                    b's' | b'S' => 2,
-                    _ => 4,
-                };
-                let n = 5 + width * u32_at(o + 1);
-                (n, n)
-            }
-            other => panic!("unknown aux type {:?}", other as char),
-        };
-        assert!(
-            skip <= rest.len(),
-            "{key:?}: value needs {skip} bytes but {} remain",
-            rest.len()
-        );
-        tags.push(AuxTag {
-            key,
-            ty,
-            value: &rest[..value_len],
-        });
-        o += skip;
-    }
-    tags
+    bwa_mem3_test_util::aux_tags(&rec[4..])
 }
 
 fn tag<'a>(rec: &'a [u8], key: &[u8; 2]) -> Option<AuxTag<'a>> {
@@ -298,6 +227,7 @@ fn mem_f_xb_names_the_hit_list_xb() {
     for ((id, xa_s), (_, xb_s)) in xa_lists.iter().zip(&xb_lists) {
         let xa_hits: Vec<&str> = xa_s.split_terminator(';').collect();
         let xb_hits: Vec<&str> = xb_s.split_terminator(';').collect();
+        assert!(!xa_hits.is_empty(), "{id:?}: empty XA:Z list");
         assert_eq!(xa_hits.len(), xb_hits.len(), "{id:?}: {xa_s} vs {xb_s}");
         for (a, b) in xa_hits.iter().zip(&xb_hits) {
             let (a, b): (Vec<&str>, Vec<&str>) = (a.split(',').collect(), b.split(',').collect());
@@ -315,6 +245,191 @@ fn mem_f_xb_names_the_hit_list_xb() {
             }
         }
     }
+
+    // SAFETY: each handle freed exactly once, never used afterward.
+    unsafe {
+        sys::bwa_shim_opts_free(opts);
+        sys::bwa_shim_idx_free(idx);
+    }
+}
+
+/// One record emitted by the resident structured-fields sink: who it is
+/// (origin index, mate, primary-ness, FLAG, POS) and its alternative-hit list,
+/// if any, as `(xa_is_xb, number of hits)`.
+type HitList = ((usize, u8, bool, u16, i32), Option<(bool, usize)>);
+
+#[derive(Default)]
+struct HitListTags(Vec<HitList>);
+
+/// # Safety
+/// `ctx` must be a valid `*mut HitListTags` that outlives the call and `f` a
+/// valid `BwaAlignedFields` for its duration -- both guaranteed by the shim
+/// when it invokes this callback from `bwa_shim_resident_pair_emit_fields`.
+unsafe extern "C" fn hit_list_sink(
+    ctx: *mut std::ffi::c_void,
+    _kind: u32,
+    idx: usize,
+    mate: u8,
+    is_primary: std::ffi::c_int,
+    f: *const sys::BwaAlignedFields,
+) {
+    // SAFETY: see the function's safety contract.
+    let (sink, f) = unsafe { (&mut *ctx.cast::<HitListTags>(), &*f) };
+    let list = (!f.xa.is_null()).then(|| {
+        // SAFETY: a non-NULL `xa` is a NUL-terminated string valid for the call.
+        let l = unsafe { std::ffi::CStr::from_ptr(f.xa) }.to_bytes();
+        (
+            f.xa_is_xb != 0,
+            l.split(|&b| b == b';').filter(|e| !e.is_empty()).count(),
+        )
+    });
+    sink.0
+        .push(((idx, mate, is_primary != 0, f.flag, f.pos), list));
+}
+
+/// Run `pairs` as one resident cohort through the structured-fields sink and
+/// return each record's [`HitListTags`] entry, in emission order.
+fn resident_hit_list_tags(
+    idx: *const sys::BwaIndex,
+    opts: *const sys::mem_opt_t,
+    pairs: &[sys::BwaReadPair],
+) -> Vec<HitList> {
+    // SAFETY: `idx`/`opts` are live handles; `sc`/`cohort`/`pes` are created,
+    // used by this single thread through the one segment they own, and freed
+    // exactly once below; each `BwaReadPair` borrows fixture bytes that outlive
+    // the calls.
+    unsafe {
+        let sc = sys::bwa_shim_scratch_new();
+        let cohort = sys::bwa_shim_resident_cohort_new(0);
+        assert!(
+            !sc.is_null() && !cohort.is_null(),
+            "{}",
+            common::last_error()
+        );
+        let mut first = 0usize;
+        let seg = sys::bwa_shim_resident_reserve_pairs(cohort, 2 * pairs.len(), &mut first);
+        assert!(!seg.is_null(), "reserve failed: {}", common::last_error());
+        let mut added = 0usize;
+        for (i, pair) in pairs.iter().enumerate() {
+            assert_eq!(
+                sys::bwa_shim_resident_write_pair(seg, i, pair, &mut added),
+                0,
+                "{}",
+                common::last_error()
+            );
+        }
+        assert_eq!(
+            sys::bwa_shim_resident_seed_extend(idx, opts, sc, seg),
+            0,
+            "{}",
+            common::last_error()
+        );
+        let pes = common::new_pestat();
+        assert_eq!(
+            sys::bwa_shim_resident_pestat_cohort(idx, opts, cohort, pes),
+            0,
+            "{}",
+            common::last_error()
+        );
+        let mut sink = HitListTags::default();
+        let ids = sys::BwaIdBases {
+            first_single_id: 0,
+            first_pair_id: 0,
+        };
+        let rc = sys::bwa_shim_resident_pair_emit_fields(
+            idx,
+            opts,
+            sc,
+            seg,
+            pes,
+            ids,
+            0,
+            Some(hit_list_sink),
+            std::ptr::addr_of_mut!(sink).cast(),
+        );
+        assert_eq!(rc, 0, "{}", common::last_error());
+        sys::bwa_shim_pestat_free(pes);
+        sys::bwa_shim_resident_cohort_free(cohort);
+        sys::bwa_shim_scratch_free(sc);
+        sink.0
+    }
+}
+
+/// The structured-fields sink must say which tag its hit list is, or a caller
+/// rebuilding the record writes the six-field XB list under `XA:Z`.
+#[test]
+fn mem_f_xb_is_reported_to_the_fields_sink() {
+    let (reference, fx) = duplicated_segment_fixture();
+    let Some((_dir, prefix)) = common::index_custom_ref(&reference) else {
+        return;
+    };
+    let idx = common::load_idx(&prefix);
+    let opts = common::new_opts();
+
+    let xa = resident_hit_list_tags(idx, opts, &fx.pairs());
+    // SAFETY: see the module docs; sets one bit of a POD field.
+    unsafe { (*opts).flag |= sys::MEM_F_XB as i32 };
+    let xb = resident_hit_list_tags(idx, opts, &fx.pairs());
+
+    // -u changes only the tag: the same records, in the same order, and the
+    // same ones carry a hit list, with the same number of hits.
+    let ids = |r: &[HitList]| r.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    assert_eq!(ids(&xb), ids(&xa), "-u changed which records are emitted");
+    let with_list = |r: &[HitList]| {
+        r.iter()
+            .filter_map(|(id, l)| l.map(|(_, n)| (*id, n)))
+            .collect::<Vec<_>>()
+    };
+    let (xa_lists, xb_lists) = (with_list(&xa), with_list(&xb));
+    assert!(!xa_lists.is_empty(), "fixture produced no hit list");
+    assert!(
+        xa_lists.iter().all(|(_, n)| *n > 0),
+        "an empty XA:Z list: {xa_lists:?}"
+    );
+    assert_eq!(
+        xb_lists, xa_lists,
+        "-u moved, dropped or resized a hit list"
+    );
+    // `map_or(true, ..)`, not `is_none_or`: the latter is stable since 1.82
+    // and this workspace's MSRV is 1.75.
+    #[allow(clippy::unnecessary_map_or)]
+    let all_lists = |lists: &[HitList], want_xb: bool| {
+        lists
+            .iter()
+            .all(|(_, l)| l.map_or(true, |(xb, _)| xb == want_xb))
+    };
+    assert!(all_lists(&xa, false), "XA:Z reported as XB without -u");
+    assert!(all_lists(&xb, true), "MEM_F_XB: every hit list is XB");
+
+    // SAFETY: each handle freed exactly once, never used afterward.
+    unsafe {
+        sys::bwa_shim_opts_free(opts);
+        sys::bwa_shim_idx_free(idx);
+    }
+}
+
+/// A NULL `compat` (a raw caller that memsets `mem_opt_t`) reads as the `off`
+/// row everywhere, as upstream's header builder takes it: the records keep the
+/// `MQ:i` / `HN:i` the default target emits, rather than the header saying one
+/// target and the records another.
+#[test]
+fn null_compat_reads_as_the_off_row() {
+    let (reference, fx) = duplicated_segment_fixture();
+    let Some((_dir, prefix)) = common::index_custom_ref(&reference) else {
+        return;
+    };
+    let idx = common::load_idx(&prefix);
+    let opts = common::new_opts();
+
+    let off = common::align_batch_records(idx, opts, &fx.pairs());
+    assert!(
+        off.iter().any(|(_, r)| has_key(r, b"MQ")) && off.iter().any(|(_, r)| has_key(r, b"HN")),
+        "fixture emits no MQ:i or no HN:i; it no longer tests the compat switches"
+    );
+    // SAFETY: see the module docs; writes one POD pointer field.
+    unsafe { (*opts).compat = std::ptr::null() };
+    let null = common::align_batch_records(idx, opts, &fx.pairs());
+    assert!(null == off, "a NULL compat changed the records");
 
     // SAFETY: each handle freed exactly once, never used afterward.
     unsafe {

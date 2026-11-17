@@ -53,10 +53,10 @@ pub use error::{Error, Result};
 pub use index::BwaIndex;
 pub use memo::{MemoStats, PairMemo};
 pub use opts::{
-    MemOpts, MemPeStat, MethChem, MethScoring, MethSeedPrune, Mode, PeOrient, PeOrientation,
-    SeedOrder,
+    MdMode, MemOpts, MemPeStat, MethChem, MethContext, MethScoring, MethSeedPrune, Mode, PeOrient,
+    PeOrientation, SeedOrder,
 };
 pub use resident::{
-    AlignedFields, AlignedFieldsSink, Mate, MethFields, ResidentCohort, ResidentRange,
+    AlignedFields, AlignedFieldsSink, AltHits, Mate, MethFields, ResidentCohort, ResidentRange,
 };
 pub use xa::{parse_xa, AuxHit};

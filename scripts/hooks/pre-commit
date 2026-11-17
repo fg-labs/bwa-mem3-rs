@@ -13,7 +13,17 @@ echo "==> cargo ci-fmt"
 cargo ci-fmt
 
 echo "==> cargo ci-lint"
-cargo ci-lint
+# The stable-only clippy settings CI's lint job uses (.config/clippy/clippy.toml).
+# Clippy before 0.1.87 (Rust 1.87) rejects their key, so an older toolchain
+# (e.g. RUSTUP_TOOLCHAIN=1.75.0, the MSRV) lints without them.
+clippy_version="$(cargo clippy --version)"
+if [[ "${clippy_version}" =~ ^clippy\ 0\.1\.([0-9]+) ]] && (( BASH_REMATCH[1] >= 87 )); then
+    CLIPPY_CONF_DIR="${PWD}/.config/clippy" cargo ci-lint
+else
+    echo "    (${clippy_version}: too old for .config/clippy, linting without it)"
+    # Drop an inherited CLIPPY_CONF_DIR too, which may name the same directory.
+    (unset CLIPPY_CONF_DIR; cargo ci-lint)
+fi
 
 # Python static analysis for the bwa-mem3-py bindings. Skipped (with a note)
 # when pixi isn't installed so the hook stays usable on Rust-only setups.

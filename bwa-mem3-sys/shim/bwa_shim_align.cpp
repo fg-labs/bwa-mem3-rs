@@ -489,6 +489,23 @@ static const bntseq_t *shim_header_bns(void *opaque) {
     return idx->meth_orig_bns ? idx->meth_orig_bns : idx->fmi->idx->bns;
 }
 
+/* The SAM header text `bwa-mem3 mem` writes for this index, via upstream's own
+ * builder (bwa_build_sam_hdr, the one definition its SAM-text and --bam writers
+ * share as of v0.17.0): @HD from opt->compat, then one generated @SQ per contig
+ * (bwa_format_sq_line: SN, LN, and AH:* on an ALT contig). Two inputs are
+ * deliberately NULL: the index sidecar (`read_sidecar`, gotcha #15) and @PG,
+ * which is the caller's to append. Under --meth the contigs are the original
+ * reference's (shim_header_bns). Returns a malloc'd NUL-terminated string the
+ * caller frees, or NULL on allocation failure. */
+char *shim_align_header_text(void *opaque, const mem_opt_t *opt) {
+    kstring_t ks = {0, 0, NULL};
+    if (bwa_build_sam_hdr(&ks, shim_header_bns(opaque), NULL, NULL, NULL, opt->compat) < 0) {
+        free(ks.s);
+        return NULL;
+    }
+    return ks.s ? ks.s : strdup("");
+}
+
 /* Non-zero iff `opaque` was loaded as a --meth dual index (shim_align_idx_load_meth). */
 int shim_align_idx_is_meth(void *opaque) {
     return static_cast<BwaShimIndex *>(opaque)->meth_orig_bns != nullptr;
@@ -506,6 +523,15 @@ int64_t shim_align_idx_contig_len(void *opaque, size_t i) {
     return shim_header_bns(opaque)->anns[i].len;
 }
 
+/* The output-compatibility target `opt` selects. `compat` is set by
+ * mem_opt_init, but it is a pointer on a struct callers can memset; a NULL
+ * means the `off` row, as upstream's header builder takes it
+ * (bwa_build_sam_hdr), so the header and every record-level switch (MQ, HN)
+ * agree on one target. */
+static const compat_target_t *shim_compat(const mem_opt_t *opt) {
+    return opt->compat ? opt->compat : &COMPAT_TARGET_OFF;
+}
+
 /* The @HD line the selected compat target wants, or NULL when it suppresses
  * @HD entirely (bwa-mem2 emits none; see compat_target.cpp).
  *
@@ -518,11 +544,53 @@ int64_t shim_align_idx_contig_len(void *opaque, size_t i) {
  * upstream just finished fixing -- and it did: bwa-rs emitted
  * "@HD VN:1.6 SO:unknown" against the CLI's "@HD VN:1.5 SO:unsorted GO:query".
  *
- * `compat` is set by mem_opt_init, but it is a pointer on a struct callers can
- * memset, so it is NULL-checked like the emit_mq / emit_hn gates. */
+ * The target comes from shim_compat, like every other compat read here. */
 const char *shim_compat_hd_line(const mem_opt_t *opt) {
-    if (opt == NULL || opt->compat == NULL || !opt->compat->emit_hd) return NULL;
-    return opt->compat->hd_line;
+    if (opt == NULL) return NULL;
+    const compat_target_t *c = shim_compat(opt);
+    return c->emit_hd ? c->hd_line : NULL;
+}
+
+/* The Rust mirrors (opts.rs MdMode / MethContext) hardcode these values. */
+static_assert(MEM_MD_NONE == 0 && MEM_MD_FULL == 1 && MEM_MD_SHORT == 2,
+              "mem_md_mode renumbered: update MdMode in bwa-mem3-rs/src/opts.rs");
+static_assert(METH_CTX_ALL == 0 && METH_CTX_CPG == 1,
+              "meth_ctx_t renumbered: update MethContext in bwa-mem3-rs/src/opts.rs");
+
+/* The --meth-context checks upstream's meth_opts_finalize makes with exit(1):
+ * cpg requires --meth, refuses em-seq chemistry, and refuses COLLAPSED
+ * scoring. Returns NULL when the combination is valid, else the message (a
+ * static string, or a thread-local buffer for an unknown context value, valid
+ * until the next call on this thread).
+ *
+ * `resolve_taps_default` judges the scoring the way meth_opts_finalize is about
+ * to resolve it (TAPS with no explicit mode becomes NEUTRAL), for the apply
+ * path, which runs before finalize. Zero judges `opt` as it stands, for the
+ * alignment entry points (MemOpts::check_meth_options), which run after it --
+ * or without it, if the caller skipped apply_meth_defaults. This is the one
+ * copy of the check list in this crate; diff it against meth_opts_finalize on
+ * every refresh. */
+const char *shim_opts_meth_context_error(const mem_opt_t *opt, int resolve_taps_default) {
+    if (opt->meth_context == METH_CTX_ALL) return NULL;
+    if (opt->meth_context != METH_CTX_CPG) {
+        static thread_local char msg[96];
+        snprintf(msg, sizeof(msg), "unknown meth_context %d (MemOpts::set_meth_context)",
+                 opt->meth_context);
+        return msg;
+    }
+    if (!opt->meth_mode)
+        return "--meth-context requires --meth (MemOpts::set_meth)";
+    if (opt->meth_chem == METH_CHEM_EMSEQ)
+        return "--meth-context cpg requires --meth=taps or --meth=5base: under "
+               "EM-seq/bisulfite every unmethylated C converts, so conversions are not "
+               "confined to CpG (MemOpts::set_meth_chem)";
+    const int scoring = (resolve_taps_default && opt->meth_chem == METH_CHEM_TAPS)
+                            ? (int) MEM_METH_SCORING_NEUTRAL : opt->meth_scoring;
+    if (scoring == MEM_METH_SCORING_COLLAPSED)
+        return "--meth-context cpg is incompatible with --meth-scoring collapsed: "
+               "collapsed also frees reference T against read C, which has no CpG meaning "
+               "(MemOpts::set_meth_scoring)";
+    return NULL;
 }
 
 /* Apply what `bwa-mem3 mem --meth` sets for bisulfite alignment: upstream's
@@ -560,9 +628,12 @@ const char *shim_compat_hd_line(const mem_opt_t *opt) {
  * meth_opts_finalize is a no-op unless opt->meth_mode is set, exactly as in
  * main_mem, so set meth_mode FIRST. It also runs the CLI's cross-option checks:
  * an em-seq + explicit NEUTRAL scoring prints upstream's warning to stderr, and
- * `--meth-context cpg` with em-seq chemistry or COLLAPSED scoring exit(1)s.
- * MemOpts cannot set meth_context, so those exits are unreachable from the
- * safe API; a raw-FFI caller that sets it must validate first.
+ * an invalid `--meth-context cpg` (without --meth, with em-seq chemistry, or
+ * with COLLAPSED scoring) exit(1)s. A library must not exit, so this runs the
+ * same three checks FIRST (shim_opts_meth_context_error, against the scoring
+ * mode finalize would resolve) and returns the message instead (NULL on
+ * success) without touching `opt`. Finalize is then only ever reached with a
+ * valid combination.
  *
  * `opt0` is upstream's "did the user set this explicitly" mask (non-zero field
  * == user supplied). Only the two bits above are expressible; every other
@@ -577,12 +648,14 @@ const char *shim_compat_hd_line(const mem_opt_t *opt) {
  *     a real mismatch, so a caller-set -B survives the bundle under those two
  *     modes and is clobbered under COLLAPSED.
  *
- * Refilling the matrices is part of the operation, not the caller's job: the
- * COLLAPSED branch can change opt->b and the TAPS default changes
- * meth_scoring, and a stale mat/mat_ot/mat_ob would score every subsequent
- * alignment with the old values. Upstream refills at the same point. */
-void shim_opts_apply_meth_defaults(mem_opt_t *opt, unsigned explicit_mask) {
-    if (opt == NULL) return;
+ * The caller, bwa_shim_opts_apply_meth_defaults_masked, owns the two steps
+ * around this: before it, refusing a match score the bundle would multiply
+ * into an int overflow; after it, refilling the matrices (the COLLAPSED branch
+ * can change opt->b and the TAPS default changes meth_scoring, so a stale
+ * mat/mat_ot/mat_ob would score every later alignment with the old values;
+ * upstream refills at the same point). */
+const char *shim_opts_apply_meth_defaults(mem_opt_t *opt, unsigned explicit_mask) {
+    if (opt == NULL) return "null opts";
     mem_opt_t opt0;
     memset(&opt0, 0, sizeof(opt0));
     meth_cli_t cli;
@@ -596,14 +669,16 @@ void shim_opts_apply_meth_defaults(mem_opt_t *opt, unsigned explicit_mask) {
         cli.set_seed_prune = 1;
     }
 
+    /* meth_opts_finalize's --meth-context checks, minus the exit(1). */
+    const char *ctx_err = shim_opts_meth_context_error(opt, !cli.set_scoring);
+    if (ctx_err) return ctx_err;
+
     meth_opts_finalize(opt, &cli);   /* TAPS -> NEUTRAL, SPEC30 (fastmap.cpp main_mem) */
     if (opt->meth_mode) {
         mem_opt_apply_meth_defaults(opt, &opt0);
         opt->band_cert = 0;
     }
-
-    bwa_fill_scmat(opt->a, opt->b, opt->mat);
-    mem_opt_fill_meth_mat(opt);
+    return NULL;
 }
 
 /* ------------------ Helpers ------------------ */
@@ -1218,7 +1293,7 @@ static void compute_record_fields(ShimScratch *sc, BwaAlignedFields *f,
      * bwa-mem2 does not, having forked at 0.7.17 before that landed -- hence
      * the compat switch, whose default target (COMPAT_TARGET_OFF) sets
      * emit_mq = 1. */
-    if (m && opt->compat != NULL && opt->compat->emit_mq) { f->has_mq = 1; f->mq = m->mapq; }
+    if (m && shim_compat(opt)->emit_mq) { f->has_mq = 1; f->mq = m->mapq; }
     if (p->score >= 0) { f->has_as = 1; f->score = p->score; }
     if (p->sub >= 0)   { f->has_xs = 1; f->sub = p->sub; }
     if (bwa_rg_id[0]) {
@@ -1245,7 +1320,14 @@ static void compute_record_fields(ShimScratch *sc, BwaAlignedFields *f,
     if (!(p->flag & 0x100) && p->alt_sc > 0) {
         f->has_pa = 1; f->pa = bwa_pa_tag_value(p->score, p->alt_sc);
     }
-    if (p->XA) f->xa = p->XA;
+    if (p->XA) {
+        f->xa = p->XA;
+        /* Under MEM_F_XB (`-u`) mem_gen_alt builds the XB-shaped list (each
+         * hit's AS and MAPQ appended), which upstream's writers name XB:Z as of
+         * v0.17.0 (#690). Carried on the fields so a structured sink names the
+         * tag the way the packed one does. */
+        f->xa_is_xb = (opt->flag & MEM_F_XB) != 0;
+    }
     /* HN: total # of hits clustered with this primary under XA_drop_ratio
      * (set by mem_gen_alt above). -1 is upstream's "not computed" sentinel
      * (bwamem.h / bwamem.cpp's mem_reg2aln), so guard >= 0.
@@ -1258,10 +1340,8 @@ static void compute_record_fields(ShimScratch *sc, BwaAlignedFields *f,
      * -- and COMPAT_TARGET_OFF (the default, "bwa-mem3's native output") sets
      * emit_hn = 1. Keeping the old gate left HN off every --meth record while
      * the CLI emitted it.
-     *
-     * `compat` is set by mem_opt_init, but it is a pointer on a struct callers
-     * can memset, so it is NULL-checked rather than trusted. */
-    if (p->HN >= 0 && opt->compat != NULL && opt->compat->emit_hn) { f->has_hn = 1; f->hn = p->HN; }
+     * (A NULL compat reads as the `off` row; see shim_compat.) */
+    if (p->HN >= 0 && shim_compat(opt)->emit_hn) { f->has_hn = 1; f->hn = p->HN; }
 
     /* D3 (--meth) Bismark tags. XR:Z (read conversion) on every record; XG:Z
      * (genome strand) and XM:Z (per-base methylation call) on mapped records.
@@ -1326,12 +1406,10 @@ static void compute_record_fields(ShimScratch *sc, BwaAlignedFields *f,
 
 /* Serialize `f` into the packed BAM record BODY (no u32 block_size prefix) for
  * read `s`, in the scratch's reusable record buffer, and hand it to the packed
- * sink. Pure formatting: every decision was made by compute_record_fields.
- * `xb` names the alternative-hit list XB:Z instead of XA:Z: set under MEM_F_XB
- * (`-u`), where mem_gen_alt builds the XB-shaped list (each hit's AS and MAPQ
- * appended) and upstream's writers name it XB as of v0.17.0 (#690). */
+ * sink. Pure formatting: every decision was made by compute_record_fields,
+ * including the alternative-hit list's tag name (`f->xa_is_xb`). */
 static void serialize_record(ShimEmit *e, size_t origin_idx, const bseq1_t *s,
-                             const BwaAlignedFields *f, int xb)
+                             const BwaAlignedFields *f)
 {
     int l_read_name = (int) strlen(s->name) + 1;
     int n_cigar = (int) f->n_cigar;
@@ -1352,7 +1430,7 @@ static void serialize_record(ShimEmit *e, size_t origin_idx, const bseq1_t *s,
     if (f->rg)     aux_put_Z(&aux, &aux_len, &aux_cap, "RG", f->rg);
     if (f->sa)     aux_put_Z(&aux, &aux_len, &aux_cap, "SA", f->sa);
     if (f->has_pa) aux_put_f(&aux, &aux_len, &aux_cap, "pa", f->pa);
-    if (f->xa)     aux_put_Z(&aux, &aux_len, &aux_cap, xb ? "XB" : "XA", f->xa);
+    if (f->xa)     aux_put_Z(&aux, &aux_len, &aux_cap, f->xa_is_xb ? "XB" : "XA", f->xa);
     if (f->has_hn) aux_put_i(&aux, &aux_len, &aux_cap, "HN", f->hn);
     if (f->xr)     aux_put_Z(&aux, &aux_len, &aux_cap, "XR", f->xr);
     if (f->xg)     aux_put_Z(&aux, &aux_len, &aux_cap, "XG", f->xg);
@@ -1464,7 +1542,7 @@ static void append_bam_record(ShimEmit *e, size_t origin_idx,
     if (e->field_sink)
         e->field_sink(e->ctx, e->origin_kind, origin_idx, (uint8_t) is_r2, which == 0, &f);
     else
-        serialize_record(e, origin_idx, s, &f, (opt->flag & MEM_F_XB) != 0);
+        serialize_record(e, origin_idx, s, &f);
 }
 
 /* ------------------ Phase 1: scratch + fused seed+extend ------------------ */
@@ -1539,8 +1617,10 @@ void shim_regs_free(ShimRegs *r) {
  * shim_resident_resolve_memo later fills. KEEP IN SYNC with worker_bwt_memo on
  * every vendor refresh. Like it (v0.14.0+), this converts only the duplicate
  * reads, since kernel1 converts the rest; a second conversion would be harmless
- * anyway, as nst_nt4_table maps every 2-bit code to itself and, as of v0.16.0
- * (#639), '-' straight to 4. */
+ * anyway: kernel1 converts through nst_nt4_decode(c, 4), which passes 2-bit
+ * codes 0-3 through untouched and sends every other byte through nst_nt4_table,
+ * which maps 4 to 4 and, as of v0.16.0 (#639), '-' straight to 4. (The table
+ * alone is NOT idempotent: it maps bytes 0-3 to 4.) */
 static void seed_chunk_reps(ShimScratch *sc, BwaShimIndex *idx, const mem_opt_t *opt,
                             bseq1_t *chunk, int bs, int chunk_first, const int64_t *reps)
 {
@@ -2846,14 +2926,14 @@ static void copy_regs(mem_alnreg_v *dst, const mem_alnreg_v *src) {
 /* The memo barrier: give every duplicate pair (a pair segment's reps[p] >= 0)
  * its first copy's alignment regions, after checking their 2-bit bases match; a
  * mismatch (a hash collision, or a hand-built mark) seed-extends the pair on its
- * own instead. Must run with every pair segment extended and none emitted --
- * emitting releases a segment's regs (resident_segment_release_reads), so a
- * representative emitted early would be copied as empty -- and exclusive of
- * every other call on the cohort. Every mark is validated before anything is
- * copied, so an error leaves the cohort unchanged. A repeat call returns the
- * first call's stats and does nothing. Returns 0, -1 on a null arg, -3 when a
- * pair segment is not extended, -4 when one was emitted, or -5 when a mark
- * names no pair of the cohort. */
+ * own instead. Must run with every pair segment extended and no non-empty one
+ * emitted -- emitting releases a segment's regs (resident_segment_release_reads),
+ * so a representative emitted early would be copied as empty -- and exclusive
+ * of every other call on the cohort. Every mark is validated before anything
+ * is copied, so an error leaves the cohort unchanged. A repeat call returns
+ * the first call's stats and does nothing. Returns 0, -1 on a null arg, -3
+ * when a pair segment is not extended, -4 when a non-empty one was emitted, or
+ * -5 when a mark names no pair of the cohort. */
 int shim_resident_resolve_memo(void *idx_opaque, const mem_opt_t *opts, ShimScratch *sc,
                                ShimResidentCohort *c, ShimMemoStats *out) {
     if (!idx_opaque || !opts || !sc || !c || !out) return -1;
@@ -2861,7 +2941,8 @@ int shim_resident_resolve_memo(void *idx_opaque, const mem_opt_t *opts, ShimScra
     const ShimResidentRegion *rg = &c->pairs;
     for (size_t s = 0; s < rg->n_segments; ++s) {
         if (!rg->segs[s]->extended) return -3;
-        if (rg->segs[s]->emitted) return -4;
+        /* An emitted empty segment held no pairs to copy into or from. */
+        if (rg->segs[s]->emitted && rg->segs[s]->n > 0) return -4;
     }
     for (size_t s = 0; s < rg->n_segments; ++s) {
         const ShimResidentSegment *sg = rg->segs[s];
@@ -2892,8 +2973,9 @@ int shim_resident_resolve_memo(void *idx_opaque, const mem_opt_t *opts, ShimScra
                  * align the two reads as a batch of one pair (kernel1's mate cap
                  * reads l^1 < nseq, which a two-read view satisfies). Their
                  * bases are already 2-bit and kernel1 converts them again,
-                 * which is a no-op: nst_nt4_table maps 0-4 to themselves and,
-                 * since v0.16.0 (#639), '-' straight to 4, so no code changes. */
+                 * which is a no-op: it converts through nst_nt4_decode(c, 4),
+                 * which passes codes 0-3 through, and the table maps 4 (and,
+                 * since v0.16.0 (#639), '-') to 4, so no code changes. */
                 release_regs(&sg->regs[2 * p]);
                 release_regs(&sg->regs[2 * p + 1]);
                 seed_extend_reads(sc, idx, &opt, sg->seqs + 2 * p, sg->regs + 2 * p, 2, nullptr);
@@ -2913,14 +2995,17 @@ int shim_resident_resolve_memo(void *idx_opaque, const mem_opt_t *opts, ShimScra
  * caller no longer has to collect every sub-batch's regs to call it. A
  * whole-cohort call: must not run concurrently with any per-segment call or
  * reserve. Returns 0, -1 on a null arg / OOM, or -3 when some pair segment is
- * not seed-extended yet (the model would silently omit its reads) or has
- * already been emitted (mate rescue has appended to its regs, so the model
- * would no longer be the one the CLI computes before pairing). */
+ * not seed-extended yet (the model would silently omit its reads) or holds
+ * pairs and has already been emitted (mate rescue has appended to its regs, so
+ * the model would no longer be the one the CLI computes before pairing). */
 int shim_resident_pestat_cohort(void *idx_opaque, const mem_opt_t *opts,
                                 const ShimResidentCohort *c, mem_pestat_t *out) {
     if (!idx_opaque || !opts || !c || !out) return -1;
-    for (size_t s = 0; s < c->pairs.n_segments; ++s)
-        if (!c->pairs.segs[s]->extended || c->pairs.segs[s]->emitted) return -3;
+    for (size_t s = 0; s < c->pairs.n_segments; ++s) {
+        const ShimResidentSegment *sg = c->pairs.segs[s];
+        /* An emitted empty segment contributes no reads to the model. */
+        if (!sg->extended || (sg->emitted && sg->n > 0)) return -3;
+    }
     size_t total = c->pairs.len;
     mem_alnreg_v *cat = total ? (mem_alnreg_v *) malloc(total * sizeof(mem_alnreg_v)) : nullptr;
     if (total && !cat) return -1;

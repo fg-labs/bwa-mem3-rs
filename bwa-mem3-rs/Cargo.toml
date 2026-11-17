@@ -25,6 +25,7 @@ thiserror = "1"
 libc = "0.2"
 
 [dev-dependencies]
+bwa-mem3-test-util = { path = "../bwa-mem3-test-util" }
 rayon = "1"
 rstest = "0.18"
 tempfile = "3"

@@ -10,3 +10,9 @@ pr_labels = ["release"]
 git_release_enable = false
 # Enable once a stable baseline is published.
 semver_check = false
+
+# Test-only helpers shared by the workspace's test suites: never published, so
+# never versioned or released either.
+[[package]]
+name = "bwa-mem3-test-util"
+release = false

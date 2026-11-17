@@ -12,6 +12,10 @@ three-crate workspace:
 - `bwa-mem3-rs` — safe wrapper.
 - `bwa-mem3-rs-cli` — thin `bwa-rs` CLI binary.
 
+(Plus `bwa-mem3-py`, the Python bindings, and `bwa-mem3-test-util`, unpublished
+helpers the three crates' test suites share as a path dev-dependency, such as
+the one BAM aux-tag decoder.)
+
 Hosted under [`fg-labs/bwa-mem3-rs`](https://github.com/fg-labs/bwa-mem3-rs).
 Vendors [`fg-labs/bwa-mem3`](https://github.com/fg-labs/bwa-mem3) at the
 `main` branch.
@@ -228,12 +232,62 @@ TAPS (`meth_chem`) defaults `meth_scoring` to NEUTRAL (before the helper, whose
 `main_mem`'s order: finalize, then (only under `meth_mode`, as upstream) the
 bundle and `band_cert = 0`. So `set_meth(true)` must precede
 `apply_meth_defaults`. `meth_opts_finalize` also runs the CLI's cross-option
-checks: em-seq with an explicit NEUTRAL prints a warning to stderr, and
-`--meth-context cpg` with em-seq or COLLAPSED `exit(1)`s. Those exits are
-unreachable while `MemOpts` cannot set `meth_context`, so expose it only with a
-validating setter. The em-seq scoring default is set by neither helper: it
-comes from `mem_opt_init` (GENOMIC as of v0.17.0, #756; COLLAPSED before),
-which the shim inherits. SPEC30 changes **output** — it
+checks: em-seq with an explicit NEUTRAL prints a warning to stderr, and an
+invalid `--meth-context cpg` (without `--meth`, with em-seq, or with COLLAPSED)
+`exit(1)`s. A library must not exit, so `shim_opts_apply_meth_defaults` makes
+those three checks first (`shim_opts_meth_context_error`, against the scoring
+mode finalize would resolve) and returns the message;
+`MemOpts::apply_meth_defaults` surfaces it as `Error::InvalidOpts` with the
+options untouched. Because a later setter can undo that check, or the call can
+be skipped, `MemOpts::check_meth_options` repeats it against the options as
+they stand, through the same C function (`bwa_shim_opts_meth_context_error`),
+at every alignment entry point; `set_meth_context` only stores the value. So
+upstream's check list has two copies, `meth_opts_finalize` and
+`shim_opts_meth_context_error`: diff them on every refresh, and replace ours
+with a call if upstream ever exposes a non-exiting validator.
+`check_meth_options` also carries `main_mem`'s post-defaults refusal of a
+non-positive effective mismatch penalty under `--meth` (`opt->b <= 0`, which
+collapses NM to zero); that check lives in `fastmap.cpp`, outside
+`meth_opts_finalize`, so diff it too.
+
+Its neighbour `check_effective_scoring` (every path, not only `--meth`: `b` in
+`0..=128`, each `o + e` at most `2^29 - 1`) is mirrored as
+`MemOpts::check_effective_scoring`, together with the ranges `main_mem`'s
+parser holds for every knob a setter here can write (`-A` in `1..=127`, `-w` in
+`0..=INT_MAX >> 2`, `-O >= 0`, `-E >= 1`, `-U >= 0`, `-c >= 1`), since the
+setters accept any `i32` and outside those ranges the kernels overflow `int`,
+divide by zero or write past a band. On every refresh, grep `fastmap.cpp` for
+`parse_bounded_i64` and check each bound against a setter. (`-L` and `-T` are
+unbounded upstream too, so they are not checked.) The two run together as
+`MemOpts::validate_for_alignment`, which every alignment entry point reaches
+through `check_alignment_preconditions` (with the meth-mode/index match).
+`MemPeStat` is deliberately *not* held to the `-I` parser's rules: upstream's
+own `mem_pestat` emits non-`failed` orientations with `std == 0`, which the CLI
+pairs with as-is.
+
+Every matrix refill is skipped while `b` is unstorable, since `bwa_fill_scmat`
+negates it as an `int`. The rule lives once, in `bwa_shim.cpp`'s
+`shim_b_storable`, behind `bwa_shim_opts_fill_scmat` (which
+`MemOpts::refill_matrices` and `bwa_shim_opts_apply_meth_defaults_masked`
+call, the latter after the COLLAPSED bundle has had its chance to replace `b`)
+and `bwa_shim_opts_fill_meth_mat` (behind `set_meth` / `set_meth_scoring`).
+That covers the meth matrices too: they are copies of the stale base matrix, so
+they wait with it, and the next storable `b` rebuilds all of them from the
+scoring mode as it then stands. Until then every C alignment entry point
+refuses the options (`shim_opts_alignable`), for raw `mem_opt_t` callers that
+skip `validate_for_alignment`. Under `--meth`,
+`bwa_shim_opts_apply_meth_defaults_masked` also refuses an `a` outside
+`1..=127` before the bundle runs, since the bundle multiplies it by up to 100.
+
+`band_cert` and `skip_contained_ext`, which `main_mem` turns off outside their
+proven parameter envelopes, need no mirror: upstream re-checks both on a local
+copy inside the kernels (`mem_chain2aln_across_reads_V2`, and the `two_wave`
+gate beside `mem_skip_contained_ext_sound`) for exactly this kind of library
+caller.
+
+The em-seq scoring default is set by neither helper: it comes from
+`mem_opt_init` (GENOMIC as of v0.17.0, #756; COLLAPSED before), which the shim
+inherits. SPEC30 changes **output** — it
 decides which SMEMs reach SA resolution. Until it was mirrored, `bwa-rs mem
 --meth` differed from `bwa-mem3 mem --meth` on ~half the records of an hg38
 chr22 EM-seq simulation while every PhiX parity test stayed green, because on
@@ -387,21 +441,26 @@ selector, so the only reachable row is `COMPAT_TARGET_OFF` — which turns
 
 | field | honored | where |
 |---|---|---|
-| `emit_hd` / `hd_line` | yes | `MemOpts::compat_hd_line` → `write_bam_header` |
+| `emit_hd` / `hd_line` | yes | `BwaIndex::sam_header` (upstream's `bwa_build_sam_hdr`) → `write_bam_header` |
 | `emit_mq` | yes | `compute_record_fields` |
 | `emit_hn` | yes | `compute_record_fields` |
 | `read_sidecar` | **no — deliberate** | see below |
 | `chain_flt_resurrect_empty` | inherited | read inside upstream's kernels (`bwamem.cpp`); nothing for the shim to do |
 | `sa_sentinel_drop_offset` | inherited | ditto (`bwamem.cpp`) |
-| `has_xb` (v0.17.0) | n/a | read only by the CLI's `--compat` divergence guard (`fastmap.cpp`), which refuses `-u` on a target without it. The `XA`/`XB` tag name and entry shape key off `MEM_F_XB` itself, and the shim's packed-BAM writer names the tag from that flag (`serialize_record`). `MemOpts` cannot set `MEM_F_XB`; only a raw `mem_opt_t` caller can. |
-| *(not a compat field)* `md_mode` (v0.17.0 `--md`) | yes | `compute_record_fields` omits MD under `MEM_MD_NONE` (`mem_reg2aln` builds none); `MEM_MD_SHORT` is emitted as built. `MemOpts` does not expose it; the default is `MEM_MD_FULL`. |
+| `has_xb` (v0.17.0) | n/a | read only by the CLI's `--compat` divergence guard (`fastmap.cpp`), which refuses `-u` on a target without it. The `XA`/`XB` tag name and entry shape key off `MEM_F_XB` itself, and the shim records that flag as `BwaAlignedFields::xa_is_xb` (`compute_record_fields`), which the packed-BAM writer (`serialize_record`) names the tag from and the structured sink reports as `AlignedFields::alt_hits` (`AltHits::Xa` / `AltHits::Xb`). `MemOpts` cannot set `MEM_F_XB`; only a raw `mem_opt_t` caller can. |
+| *(not a compat field)* `md_mode` (v0.17.0 `--md`) | yes | `compute_record_fields` omits MD under `MEM_MD_NONE` (`mem_reg2aln` builds none); `MEM_MD_SHORT` is emitted as built. Exposed as `MemOpts::set_md_mode` / `bwa-rs mem --md`; the default is `MEM_MD_FULL`. |
 
 `emit_hd` was a live bug until it was wired up: `write_bam_header` hardcoded
 `@HD VN:1.6 SO:unknown` while the CLI emitted `@HD VN:1.5 SO:unsorted GO:query`
 (`BWAMEM3_DEFAULT_HD_LINE`). That is the same failure upstream fixed in #288 by
-folding three drifted literals into one macro — we were a fourth. Read the line
-off the target; never spell it out. `bwa-mem3-rs-cli/tests/header_parity.rs`
-pins it.
+folding three drifted literals into one macro — we were a fourth. Since the
+v0.17.0 refresh the whole `@HD` + `@SQ` block comes from upstream's
+`bwa_build_sam_hdr` (`bwa_shim_header_text` → `BwaIndex::sam_header`), the
+builder its SAM-text and `--bam` writers share; the hand-written `@SQ SN/LN`
+lines it replaced had silently dropped `AH:*` on ALT contigs. Never spell the
+header out. `header_parity.rs` pins `@HD`/`@SQ`, and `cli_parity_alt.rs` the
+`AH:*`. Both builder inputs this crate passes as NULL are deliberate: the
+sidecar (below) and `@PG`, which names `bwa-rs`.
 
 `read_sidecar` is **not** implemented, by decision. It makes bwa-mem3 load an
 optional `<prefix>.hdr` / `<baseprefix>.dict` next to the index
@@ -409,8 +468,14 @@ optional `<prefix>.hdr` / `<baseprefix>.dict` next to the index
 (`M5`/`AS`/`UR`/`SP`) plus `@CO`/`@RG` into the header, with lh3/bwa#348's
 precedence rules. It is header provenance, not alignment output — **no emitted
 record changes** — and a half-right merge is worse than an honestly minimal
-header. Consequence: with a sidecar present, `bwa-rs`'s header is a strict
-subset of the CLI's. Records still match byte for byte. (Note the naming rule:
+header. Consequence: with a sidecar present, `bwa-rs`'s header differs from
+the CLI's. The CLI takes the sidecar's `@HD` and its whole `@SQ` block in place
+of the generated ones (under `--meth` it merges the sidecar's identity tags
+into the generated `@SQ` instead), and adds the sidecar's other records.
+Records still match byte for byte, unless the sidecar's `@SQ` order differs
+from the index's: upstream's BAM writer then remaps each record's `tid`/`mtid`
+by name (`bam_writer.cpp`'s `tid_map`), while `bwa-rs` keeps index order, so
+the same alignments carry different reference IDs. (Note the naming rule:
 for `ref.fasta` the fallback is `ref.dict`, *not* `ref.fasta.dict` — the GATK
 hg38 bundle ships the latter, so that index has no sidecar as far as bwa-mem3 is
 concerned.)
@@ -431,6 +496,29 @@ global read offset. The legacy `align_batch` uses ids from 0 and a per-batch
 pestat — which is why it is CLI-identical only when the batch IS the cohort.
 `three_phase_ffi.rs::first_pair_id_reaches_the_tie_break_hash` pins that the
 id is plumbed; the CLI-crate `three_phase_parity.rs` pins the formulas.
+
+The options must not change between phases either: regions scored under one
+`mem_opt_t` and then paired, rescued and passed through `mem_reg2aln` under
+another mix the two in one record (and regions read against another index
+abort or read its reference out of bounds, so `Seeds`, `AlnRegs` and
+`ResidentCohort` also record `BwaIndex::id` and every consuming call compares
+it). `Seeds`, `AlnRegs` and `ResidentCohort` carry `MemOpts::phase_snapshot`, the raw `mem_opt_t` bytes with the fields
+that cannot change the result blanked, and every consuming call compares it.
+Blanked: the emission-only knobs (`md_mode`, the `MEM_F_XB` bit) and the two
+the shim overrides on its per-call copy in every phase (`MEM_F_PE`, set per
+read group, and `n_threads`, forced to 1). A field a refresh adds is compared
+by default; if it is emission-only or shim-overridden, add it to the blanked
+set. A `ResidentCohort` binds its snapshot tentatively when its first
+seed-extend of a non-empty range reaches the native call (under the shared
+range lock, after every input check) and publishes it only on success, so a
+failed seed binds nothing. An empty range neither binds the phase snapshot nor
+is compared against it, at seed or at emit, though its options are still
+validated and its index still binds or is checked like any other call's.
+Concurrent first seeds share the tentative binding only when their options
+match, and `seed_extend_with_reps` admits its marks between the options check
+and the binding, so a closed memo binds nothing. `resolve_memo` and
+`infer_cohort` check the binding under the exclusive range lock, so they never
+see a tentative one.
 
 ### 17. Bindings are committed; regenerate them when `bwa_shim.h` changes
 

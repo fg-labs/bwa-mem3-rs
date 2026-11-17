@@ -1,0 +1,10 @@
+# Clippy settings for the stable lint path only: CI's lint job and the
+# pre-commit hook select this directory with CLIPPY_CONF_DIR. It is kept out of
+# the repository root so that clippy on the declared MSRV (1.75), which does
+# not know these keys and rejects the file, still runs. The key below needs
+# clippy 1.87 or newer; the hook omits this directory on older toolchains.
+#
+# Hold test code to the workspace MSRV (`rust-version`) too: clippy's
+# incompatible_msrv lint skips tests by default, and a test that needs a newer
+# std than the MSRV breaks `cargo test` on the toolchain we claim to support.
+check-incompatible-msrv-in-tests = true

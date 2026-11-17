@@ -25,7 +25,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bwa_mem3_rs::{align_batch, shm, BwaIndex, MemOpts, MethChem, ReadPair};
+use bwa_mem3_rs::{align_batch, shm, BwaIndex, MdMode, MemOpts, MethChem, MethContext, ReadPair};
 use clap::{Parser, Subcommand, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use noodles_bgzf as bgzf;
@@ -75,6 +75,19 @@ enum Cmd {
             default_missing_value = "emseq"
         )]
         meth: Option<MethChemArg>,
+        /// Where a methylation conversion is free (`--meth-context`): `all`
+        /// (every C; the default) or `cpg` (only at a CpG). `cpg` needs
+        /// `--meth=taps` or `--meth=5base`, as with `bwa-mem3`.
+        #[arg(long, value_name = "CTX", value_enum, requires = "meth")]
+        meth_context: Option<MethContextArg>,
+        /// How the MD tag is written: `full` (literal; the default), `short`
+        /// (only the mismatches NM counts; the same as `full` without
+        /// `--meth`) or `none`. Under `--meth`, `short` writes the conversions
+        /// the scoring frees as matches, so rebuilding the reference from
+        /// CIGAR + SEQ + MD yields the read's base there; keep `full` for
+        /// literal reference differences.
+        #[arg(long, value_name = "MODE", value_enum, default_value = "full")]
+        md: MdModeArg,
     },
     /// Manage indexes pinned in POSIX shared memory.
     Shm {
@@ -93,6 +106,45 @@ enum MethChemArg {
     /// v0.16.0+) is the same chemistry as far as the aligner is concerned.
     #[value(alias = "5base", alias = "5-base")]
     Taps,
+}
+
+/// `--meth-context`, spelled as `bwa-mem3 mem` accepts it.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MethContextArg {
+    /// A conversion is free at every C.
+    All,
+    /// A conversion is free only at a CpG.
+    Cpg,
+}
+
+impl From<MethContextArg> for MethContext {
+    fn from(arg: MethContextArg) -> Self {
+        match arg {
+            MethContextArg::All => MethContext::All,
+            MethContextArg::Cpg => MethContext::Cpg,
+        }
+    }
+}
+
+/// `--md`, spelled as `bwa-mem3 mem` accepts it.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MdModeArg {
+    /// The literal MD.
+    Full,
+    /// Only the mismatches NM counts.
+    Short,
+    /// No MD tag.
+    None,
+}
+
+impl From<MdModeArg> for MdMode {
+    fn from(arg: MdModeArg) -> Self {
+        match arg {
+            MdModeArg::Full => MdMode::Full,
+            MdModeArg::Short => MdMode::Short,
+            MdModeArg::None => MdMode::None,
+        }
+    }
 }
 
 impl From<MethChemArg> for MethChem {
@@ -134,6 +186,8 @@ fn main() -> Result<()> {
             batch_size,
             min_seed_len,
             meth,
+            meth_context,
+            md,
         } => run_mem(
             &prefix,
             &r1,
@@ -142,6 +196,8 @@ fn main() -> Result<()> {
             batch_size,
             min_seed_len,
             meth.map(MethChem::from),
+            meth_context.map(MethContext::from),
+            md.into(),
         ),
         Cmd::Shm { action } => run_shm(action),
     }
@@ -171,24 +227,21 @@ fn run_mem(
     batch_size: usize,
     min_seed_len: Option<i32>,
     meth: Option<MethChem>,
+    meth_context: Option<MethContext>,
+    md: MdMode,
 ) -> Result<()> {
-    // In --meth mode the seed index is `<prefix>.meth` and the original
-    // reference is `<prefix>` (built together by `bwa-mem3 index --meth`).
-    let idx = if meth.is_some() {
-        let mut seed = prefix.as_os_str().to_owned();
-        seed.push(".meth");
-        let seed = std::path::PathBuf::from(seed);
-        BwaIndex::load_meth(&seed, prefix)
-            .with_context(|| format!("loading meth dual index {seed:?} / {prefix:?}"))?
-    } else {
-        BwaIndex::load(prefix).with_context(|| format!("loading index {prefix:?}"))?
-    };
+    // Options first, as `bwa-mem3 mem` does: an invalid combination (e.g.
+    // `--meth-context cpg` with em-seq) fails before a multi-GB index load.
     let mut opts = MemOpts::new()?;
-    opts.set_pe(true);
+    opts.set_pe(true).set_md_mode(md);
     if let Some(chem) = meth {
         opts.set_meth(true);
-        // Before the defaults: TAPS changes the scoring mode they pick.
+        // Before the defaults: TAPS changes the scoring mode they pick, and
+        // they validate the context against the chemistry and scoring.
         opts.set_meth_chem(chem);
+        if let Some(ctx) = meth_context {
+            opts.set_meth_context(ctx);
+        }
         // What `bwa-mem3 mem --meth` sets, so `bwa-rs mem --meth` is a drop-in
         // for it: the bwameth-compatibility bundle, the TAPS scoring default,
         // and SPEC30 seed pruning (which changes output). The bundle is
@@ -212,24 +265,39 @@ fn run_mem(
         // overwritten. `-B` is the awkward one: the bundle writes it only under
         // COLLAPSED scoring, so it must come after under COLLAPSED but survives
         // the call under GENOMIC/NEUTRAL.
-        opts.apply_meth_defaults();
+        opts.apply_meth_defaults()?;
     }
     if let Some(k) = min_seed_len {
         opts.set_min_seed_len(k);
     }
+
+    // In --meth mode the seed index is `<prefix>.meth` and the original
+    // reference is `<prefix>` (built together by `bwa-mem3 index --meth`).
+    let idx = if meth.is_some() {
+        let mut seed = prefix.as_os_str().to_owned();
+        seed.push(".meth");
+        let seed = std::path::PathBuf::from(seed);
+        BwaIndex::load_meth(&seed, prefix)
+            .with_context(|| format!("loading meth dual index {seed:?} / {prefix:?}"))?
+    } else {
+        BwaIndex::load(prefix).with_context(|| format!("loading index {prefix:?}"))?
+    };
 
     let r1 = open_fastq(r1_path)?;
     let r2 = open_fastq(r2_path)?;
     let mut r1_it = noodles_fastq::io::Reader::new(r1);
     let mut r2_it = noodles_fastq::io::Reader::new(r2);
 
+    // Build the header before opening the output, so a header error leaves
+    // an existing destination file untouched rather than truncated.
+    let header_text = bam_header_text(&idx, &opts)?;
     let out: Box<dyn Write> = match output {
         Some(p) => Box::new(File::create(p).with_context(|| format!("create {p:?}"))?),
         None => Box::new(io::stdout().lock()),
     };
     let mut bgzf_writer = bgzf::io::Writer::new(out);
 
-    write_bam_header(&mut bgzf_writer, &idx, &opts)?;
+    write_bam_header(&mut bgzf_writer, &idx, &header_text)?;
 
     // Buffers: we accumulate full Record structures so lifetime-free
     // ownership is easy. Each inner Vec holds name + seq + qual.
@@ -315,60 +383,46 @@ fn open_fastq(path: &std::path::Path) -> Result<Box<dyn BufRead>> {
     }
 }
 
-/// Emit a minimal BAM header: magic + l_text + @HD + @SQ lines +
-/// n_ref + per-ref (l_name + name + NUL + l_ref).
+/// The SAM header text the BAM carries: `@HD` + `@SQ` lines, then this
+/// program's `@PG`.
 ///
 /// # Compat-target coverage
 ///
 /// `compat_target_t` (bwa-mem3 v0.9.0) carries the output-shaping switches;
 /// CLAUDE.md gotcha #15 tabulates each one. This writer honors `emit_hd` /
-/// `hd_line` via [`MemOpts::compat_hd_line`]; the record emitter honors
-/// `emit_mq` and `emit_hn`. `read_sidecar` is **deliberately not
-/// implemented**: it makes bwa-mem3 load an optional
+/// `hd_line` through bwa-mem3's own `bwa_build_sam_hdr`
+/// ([`BwaIndex::sam_header`]), which also writes `AH:*` on ALT contigs' `@SQ`;
+/// the record emitter honors `emit_mq` and `emit_hn`. `read_sidecar` is
+/// **deliberately not implemented**: it makes bwa-mem3 load an optional
 /// `<prefix>.hdr` / `<baseprefix>.dict` alongside the index and merge its
 /// richer `@SQ` (`M5`/`AS`/`UR`/`SP`) plus any `@CO`/`@RG` into the header
 /// (`bwa_load_hdr_from_index`, bwa.cpp:987). That is header *provenance*
 /// metadata, not alignment output — every record this crate emits is
 /// unaffected — and a partial merge that got lh3/bwa#348's precedence rules
 /// subtly wrong would be worse than a header that is honestly minimal. So:
-/// with a sidecar present next to the index, this header is a strict subset of
-/// what `bwa-mem3 mem` would write. Records still match byte for byte.
-fn write_bam_header<W: Write>(w: &mut W, idx: &BwaIndex, opts: &MemOpts) -> Result<()> {
-    // Build the SAM header text.
-    let mut text = String::new();
-    // From the compat target, never a literal: see MemOpts::compat_hd_line.
-    if let Some(hd) = opts.compat_hd_line() {
-        text.push_str(hd);
-        text.push('\n');
-    }
-    for (name, len) in idx.contigs() {
-        text.push_str(&format!("@SQ\tSN:{name}\tLN:{len}\n"));
-    }
+/// with a sidecar present next to the index, this header's `@HD`/`@SQ` can
+/// differ from what `bwa-mem3 mem` would write (the CLI takes the sidecar's
+/// `@HD` and `@SQ` block, or under `--meth` merges its identity tags into the
+/// generated `@SQ`) and it lacks the sidecar's other records. Records still
+/// match byte for byte, unless the sidecar lists the contigs in a different
+/// order: the CLI's BAM writer then remaps each record's `tid`/`mtid` onto the
+/// sidecar's order, while bwa-rs keeps the index's, so the same alignments
+/// carry different reference IDs.
+fn bam_header_text(idx: &BwaIndex, opts: &MemOpts) -> Result<String> {
+    // @HD and @SQ from bwa-mem3's own header builder, so they cannot drift
+    // from the CLI's (@HD from the compat target, AH:* on ALT contigs).
+    let mut text = idx.sam_header(opts)?;
     text.push_str("@PG\tID:bwa-rs\tPN:bwa-rs\tVN:");
     text.push_str(env!("CARGO_PKG_VERSION"));
     text.push('\n');
+    Ok(text)
+}
 
-    let text_bytes = text.as_bytes();
-    // magic
-    w.write_all(b"BAM\x01")?;
-    // l_text
-    w.write_all(&u32::try_from(text_bytes.len())?.to_le_bytes())?;
-    w.write_all(text_bytes)?;
-
-    // n_ref
-    let n_ref = u32::try_from(idx.n_contigs())?;
-    w.write_all(&n_ref.to_le_bytes())?;
-    for (name, len) in idx.contigs() {
-        let name_bytes = name.as_bytes();
-        // l_name = strlen + NUL
-        let l_name = u32::try_from(name_bytes.len() + 1)?;
-        w.write_all(&l_name.to_le_bytes())?;
-        w.write_all(name_bytes)?;
-        w.write_all(b"\0")?;
-        // l_ref
-        w.write_all(&u32::try_from(len)?.to_le_bytes())?;
-    }
-
+/// Emit the binary BAM header around `text` (from [`bam_header_text`]):
+/// [`BwaIndex::bam_header`], whose reference list is the index's contigs in the
+/// order records' `tid`/`mtid` index.
+fn write_bam_header<W: Write>(w: &mut W, idx: &BwaIndex, text: &str) -> Result<()> {
+    w.write_all(&idx.bam_header(text)?)?;
     Ok(())
 }
 
@@ -380,6 +434,32 @@ fn _ensure_read_trait_in_scope<R: Read>(_: R) {}
 mod tests {
     use super::*;
     use bwa_mem3_rs::MethScoring;
+
+    /// As `bwa-mem3 mem` does, any explicit `--meth-context` (even the default
+    /// `all`) is refused without `--meth`.
+    #[test]
+    fn meth_context_requires_meth() {
+        for ctx in ["all", "cpg"] {
+            let err = Cli::try_parse_from(["bwa-rs", "mem", "p", "a", "b", "--meth-context", ctx])
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{ctx}"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "bwa-rs",
+            "mem",
+            "p",
+            "a",
+            "b",
+            "--meth=taps",
+            "--meth-context",
+            "cpg"
+        ])
+        .is_ok());
+    }
 
     /// Pins every knob in the `--meth` bundle against upstream's list in
     /// `mem_opt_apply_meth_defaults` (`bwamem.cpp:504`, called from
@@ -395,7 +475,7 @@ mod tests {
     fn meth_defaults_match_upstreams_bwameth_bundle() {
         let mut opts = MemOpts::new().unwrap();
         opts.set_meth(true);
-        opts.apply_meth_defaults();
+        opts.apply_meth_defaults().unwrap();
 
         assert_eq!(opts.minimum_score(), 40, "bwameth -T 40");
         assert_eq!(opts.clip_penalty(), (10, 10), "bwameth -L 10,10");
@@ -436,7 +516,7 @@ mod tests {
         opts.set_meth_scoring(MethScoring::Collapsed);
         // Before the call: `a` is an input the constants are scaled by.
         opts.set_match_score(3);
-        opts.apply_meth_defaults();
+        opts.apply_meth_defaults().unwrap();
 
         assert_eq!(opts.minimum_score(), 120, "bwameth -T 40, scaled by a=3");
         assert_eq!(
@@ -518,7 +598,7 @@ mod tests {
             opts.set_meth(true);
             opts.set_meth_scoring(scoring);
             opts.set_mismatch_penalty(7);
-            opts.apply_meth_defaults();
+            opts.apply_meth_defaults().unwrap();
             assert_eq!(
                 opts.mismatch_penalty(),
                 7,
@@ -532,7 +612,7 @@ mod tests {
         opts.set_meth(true);
         opts.set_meth_scoring(MethScoring::Collapsed);
         opts.set_mismatch_penalty(7);
-        opts.apply_meth_defaults();
+        opts.apply_meth_defaults().unwrap();
         assert_eq!(
             opts.mismatch_penalty(),
             2,
@@ -547,7 +627,7 @@ mod tests {
         let mut opts = MemOpts::new().unwrap();
         opts.set_meth(true);
         opts.set_meth_scoring(MethScoring::Genomic);
-        opts.apply_meth_defaults();
+        opts.apply_meth_defaults().unwrap();
 
         assert_eq!(
             opts.mismatch_penalty(),

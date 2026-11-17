@@ -33,6 +33,7 @@ thiserror = "1"
 anyhow = "1"
 
 [dev-dependencies]
+bwa-mem3-test-util = { path = "../bwa-mem3-test-util" }
 tempfile = "3"
 rstest = "0.18"
 rayon = "1"

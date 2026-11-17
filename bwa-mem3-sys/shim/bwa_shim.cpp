@@ -73,11 +73,16 @@ extern "C" {
      * real struct are asserted layout-identical at build time, so passing the
      * POD pointer through is sound. */
     const char *shim_compat_hd_line(const mem_opt_t *opts);
+    /* Calls upstream's bwa_build_sam_hdr with opt->compat (opaque here, as
+     * above), so it too lives in bwa_shim_align.cpp. */
+    char *shim_align_header_text(void *fmi, const mem_opt_t *opts);
     /* Calls upstream's mem_opt_apply_meth_defaults, which has C++ linkage
      * (bwamem.h declares it outside any extern "C" block -- see gotcha #5), so
      * it can only be reached from bwa_shim_align.cpp where the real header is
      * included. */
-    void shim_opts_apply_meth_defaults(mem_opt_t *opts, unsigned explicit_mask);
+    const char *shim_opts_apply_meth_defaults(mem_opt_t *opts, unsigned explicit_mask);
+    /* Needs upstream's meth enums, so it lives beside the above. */
+    const char *shim_opts_meth_context_error(const mem_opt_t *opts, int resolve_taps_default);
 
     struct ShimSeeds;
     struct ShimScratch; struct ShimRegs;
@@ -303,31 +308,87 @@ extern "C" const char *bwa_shim_compat_hd_line(const mem_opt_t *opts) {
     return shim_compat_hd_line(opts);
 }
 
-extern "C" void bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts) {
-    if (opts) shim_opts_apply_meth_defaults(opts, 0u);
+/* Whether `b` can be stored in the scoring matrices: bwa_fill_scmat negates it
+ * as an int (overflow at INT_MIN) and stores int8_t cells. Every refill is
+ * skipped while it cannot, leaving every matrix (mat, mat_ot/mat_ob and the
+ * cpg 7x7 pair) as it was; such options are refused at every alignment entry
+ * point anyway (shim_opts_alignable), and the next storable b rebuilds them.
+ * The one copy of this rule (MemOpts::refill_matrices reaches it through
+ * bwa_shim_opts_fill_scmat). */
+static bool shim_b_storable(const mem_opt_t *opts) {
+    return opts->b >= 0 && opts->b <= 128;
 }
 
-extern "C" void bwa_shim_opts_apply_meth_defaults_masked(mem_opt_t *opts, unsigned explicit_mask) {
-    if (opts) shim_opts_apply_meth_defaults(opts, explicit_mask);
+/* The C alignment entry points' own refusal of an unstorable b. MemOpts runs
+ * the full check (MemOpts::validate_for_alignment) before any of them, but a
+ * raw mem_opt_t caller does not, and would otherwise align with matrices that
+ * still hold the last storable penalty while opt->b, which the MAPQ model and
+ * primary marking read, holds the new one. */
+static bool shim_opts_alignable(const mem_opt_t *opts, const char *what) {
+    if (shim_b_storable(opts)) return true;
+    shim_set_err("%s: the effective mismatch penalty is %d, outside 0..128; the scoring "
+                 "matrices cannot hold it (set a storable opts->b, then "
+                 "bwa_shim_opts_fill_scmat)", what, opts->b);
+    return false;
+}
+
+extern "C" int bwa_shim_opts_apply_meth_defaults_masked(mem_opt_t *opts, unsigned explicit_mask) {
+    shim_clear_err();
+    if (opts == NULL) {
+        shim_set_err("null opts");
+        return -1;
+    }
+    /* The bundle multiplies the match score by up to 100 (pen_unpaired), which
+     * overflows int -- undefined behaviour -- for an `a` the setters accept but
+     * main_mem's parser never would. Refuse it with that parser's range, and
+     * MemOpts::check_effective_scoring's message (a unit test pins the two
+     * equal), before anything is written. Only the bundle multiplies, so only
+     * meth_mode needs it. */
+    if (opts->meth_mode && (opts->a < 1 || opts->a > 127)) {
+        shim_set_err("-A match score must be an integer in 1..127 (got %d): a score of 0 or less "
+                     "leaves nothing to align, and the alignment kernels store it in 8 bits "
+                     "(MemOpts::set_match_score)",
+                     opts->a);
+        return -1;
+    }
+    const char *err = shim_opts_apply_meth_defaults(opts, explicit_mask);
+    if (err) {
+        shim_set_err("%s", err);
+        return -1;
+    }
+    bwa_shim_opts_fill_scmat(opts);
+    return 0;
+}
+
+extern "C" int bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts) {
+    return bwa_shim_opts_apply_meth_defaults_masked(opts, 0u);
+}
+
+extern "C" const char *bwa_shim_opts_meth_context_error(const mem_opt_t *opts) {
+    return opts ? shim_opts_meth_context_error(opts, 0) : "null opts";
 }
 
 /* D3 (--meth): (re)build the per-hypothesis bisulfite scoring matrices
  * (mat_ot / mat_ob) from `mat` per opt->meth_scoring. mem_opt_init already
  * calls this once; Rust must call it again after changing meth_scoring so the
- * meth matrices stay consistent (see MemOpts::set_meth / set_meth_scoring). */
+ * meth matrices stay consistent (see MemOpts::set_meth / set_meth_scoring).
+ * Skipped while b is unstorable, like every other refill: `mat` is then stale,
+ * and the next storable b rebuilds both through bwa_shim_opts_fill_scmat. */
 extern "C" void bwa_shim_opts_fill_meth_mat(mem_opt_t *opts) {
-    if (opts) mem_opt_fill_meth_mat(opts);
+    if (opts && shim_b_storable(opts)) mem_opt_fill_meth_mat(opts);
 }
 
 extern "C" void bwa_shim_opts_fill_scmat(mem_opt_t *opts) {
     if (!opts) return;
-    bwa_fill_scmat(opts->a, opts->b, opts->mat);
-    /* Unconditional, mirroring main_mem (fastmap.cpp:2726, :2730): the meth
-     * matrices are
-     * copies of opts->mat, so a stale pair would silently ignore the new
-     * scores the moment --meth is enabled. Harmless outside --meth, where
-     * mat_ot / mat_ob are never read. */
-    mem_opt_fill_meth_mat(opts);
+    /* An unstorable b keeps the previous matrices (shim_b_storable). Otherwise
+     * the meth matrices are refilled with mat, mirroring main_mem
+     * (fastmap.cpp:2726, :2730): they are copies of opts->mat, so a stale pair
+     * would silently ignore the new scores the moment --meth is enabled.
+     * Harmless outside --meth, where mat_ot / mat_ob are never read. */
+    if (shim_b_storable(opts)) {
+        bwa_fill_scmat(opts->a, opts->b, opts->mat);
+        mem_opt_fill_meth_mat(opts);
+    }
 }
 
 extern "C" int bwa_shim_opts_set_int(mem_opt_t *opts, const char *key, int value) {
@@ -457,6 +518,21 @@ extern "C" int64_t bwa_shim_idx_contig_len(const BwaIndex *h, size_t i) {
     return shim_align_idx_contig_len(h->fmi, i);
 }
 
+extern "C" char *bwa_shim_header_text(const BwaIndex *h, const mem_opt_t *opts) {
+    shim_clear_err();
+    if (!h || !h->fmi || !opts) {
+        shim_set_err("null arg");
+        return NULL;
+    }
+    char *text = shim_align_header_text(h->fmi, opts);
+    if (!text) shim_set_err("out of memory building the SAM header");
+    return text;
+}
+
+extern "C" void bwa_shim_header_text_free(char *text) {
+    free(text);
+}
+
 /* -------- seeds / batches ----------------------------------------- */
 
 /* BwaBatch wraps the ShimAlignOutput produced by shim_align_batch.
@@ -479,6 +555,7 @@ extern "C" BwaSeeds *bwa_shim_seed_batch(
         shim_set_err("null arg");
         return NULL;
     }
+    if (!shim_opts_alignable(opts, "seed_batch")) return NULL;
     ShimSeeds *inner = shim_seed_batch(
         idx->fmi, opts,
         reinterpret_cast<const ShimReadPair *>(pairs), n_pairs);
@@ -511,6 +588,10 @@ extern "C" BwaBatch *bwa_shim_extend_batch(
         shim_set_err("null arg");
         return NULL;
     }
+    if (!shim_opts_alignable(opts, "extend_batch")) {
+        bwa_shim_seeds_free(seeds);
+        return NULL;
+    }
     /* Transfer the ShimSeeds ownership into the shim bridge. */
     ShimSeeds *inner_seeds = seeds->inner;
     seeds->inner = nullptr;
@@ -538,6 +619,7 @@ extern "C" BwaBatch *bwa_shim_align_batch(
         shim_set_err("null arg");
         return NULL;
     }
+    if (!shim_opts_alignable(opts, "align_batch")) return NULL;
     /* Cast our BwaReadPair (from bwa_shim.h) to the bridge's ShimReadPair.
      * Both have identical layout (same fields in same order). */
     ShimAlignOutput *inner = shim_align_batch(
@@ -564,6 +646,7 @@ extern "C" int bwa_shim_estimate_pestat(
         shim_set_err("null arg");
         return -1;
     }
+    if (!shim_opts_alignable(opts, "estimate_pestat")) return -1;
     return shim_estimate_pestat(
         idx->fmi, opts,
         reinterpret_cast<const ShimReadPair *>(pairs), n_pairs, pestat_out);
@@ -598,6 +681,7 @@ extern "C" BwaRegs *bwa_shim_seed_extend(const BwaIndex *idx, const mem_opt_t *o
     if (!idx || !opts || !sc || !batch) { shim_set_err("null arg"); return NULL; }
     if (batch->n_pairs > 0 && !batch->pairs) { shim_set_err("null pairs"); return NULL; }
     if (batch->n_singles > 0 && !batch->singles) { shim_set_err("null singles"); return NULL; }
+    if (!shim_opts_alignable(opts, "seed_extend")) return NULL;
     ShimRegs *inner = shim_seed_extend(idx->fmi, opts, sc->inner,
                                        reinterpret_cast<const ShimReadBatch *>(batch));
     if (!inner) {
@@ -621,6 +705,7 @@ extern "C" int bwa_shim_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts
                                       const BwaRegs *const *regs, size_t n_regs, mem_pestat_t *out) {
     shim_clear_err();
     if (!idx || !opts || !out || (n_regs > 0 && !regs)) { shim_set_err("null arg"); return -1; }
+    if (!shim_opts_alignable(opts, "pestat_cohort")) return -1;
     /* Unwrap the handles into a bridge array. */
     const ShimRegs **inner = (const ShimRegs **) malloc((n_regs ? n_regs : 1) * sizeof(*inner));
     if (!inner) { shim_set_err("malloc failed"); return -1; }
@@ -641,6 +726,7 @@ extern "C" int bwa_shim_pair_emit(const BwaIndex *idx, const mem_opt_t *opts, Bw
     if (!regs) { shim_set_err("null regs"); return -1; }
     ShimRegs *inner = regs->inner; regs->inner = NULL; free(regs);   /* consumed on every path */
     if (!idx || !opts || !sc || !sink) { shim_regs_free(inner); shim_set_err("null arg"); return -1; }
+    if (!shim_opts_alignable(opts, "pair_emit")) { shim_regs_free(inner); return -1; }
     ShimIdBases sids = { ids.first_single_id, ids.first_pair_id };
     int rc = shim_pair_emit(idx->fmi, opts, sc->inner, inner, pestat, sids,
                             reinterpret_cast<ShimRecordSinkFn>(sink), ctx);
@@ -749,6 +835,7 @@ extern "C" int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_
                                              BwaScratch *sc, BwaResidentSegment *sg) {
     shim_clear_err();
     if (!idx || !opts || !sc || !sg) { shim_set_err("null arg"); return -1; }
+    if (!shim_opts_alignable(opts, "resident_seed_extend")) return -1;
     return resident_status(shim_resident_seed_extend(idx->fmi, opts, sc->inner, shim_seg(sg)),
                            "resident_seed_extend");
 }
@@ -757,6 +844,7 @@ extern "C" int bwa_shim_resident_seed_extend_reps(const BwaIndex *idx, const mem
                                                   const int64_t *reps, size_t n_pairs) {
     shim_clear_err();
     if (!idx || !opts || !sc || !sg) { shim_set_err("null arg"); return -1; }
+    if (!shim_opts_alignable(opts, "resident_seed_extend_reps")) return -1;
     return resident_status(shim_resident_seed_extend_reps(idx->fmi, opts, sc->inner,
                                                           shim_seg(sg), reps, n_pairs),
                            "resident_seed_extend_reps");
@@ -766,6 +854,7 @@ extern "C" int bwa_shim_resident_resolve_memo(const BwaIndex *idx, const mem_opt
                                               BwaMemoStats *out) {
     shim_clear_err();
     if (!idx || !opts || !sc || !c || !out) { shim_set_err("null arg"); return -1; }
+    if (!shim_opts_alignable(opts, "resident_resolve_memo")) return -1;
     ShimMemoStats st = { 0, 0, 0 };
     int rc = shim_resident_resolve_memo(idx->fmi, opts, sc->inner, c->inner, &st);
     /* Name the lifecycle violation: the Rust wrapper surfaces the message. */
@@ -787,6 +876,7 @@ extern "C" int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_op
                                                const BwaResidentCohort *c, mem_pestat_t *out) {
     shim_clear_err();
     if (!idx || !opts || !c || !out) { shim_set_err("null arg"); return -1; }
+    if (!shim_opts_alignable(opts, "resident_pestat_cohort")) return -1;
     return resident_status(shim_resident_pestat_cohort(idx->fmi, opts, c->inner, out),
                            "resident_pestat_cohort");
 }
@@ -797,6 +887,7 @@ extern "C" int bwa_shim_resident_pair_emit(const BwaIndex *idx, const mem_opt_t 
                                            void *ctx) {
     shim_clear_err();
     if (!idx || !opts || !sc || !sg || !sink) { shim_set_err("null arg"); return -1; }
+    if (!shim_opts_alignable(opts, "resident_pair_emit")) return -1;
     ShimIdBases sids = { ids.first_single_id, ids.first_pair_id };
     return resident_status(
         shim_resident_pair_emit(idx->fmi, opts, sc->inner, shim_seg(sg), pestat, sids,
@@ -810,6 +901,7 @@ extern "C" int bwa_shim_resident_pair_emit_fields(const BwaIndex *idx, const mem
                                                   void *ctx) {
     shim_clear_err();
     if (!idx || !opts || !sc || !sg || !sink) { shim_set_err("null arg"); return -1; }
+    if (!shim_opts_alignable(opts, "resident_pair_emit_fields")) return -1;
     ShimIdBases sids = { ids.first_single_id, ids.first_pair_id };
     return resident_status(
         shim_resident_pair_emit_fields(idx->fmi, opts, sc->inner, shim_seg(sg), pestat, sids,
