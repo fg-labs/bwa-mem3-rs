@@ -81,7 +81,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned rather than ubuntu-latest, like the arm row: apt.llvm.org
+          # publishes no llvm-toolchain-19 repo for Ubuntu 26.04 (resolute),
+          # which ubuntu-latest now resolves to (see the clang-19 step).
+          - os: ubuntu-24.04
             bwa_arch: avx2
           - os: ubuntu-24.04-arm
             bwa_arch: arm64

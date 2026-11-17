@@ -128,7 +128,11 @@ jobs:
     # runs here too but only checks flag bits against hardcoded expectations
     # after a bwa-mem3 `index`; it never invokes the CLI aligner, so it is
     # not part of the byte-for-byte comparison.
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: the clang-19 step below needs an
+    # apt.llvm.org repo for the runner's codename, and apt.llvm.org publishes
+    # no llvm-toolchain-19 repo for Ubuntu 26.04 (resolute), which
+    # ubuntu-latest now resolves to.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Install build deps + samtools
