@@ -383,27 +383,27 @@ void bwamem3_simd_init(void)
 std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
     int o_del, int e_del, int o_ins, int e_ins, int zdrop,
     int end_bonus, const int8_t *mat,
-    int8_t w_match, int8_t w_mismatch, int numThreads)
+    int8_t w_match, int8_t w_mismatch, int numThreads, int m)
 {
     bwamem3_simd_init();
     IBandedPairWiseSW *raw;
     switch (g_tier) {
       case BWAMEM3_TIER_AVX512BW:
-        raw = make_bsw_kernel_avx512bw(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
-                                       mat, w_match, w_mismatch, numThreads); break;
+        raw = make_bsw_kernel_m_avx512bw(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                         mat, w_match, w_mismatch, numThreads, m); break;
       case BWAMEM3_TIER_AVX2:
-        raw = make_bsw_kernel_avx2(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
-                                   mat, w_match, w_mismatch, numThreads); break;
+        raw = make_bsw_kernel_m_avx2(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                     mat, w_match, w_mismatch, numThreads, m); break;
       case BWAMEM3_TIER_AVX:
-        raw = make_bsw_kernel_avx(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
-                                  mat, w_match, w_mismatch, numThreads); break;
+        raw = make_bsw_kernel_m_avx(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                    mat, w_match, w_mismatch, numThreads, m); break;
       case BWAMEM3_TIER_SSE42:
-        raw = make_bsw_kernel_sse42(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
-                                    mat, w_match, w_mismatch, numThreads); break;
+        raw = make_bsw_kernel_m_sse42(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                      mat, w_match, w_mismatch, numThreads, m); break;
       case BWAMEM3_TIER_SSE41:
       default:
-        raw = make_bsw_kernel_sse41(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
-                                    mat, w_match, w_mismatch, numThreads); break;
+        raw = make_bsw_kernel_m_sse41(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                      mat, w_match, w_mismatch, numThreads, m); break;
     }
     return std::unique_ptr<IBandedPairWiseSW>(raw);
 }
@@ -414,27 +414,27 @@ std::unique_ptr<Ikswv> make_kswv(
     int o_del, int e_del, int o_ins, int e_ins,
     int8_t w_match, int8_t w_mismatch,
     int numThreads, int32_t maxRefLen, int32_t maxQerLen,
-    const int8_t *mat25)
+    const int8_t *mat25, bool meth_cpg)
 {
     bwamem3_simd_init();
     Ikswv *raw;
     switch (g_tier) {
       case BWAMEM3_TIER_AVX512BW:
         raw = make_kswv_kernel_avx512bw_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                            numThreads, maxRefLen, maxQerLen, mat25); break;
+                                            numThreads, maxRefLen, maxQerLen, mat25, meth_cpg); break;
       case BWAMEM3_TIER_AVX2:
         raw = make_kswv_kernel_avx2_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                        numThreads, maxRefLen, maxQerLen, mat25); break;
+                                        numThreads, maxRefLen, maxQerLen, mat25, meth_cpg); break;
       case BWAMEM3_TIER_AVX:
         raw = make_kswv_kernel_avx_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                       numThreads, maxRefLen, maxQerLen, mat25); break;
+                                       numThreads, maxRefLen, maxQerLen, mat25, meth_cpg); break;
       case BWAMEM3_TIER_SSE42:
         raw = make_kswv_kernel_sse42_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                         numThreads, maxRefLen, maxQerLen, mat25); break;
+                                         numThreads, maxRefLen, maxQerLen, mat25, meth_cpg); break;
       case BWAMEM3_TIER_SSE41:
       default:
         raw = make_kswv_kernel_sse41_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                         numThreads, maxRefLen, maxQerLen, mat25); break;
+                                         numThreads, maxRefLen, maxQerLen, mat25, meth_cpg); break;
     }
     return std::unique_ptr<Ikswv>(raw);
 }
@@ -455,11 +455,11 @@ std::unique_ptr<Ikswv> make_kswv(
 std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
     int o_del, int e_del, int o_ins, int e_ins, int zdrop,
     int end_bonus, const int8_t *mat,
-    int8_t w_match, int8_t w_mismatch, int numThreads)
+    int8_t w_match, int8_t w_mismatch, int numThreads, int m)
 {
     return std::unique_ptr<IBandedPairWiseSW>(
         new BandedPairWiseSW(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
-                             mat, w_match, w_mismatch, numThreads));
+                             mat, w_match, w_mismatch, numThreads, m));
 }
 
 /* Mat-aware factory (issue 173): single unsuffixed arm64 kswv, constructed via
@@ -468,11 +468,11 @@ std::unique_ptr<Ikswv> make_kswv(
     int o_del, int e_del, int o_ins, int e_ins,
     int8_t w_match, int8_t w_mismatch,
     int numThreads, int32_t maxRefLen, int32_t maxQerLen,
-    const int8_t *mat25)
+    const int8_t *mat25, bool meth_cpg)
 {
     return std::unique_ptr<Ikswv>(
         new kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                 numThreads, maxRefLen, maxQerLen, mat25));
+                 numThreads, maxRefLen, maxQerLen, mat25, meth_cpg));
 }
 
 /* 9-arg factory: delegates with mat25 == nullptr (original behavior). */
@@ -526,6 +526,7 @@ extern "C" unsigned long ksw_g2_wave16_exec_count##suffix(void);                
 extern "C" int ksw_g2_wave16_wmin##suffix(void);                                      \
 extern "C" int ksw_g2_wave_wmin##suffix(void);                                        \
 extern "C" unsigned long ksw_g2_wave_zr_capacity##suffix(void);                       \
+extern "C" void ksw_g2_wave_set_zr_poison##suffix(int byte);                          \
 extern "C" int ksw_global##suffix(int qlen, const uint8_t *query, int tlen,           \
     const uint8_t *target, int m, const int8_t *mat, int gapo, int gape,              \
     int w, int *n_cigar, uint32_t **cigar);                                           \
@@ -632,6 +633,12 @@ extern "C" int ksw_g2_wave_wmin(void) {
 extern "C" unsigned long ksw_g2_wave_zr_capacity(void) {
     bwamem3_simd_init();
     KSW_DISPATCH_CALL(ksw_g2_wave_zr_capacity);
+}
+
+/* Test-only: poison the active tier's direction-byte store (see ksw.cpp). */
+extern "C" void ksw_g2_wave_set_zr_poison(int byte) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_g2_wave_set_zr_poison, byte);
 }
 
 extern "C" int ksw_global(int qlen, const uint8_t *query, int tlen,

@@ -124,6 +124,9 @@ extern "C" {
 	/* Build the .pac path bns_restore opens for `prefix` ("<prefix>.pac") into
 	 * `out` (sized `outsz`, e.g. PATH_MAX); aborts if it would not fit. */
 	void bns_pac_path(char *out, size_t outsz, const char *prefix);
+	/* The same for the .alt sidecar bns_restore reads the ALT contig names from
+	 * ("<prefix>.alt"); `mem --alt-project` reads the alignments from it too. */
+	void bns_alt_path(char *out, size_t outsz, const char *prefix);
 	bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, const char* pac_filename);
 	void bns_destroy(bntseq_t *bns);
 	int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only);
@@ -142,6 +145,11 @@ extern "C" {
 	typedef int (*bns_amb_visit_fn)(int64_t amb_st, int64_t amb_en, void *ctx);
 	int bns_iter_ambi(const bntseq_t *bns, int64_t pos_f, int len,
 	                  bns_amb_visit_fn fn, void *ctx);
+	/* Whether forward-strand bases [a, a + len) and [b, b + len) of the 2-bit
+	 * `pac` are identical. Both ranges must lie in [0, l_pac). Ambiguous (N)
+	 * positions compare by their stored 2-bit code, as bns_get_seq_into decodes
+	 * them. */
+	int bns_pac_fwd_equal(int64_t l_pac, const uint8_t *pac, int64_t a, int64_t b, int64_t len);
 	/* Decode forward/reverse-complement bases [beg, end) of `pac` into
 	 * caller-provided `dst` (capacity must be >= max(end - beg, 0)).
 	 * `dst` is filled with 2-bit-decoded bases (0..3 = A/C/G/T); ambiguous
