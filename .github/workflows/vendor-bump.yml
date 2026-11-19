@@ -189,8 +189,10 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ inputs.tag }}
+          TARGET_SHA: ${{ steps.detect.outputs.latest_sha }}
         run: |
           set -euo pipefail
+          source scripts/bwa-mem3-bump-existing.sh
           branch="vendor-bump/bwa-mem3-${{ steps.detect.outputs.latest_version }}"
           # Exported, not recomputed at the issue-creation site: the dedup
           # lookup below matches on this exact string, so two independent
@@ -206,6 +208,10 @@ jobs:
           found="$(gh pr list --head "$branch" --state all --json number,state \
                      --jq '.[0] | select(.) | "\(.number):\(.state)"')"
           echo "found=$found" >> "$GITHUB_OUTPUT"
+
+          issue_number=""
+          issue_exists=false
+          issue_lookup_ok=1
 
           # Fail CLOSED toward "skip creation", not open toward "create
           # another one": a missed tracking issue is a human noticing a
@@ -226,20 +232,29 @@ jobs:
           # misses the real tracking issue and files a duplicate, which is the
           # exact loop this lookup exists to prevent. The REST endpoint returns
           # PRs alongside issues, so pull_request-bearing entries are dropped.
-          issue_titles=""
-          if ! issue_titles="$(gh api --paginate \
+          if ! issues="$(gh api --paginate \
                      "repos/${{ github.repository }}/issues?state=open&per_page=100" \
-                     --jq '.[] | select(.pull_request == null) | .title' \
+                     --jq "$ISSUE_LINES_JQ" \
                      2>/tmp/issue-lookup.stderr)"; then
             echo "::warning::gh issue list failed; treating as if an open tracking issue already exists, to avoid a duplicate-issue loop. See the step log for the lookup's stderr." \
               | tee -a "$GITHUB_STEP_SUMMARY"
             cat /tmp/issue-lookup.stderr
-            issue_titles="$title"
-          fi
-          issue_exists=false
-          if grep -qFx "$title" <<< "$issue_titles"; then
             issue_exists=true
+            issue_lookup_ok=0
+          else
+            # Any author's open issue with the title stops a cron run (the
+            # dedup fails toward "already filed"), but a forced run reuses
+            # only the bot's own issue: it posts the report there and links
+            # it from the PR.
+            if [ -n "$(issue_number_for_title "$title" <<< "$issues")" ]; then
+              issue_exists=true
+            fi
+            issue_number="$(issue_number_for_title "$title" 'fg-labs-bot[bot]' <<< "$issues")"
           fi
+          # The issue a forced run reuses rather than filing a duplicate (see
+          # "File the tracking issue"). Empty when the bot has none open; a
+          # forced run whose lookup failed stops below instead.
+          echo "issue_number=$issue_number" >> "$GITHUB_OUTPUT"
 
           # `--tag` ("Implies force" per its own input description) is the
           # one deliberate bypass: a human recovering from either dedup case
@@ -249,23 +264,27 @@ jobs:
           # cron tick never sets `inputs.tag`, so it can never hit this
           # bypass; only a human explicitly typing `-f tag=...` can.
           if [ -n "$TAG" ]; then
-            if [ -n "$found" ]; then
-              # Reusing or force-pushing the existing branch risks orphaning
-              # any review comments left on its commits (the same concern
-              # "Supersede older bump PRs" below avoids by closing rather
-              # than force-updating) -- and pushing fresh history to it
-              # without force would just fail as a non-fast-forward push
-              # further down. Fail here, loudly and early, instead of
-              # producing a duplicate issue and then a failed push.
+            # Only a live branch blocks a forced run, besides the two cases it
+            # cannot act on safely (an unknown branch or issue state) and a
+            # target that is already vendored. A closed or merged PR whose
+            # branch is gone does not block: closing the PR and deleting the
+            # branch is the documented way to retry a release
+            # (CONTRIBUTING.md). An open PR always has a live branch, since
+            # deleting the branch closes the PR. Reusing or force-pushing a
+            # live branch risks orphaning review comments on its commits (the
+            # same concern "Supersede older bump PRs" below avoids by closing
+            # rather than force-updating), and pushing fresh history to it
+            # without force would fail as a non-fast-forward further down. So
+            # fail here, loudly and early, before filing or pushing anything.
+            # forced_verdict (scripts/bwa-mem3-bump-existing.sh) decides.
+            ls_rc=0
+            git ls-remote --exit-code --heads origin "refs/heads/$branch" > /dev/null || ls_rc=$?
+            vendored="$(tr -d '[:space:]' < bwa-mem3-sys/vendor/COMMIT)"
+            verdict="$(forced_verdict "$ls_rc" "$issue_lookup_ok" "$vendored" "$TARGET_SHA")"
+            if [ "$verdict" != proceed ]; then
               echo "skip=true" >> "$GITHUB_OUTPUT"
-              {
-                echo "A PR/branch already exists for $branch ($found)."
-                echo "Force-dispatching --tag=$TAG here would either fail to push"
-                echo "(non-fast-forward) or require force-pushing over it, orphaning"
-                echo "any review comments on its commits. Close PR $found and delete"
-                echo "branch $branch first, then re-dispatch. Nothing was created or"
-                echo "pushed by this run."
-              } | tee -a "$GITHUB_STEP_SUMMARY"
+              forced_message "$verdict" "$TAG" "$branch" "$found" "$ls_rc" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -275,7 +294,7 @@ jobs:
               | tee -a "$GITHUB_STEP_SUMMARY"
           elif [ "$issue_exists" = "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "An open tracking issue already exists (\"$title\"); nothing to do. Close it and re-dispatch with -f tag=... to force a retry." \
+            echo "An open tracking issue already exists (\"$title\"); nothing to do. Re-dispatch with -f tag=... to force a retry; the run comments on this issue rather than filing another." \
               | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -448,11 +467,24 @@ jobs:
           inputs.dry_run != true
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EXISTING_ISSUE: ${{ steps.existing.outputs.issue_number }}
         run: |
           set -euo pipefail
           title="${{ steps.existing.outputs.title }}"
-          url="$(gh issue create --title "$title" --body-file /tmp/report-body.md)"
-          num="$(printf '%s' "$url" | grep -oE '[0-9]+$')"
+          existing="$EXISTING_ISSUE"
+          # Only a forced (--tag) run gets here with the bot's tracking issue
+          # already open: every other run skips on it. Reuse it, posting this
+          # run's report as a comment, rather than filing a second issue with
+          # the same title. (A forced run whose issue lookup failed stopped in
+          # "Check for an existing PR or issue", so an empty number here means
+          # the bot has no such issue open.)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file /tmp/report-body.md
+            num="$existing"
+          else
+            url="$(gh issue create --title "$title" --body-file /tmp/report-body.md)"
+            num="$(printf '%s' "$url" | grep -oE '[0-9]+$')"
+          fi
           echo "number=$num" >> "$GITHUB_OUTPUT"
 
       # `steps.issue.outcome == 'success'` is load-bearing, not decorative:
