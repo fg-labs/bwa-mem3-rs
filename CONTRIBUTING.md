@@ -133,12 +133,17 @@ gh workflow run vendor-bump.yml -f tag=v0.8.0 -f dry_run=true   # report only
 
 Passing `-f tag=` implies **force**: it is the deliberate bypass of the
 tracking-issue dedup, so an already-open issue for that release no longer stops
-the run. It does *not* bypass an existing PR or branch — if
-`vendor-bump/bwa-mem3-<version>` already exists, the run fails immediately and
-creates nothing, because reusing that branch would either fail as a
-non-fast-forward push or require force-pushing over commits that may already
-carry review comments. Close the PR and delete the branch first, then
-re-dispatch. A cron tick never sets `tag`, so only a human can reach this path.
+the run; the run reuses the bot's open issue, posting its report as a comment,
+instead of filing a second one. It does *not* bypass a live branch — if
+`vendor-bump/bwa-mem3-<version>` still exists (an open PR always has one), the
+run fails immediately and creates nothing, because reusing that branch would
+either fail as a non-fast-forward push or require force-pushing over commits
+that may already carry review comments. Close the PR and delete the branch
+first, then re-dispatch; a closed or merged PR whose branch is gone does not
+block. A forced run also stops, creating nothing, when the tag is already the
+vendored snapshot (there is nothing to refresh) or when it cannot look up the
+branch or the open issues (it would risk a duplicate); re-dispatch once the
+lookup works. A cron tick never sets `tag`, so only a human can reach this path.
 
 Two cases produce an issue but no PR: a refresh that fails outright (e.g.
 upstream dropped `-DMATE_SORT=0`), and upstream adding an `ext/` submodule the
