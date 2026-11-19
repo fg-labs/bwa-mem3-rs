@@ -1065,7 +1065,8 @@ impl MemOpts {
     /// pairing and emission) sees the same ones: the raw `mem_opt_t` bytes
     /// with the fields that cannot change the result blanked. Those are the
     /// emission-only knobs (`md_mode` and the `MEM_F_XB` bit, which only shape
-    /// the tags written), and the two the shim overrides on its own per-call
+    /// the tags written, and `tie_break_mode`, which only the emit phase reads,
+    /// through `mem_tie_break_id`), and the two the shim overrides on its own per-call
     /// copy in every phase (`MEM_F_PE`, set for the pair group and cleared for
     /// singles, and `n_threads`, forced to 1). Every other field is compared,
     /// so a field a future bwa-mem3 adds is covered by default.
@@ -1082,7 +1083,7 @@ impl MemOpts {
         // zeroed by `mem_opt_init` (calloc), so its padding bytes are
         // initialized too; `bytes` holds exactly `n` bytes. The field pointers
         // are taken without creating references.
-        let (md, threads, flag) = unsafe {
+        let (md, tie, threads, flag) = unsafe {
             std::ptr::copy_nonoverlapping(self.handle.cast::<u8>(), bytes.as_mut_ptr(), n);
             let h = self.handle.cast_const();
             // `flag` is read back as an `i32` to clear two bits; a retyped
@@ -1090,11 +1091,13 @@ impl MemOpts {
             let flag: *const i32 = std::ptr::addr_of!((*h).flag);
             (
                 span(h, std::ptr::addr_of!((*h).md_mode)),
+                span(h, std::ptr::addr_of!((*h).tie_break_mode)),
                 span(h, std::ptr::addr_of!((*h).n_threads)),
                 span(h, flag),
             )
         };
         bytes[md].fill(0);
+        bytes[tie].fill(0);
         bytes[threads].fill(0);
         let flag_bytes: [u8; 4] = bytes[flag.clone()].try_into().unwrap();
         let flag_val = i32::from_ne_bytes(flag_bytes) & !((sys::MEM_F_XB | sys::MEM_F_PE) as i32);
@@ -2096,7 +2099,8 @@ mod tests {
     }
 
     /// The phase snapshot ignores only the emission-only knobs (`md_mode`,
-    /// `MEM_F_XB`); any alignment-bearing change makes it differ.
+    /// `MEM_F_XB`, `tie_break_mode`) and the two fields the shim overrides;
+    /// any alignment-bearing change makes it differ.
     #[test]
     fn phase_snapshot_ignores_only_emission_knobs() {
         let base = MemOpts::new().unwrap();
@@ -2108,6 +2112,11 @@ mod tests {
         // SAFETY: a live, uniquely owned mem_opt_t; sets one bit of a POD field.
         unsafe { (*emit_only.handle).flag |= sys::MEM_F_XB as i32 };
         emit_only.check_phase(&seeded, "t").unwrap();
+        // --tie-break: read only at emit, by mem_tie_break_id.
+        let tie = MemOpts::new().unwrap();
+        // SAFETY: a live, uniquely owned mem_opt_t; writes one POD field.
+        unsafe { (*tie.handle).tie_break_mode = 1 };
+        tie.check_phase(&seeded, "t").unwrap();
 
         // The two fields the shim overrides on its own per-call copy are
         // blanked too, each on its own.

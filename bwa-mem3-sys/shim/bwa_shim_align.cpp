@@ -120,6 +120,11 @@ static void worker_alloc(worker_t &w, int tid)
     xassert(tid >= 0 && tid < SHIM_TID_SLOTS, "worker_alloc: tid slot out of range");
     w.nthreads = 1;
     w.regs = NULL;
+    /* v0.18.0: upstream callocs the --alt-project primary OA:Z side array
+     * (parallel to regs) only under alt_project_primary, which
+     * shim_opts_alignable refuses, so it stays NULL here; worker_free still
+     * frees it, as upstream's does. */
+    w.alt_oa = NULL;
     w.memo = NULL;   /* the shim runs its own read-pair memo (gotcha #19), never upstream's */
     w.emit_prefix = NULL; w.emit_prefix_ctx = NULL;   /* no output streaming: the shim
                       * never runs upstream's worker_sam pass, which is what reads these */
@@ -222,6 +227,8 @@ static void worker_free(worker_t &w, int tid)
     /* w.regs is NOT freed here: during seed_extend_reads it aliases the
      * caller-owned ShimRegs::regs, which shim_regs_free owns. worker_alloc
      * leaves it NULL and nothing in the scratch ever allocates it. */
+    free(w.alt_oa);
+    w.alt_oa = NULL;
     free(w.seed_scratch);
 
     for (int l = tid; l <= tid; l++) {
@@ -1891,8 +1898,13 @@ static void pair_emit_pairs_chunked(ShimEmit *e, const mem_opt_t *opt_pe,
 
         int32_t maxRefLen = 0, maxQerLen = 0, gcnt = 0;
         int64_t pcnt = 0;
+        /* The tie-break seed goes through mem_tie_break_id as worker_sam's
+         * does (v0.18.0): under --tie-break name it hashes the read name in
+         * place of the ordinal, and under the default index it returns the
+         * ordinal unchanged. Mate 1's name, as upstream passes. */
         for (size_t i = chunk_start; i < chunk_end; ++i)
-            mem_sam_pe_batch_pre(opt_pe, bns, pac, pestat, first_pair_id + (uint64_t)i,
+            mem_sam_pe_batch_pre(opt_pe, bns, pac, pestat,
+                                 mem_tie_break_id(opt_pe, seqs[2*i].name, first_pair_id + (uint64_t)i),
                                  seqs + 2*i, regs + 2*i, &w.mmc, pcnt, gcnt,
                                  maxRefLen, maxQerLen, tid);
         int64_t pcnt8 = sort_classify(&w.mmc, pcnt, tid);
@@ -1909,7 +1921,8 @@ static void pair_emit_pairs_chunked(ShimEmit *e, const mem_opt_t *opt_pe,
                 if (regs[2*i + 3].n > 0) shim_prefetch_cigar_ref(bns, pac, regs[2*i + 3].a[0].rb);
             }
             int n_pri[2], z[2], q_se[2], extra_flag, paired;
-            mem_pair_resolve_batch_post(opt_pe, bns, pac, pestat, first_pair_id + (uint64_t)i,
+            mem_pair_resolve_batch_post(opt_pe, bns, pac, pestat,
+                                        mem_tie_break_id(opt_pe, seqs[2*i].name, first_pair_id + (uint64_t)i),
                                         seqs + 2*i, regs + 2*i, &myaln, &w.mmc, gcnt, tid,
                                         n_pri, z, q_se, &extra_flag, &paired);
             emit_resolved_pair(e, origin_base + i, opt_pe, bns, pac, seqs + 2*i, regs + 2*i,
@@ -2393,7 +2406,7 @@ static void single_and_emit(ShimEmit *e, size_t origin_idx, uint64_t id,
                             const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                             bseq1_t *s, mem_alnreg_v *a)
 {
-    mem_mark_primary_se(opt, a->n, a->a, (int64_t)id);
+    mem_mark_primary_se(opt, a->n, a->a, (int64_t)mem_tie_break_id(opt, s->name, id));
 #if V17
     if (opt->flag & MEM_F_PRIMARY5) mem_reorder_primary5(opt->T, a);
 #endif

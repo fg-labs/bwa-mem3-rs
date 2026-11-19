@@ -525,8 +525,8 @@ impl Drop for SeedAttempt<'_> {
 ///   cohort's, options that differ from the ones the first successful
 ///   seed-extend of a non-empty range bound (a seed-extend or pair emit of an
 ///   empty range neither binds them nor is compared against them; the
-///   comparison ignores only the MD mode, the `MEM_F_XB` and paired-end flags,
-///   and the thread count),
+///   comparison ignores only the MD mode, the tie-break mode, the `MEM_F_XB`
+///   and paired-end flags, and the thread count),
 ///   `infer_cohort` or a pair emit while duplicate marks await `resolve_memo`,
 ///   and duplicate marks once the memo is closed (by `resolve_memo`,
 ///   `infer_cohort` or a pair emit) all return `Err`.

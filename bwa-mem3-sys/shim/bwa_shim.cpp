@@ -319,17 +319,53 @@ static bool shim_b_storable(const mem_opt_t *opts) {
     return opts->b >= 0 && opts->b <= 128;
 }
 
-/* The C alignment entry points' own refusal of an unstorable b. MemOpts runs
- * the full check (MemOpts::validate_for_alignment) before any of them, but a
- * raw mem_opt_t caller does not, and would otherwise align with matrices that
- * still hold the last storable penalty while opt->b, which the MAPQ model and
- * primary marking read, holds the new one. */
+/* Options this shim cannot align with as the CLI would, refused by every C
+ * entry point (through shim_opts_alignable) for raw mem_opt_t callers; MemOpts
+ * sets none of these fields, and mem_opt_init leaves them all at their
+ * accepted defaults.
+ *
+ * --alt-project (v0.18.0): the projection itself runs inside upstream's
+ * kernels, but the shim's record writer emits neither the lift-source XL:Z tag
+ * nor a demoted read's OA:Z, and under alt_project_primary mem_kernel2_core
+ * asserts the OA:Z side array, which worker_alloc leaves NULL. Refused rather
+ * than handing back records that differ from the CLI's.
+ *
+ * --tie-break (v0.18.0): the CLI's parser accepts only index (0) and name
+ * (1). mem_tie_break_id treats any other value as index, so an out-of-range
+ * value would silently mean index here. */
+static bool shim_opts_supported(const mem_opt_t *opts, const char *what) {
+    const char *alt = opts->alt_lift ? "alt_lift"
+                    : opts->alt_project_min_gap ? "alt_project_min_gap"
+                    : opts->alt_project_pair_gap ? "alt_project_pair_gap"
+                    : opts->alt_project_primary ? "alt_project_primary"
+                    : NULL;
+    if (alt != NULL) {
+        shim_set_err("%s: --alt-project is not supported (opts->%s is set; clear alt_lift "
+                     "and every alt_project_* field)", what, alt);
+        return false;
+    }
+    if (opts->tie_break_mode != 0 && opts->tie_break_mode != 1) {
+        shim_set_err("%s: opts->tie_break_mode is %d, not 0 (index) or 1 (name)",
+                     what, opts->tie_break_mode);
+        return false;
+    }
+    return true;
+}
+
+/* The gate every C alignment entry point runs on its options first: an
+ * unstorable b, then anything shim_opts_supported refuses. MemOpts runs its own
+ * full check (MemOpts::validate_for_alignment) before any of them, but a raw
+ * mem_opt_t caller does not. An unstorable b would otherwise align with
+ * matrices that still hold the last storable penalty while opt->b, which the
+ * MAPQ model and primary marking read, holds the new one. */
 static bool shim_opts_alignable(const mem_opt_t *opts, const char *what) {
-    if (shim_b_storable(opts)) return true;
-    shim_set_err("%s: the effective mismatch penalty is %d, outside 0..128; the scoring "
-                 "matrices cannot hold it (set a storable opts->b, then "
-                 "bwa_shim_opts_fill_scmat)", what, opts->b);
-    return false;
+    if (!shim_b_storable(opts)) {
+        shim_set_err("%s: the effective mismatch penalty is %d, outside 0..128; the scoring "
+                     "matrices cannot hold it (set a storable opts->b, then "
+                     "bwa_shim_opts_fill_scmat)", what, opts->b);
+        return false;
+    }
+    return shim_opts_supported(opts, what);
 }
 
 extern "C" int bwa_shim_opts_apply_meth_defaults_masked(mem_opt_t *opts, unsigned explicit_mask) {

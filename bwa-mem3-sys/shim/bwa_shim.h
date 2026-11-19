@@ -58,7 +58,19 @@ typedef struct {
 
 /* Options lifecycle. `opts_new` returns a heap-allocated mem_opt_t populated
  * with bwa-mem3 defaults (mem_opt_init). `opts_free` releases it. Field-level
- * getters/setters will be added once the full mem_opt_t is bound to Rust. */
+ * getters/setters will be added once the full mem_opt_t is bound to Rust.
+ *
+ * Refused options: every alignment entry point below refuses (-1 or NULL, with
+ * bwa_shim_last_error set) options with an unstorable `b` (outside 0..=128; see
+ * bwa_shim_opts_fill_scmat), with --alt-project enabled (a non-NULL
+ * opts->alt_lift or any non-zero opts->alt_project_*), which the shim does not
+ * support since its records would lack the CLI's XL:Z / OA:Z tags, or with
+ * opts->tie_break_mode other than 0 (index) or 1 (name).
+ *
+ * Under tie_break_mode 1 the shim hashes each read's name exactly as given
+ * (mate 1's for a pair). The CLI hashes the name its FASTQ reader produced,
+ * which drops a trailing '/' plus one digit (/1, /2), so parity under name mode
+ * needs names in that form. */
 mem_opt_t *bwa_shim_opts_new(void);
 void              bwa_shim_opts_free(mem_opt_t *opts);
 
@@ -195,11 +207,13 @@ char     *bwa_shim_header_text(const BwaIndex *idx, const mem_opt_t *opts);
 void      bwa_shim_header_text_free(char *text);
 
 /* Every alignment call below that takes `opts` (seed, extend, align, pestat,
- * pair/emit and the resident-cohort equivalents) refuses options whose `b` is
- * outside 0..=128 before doing anything else, returning NULL or -1 with the
- * reason in bwa_shim_last_error: bwa_shim_opts_fill_scmat cannot store such a
- * `b`, so the matrices would disagree with the `b` the MAPQ model reads. A
- * handle the call consumes is freed on that path too. */
+ * pair/emit and the resident-cohort equivalents) refuses the options listed at
+ * bwa_shim_opts_new (an unstorable `b`, --alt-project, an unknown
+ * tie_break_mode) before doing anything else, returning NULL or -1 with the
+ * reason in bwa_shim_last_error. For `b` outside 0..=128,
+ * bwa_shim_opts_fill_scmat cannot store it, so the matrices would disagree with
+ * the `b` the MAPQ model reads. A handle the call consumes is freed on that
+ * path too. */
 BwaSeeds *bwa_shim_seed_batch(
     const BwaIndex *idx, const mem_opt_t *opts,
     const BwaReadPair *pairs, size_t n_pairs);
@@ -278,7 +292,7 @@ typedef void (*BwaRecordSinkFn)(void *ctx, uint32_t origin_kind, size_t origin_i
  * (mem_pestat once, over the concatenated per-read alnreg headers, in the
  * order given). Singles are ignored. `out` = mem_pestat_t[4]. Returns 0 on
  * success, -1 on a null argument (idx/opts/out, or a null regs array or a null
- * regs[k] when n_regs > 0), an unstorable `b` or an internal allocation failure;
+ * regs[k] when n_regs > 0), refused options (see bwa_shim_opts_new) or an internal allocation failure;
  * callers rely on that -1. */
 int bwa_shim_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
                            const BwaRegs *const *regs, size_t n_regs, mem_pestat_t *out);
@@ -364,7 +378,7 @@ int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
  * pair is not seeded -- bwa_shim_resident_resolve_memo copies its regions later
  * and must run before the cohort's pestat or any emit. All -1 is exactly
  * bwa_shim_resident_seed_extend. Marks are refused on a --meth cohort. Returns
- * 0, -1 on a bad argument (an unstorable `b` included), or -3. */
+ * 0, -1 on a bad argument (refused options included; see bwa_shim_opts_new), or -3. */
 int bwa_shim_resident_seed_extend_reps(const BwaIndex *idx, const mem_opt_t *opts,
                                        BwaScratch *sc, BwaResidentSegment *sg,
                                        const int64_t *reps, size_t n_pairs);
@@ -377,12 +391,12 @@ int bwa_shim_resident_seed_extend_reps(const BwaIndex *idx, const mem_opt_t *opt
  * the reason in the last error); must not run concurrently with any other call
  * on the cohort. Run it before bwa_shim_resident_pestat_cohort. A repeat call
  * returns the same stats. Aborts on allocation failure. Returns 0, -1 on a
- * null arg or an unstorable `b`, or -3. */
+ * null arg or refused options (see bwa_shim_opts_new), or -3. */
 int bwa_shim_resident_resolve_memo(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *sc,
                                    BwaResidentCohort *c, BwaMemoStats *out);
 
 /* mem_pestat over the whole cohort's pair region. `out` = mem_pestat_t[4].
- * Returns 0, -1 on a null arg / unstorable `b` / allocation failure, or -3. */
+ * Returns 0, -1 on a null arg / refused options / allocation failure, or -3. */
 int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
                                     const BwaResidentCohort *c, mem_pestat_t *out);
 
@@ -392,7 +406,7 @@ int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
  * `ids.first_pair_id`/`first_single_id` is the GLOBAL read ordinal of the
  * segment's first pair/single; `origin_base` is added to the local index for
  * the sink's origin_idx. Records stream to `sink` in input order. Returns 0, -1
- * on a bad argument (an unstorable `b` included), -2 when a pair segment has no
+ * on a bad argument (refused options included; see bwa_shim_opts_new), -2 when a pair segment has no
  * pestat, or -3. */
 int bwa_shim_resident_pair_emit(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *sc,
                                 BwaResidentSegment *sg, const mem_pestat_t *pestat,
