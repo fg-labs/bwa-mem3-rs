@@ -101,12 +101,22 @@ vendored-in-principle but never compiled. If a future refresh wants to
 re-enable any of them, restore the relevant submodule first (or edit the
 shared list).
 
+`alt_lift.cpp` (v0.18.0, the `--alt-project` ALT -> primary liftover) is the
+exception: it includes `htslib/sam.h` but **is** compiled, because
+`mem_kernel2_core` and the pairing code call into it, so skipping it only moves
+the failure to link time. It uses nothing from htslib but the BAM CIGAR
+encoding (`BAM_C*`, the `bam_cigar_*` macros, `bam_cigar_table`), which
+`shim/compat/htslib/sam.h` supplies; `build.rs` puts `shim/compat` on the
+baseline include path. The header defines only what `alt_lift.cpp` uses, so a
+new htslib use there fails the build on the missing name. Delete it once
+upstream stops including htslib. The feature itself is refused (see gotcha #13).
+
 `fastmap.cpp` was compiled at 0.2.x purely to export `worker_alloc` /
 `worker_free`. As of bwa-mem3 0.6.0 it is transitively coupled to the new
 `fast_reader` FASTQ path (libdeflate + zlib-ng), `numa`, and htslib — none of
 which this crate vendors — so it is excluded again. We instead carry verbatim
 file-local copies of just `worker_alloc` / `worker_free` in
-`shim/bwa_shim_align.cpp`; **keep them in sync** (v0.14.0 added the per-thread `mem_cache::rescue_narrow_off` / `rescue_narrow_cap` / `rescue_band` mate-rescue buffers, which `worker_alloc` NULLs and `worker_free` releases via `free` / `rescue_band_batch_free` — a missed field is an uninitialized pointer that `mem_matesw_batch_pre` grows from; v0.15.1 added `rescue_skip_set` / `rescue_skip_set_cap` on the same terms, plus `worker_t::emit_prefix` / `emit_prefix_ctx`, which `worker_alloc` NULLs; v0.16.0 added `smem_sort_scratch[].pairs` / `pairsCap` (#648), NULLed and `_mm_free`d alongside `cnt` / `tmp`) with upstream's `fastmap.cpp`
+`shim/bwa_shim_align.cpp`; **keep them in sync** (v0.14.0 added the per-thread `mem_cache::rescue_narrow_off` / `rescue_narrow_cap` / `rescue_band` mate-rescue buffers, which `worker_alloc` NULLs and `worker_free` releases via `free` / `rescue_band_batch_free` — a missed field is an uninitialized pointer that `mem_matesw_batch_pre` grows from; v0.15.1 added `rescue_skip_set` / `rescue_skip_set_cap` on the same terms, plus `worker_t::emit_prefix` / `emit_prefix_ctx`, which `worker_alloc` NULLs; v0.16.0 added `smem_sort_scratch[].pairs` / `pairsCap` (#648), NULLed and `_mm_free`d alongside `cnt` / `tmp`; v0.18.0 added `worker_t::alt_oa`, the `--alt-project primary` `OA:Z` side array, which upstream callocs only in that mode, so `worker_alloc` NULLs it and `worker_free` frees it) with upstream's `fastmap.cpp`
 on every vendor refresh (the buffer set must match what `mem_kernel1_core` /
 `mem_kernel2_core` expect).
 
@@ -348,9 +358,18 @@ upstream keeps adding them:
 |---|---|
 | `mem_gen_alt` | `meth_orig_query`, `want0`, `want1`, `emitted_only` |
 | `mem_reg2aln` | `meth_orig_query`, `want_md`, `reuse`, `made`, `made_NM` |
-| `mem_kernel1_core` / `mem_kernel2_core` | `meth_orig_bns`, `meth_orig_pac` |
+| `mem_kernel1_core` / `mem_kernel2_core` | `meth_orig_bns`, `meth_orig_pac`; kernel2 also `alt_oa` (v0.18.0) |
 | `mem_matesw_batch_pre` | `mate_meth_ot`, `known_skip` |
 | `mem_matesw_batch_post` | `ms_orig`, `mat`, `mate_meth_ot`, `dedup_state`, `known_skip`, `pushed_rb` |
+
+(`mem_sam_pe_batch_post` and `mem_reg2sam[_anchored]` gained a defaulted
+`oa` / `alt_oa` in v0.18.0 too; the shim calls neither, so they stay out of
+the table.) `alt_oa` is the `--alt-project primary` `OA:Z` side
+array: the shim passes none, and `shim_opts_alignable` refuses `alt_lift` and
+every `alt_project_*` knob at each C entry point (`shim_opts_supported`), since the shim's writer
+emits neither `XL:Z` nor `OA:Z` and `mem_kernel2_core` asserts `alt_oa` under
+`alt_project_primary`. Exposing `--alt-project` means emitting both tags and
+allocating that array first.
 
 (The scalar `mem_matesw` is gone — gotcha #18. The shim reaches both
 `mem_matesw_batch_*` only through `mem_sam_pe_batch_pre` /
@@ -497,6 +516,21 @@ pestat — which is why it is CLI-identical only when the batch IS the cohort.
 `three_phase_ffi.rs::first_pair_id_reaches_the_tie_break_hash` pins that the
 id is plumbed; the CLI-crate `three_phase_parity.rs` pins the formulas.
 
+As of v0.18.0 the CLI passes each of those ordinals through
+`mem_tie_break_id(opt, name, id)` before seeding, which returns the ordinal
+under the default `--tie-break index` and a hash of the read name (mate 1's for
+a pair) under `name`. The shim does the same at its three id sites
+(`mem_sam_pe_batch_pre`, `mem_pair_resolve_batch_post`, `single_and_emit`'s
+`mem_mark_primary_se`), so a raw `mem_opt_t` caller selecting name mode gets
+order-independent tie-breaks; `MemOpts` does not expose the knob. The shim
+hashes each name as the caller passed it, while the CLI hashes its FASTQ
+reader's name, which drops a trailing `/` plus one digit; name-mode parity
+needs names in that form. A `tie_break_mode` other than 0 or 1 is refused
+(`shim_opts_supported`), since `mem_tie_break_id` would read it as index.
+`three_phase_ffi.rs::tie_break_name_hashes_mate_one_name_not_the_id` pins the
+pair and single paths, with a fixed insert-size model so `mem_pair`'s tie key
+runs too.
+
 The options must not change between phases either: regions scored under one
 `mem_opt_t` and then paired, rescued and passed through `mem_reg2aln` under
 another mix the two in one record (and regions read against another index
@@ -504,7 +538,8 @@ abort or read its reference out of bounds, so `Seeds`, `AlnRegs` and
 `ResidentCohort` also record `BwaIndex::id` and every consuming call compares
 it). `Seeds`, `AlnRegs` and `ResidentCohort` carry `MemOpts::phase_snapshot`, the raw `mem_opt_t` bytes with the fields
 that cannot change the result blanked, and every consuming call compares it.
-Blanked: the emission-only knobs (`md_mode`, the `MEM_F_XB` bit) and the two
+Blanked: the emission-only knobs (`md_mode`, the `MEM_F_XB` bit, and
+`tie_break_mode`, which only the emit phase reads) and the two
 the shim overrides on its per-call copy in every phase (`MEM_F_PE`, set per
 read group, and `n_threads`, forced to 1). A field a refresh adds is compared
 by default; if it is emission-only or shim-overridden, add it to the blanked

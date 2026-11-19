@@ -98,6 +98,18 @@ typedef struct mem_opt_t {
     int    meth_context;
     /* v0.9.0 */
     int    proper_pair_from_emitted;
+    /* v0.18.0: --tie-break, a mem_tie_break_mode (MEM_TIE_BREAK_INDEX = 0,
+     * MEM_TIE_BREAK_NAME = 1). mem_opt_init leaves it INDEX, the bwa/bwa-mem2
+     * behaviour, which seeds the tie-break hash from the read ordinal. */
+    int    tie_break_mode;
+    /* v0.18.0: --alt-project. Upstream's type is `const struct alt_lift_t *`;
+     * mirrored as an opaque pointer, as `compat` below is, so bindgen does not
+     * pull in the liftover table. NULL (mem_opt_init's default) disables the
+     * projection and leaves output byte-identical. */
+    const void *alt_lift;
+    int    alt_project_min_gap;
+    int    alt_project_pair_gap;
+    int    alt_project_primary;
     /* v0.17.0: --md, a mem_md_mode (MEM_MD_NONE = 0, MEM_MD_FULL = 1, MEM_MD_SHORT = 2). */
     int    md_mode;
     int    supp_rep_hard_cap;

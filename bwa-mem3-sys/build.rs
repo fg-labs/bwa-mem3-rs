@@ -65,6 +65,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/bwa_shim_types.h");
     println!("cargo:rerun-if-changed=shim/bwa_shim_fields.h");
     println!("cargo:rerun-if-changed=shim/bwa_shim_meth.h");
+    println!("cargo:rerun-if-changed=shim/compat");
     println!("cargo:rerun-if-changed=vendor/COMMIT");
     println!("cargo:rerun-if-changed=patches");
 
@@ -221,6 +222,11 @@ fn main() {
     build.file(manifest.join("shim/bwa_shim_layout_assert.cpp"));
     build.include(manifest.join("shim"));
     build.include(&vendor_src);
+    // alt_lift.cpp (v0.18.0, --alt-project) includes htslib/sam.h for the BAM
+    // CIGAR encoding alone, and the core kernels call into it, so it cannot be
+    // skipped like the htslib writers above. shim/compat/htslib/sam.h supplies
+    // just that encoding; no other compiled TU includes htslib. See the header.
+    build.include(manifest.join("shim/compat"));
 
     apply_simd_flags(&mut build);
 

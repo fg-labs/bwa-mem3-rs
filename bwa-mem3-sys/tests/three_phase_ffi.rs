@@ -320,67 +320,243 @@ fn three_phase_is_invariant_to_sub_batch_size_and_matches_legacy() {
     }
 }
 
+/// A tandem-repeat reference (a 300 bp PhiX window repeated five times) and
+/// reads drawn from within one copy, so every read maps to several
+/// EQUAL-score locations and the tie-breaks decide which copy is primary (and
+/// the XA order of the rest). `common::simulate` draws across the repeat-free
+/// PhiX genome, where unique reads never tie and an id has no observable
+/// effect.
+struct RepeatReads {
+    r1: Vec<Vec<u8>>,
+    r2: Vec<Vec<u8>>,
+    singles: Vec<Vec<u8>>,
+    qual: Vec<u8>,
+}
+
+const REPEAT_READ_LEN: usize = 60;
+const REPEAT_INSERT: usize = 120;
+const REPEAT_N: usize = 50;
+
+fn repeat_unit() -> &'static [u8] {
+    &common::PHIX_SEQ.as_bytes()[500..800]
+}
+
+fn repeat_reference() -> Vec<u8> {
+    repeat_unit().repeat(5)
+}
+
+impl RepeatReads {
+    fn new() -> Self {
+        let unit = repeat_unit();
+        let (len, insert) = (REPEAT_READ_LEN, REPEAT_INSERT);
+        let (mut r1, mut r2, mut singles) = (Vec::new(), Vec::new(), Vec::new());
+        // Pairs and singles draw from separate generators, so the pairs are
+        // the same whether or not a test uses the singles.
+        let (mut rng, mut single_rng) = (common::Rng(5), common::Rng(6));
+        for _ in 0..REPEAT_N {
+            let start = (rng.next() as usize) % (unit.len() - insert + 1);
+            r1.push(unit[start..start + len].to_vec());
+            r2.push(common::revcomp(&unit[start + insert - len..start + insert]));
+            let at = (single_rng.next() as usize) % (unit.len() - len + 1);
+            singles.push(unit[at..at + len].to_vec());
+        }
+        RepeatReads {
+            r1,
+            r2,
+            singles,
+            qual: vec![b'I'; len],
+        }
+    }
+
+    /// The pairs, R1 named from `r1_names` and R2 from `r2_names`.
+    fn pairs(
+        &self,
+        r1_names: &[std::ffi::CString],
+        r2_names: &[std::ffi::CString],
+    ) -> Vec<sys::BwaReadPair> {
+        (0..REPEAT_N)
+            .map(|i| sys::BwaReadPair {
+                r1_name: r1_names[i].as_ptr(),
+                r1_name_len: r1_names[i].as_bytes().len(),
+                r1_seq: self.r1[i].as_ptr(),
+                r1_seq_len: self.r1[i].len(),
+                r1_qual: self.qual.as_ptr(),
+                r2_name: r2_names[i].as_ptr(),
+                r2_name_len: r2_names[i].as_bytes().len(),
+                r2_seq: self.r2[i].as_ptr(),
+                r2_seq_len: self.r2[i].len(),
+                r2_qual: self.qual.as_ptr(),
+            })
+            .collect()
+    }
+
+    fn singles(&self, names: &[std::ffi::CString]) -> Vec<sys::BwaSingleRead> {
+        (0..REPEAT_N)
+            .map(|i| sys::BwaSingleRead {
+                name: names[i].as_ptr(),
+                name_len: names[i].as_bytes().len(),
+                seq: self.singles[i].as_ptr(),
+                seq_len: self.singles[i].len(),
+                qual: self.qual.as_ptr(),
+            })
+            .collect()
+    }
+}
+
+/// `{prefix}0`, `{prefix}1`, ... as read names.
+fn read_names(prefix: &str) -> Vec<std::ffi::CString> {
+    (0..REPEAT_N)
+        .map(|i| std::ffi::CString::new(format!("{prefix}{i}")).unwrap())
+        .collect()
+}
+
+/// A packed BAM record (`block_size` included) without its QNAME, so records
+/// of reads that differ only in name compare equal.
+fn without_qname(rec: &[u8]) -> Vec<u8> {
+    let l_read_name = rec[4 + 8] as usize;
+    let mut out = rec[4..4 + 32].to_vec();
+    out[8] = 0;
+    out.extend_from_slice(&rec[4 + 32 + l_read_name..]);
+    out
+}
+
 /// The pair id feeds hash_64 tie-breaks (mem_mark_primary_se / mem_pair,
 /// seeded with `id<<1|i` at bwamem_pair.cpp:893-910). Offsetting `first_pair_id`
 /// must therefore change *something* on a fixture with equal-score ties (proves
 /// the id is wired), and legacy `align_batch` must equal `first_pair_id = 0`
 /// (its own convention).
-///
-/// NB: `common::simulate` draws reads across the whole (repeat-free) PhiX
-/// genome, where unique reads never tie, so the id would have no observable
-/// effect there. This builds a tandem-repeat reference (a PhiX window repeated
-/// several times) and draws reads from within one copy, so every pair maps to
-/// several EQUAL-score locations; which copy is primary (and the XA order of
-/// the rest) is exactly what the id-seeded hash decides.
 #[test]
 fn first_pair_id_reaches_the_tie_break_hash() {
-    let unit = &common::PHIX_SEQ.as_bytes()[500..800]; // 300 bp repeat unit
-    let copies = 5usize;
-    let mut refseq = Vec::with_capacity(unit.len() * copies);
-    for _ in 0..copies {
-        refseq.extend_from_slice(unit);
-    }
-    let Some((_dir, prefix)) = common::index_custom_ref(&refseq) else {
+    let Some((_dir, prefix)) = common::index_custom_ref(&repeat_reference()) else {
         return;
     };
     let idx = common::load_idx(&prefix);
     let opts = common::new_opts();
+    let reads = RepeatReads::new();
+    let names = read_names("r");
+    let pairs = reads.pairs(&names, &names);
 
-    let (read_len, insert, n) = (60usize, 120usize, 50usize);
-    let mut names = Vec::new();
-    let (mut r1, mut r2, mut qual) = (Vec::new(), Vec::new(), Vec::new());
-    let mut rng = common::Rng(5);
-    for i in 0..n {
-        let start = (rng.next() as usize) % (unit.len() - insert + 1);
-        r1.push(unit[start..start + read_len].to_vec());
-        r2.push(common::revcomp(
-            &unit[start + insert - read_len..start + insert],
-        ));
-        names.push(std::ffi::CString::new(format!("r{i}")).unwrap());
-        qual.push(vec![b'I'; read_len]);
-    }
-    let pairs: Vec<sys::BwaReadPair> = (0..n)
-        .map(|i| sys::BwaReadPair {
-            r1_name: names[i].as_ptr(),
-            r1_name_len: names[i].as_bytes().len(),
-            r1_seq: r1[i].as_ptr(),
-            r1_seq_len: r1[i].len(),
-            r1_qual: qual[i].as_ptr(),
-            r2_name: names[i].as_ptr(),
-            r2_name_len: names[i].as_bytes().len(),
-            r2_seq: r2[i].as_ptr(),
-            r2_seq_len: r2[i].len(),
-            r2_qual: qual[i].as_ptr(),
-        })
-        .collect();
-
-    let at_zero = three_phase(idx, opts, &pairs, n, 0);
+    let at_zero = three_phase(idx, opts, &pairs, REPEAT_N, 0);
     assert_eq!(at_zero, common::align_batch_records(idx, opts, &pairs));
-    let shifted = three_phase(idx, opts, &pairs, n, 1 << 20);
+    let shifted = three_phase(idx, opts, &pairs, REPEAT_N, 1 << 20);
     assert_eq!(shifted.len(), at_zero.len());
     assert_ne!(
         shifted, at_zero,
         "first_pair_id had no observable effect; the id is not plumbed"
+    );
+    // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
+    // used afterward.
+    unsafe {
+        sys::bwa_shim_opts_free(opts);
+        sys::bwa_shim_idx_free(idx);
+    }
+}
+
+/// `--tie-break name` (v0.18.0, `mem_opt_t::tie_break_mode`): upstream's
+/// worker passes every tie-break seed through `mem_tie_break_id`, which under
+/// `MEM_TIE_BREAK_NAME` (1) hashes the read name (mate 1's, for a pair)
+/// instead of using the input ordinal. The shim derives its ids from
+/// `BwaIdBases` itself, so it must apply the same helper on the pair and the
+/// single path, or a raw `mem_opt_t` caller selecting name mode silently keeps
+/// index tie-breaks.
+///
+/// The emit runs under a fixed FR insert-size model: the repeat's own estimate
+/// fails every orientation (no read is unique), which would leave `mem_pair`,
+/// and its id-seeded choice among equal-score pairings, unexercised.
+#[test]
+fn tie_break_name_hashes_mate_one_name_not_the_id() {
+    let Some((_dir, prefix)) = common::index_custom_ref(&repeat_reference()) else {
+        return;
+    };
+    let idx = common::load_idx(&prefix);
+    let opts = common::new_opts();
+    let reads = RepeatReads::new();
+    let (r, x, q) = (read_names("r"), read_names("x"), read_names("q"));
+    let (s, t) = (read_names("s"), read_names("t"));
+
+    let failed = sys::mem_pestat_t {
+        low: 0,
+        high: 0,
+        failed: 1,
+        avg: 0.0,
+        std: 0.0,
+    };
+    let fr = sys::mem_pestat_t {
+        low: (REPEAT_INSERT - 40) as i32,
+        high: (REPEAT_INSERT + 40) as i32,
+        failed: 0,
+        avg: REPEAT_INSERT as f64,
+        std: 10.0,
+    };
+    let pestat = [failed, fr, failed, failed]; // FF, FR, RF, RR
+    type Records = Vec<(u32, usize, Vec<u8>)>;
+    // The closure reads the options through its own copy of the pointer, so
+    // the tie-break mode can still be switched through `opts` between runs.
+    let opts_ro = opts.cast_const();
+    let run = |r1: &[std::ffi::CString],
+               r2: &[std::ffi::CString],
+               sn: &[std::ffi::CString],
+               base: u64|
+     -> (Records, Records) {
+        let ids = sys::BwaIdBases {
+            first_single_id: base,
+            first_pair_id: base,
+        };
+        let recs = run_mixed_with(
+            idx,
+            opts_ro,
+            &reads.pairs(r1, r2),
+            &reads.singles(sn),
+            ids,
+            Some(&pestat),
+        );
+        recs.into_iter()
+            .partition(|(k, _, _)| *k == sys::BWA_ORIGIN_PAIR)
+    };
+    let sans = |recs: &Records| -> Vec<Vec<u8>> {
+        recs.iter().map(|(_, _, rec)| without_qname(rec)).collect()
+    };
+
+    // Index mode: the fixture ties on both paths, and the pairs pair.
+    let (pairs0, singles0) = run(&r, &r, &s, 0);
+    let (pairs1, singles1) = run(&r, &r, &s, 1 << 20);
+    assert_ne!(pairs0, pairs1, "the pairs never tie");
+    assert_ne!(singles0, singles1, "the singles never tie");
+    assert!(
+        pairs0.iter().any(|(_, _, rec)| flag_of(rec) & 0x2 != 0),
+        "no pair was paired, so mem_pair's tie-break never ran"
+    );
+
+    // SAFETY: `opts` is a valid, uniquely-owned `mem_opt_t`; POD field write.
+    unsafe { (*opts).tie_break_mode = 1 }; // MEM_TIE_BREAK_NAME
+    let (name_pairs, name_singles) = run(&r, &r, &s, 0);
+    let (shifted_pairs, shifted_singles) = run(&r, &r, &s, 1 << 20);
+    assert_eq!(
+        name_pairs, shifted_pairs,
+        "pair ids still reach the tie-break hash under --tie-break name"
+    );
+    assert_eq!(
+        name_singles, shifted_singles,
+        "single ids still reach the tie-break hash under --tie-break name"
+    );
+    // The name, and for a pair mate 1's name only, is what is hashed.
+    let (r1_renamed, _) = run(&q, &r, &s, 0);
+    assert_ne!(
+        sans(&name_pairs),
+        sans(&r1_renamed),
+        "renaming R1 changed no tie-break: the pair seed ignores mate 1's name"
+    );
+    let (r2_renamed, _) = run(&r, &x, &s, 0);
+    assert_eq!(
+        sans(&name_pairs),
+        sans(&r2_renamed),
+        "renaming only R2 changed a tie-break: the pair seed reads mate 2's name"
+    );
+    let (_, singles_renamed) = run(&r, &r, &t, 0);
+    assert_ne!(
+        sans(&name_singles),
+        sans(&singles_renamed),
+        "renaming the singles changed no tie-break: the single seed ignores the name"
     );
     // SAFETY: `opts`/`idx` are the live owned handles; each freed once and not
     // used afterward.
@@ -487,6 +663,19 @@ fn run_mixed(
     singles: &[sys::BwaSingleRead],
     ids: sys::BwaIdBases,
 ) -> Vec<(u32, usize, Vec<u8>)> {
+    run_mixed_with(idx, opts, pairs, singles, ids, None)
+}
+
+/// `run_mixed`, emitting under `fixed` (FF, FR, RF, RR) in place of the
+/// batch's own insert-size estimate when given, as a CLI `-I` run would.
+fn run_mixed_with(
+    idx: *const sys::BwaIndex,
+    opts: *const sys::mem_opt_t,
+    pairs: &[sys::BwaReadPair],
+    singles: &[sys::BwaSingleRead],
+    ids: sys::BwaIdBases,
+    fixed: Option<&[sys::mem_pestat_t; 4]>,
+) -> Vec<(u32, usize, Vec<u8>)> {
     // SAFETY: constructor with no arguments; returns an owned scratch handle.
     let sc = unsafe { sys::bwa_shim_scratch_new() };
     let batch = sys::BwaReadBatch {
@@ -510,6 +699,10 @@ fn run_mixed(
     // `regs` pointer and the count `1` matches it.
     let rc = unsafe { sys::bwa_shim_pestat_cohort(idx, opts, regs_c.as_ptr(), 1, pes) };
     assert_eq!(rc, 0);
+    if let Some(fixed) = fixed {
+        // SAFETY: `pes` is the live `mem_pestat_t[4]` handle; `fixed` holds 4.
+        unsafe { std::ptr::copy_nonoverlapping(fixed.as_ptr(), pes, 4) };
+    }
     let mut sink = Sink(Vec::new());
     let pes_arg = if pairs.is_empty() {
         std::ptr::null()
@@ -862,6 +1055,59 @@ unsafe extern "C" fn no_fields(
     FIELDS_EMITTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// `--alt-project` (v0.18.0) is not supported: the shim's record writer emits
+/// neither the lift-source `XL:Z` tag nor the demoted read's `OA:Z`, and under
+/// `alt_project_primary` `mem_kernel2_core` asserts a side array the shim does
+/// not allocate. `MemOpts` cannot set any of these knobs, but a raw
+/// `mem_opt_t` caller can, so every C entry point refuses each one rather than
+/// emit records that silently differ from the CLI's (or abort).
+#[test]
+fn c_entry_points_refuse_alt_project() {
+    // A non-NULL table pointer is all the gate reads; the shim refuses before
+    // anything could dereference it.
+    static TABLE: u8 = 1;
+    type Set = fn(*mut sys::mem_opt_t);
+    let knobs: [(&str, Set); 4] = [
+        ("alt_lift", |o| {
+            // SAFETY: a valid, uniquely-owned `mem_opt_t`; one POD field write.
+            unsafe { (*o).alt_lift = std::ptr::addr_of!(TABLE).cast() }
+        }),
+        ("alt_project_min_gap", |o| {
+            // SAFETY: as above.
+            unsafe { (*o).alt_project_min_gap = 1 }
+        }),
+        ("alt_project_pair_gap", |o| {
+            // SAFETY: as above.
+            unsafe { (*o).alt_project_pair_gap = 1 }
+        }),
+        ("alt_project_primary", |o| {
+            // SAFETY: as above.
+            unsafe { (*o).alt_project_primary = 1 }
+        }),
+    ];
+    for (field, set) in knobs {
+        assert_every_entry_point_refuses(set, |what| {
+            format!("{what}: --alt-project is not supported (opts->{field} is set;")
+        });
+    }
+}
+
+/// `--tie-break` (v0.18.0) takes `index` (0) or `name` (1); the CLI's parser
+/// accepts nothing else. The shim reads `tie_break_mode` at its three id sites
+/// (through `mem_tie_break_id`, which treats any value but 1 as index), so a
+/// raw `mem_opt_t` caller's out-of-range value is refused rather than silently
+/// meaning index.
+#[test]
+fn c_entry_points_refuse_an_unknown_tie_break_mode() {
+    assert_every_entry_point_refuses(
+        |o| {
+            // SAFETY: a valid, uniquely-owned `mem_opt_t`; one POD field write.
+            unsafe { (*o).tie_break_mode = 2 }
+        },
+        |what| format!("{what}: opts->tie_break_mode is 2, not 0 (index) or 1 (name)"),
+    );
+}
+
 /// A raw `mem_opt_t` caller skips `MemOpts::validate_for_alignment`, so every
 /// C alignment entry point refuses an unstorable mismatch penalty itself:
 /// `bwa_shim_opts_fill_scmat` leaves the matrices at the last storable `b`,
@@ -869,6 +1115,30 @@ unsafe extern "C" fn no_fields(
 /// new `b`. Handles each call consumes are released on the refusal too.
 #[test]
 fn c_entry_points_refuse_an_unstorable_mismatch_penalty() {
+    assert_every_entry_point_refuses(
+        |o| {
+            // A COLLAPSED-style `b = 2 * a` for `a = 100`: past what the
+            // matrices hold.
+            // SAFETY: `o` is a valid, uniquely-owned `mem_opt_t`; POD field
+            // write, then a refill the shim skips for an unstorable `b`.
+            unsafe {
+                (*o).b = 200;
+                sys::bwa_shim_opts_fill_scmat(o);
+            }
+        },
+        |what| format!("{what}: the effective mismatch penalty is 200, outside 0..128"),
+    );
+}
+
+/// Builds every input under clean options, applies `mutate` to them, then
+/// calls each of the 13 C alignment entry points and asserts that each refuses
+/// with an error starting `expect(<entry point>)`, and that nothing reached a
+/// record or field sink. Every entry point gates on `shim_opts_alignable`, so
+/// one refusal cause failing here at one call names the call that lost it.
+fn assert_every_entry_point_refuses(
+    mutate: impl FnOnce(*mut sys::mem_opt_t),
+    expect: impl Fn(&str) -> String,
+) {
     let Some((_dir, prefix)) = common::phix_index() else {
         return;
     };
@@ -904,20 +1174,10 @@ fn c_entry_points_refuse_an_unstorable_mismatch_penalty() {
         common::last_error()
     );
 
-    // A COLLAPSED-style `b = 2 * a` for `a = 100`: past what the matrices hold.
-    // SAFETY: `opts` is a valid, uniquely-owned `mem_opt_t`; POD field write.
-    unsafe {
-        (*opts).b = 200;
-        sys::bwa_shim_opts_fill_scmat(opts);
-    }
+    mutate(opts);
     let refused = |what: &str| {
         let err = common::last_error();
-        assert!(
-            err.starts_with(&format!(
-                "{what}: the effective mismatch penalty is 200, outside 0..128"
-            )),
-            "{what}: {err}"
-        );
+        assert!(err.starts_with(&expect(what)), "{what}: {err}");
     };
     let ids = sys::BwaIdBases {
         first_single_id: 0,

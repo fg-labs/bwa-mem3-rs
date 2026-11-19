@@ -79,6 +79,11 @@ pub struct mem_opt_t {
     pub meth_chimera_qc: ::std::os::raw::c_int,
     pub meth_context: ::std::os::raw::c_int,
     pub proper_pair_from_emitted: ::std::os::raw::c_int,
+    pub tie_break_mode: ::std::os::raw::c_int,
+    pub alt_lift: *const ::std::os::raw::c_void,
+    pub alt_project_min_gap: ::std::os::raw::c_int,
+    pub alt_project_pair_gap: ::std::os::raw::c_int,
+    pub alt_project_primary: ::std::os::raw::c_int,
     pub md_mode: ::std::os::raw::c_int,
     pub supp_rep_hard_cap: ::std::os::raw::c_int,
     pub smem_dedup: ::std::os::raw::c_int,
@@ -94,7 +99,7 @@ fn bindgen_test_layout_mem_opt_t() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::std::mem::size_of::<mem_opt_t>(),
-        448usize,
+        472usize,
         concat!("Size of: ", stringify!(mem_opt_t))
     );
     assert_eq!(
@@ -713,8 +718,58 @@ fn bindgen_test_layout_mem_opt_t() {
         )
     );
     assert_eq!(
-        unsafe { ::std::ptr::addr_of!((*ptr).md_mode) as usize - ptr as usize },
+        unsafe { ::std::ptr::addr_of!((*ptr).tie_break_mode) as usize - ptr as usize },
         412usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(mem_opt_t),
+            "::",
+            stringify!(tie_break_mode)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).alt_lift) as usize - ptr as usize },
+        416usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(mem_opt_t),
+            "::",
+            stringify!(alt_lift)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).alt_project_min_gap) as usize - ptr as usize },
+        424usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(mem_opt_t),
+            "::",
+            stringify!(alt_project_min_gap)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).alt_project_pair_gap) as usize - ptr as usize },
+        428usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(mem_opt_t),
+            "::",
+            stringify!(alt_project_pair_gap)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).alt_project_primary) as usize - ptr as usize },
+        432usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(mem_opt_t),
+            "::",
+            stringify!(alt_project_primary)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).md_mode) as usize - ptr as usize },
+        436usize,
         concat!(
             "Offset of field: ",
             stringify!(mem_opt_t),
@@ -724,7 +779,7 @@ fn bindgen_test_layout_mem_opt_t() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).supp_rep_hard_cap) as usize - ptr as usize },
-        416usize,
+        440usize,
         concat!(
             "Offset of field: ",
             stringify!(mem_opt_t),
@@ -734,7 +789,7 @@ fn bindgen_test_layout_mem_opt_t() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).smem_dedup) as usize - ptr as usize },
-        420usize,
+        444usize,
         concat!(
             "Offset of field: ",
             stringify!(mem_opt_t),
@@ -744,7 +799,7 @@ fn bindgen_test_layout_mem_opt_t() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).alnreg_sort_fast) as usize - ptr as usize },
-        424usize,
+        448usize,
         concat!(
             "Offset of field: ",
             stringify!(mem_opt_t),
@@ -754,7 +809,7 @@ fn bindgen_test_layout_mem_opt_t() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).skip_contained_ext) as usize - ptr as usize },
-        428usize,
+        452usize,
         concat!(
             "Offset of field: ",
             stringify!(mem_opt_t),
@@ -764,7 +819,7 @@ fn bindgen_test_layout_mem_opt_t() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).band_start) as usize - ptr as usize },
-        432usize,
+        456usize,
         concat!(
             "Offset of field: ",
             stringify!(mem_opt_t),
@@ -774,7 +829,7 @@ fn bindgen_test_layout_mem_opt_t() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).band_cert) as usize - ptr as usize },
-        436usize,
+        460usize,
         concat!(
             "Offset of field: ",
             stringify!(mem_opt_t),
@@ -784,7 +839,7 @@ fn bindgen_test_layout_mem_opt_t() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).compat) as usize - ptr as usize },
-        440usize,
+        464usize,
         concat!(
             "Offset of field: ",
             stringify!(mem_opt_t),
