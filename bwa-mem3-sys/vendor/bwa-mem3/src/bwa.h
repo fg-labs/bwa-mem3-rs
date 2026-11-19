@@ -97,6 +97,10 @@ typedef struct {
 
 extern int bwa_verbose;
 extern char bwa_rg_id[256];
+/* `--alt-project primary`: when nonzero, bwa_build_sam_hdr writes no @SQ for an
+ * ALT contig (generated, sidecar or -H) and the --bam writer maps ALT contigs
+ * to no header entry. 0 (every other mode) leaves the header untouched. */
+extern int bwa_hdr_primary_only;
 
 #ifdef __cplusplus
 extern "C" {
@@ -124,6 +128,11 @@ extern "C" {
 	 * reference of any lengths (see bwa.cpp), or -1. Used by bwa_gen_cigar3. */
 	int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins,
 	                         int qlen, const uint8_t *query, int tlen, const uint8_t *rseq);
+	/* The band bwa_gen_cigar4 uses for a gapped region of l_query query and rlen
+	 * reference bases given the caller's band w_ (`match` = mat[0]), before the
+	 * certified-band narrowing, which keeps the score and CIGAR (see bwa.cpp). */
+	int bwa_gen_cigar_band(int match, int o_del, int e_del, int o_ins, int e_ins, int w_,
+	                       int l_query, int64_t rlen);
 	uint32_t *bwa_gen_cigar(const int8_t mat[25], int q, int r, int w_,
 							int64_t l_pac, const uint8_t *pac, int l_query,
 							uint8_t *query, int64_t rb, int64_t re,
@@ -230,6 +239,21 @@ extern "C" {
 	 * sets *line/*len to the next record (no newline) and advances *p, returning
 	 * 1, or returns 0 at end of text. */
 	int bwa_hdr_next_line(const char **p, const char **line, size_t *len);
+	/* True if the header record `line` (`len` bytes, no newline) is an @RG or
+	 * @PG whose ID: also names a record of the same type in `user_hdr`, the
+	 * user's -R/-H header text (NULL for none). SAM requires those IDs to be
+	 * unique, so a writer forwarding index-sidecar records drops each one the
+	 * user's text redeclares: user > sidecar, as for @HD and @SQ. Only the
+	 * first ID: tag of a record counts, as in htslib; a record without one is
+	 * never overridden. The single definition shared by the SAM-text, --bam
+	 * and --meth writers. */
+	int bwa_hdr_record_overridden(const char *line, size_t len, const char *user_hdr);
+	/* Allocate the dictionary fallback path; caller frees the result. */
+	char *bwa_dict_path(const char *prefix);
+	/* Open .hdr then dictionary. strict rejects existing unreadable/nonregular
+	 * metadata instead of falling back. path is allocated even on absence;
+	 * error is nonzero only for a strict inspection/open failure. */
+	FILE *bwa_open_index_header(const char *prefix, int strict, char **path, int *error);
 	char *bwa_load_hdr_from_index(const char *prefix);
 	/* Warn (at bwa_verbose >= 2) when the index marks contigs ALT but the
 	 * sidecar's @SQ block carries no AH for them. The sidecar is authoritative

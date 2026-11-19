@@ -516,7 +516,8 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/system.o src/libsais_build.o \
 			src/bwa_shm.o src/bwa_hugepages.o src/bwa_thp.o src/simd_dispatch.o \
 			src/fast_reader.o src/fast_reader_bseq.o src/fr_fastq.o src/stage_prof.o \
-			src/smem_dedup.o src/lockstep_width.o src/read_memo.o src/rescue_band.o
+			src/smem_dedup.o src/lockstep_width.o src/read_memo.o src/rescue_band.o \
+			src/alt_lift.o
 
 # Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
 # and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
@@ -1475,9 +1476,11 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	./kvec_alloc_fail_test
 	./klib_alloc_fail_test
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
+	BWA_MEM3="$(CURDIR)/bwa-mem3" ./test/regression/meth_index_output.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/thp_check_smoke.sh
+	./test/help_prescan_test.sh --list-only
 	./test/regression/mem_cli_selftest.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/mem_cli_basics.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/mem_io_cli.sh

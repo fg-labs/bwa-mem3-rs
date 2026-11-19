@@ -33,6 +33,8 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdlib.h>
 #include <zlib.h>
 #include <assert.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include "bntseq.h"
 #include "bwa.h"
 #include "ksw.h"
@@ -47,6 +49,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 int bwa_verbose = 3;
 char bwa_rg_id[256];
 char *bwa_pg;
+int bwa_hdr_primary_only = 0;
 
 /************************
  * Batch FASTA/Q reader *
@@ -363,6 +366,26 @@ template <int M> static inline uint8_t bwa_ref_base(uint8_t r)
     return M == 5 ? r : meth_code_base(r);
 }
 
+/* The band bwa_gen_cigar4 aligns a gapped region with, before the certified-band
+ * narrowing (which keeps the score and CIGAR): half the longest gap a match run
+ * of half the query can pay for, plus half the length difference, capped at the
+ * caller's w_, then raised to |rlen - l_query| + 3. `match` is mat[0]. Shared
+ * with --alt-project's lift gate (mem_alt_project), which must know the band a
+ * lifted region will get, so the two cannot drift apart. */
+int bwa_gen_cigar_band(int match, int o_del, int e_del, int o_ins, int e_ins, int w_, int l_query, int64_t rlen)
+{
+    int max_gap, max_ins, max_del, min_w, w;
+    max_ins = (int)((double)(((l_query+1)>>1) * match - o_ins) / e_ins + 1.);
+    max_del = (int)((double)(((l_query+1)>>1) * match - o_del) / e_del + 1.);
+    max_gap = max_ins > max_del? max_ins : max_del;
+    max_gap = max_gap > 1? max_gap : 1;
+    w = (max_gap + abs(rlen - l_query) + 1) >> 1;
+    w = w < w_? w : w_;
+    min_w = abs(rlen - l_query) + 3;
+    w = w > min_w? w : min_w;
+    return w;
+}
+
 /* bwa_global_cert_band over a matrix of alphabet size M (row stride M). */
 template <int M>
 static int bwa_global_cert_band_m(const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins,
@@ -666,16 +689,8 @@ static uint32_t *bwa_gen_cigar4_m(const int8_t *mat, const bntseq_t *bns, int o_
         int ungapped = (l_query == re - rb && w_ == 0);
         int w = 0;
         if (!ungapped) {
-            int max_gap, max_ins, max_del, min_w;
-            // set the band-width
-            max_ins = (int)((double)(((l_query+1)>>1) * mat[0] - o_ins) / e_ins + 1.);
-            max_del = (int)((double)(((l_query+1)>>1) * mat[0] - o_del) / e_del + 1.);
-            max_gap = max_ins > max_del? max_ins : max_del;
-            max_gap = max_gap > 1? max_gap : 1;
-            w = (max_gap + abs(rlen - l_query) + 1) >> 1;
-            w = w < w_? w : w_;
-            min_w = abs(rlen - l_query) + 3;
-            w = w > min_w? w : min_w;
+            const int min_w = abs(rlen - l_query) + 3;
+            w = bwa_gen_cigar_band(mat[0], o_del, e_del, o_ins, e_ins, w_, l_query, rlen);
             // the certified band, when narrower: same score and CIGAR (bwa_global_cert_band)
             // Unequal lengths keep the floor min_w (the wavefront kernels' proof needs it), so
             // there the certificate can only help when w is above it. kc is at least
@@ -1030,6 +1045,45 @@ int bwa_hdr_text_has_type(const char *s, const char *tag)
     return 0;
 }
 
+/* The value of the first ID: tag of header record `line` (`len` bytes, no
+ * newline): sets *id/*id_len and returns 1, or returns 0 if it has none. The
+ * first wins, as in htslib's header parser. */
+static int hdr_record_id(const char *line, size_t len, const char **id, size_t *id_len)
+{
+    const char *end = line + len;
+    const char *p = (const char *)memchr(line, '\t', len);
+    while (p != NULL) {
+        const char *tok = p + 1;
+        const char *tok_end = (const char *)memchr(tok, '\t', (size_t)(end - tok));
+        if (tok_end == NULL) tok_end = end;
+        if (tok_end - tok >= 3 && strncmp(tok, "ID:", 3) == 0) {
+            *id = tok + 3;
+            *id_len = (size_t)(tok_end - tok - 3);
+            return 1;
+        }
+        p = tok_end < end ? tok_end : NULL;
+    }
+    return 0;
+}
+
+/* Whether a sidecar @RG/@PG record yields to one in the user's header text;
+ * contract at the declaration in bwa.h. */
+int bwa_hdr_record_overridden(const char *line, size_t len, const char *user_hdr)
+{
+    if (user_hdr == NULL || len < 4) return 0;
+    if (strncmp(line, "@RG\t", 4) != 0 && strncmp(line, "@PG\t", 4) != 0) return 0;
+    const char *id, *user_id; size_t id_len, user_id_len;
+    if (!hdr_record_id(line, len, &id, &id_len)) return 0;
+    const char *cur = user_hdr, *u; size_t u_len;
+    while (bwa_hdr_next_line(&cur, &u, &u_len)) {
+        if (u_len >= 4 && strncmp(u, line, 4) == 0 &&
+            hdr_record_id(u, u_len, &user_id, &user_id_len) &&
+            user_id_len == id_len && memcmp(user_id, id, id_len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 // Return 1 iff `lines` contains any @SQ header records.
 static int has_SQ(const char *lines)
 {
@@ -1191,12 +1245,15 @@ static int hdr_put(kstring_t *out, const char *p, size_t len, int nl)
 
 /* Append the records of `lines` (newline-separated, terminated or not) to
  * `out`, one per line, dropping every @HD -- the builder emits the one that
- * wins itself, first -- and every empty line, which is not a header record. */
-static int append_records_without_HD(kstring_t *out, const char *lines)
+ * wins itself, first -- every empty line, which is not a header record, and
+ * every @RG/@PG whose ID the user header text `user_hdr` also declares (NULL
+ * for none; see bwa_hdr_record_overridden). */
+static int append_records_without_HD(kstring_t *out, const char *lines, const char *user_hdr)
 {
     const char *cur = lines, *line; size_t len;
     while (bwa_hdr_next_line(&cur, &line, &len)) {
         if (len == 0 || (len >= 4 && strncmp(line, "@HD\t", 4) == 0)) continue;
+        if (bwa_hdr_record_overridden(line, len, user_hdr)) continue;
         if (hdr_put(out, line, len, 1) < 0) return -1;
     }
     return 0;
@@ -1211,6 +1268,60 @@ static const char *first_HD(const char *lines, size_t *len)
     return NULL;
 }
 
+static int build_sam_hdr_core(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_lines,
+                              const char *hdr_line, const char *pg,
+                              const compat_target_t *compat, int n_seqs_out);
+
+/* --alt-project primary: a copy of the newline-separated header text `lines`
+ * without its @SQ records whose SN names an ALT contig of `bns` (contigs named
+ * in <idxbase>.alt), adding the number dropped to *n_dropped. Every other record
+ * is kept byte for byte, including AH on an @SQ that is not an ALT of `bns`
+ * (the .alt decides what is ALT); those are added to *n_ah_kept. Returns NULL
+ * for NULL `lines`, and on allocation failure sets *failed. The caller frees
+ * the result. */
+static char *drop_alt_SQ(const char *lines, const bntseq_t *bns, int *n_dropped, int *n_ah_kept,
+                         int *failed)
+{
+    if (lines == NULL) return NULL;
+    khash_t(sqname) *alt = kh_init(sqname);
+    if (alt == NULL) { *failed = 1; return NULL; }
+    for (int i = 0; i < bns->n_seqs; ++i) {
+        if (!bns->anns[i].is_alt) continue;
+        int absent;
+        khiter_t k = kh_put(sqname, alt, bns->anns[i].name, &absent);
+        if (absent < 0) { kh_destroy(sqname, alt); *failed = 1; return NULL; }
+        kh_val(alt, k) = i;
+    }
+    kstring_t out = {0, 0, NULL};
+    kstring_t key = {0, 0, NULL};
+    const char *p = lines;
+    int bad = 0;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        const size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        const char *sn; size_t sn_len; int has_ah;
+        int drop = 0;
+        if (sq_scan(p, len, &sn, &sn_len, &has_ah)) {
+            key.l = 0;
+            if (hdr_put(&key, sn, sn_len, 0) < 0) { bad = 1; break; }
+            drop = kh_get(sqname, alt, key.s) != kh_end(alt);
+            if (!drop && has_ah) ++*n_ah_kept;
+        }
+        if (drop) {
+            ++*n_dropped;
+        } else if (hdr_put(&out, p, len, eol ? 1 : 0) < 0) {
+            bad = 1; break;
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    kh_destroy(sqname, alt);
+    free(key.s);
+    if (bad) { free(out.s); *failed = 1; return NULL; }
+    if (out.s == NULL && hdr_put(&out, "", 0, 0) < 0) { *failed = 1; return NULL; }
+    return out.s;
+}
+
 /* Build the complete output header -- the one definition the SAM-text writer
  * prints and the --bam writer hands to htslib, so the two containers cannot
  * carry different headers. It merges, in precedence order, the user's -H text
@@ -1223,29 +1334,69 @@ static const char *first_HD(const char *lines, size_t *len)
  *         wherever it sat in its source; every other @HD is dropped.
  *   @SQ : if -H supplies any, the user's alone (the sidecar is then ignored
  *         entirely); else the sidecar's; else generated from bns.
+ *   @RG/@PG: IDs must be unique, so a sidecar record whose type and ID
+ *         -H also declares is dropped and only the user's is emitted.
  *   Other: the sidecar's remaining records, then -H's, then `pg` (the @PG
  *         text, newline-terminated; NULL for none).
  * The @SQ block is authoritative as given: it is not reordered or completed
  * against the index. The --bam writer maps its records' contigs onto it by
- * name (bam_writer_open). Returns 0, or -1 if `out` could not be grown. */
+ * name (bam_writer_open). Under bwa_hdr_primary_only (--alt-project primary)
+ * no @SQ names an ALT contig: they are dropped from -H and the sidecar and not
+ * generated. Returns 0, or -1 if `out` could not be grown. */
 int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_lines,
                       const char *hdr_line, const char *pg, const compat_target_t *compat)
 {
     if (compat == NULL) compat = &COMPAT_TARGET_OFF;
+    /* --alt-project primary: the output names no ALT contig, so drop their @SQ
+     * from -H and the sidecar here, before the precedence rules below see them,
+     * and skip them when generating. The note says so when any were supplied. */
+    char *hdr_line_pri = NULL, *idx_hdr_pri = NULL;
+    int n_seqs_out = bns->n_seqs;
+    if (bwa_hdr_primary_only) {
+        int dropped = 0, ah_kept = 0, failed = 0;
+        hdr_line_pri = drop_alt_SQ(hdr_line, bns, &dropped, &ah_kept, &failed);
+        idx_hdr_pri = failed ? NULL : drop_alt_SQ(idx_hdr_lines, bns, &dropped, &ah_kept, &failed);
+        if (failed) { free(hdr_line_pri); free(idx_hdr_pri); return -1; }
+        if (hdr_line) hdr_line = hdr_line_pri;
+        if (idx_hdr_lines) idx_hdr_lines = idx_hdr_pri;
+        for (int i = 0; i < bns->n_seqs; ++i) n_seqs_out -= bns->anns[i].is_alt != 0;
+        if (dropped > 0 && bwa_verbose >= 3)
+            fprintf(stderr, "[M::%s] --alt-project primary: left out %d ALT @SQ record%s "
+                    "supplied by -H or the index's .hdr/.dict sidecar\n", __func__, dropped,
+                    dropped == 1 ? "" : "s");
+        /* The .alt, not AH, decides what is ALT: an AH on any other @SQ is kept
+         * as supplied (and that contig's records are written as usual). */
+        if (ah_kept > 0 && bwa_verbose >= 3)
+            fprintf(stderr, "[M::%s] --alt-project primary: kept AH on %d @SQ record%s supplied by "
+                    "-H or the index's .hdr/.dict sidecar for contigs the index's .alt does not "
+                    "list; they are not treated as ALT\n", __func__, ah_kept, ah_kept == 1 ? "" : "s");
+    }
+    const int rc = build_sam_hdr_core(out, bns, idx_hdr_lines, hdr_line, pg, compat, n_seqs_out);
+    free(hdr_line_pri);
+    free(idx_hdr_pri);
+    return rc;
+}
+
+/* bwa_build_sam_hdr after the primary-only @SQ filter; `n_seqs_out` is the
+ * number of index contigs the header is expected to describe. */
+static int build_sam_hdr_core(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_lines,
+                              const char *hdr_line, const char *pg,
+                              const compat_target_t *compat, int n_seqs_out)
+{
     const int n_SQ = count_SQ(hdr_line);
     // If the user's -H supplies any @SQ, ignore the sidecar entirely: the user
     // has taken responsibility for the @SQ block.
     const char *bns_hdr = n_SQ > 0 ? NULL : idx_hdr_lines;
     if (bns_hdr) {
         const int idx_SQ = count_SQ(bns_hdr);
-        if (idx_SQ != 0 && idx_SQ != bns->n_seqs && bwa_verbose >= 2)
+        if (idx_SQ != 0 && idx_SQ != n_seqs_out && bwa_verbose >= 2)
             fprintf(stderr,
                     "[W::%s] %d @SQ lines loaded from index; %d sequences in the index. "
-                    "Continue anyway.\n", __func__, idx_SQ, bns->n_seqs);
+                    "Continue anyway.\n", "bwa_build_sam_hdr", idx_SQ, n_seqs_out);
     }
-    if (n_SQ != 0 && n_SQ != bns->n_seqs && bwa_verbose >= 2)
+    if (n_SQ != 0 && n_SQ != n_seqs_out && bwa_verbose >= 2)
         fprintf(stderr, "[W::%s] %d @SQ lines provided with -H; %d sequences in the index. "
-                "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
+                "Continue anyway.\n", "bwa_build_sam_hdr", n_SQ, n_seqs_out);
 
     /* @HD policy for the default comes from the selected compat target; the
      * evidence for each row is in src/compat_target.cpp. DO NOT "fix" the
@@ -1262,6 +1413,7 @@ int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_l
     // Generate @SQ from bns only when neither -H nor the sidecar supplies any.
     if (n_SQ == 0 && !has_SQ(bns_hdr)) {
         for (int i = 0; i < bns->n_seqs; ++i) {
+            if (bwa_hdr_primary_only && bns->anns[i].is_alt) continue;
             // Formatted apart: bwa_format_sq_line grows its buffer through
             // kstring.h, which drops the buffer when the realloc fails.
             kstring_t sq = {0, 0, NULL};
@@ -1271,40 +1423,65 @@ int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_l
             if (r) return -1;
         }
     }
-    if (bns_hdr && append_records_without_HD(out, bns_hdr) < 0) return -1;
-    if (hdr_line && append_records_without_HD(out, hdr_line) < 0) return -1;
+    if (bns_hdr && append_records_without_HD(out, bns_hdr, hdr_line) < 0) return -1;
+    if (hdr_line && append_records_without_HD(out, hdr_line, NULL) < 0) return -1;
     if (pg && hdr_put(out, pg, strlen(pg), 0) < 0) return -1;
     return 0;
 }
 
-// Load the contents of `<prefix>.hdr` if present, else `<baseprefix>.dict`
-// (where baseprefix drops a trailing ".gz" then the final dotted suffix of the
-// basename, whatever it is -- e.g. foo.fa -> foo, GRCh38.p14 -> GRCh38), into
-// a newly-allocated, newline-separated but not newline-terminated string.
-// Returns NULL if neither file exists (or is empty). Caller owns the result
-// and must free() it.
+char *bwa_dict_path(const char *prefix)
+{
+    std::string path(prefix);
+    if (path.size() >= 3 && path.compare(path.size() - 3, 3, ".gz") == 0)
+        path.resize(path.size() - 3);
+    size_t dot = path.find_last_of('.'), slash = path.find_last_of('/');
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        path.resize(dot);
+    char *result = strdup((path + ".dict").c_str());
+    if (!result) err_fatal(__func__, "out of memory allocating dictionary path");
+    return result;
+}
+
+FILE *bwa_open_index_header(const char *prefix, int strict, char **path, int *error)
+{
+    *error = 0;
+    *path = strdup((std::string(prefix) + ".hdr").c_str());
+    if (!*path) err_fatal(__func__, "out of memory allocating header path");
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        struct stat st;
+        bool missing = false;
+        if (strict && stat(*path, &st) != 0) {
+            int saved = errno;
+            // A dangling symlink is existing metadata, not absence.
+            if (saved != ENOENT || lstat(*path, &st) == 0) {
+                *error = saved;
+                return NULL;
+            }
+            missing = true;
+        }
+        if (strict && !missing && !S_ISREG(st.st_mode)) {
+            *error = EINVAL;
+            return NULL;
+        }
+        FILE *fp = missing ? NULL : fopen(*path, "r");
+        if (fp) return fp;
+        if (strict && !missing) { *error = errno; return NULL; }
+        if (attempt == 0) {
+            free(*path);
+            *path = bwa_dict_path(prefix);
+        }
+    }
+    return NULL;
+}
+
+// Preserve the loader's permissive .hdr-open failure -> dictionary fallback.
+// The indexer uses the same selector in strict mode before replacing outputs.
 char *bwa_load_hdr_from_index(const char *prefix)
 {
     if (prefix == NULL) return NULL;
-
-    kstring_t path = { 0, 0, NULL };
-    ksprintf(&path, "%s.hdr", prefix);
-    FILE *fp = fopen(path.s, "r");
-    if (!fp) {
-        // Try <baseprefix>.dict: drop the ".hdr" we just appended, then drop
-        // a trailing ".gz" (if any) and the final dotted suffix inside the
-        // basename — e.g. foo.fa -> foo, foo.fasta.gz -> foo — before
-        // appending ".dict".
-        size_t l;
-        path.l -= 4; // drop ".hdr"
-        if (path.l >= 3 && strncmp(&path.s[path.l - 3], ".gz", 3) == 0)
-            path.l -= 3;
-        for (l = path.l; l > 0 && path.s[l - 1] != '/'; --l) {
-            if (path.s[l - 1] == '.') { path.l = l - 1; break; }
-        }
-        ksprintf(&path, ".dict");
-        fp = fopen(path.s, "r");
-    }
+    char *path = NULL;
+    int error = 0;
+    FILE *fp = bwa_open_index_header(prefix, 0, &path, &error);
 
     char *out = NULL;
     if (fp) {
@@ -1323,7 +1500,7 @@ char *bwa_load_hdr_from_index(const char *prefix)
         }
     }
 
-    free(path.s);
+    free(path);
     return out;
 }
 
