@@ -70,10 +70,18 @@ static void bns_build_path(char *out, size_t outsz, const char *prefix, const ch
 		err_fatal(__func__, "path too long for prefix '%s' (suffix '%s')", prefix, suffix);
 }
 
+/* ASCII -> 2-bit base code: A/C/G/T (either case) -> 0..3, everything else -> 4 (N).
+ * '-' is N too. Upstream bwa/bwa-mem2 map it to a separate code 5 that no scoring
+ * matrix row defines, so each alignment kernel scored it however its N test happened
+ * to work (a read past the 5x5 matrix row in the scalar paths, w_ambig or w_mismatch
+ * by SIMD tier and width in the vector ones), and SEQ printed a NUL for it. Mapping it
+ * to 4 scores and prints a read '-' as N on every path and tier. The reference parser
+ * (bns_fasta2bntseq) treats every code >= 4 as a hole keyed on the raw character, so
+ * index construction is unchanged. */
 unsigned char nst_nt4_table[256] = {
 	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4, 
 	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4, 
-	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 5 /*'-'*/, 4, 4,
+	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4 /*'-'*/, 4, 4,
 	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4, 
 	4, 0, 4, 1,  4, 4, 4, 2,  4, 4, 4, 4,  4, 4, 4, 4, 
 	4, 4, 4, 4,  3, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4, 
@@ -127,16 +135,20 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 	FILE *fp;
 	const char *fname;
 	bntseq_t *bns;
-	long long xx;
+	long long xx, cnt;
 	int i;
 	int scanres;
 	bns = (bntseq_t*)calloc(1, sizeof(bntseq_t));
 	xassert(bns != NULL, "out of memory: bns");
 	{ // read .ann
 		fp = xopen(fname = ann_filename, "r");
-		scanres = fscanf(fp, "%lld%d%u", &xx, &bns->n_seqs, &bns->seed);
-		assert(bns->n_seqs >= 0 && bns->n_seqs <= INT_MAX);
+		// The header counts are read as long long and range-checked before
+		// narrowing: %d into an int would wrap an oversized count to a small one.
+		scanres = fscanf(fp, "%lld%lld%u", &xx, &cnt, &bns->seed);
 		if (scanres != 3) goto badread;
+		if (xx < 0) err_fatal(__func__, "corrupt index %s: reference length %lld is negative", fname, xx);
+		if (cnt < 0 || cnt > INT_MAX) err_fatal(__func__, "corrupt index %s: sequence count %lld is out of range", fname, cnt);
+		bns->n_seqs = (int32_t)cnt;
 		bns->l_pac = xx;
 		bns->anns = (bntann1_t*)calloc(bns->n_seqs, sizeof(bntann1_t));
         // A zero-sequence .ann is degenerate but not an allocation failure:
@@ -151,15 +163,22 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 			scanres = fscanf(fp, "%u%8192s", &p->gi, str);
 			if (scanres != 2) goto badread;
 			p->name = strdup(str);
-			// read fasta comments 
+			// read fasta comments; a line longer than str keeps its first
+			// sizeof(str) - 1 characters, and the rest is skipped with a warning
+			int truncated = 0;
 			while (q - str < sizeof(str) - 1 && (c = fgetc(fp)) != '\n' && c != EOF) *q++ = c;
-			while (c != '\n' && c != EOF) c = fgetc(fp);
+			while (c != '\n' && c != EOF) {
+				c = fgetc(fp);
+				if (c != '\n' && c != EOF) truncated = 1;
+			}
 			if (c == EOF) {
 				scanres = EOF;
 				goto badread;
 			}
 			*q = 0;
-			assert(strlen(str) < 8192);
+			if (truncated)
+				fprintf(stderr, "[W::%s] %s: the comment of '%s' is longer than %d characters and was truncated\n",
+						__func__, fname, p->name, (int)sizeof(str) - 2);
 			if (q - str > 1 && strcmp(str, " (null)") != 0) p->anno = strdup(str + 1); // skip leading space
 			else p->anno = strdup("");
 			// read the rest
@@ -170,14 +189,15 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 		err_fclose(fp);
 	}
 	{ // read .amb
-		int64_t l_pac;
-		int32_t n_seqs;
+		long long n_seqs;
 		fp = xopen(fname = amb_filename, "r");
-		scanres = fscanf(fp, "%lld%d%d", &xx, &n_seqs, &bns->n_holes);
-		assert(bns->n_holes >= 0 && bns->n_holes <= INT_MAX);
+		scanres = fscanf(fp, "%lld%lld%lld", &xx, &n_seqs, &cnt);
 		if (scanres != 3) goto badread;
-		l_pac = xx;
-		xassert(l_pac == bns->l_pac && n_seqs == bns->n_seqs, "inconsistent .ann and .amb files.");
+		if (cnt < 0 || cnt > INT_MAX) err_fatal(__func__, "corrupt index %s: hole count %lld is out of range", fname, cnt);
+		bns->n_holes = (int32_t)cnt;
+		if (xx != bns->l_pac || n_seqs != bns->n_seqs)
+			err_fatal(__func__, "corrupt index %s: header (%lld %lld) does not match the .ann header (%lld %d)",
+					  fname, xx, n_seqs, (long long)bns->l_pac, bns->n_seqs);
         if(bns->n_holes){
             bns->ambs = (bntamb1_t*)calloc(bns->n_holes, sizeof(bntamb1_t));
             xassert(bns->ambs != NULL, "out of memory: bns->ambs");
@@ -631,6 +651,11 @@ const Pac2Nt4Lut &pac2nt4_lut() {
 }
 }  // namespace
 
+/* bns_pac_load32, and bns_pac16_end in SIMD builds, build a big-endian word from a native load
+ * and a byte swap, which puts the lower-addressed pac byte on top only on a little-endian host. */
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+              "the pac word loads below assume a little-endian host");
+
 #ifdef BNS_SIMD_UNPACK
 /* Expand 16 packed bytes (64 2-bit bases) into four __m128i, then interleave to base order.
  * In-byte positions are bits [7:6],[5:4],[3:2],[1:0] (MSB-first, matching _get_pac); a
@@ -647,7 +672,172 @@ static inline void bns_expand4(__m128i v, __m128i *o0, __m128i *o1, __m128i *o2,
 	*o0 = _mm_unpacklo_epi16(lo01, lo23); *o1 = _mm_unpackhi_epi16(lo01, lo23);
 	*o2 = _mm_unpacklo_epi16(hi01, hi23); *o3 = _mm_unpackhi_epi16(hi01, hi23);
 }
+
+/* Reverse the order of 16 bases (pshufb) and complement them (^3). */
+static inline __m128i bns_rc16(__m128i x)
+{
+	const __m128i rmask = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+	return _mm_xor_si128(_mm_shuffle_epi8(x, rmask), _mm_set1_epi8(3));
+}
+
+/* Forward bases [k, k+64) to d[0..64); k is a multiple of 4, so the block is the 16 pac bytes
+ * from k>>2. Byte-identical to the LUT loops (verified vs them over 200k random windows). */
+static inline void bns_block(const uint8_t *pac, int64_t k, uint8_t *d)
+{
+	__m128i v = _mm_loadu_si128((const __m128i *)(pac + (k >> 2))), o0, o1, o2, o3;
+	bns_expand4(v, &o0, &o1, &o2, &o3);
+	_mm_storeu_si128((__m128i *)d,        o0);
+	_mm_storeu_si128((__m128i *)(d + 16), o1);
+	_mm_storeu_si128((__m128i *)(d + 32), o2);
+	_mm_storeu_si128((__m128i *)(d + 48), o3);
+}
+
+/* Forward bases k, k-1, ..., k-63, complemented, to d[0..64); k is the last base of its byte.
+ * Forward-expands the 16-byte block [k-63, k], then reverse-complements each 16 bases;
+ * byte-identical to the rev-LUT (verified over 200k windows). The load reads
+ * pac[(k>>2)-15 .. k>>2], the same span the LUT loop reads; the callers keep k-64 >= beg_f,
+ * and beg_f >= -1 after the end <= 2*l_pac clamp, so it never reads before pac[0]. */
+static inline void bns_block_rc(const uint8_t *pac, int64_t k, uint8_t *d)
+{
+	__m128i v = _mm_loadu_si128((const __m128i *)(pac + ((k >> 2) - 15))), o0, o1, o2, o3;
+	bns_expand4(v, &o0, &o1, &o2, &o3);   // o0..o3 = forward bases [k-63, k] ascending
+	_mm_storeu_si128((__m128i *)d,        bns_rc16(o3));
+	_mm_storeu_si128((__m128i *)(d + 16), bns_rc16(o2));
+	_mm_storeu_si128((__m128i *)(d + 32), bns_rc16(o1));
+	_mm_storeu_si128((__m128i *)(d + 48), bns_rc16(o0));
+}
+
+/* The first of the 8 pac bytes bns_pac16_end loads for the piece ending at base e. */
+static constexpr int64_t bns_pac16_first_byte(int64_t e) { return ((e - 1) >> 2) - 7; }
+
+/* The lowest piece end for which bns_pac16_end reads nothing before pac[0]. */
+static constexpr int64_t BNS_PIECE_END_MIN = 29;
+static_assert(bns_pac16_first_byte(BNS_PIECE_END_MIN) == 0 &&
+              bns_pac16_first_byte(BNS_PIECE_END_MIN - 1) < 0,
+              "BNS_PIECE_END_MIN must be the lowest piece end whose load starts at pac[0]");
+
+/* The forward bases [e-16, e) at any phase, as 4 packed bytes in memory order in the low 32 bits.
+ * Loads the 8 pac bytes from bns_pac16_first_byte(e), 3-4 bytes below the byte holding base
+ * e-16, to the byte holding base e-1. Needs BNS_PIECE_END_MIN <= e <= l_pac. */
+static inline __m128i bns_pac16_end(const uint8_t *pac, int64_t e)
+{
+	uint64_t w;
+	memcpy(&w, pac + bns_pac16_first_byte(e), 8);
+	w = __builtin_bswap64(w) >> ((~(e - 1) & 3) << 1);   // MSB-first, base e-1 in bits 1:0
+	return _mm_cvtsi32_si128((int)__builtin_bswap32((uint32_t)w));
+}
+
+/* Forward bases [e-16, e) to d[0..16): o0 of bns_expand4 on bns_pac16_end's 4 bytes. */
+static inline void bns_piece(const uint8_t *pac, int64_t e, uint8_t *d)
+{
+	__m128i o0, o1, o2, o3;
+	bns_expand4(bns_pac16_end(pac, e), &o0, &o1, &o2, &o3);
+	_mm_storeu_si128((__m128i *)d, o0);
+}
+
+/* Forward bases e-1, e-2, ..., e-16, complemented, to d[0..16). */
+static inline void bns_piece_rc(const uint8_t *pac, int64_t e, uint8_t *d)
+{
+	__m128i o0, o1, o2, o3;
+	bns_expand4(bns_pac16_end(pac, e), &o0, &o1, &o2, &o3);
+	_mm_storeu_si128((__m128i *)d, bns_rc16(o0));
+}
+
+/* Thresholds for the window tails below. With fewer than BNS_TAIL_MIN_LEFT bases left, the LUT
+ * loops are cheaper. A window shorter than BNS_TAIL_MIN_WINDOW cannot hold a whole piece. The
+ * lowest piece ends at or above beg+16 forward and beg_f+17 reverse, so the start floors keep
+ * every piece end at or above BNS_PIECE_END_MIN. */
+static constexpr int64_t BNS_TAIL_MIN_LEFT = 8;
+static constexpr int64_t BNS_TAIL_MIN_WINDOW = 16;
+static constexpr int64_t BNS_TAIL_BEG_MIN = BNS_PIECE_END_MIN - 16;     // forward beg
+static constexpr int64_t BNS_TAIL_BEG_F_MIN = BNS_PIECE_END_MIN - 17;   // reverse beg_f
+
+/* Window tails. After the leading partial bases and the whole blocks, bns_tail and bns_tail_rc
+ * write the rest of the window at any base phase instead of the LUT loops. They do so only when
+ * at least BNS_TAIL_MIN_LEFT bases are left, the window holds at least BNS_TAIL_MIN_WINDOW bases,
+ * and beg >= BNS_TAIL_BEG_MIN (forward) or beg_f >= BNS_TAIL_BEG_F_MIN (reverse).
+ * Otherwise they write nothing and return false, and the LUT and scalar loops write the tail.
+ *
+ * If more than 32 bases are left and a whole block fits in the window at a byte boundary, they
+ * write the block that ends closest to the window's end. If 1-3 bases follow that block, one
+ * 16-base piece ending at the window's end writes them. Otherwise they write 16-base pieces from
+ * the first unwritten base, and the last piece ends exactly at the window's end.
+ *
+ * The block and the pieces may rewrite bases already written, with the same values. Nothing is
+ * written outside the window. A window's lowest piece reads up to 4 pac bytes below the
+ * window's lowest byte (see bns_pac16_end). */
+
+/* Forward bases [k, end) of the window [beg, end) to d[0 ..]; k >= beg is a multiple of 4 and
+ * end <= l_pac. */
+static inline bool bns_tail(const uint8_t *pac, int64_t beg, int64_t k, int64_t end, uint8_t *d)
+{
+	if (end - k < BNS_TAIL_MIN_LEFT || end - beg < BNS_TAIL_MIN_WINDOW || beg < BNS_TAIL_BEG_MIN)
+		return false;
+	const int64_t kb = (end - 64) & ~(int64_t)3;   // last block start that ends inside the window
+	if (end - k > 32 && kb >= beg) {
+		bns_block(pac, kb, d + (kb - k));
+		if (kb + 64 < end) bns_piece(pac, end, d + (end - 16 - k));
+		return true;
+	}
+	for (int64_t e = k + 16; ; e += 16) {
+		if (e > end) e = end;
+		bns_piece(pac, e, d + (e - 16 - k));
+		if (e == end) break;
+	}
+	return true;
+}
+
+/* Forward bases k, k-1, ..., beg_f+1, complemented, to d[0 ..]: the reverse window's bases from
+ * forward base k down to beg_f+1. k <= end_f is the last base of its byte. */
+static inline bool bns_tail_rc(const uint8_t *pac, int64_t beg_f, int64_t k, int64_t end_f,
+                               uint8_t *d)
+{
+	if (k - beg_f < BNS_TAIL_MIN_LEFT || end_f - beg_f < BNS_TAIL_MIN_WINDOW ||
+	    beg_f < BNS_TAIL_BEG_F_MIN)
+		return false;
+	const int64_t lo = beg_f + 17;         // the lowest piece: bases beg_f+1 .. beg_f+16
+	const int64_t kb = (beg_f + 64) | 3;   // lowest block top whose block stays above beg_f
+	if (k - beg_f > 32 && kb <= end_f) {
+		bns_block_rc(pac, kb, d + (k - kb));
+		if (kb - 64 > beg_f) bns_piece_rc(pac, lo, d + (k + 1 - lo));
+		return true;
+	}
+	for (int64_t e = k + 1; ; e -= 16) {
+		if (e < lo) e = lo;
+		bns_piece_rc(pac, e, d + (k + 1 - e));
+		if (e == lo) break;
+	}
+	return true;
+}
 #endif
+
+/* 32 forward-strand bases of the 2-bit pac starting at base p, the first base in
+ * the top two bits. Reads pac bytes [p>>2, (p>>2) + 8]. The byte swap puts pac
+ * byte p>>2 on top only on a little-endian host (see the static_assert above). */
+static inline uint64_t bns_pac_load32(const uint8_t *pac, int64_t p)
+{
+	const uint8_t *q = pac + (p >> 2);
+	uint64_t x;
+	memcpy(&x, q, 8);
+	x = __builtin_bswap64(x);
+	const int sh = (int)(p & 3) << 1;
+	if (sh) x = x << sh | (uint64_t) q[8] >> (8 - sh);
+	return x;
+}
+
+int bns_pac_fwd_equal(int64_t l_pac, const uint8_t *pac, int64_t a, int64_t b, int64_t len)
+{
+	if (a == b || len <= 0) return 1;
+	const int64_t hi = a > b ? a : b;
+	if (hi + len + 64 < l_pac) { // every bns_pac_load32 stays inside the pac
+		for (; len >= 32; a += 32, b += 32, len -= 32)
+			if (bns_pac_load32(pac, a) != bns_pac_load32(pac, b)) return 0;
+		return len == 0 || ((bns_pac_load32(pac, a) ^ bns_pac_load32(pac, b)) >> (64 - 2 * len)) == 0;
+	}
+	for (int64_t k = 0; k < len; ++k) // near the end of the pac: one base at a time
+		if (_get_pac(pac, a + k) != _get_pac(pac, b + k)) return 0;
+	return 1;
+}
 
 void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
                       int64_t beg, int64_t end,
@@ -667,25 +857,8 @@ void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
 			// leading partial bases until k is the last base of its byte
 			for (; k > beg_f && (k & 3) != 3; --k) dst[l++] = 3 - _get_pac(pac, k);
 #ifdef BNS_SIMD_UNPACK
-			// SIMD reverse: forward-expand the 16-byte block [k-63, k], then reverse the byte
-			// order (pshufb) and complement (^3). k is the last base of its byte, so the block
-			// stays byte-aligned; byte-identical to the rev-LUT below (verified over 200k windows).
-			// The load reads pac[(k>>2)-15 .. k>>2] -- the same span the scalar loop below reads;
-			// the guard (k-64 >= beg_f, and beg_f >= -1 after the end<=2*l_pac clamp) keeps the low
-			// index >= 0, so it never reads before pac[0].
-			{
-				const __m128i rmask = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-				const __m128i m3 = _mm_set1_epi8(3);
-				for (; k - 64 >= beg_f; k -= 64) {
-					__m128i v = _mm_loadu_si128((const __m128i *)(pac + ((k >> 2) - 15))), o0, o1, o2, o3;
-					bns_expand4(v, &o0, &o1, &o2, &o3);   // o0..o3 = forward bases [k-63, k] ascending
-					_mm_storeu_si128((__m128i *)(dst + l),      _mm_xor_si128(_mm_shuffle_epi8(o3, rmask), m3));
-					_mm_storeu_si128((__m128i *)(dst + l + 16), _mm_xor_si128(_mm_shuffle_epi8(o2, rmask), m3));
-					_mm_storeu_si128((__m128i *)(dst + l + 32), _mm_xor_si128(_mm_shuffle_epi8(o1, rmask), m3));
-					_mm_storeu_si128((__m128i *)(dst + l + 48), _mm_xor_si128(_mm_shuffle_epi8(o0, rmask), m3));
-					l += 64;
-				}
-			}
+			for (; k - 64 >= beg_f; k -= 64, l += 64) bns_block_rc(pac, k, dst + l);
+			if (bns_tail_rc(pac, beg_f, k, end_f, dst + l)) return;
 #endif
 			// whole packed bytes: expand 4 rev-complemented bases per indexed load
 			for (; k - 4 >= beg_f; k -= 4) {
@@ -700,17 +873,8 @@ void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
 			// leading partial bases until k is byte-aligned
 			for (; k < end && (k & 3) != 0; ++k) dst[l++] = _get_pac(pac, k);
 #ifdef BNS_SIMD_UNPACK
-			// SIMD: 16 packed bytes -> 64 bases per step; byte-identical to the LUT below
-			// (verified vs it over 200k random windows), ~3x faster on ~150 bp windows.
-			for (; k + 64 <= end; k += 64) {
-				__m128i v = _mm_loadu_si128((const __m128i *)(pac + (k >> 2))), o0, o1, o2, o3;
-				bns_expand4(v, &o0, &o1, &o2, &o3);
-				_mm_storeu_si128((__m128i *)(dst + l),      o0);
-				_mm_storeu_si128((__m128i *)(dst + l + 16), o1);
-				_mm_storeu_si128((__m128i *)(dst + l + 32), o2);
-				_mm_storeu_si128((__m128i *)(dst + l + 48), o3);
-				l += 64;
-			}
+			for (; k + 64 <= end; k += 64, l += 64) bns_block(pac, k, dst + l);
+			if (bns_tail(pac, beg, k, end, dst + l)) return;
 #endif
 			// whole packed bytes: expand 4 bases per indexed load
 			for (; k + 4 <= end; k += 4) {

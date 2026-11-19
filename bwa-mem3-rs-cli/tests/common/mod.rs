@@ -59,6 +59,144 @@ pub fn require_bwa_mem3() -> Option<String> {
     }
 }
 
+/// The leading `X.Y.Z` of a version string (`0.17.0`, `v0.17.0-3-gabc`,
+/// `0.17.0-dirty`), or `None` if it does not start with one.
+pub fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
+    let v = v.trim().trim_start_matches('v');
+    let mut it = v.splitn(3, '.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    let rest = it.next()?;
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let patch = rest[..digits].parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// [`require_bwa_mem3`], also requiring the binary to be at least the
+/// vendored bwa-mem3 version: a parity test passes the oracle flags and
+/// expects defaults that an older `bwa-mem3` lacks, which would otherwise
+/// surface as a bare "bwa-mem3 mem failed" or a spurious divergence. An
+/// older or unreadable version, or a failed `version` probe, is skipped with a
+/// message naming it, or is a hard failure when [`tools_required`] holds.
+pub fn require_vendored_bwa_mem3() -> Option<String> {
+    let bwa = require_bwa_mem3()?;
+    let want = bwa_mem3_rs::version();
+    let min = parse_version(want).expect("vendored bwa-mem3 version is X.Y.Z");
+    // Only a successful probe's stdout is a version: a wrapper that prints
+    // one and then fails is not a usable oracle.
+    let reported = match Command::new(&bwa).arg("version").output() {
+        Ok(o) if o.status.success() => {
+            let got = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            if parse_version(&got).is_some_and(|v| v >= min) {
+                return Some(bwa);
+            }
+            format!("reports version {got:?}")
+        }
+        Ok(o) => format!("`version` failed ({})", o.status),
+        Err(e) => format!("`version` could not run ({e})"),
+    };
+    let msg = format!(
+        "{bwa} {reported}, but the parity tests need bwa-mem3 >= {want} (the vendored \
+         version); build one from bwa-mem3-sys/vendor/COMMIT and point BWA_MEM3_BIN at it"
+    );
+    assert!(
+        !tools_required(),
+        "BWA_MEM3_RS_REQUIRE_TOOLS is set, and {msg}"
+    );
+    eprintln!("skip: {msg}");
+    None
+}
+
+/// The header text a BAM file actually stores (its `l_text` bytes), read
+/// directly rather than through `samtools view -H`, which can rebuild `@SQ`
+/// `SN`/`LN` from the binary reference list when the text omits them.
+///
+/// The text and the binary reference list after it (`n_ref`, then each
+/// `name`/`l_ref`) come from different code in `bwa-rs`, and records index the
+/// binary list, so this also asserts the two agree: the binary list must be
+/// exactly the text's `@SQ` `SN`/`LN` pairs, in order.
+pub fn stored_bam_header_lines(bam: &std::path::Path) -> Vec<String> {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    noodles_bgzf::io::Reader::new(std::fs::File::open(bam).expect("open BAM"))
+        .read_to_end(&mut raw)
+        .expect("decompress BAM");
+    assert!(raw.len() >= 8 && &raw[..4] == b"BAM\x01", "not a BAM file");
+    let u32_at = |o: usize| {
+        let b = raw.get(o..o + 4).expect("BAM truncated inside its header");
+        u32::from_le_bytes(b.try_into().unwrap()) as usize
+    };
+    let l_text = u32_at(4);
+    let text = raw
+        .get(8..8 + l_text)
+        .expect("BAM truncated inside its header text");
+    // l_text may include a trailing NUL pad, which no line carries.
+    let lines: Vec<String> = String::from_utf8(text.to_vec())
+        .expect("BAM header text is not UTF-8")
+        .trim_end_matches('\0')
+        .lines()
+        .map(str::to_owned)
+        .collect();
+
+    let mut o = 8 + l_text;
+    let n_ref = u32_at(o);
+    o += 4;
+    let mut binary = Vec::with_capacity(n_ref);
+    for _ in 0..n_ref {
+        let l_name = u32_at(o);
+        let name = raw
+            .get(o + 4..o + 4 + l_name)
+            .expect("BAM truncated inside a reference name");
+        let name = String::from_utf8(name.strip_suffix(b"\0").expect("name has no NUL").to_vec())
+            .expect("reference name is not UTF-8");
+        o += 4 + l_name;
+        binary.push((name, u32_at(o)));
+        o += 4;
+    }
+    let field = |l: &str, tag: &str| {
+        l.split('\t')
+            .find_map(|f| f.strip_prefix(tag))
+            .unwrap_or_else(|| panic!("@SQ line without {tag}: {l}"))
+            .to_owned()
+    };
+    let text_refs: Vec<(String, usize)> = lines
+        .iter()
+        .filter(|l| l.starts_with("@SQ\t"))
+        .map(|l| {
+            (
+                field(l, "SN:"),
+                field(l, "LN:").parse().expect("LN is not a number"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        binary, text_refs,
+        "the BAM's binary reference list disagrees with its @SQ text"
+    );
+    lines
+}
+
+/// The `@`-prefixed header lines of a SAM or BAM file, via `samtools view -H`
+/// (used for the reference aligner's output, which may be either).
+pub fn samtools_header_lines(path: &std::path::Path) -> Vec<String> {
+    let out = Command::new("samtools")
+        .args(["view", "-H"])
+        .arg(path)
+        .output()
+        .expect("run samtools view -H");
+    assert!(out.status.success(), "samtools view -H failed");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Check for `samtools`, panicking instead of returning `false` when
 /// [`tools_required`] holds.
 pub fn require_samtools() -> bool {
@@ -362,26 +500,10 @@ pub fn write_bam(
     bodies: &[Vec<u8>],
 ) {
     let mut w = noodles_bgzf::io::Writer::new(fs::File::create(path).unwrap());
-    let mut text = String::new();
-    if let Some(hd) = opts.compat_hd_line() {
-        text.push_str(hd);
-        text.push('\n');
-    }
-    for (name, len) in idx.contigs() {
-        text.push_str(&format!("@SQ\tSN:{name}\tLN:{len}\n"));
-    }
-    w.write_all(b"BAM\x01").unwrap();
-    w.write_all(&(text.len() as u32).to_le_bytes()).unwrap();
-    w.write_all(text.as_bytes()).unwrap();
-    w.write_all(&(idx.n_contigs() as u32).to_le_bytes())
-        .unwrap();
-    for (name, len) in idx.contigs() {
-        w.write_all(&((name.len() + 1) as u32).to_le_bytes())
-            .unwrap();
-        w.write_all(name.as_bytes()).unwrap();
-        w.write_all(b"\0").unwrap();
-        w.write_all(&(len as u32).to_le_bytes()).unwrap();
-    }
+    // bwa-mem3's own @HD + @SQ, as the CLI writes them (never spelled out),
+    // encoded by the library, as the CLI encodes them.
+    let text = idx.sam_header(opts).unwrap();
+    w.write_all(&idx.bam_header(&text).unwrap()).unwrap();
     for b in bodies {
         w.write_all(&(b.len() as u32).to_le_bytes()).unwrap();
         w.write_all(b).unwrap();

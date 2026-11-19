@@ -50,6 +50,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "utils.h"        /* ATTRIBUTE, err_fread_noeof */
 #include "io_utils.h"     /* io_request_size, IO_MAX_ONCE */
 #include "FMI_search.h"
+#include "ksort.h"        /* smem_sort_rid_mn: per-rid introsort on (key, idx) pairs */
 #include "smem_parked.h"
 #include "profiling.h"
 #include "libsais_build.h"
@@ -67,8 +68,10 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
  *
  * The destination stays the _mm_malloc'd + MADV_HUGEPAGE buffer, so the
  * transparent-hugepage coverage the hot Occ-lookup loop relies on is preserved
- * -- unlike an mmap/shm alias of the file, which lands on non-THP pages and
- * slows alignment enough to erase the load saving.
+ * -- unlike an mmap alias of the file, which lands on non-THP pages and slows
+ * alignment enough to erase the load saving. (An shm segment is advised the
+ * same way, but gets huge pages only if /dev/shm is mounted huge=advise or
+ * huge=within_size; see idx_segment_map in bwa_shm.cpp.)
  */
 
 /* Declared in FMI_search.h; see there for the contract. Uses a floor division
@@ -221,8 +224,9 @@ void parallel_pread(int shared_fd, const char *path, void *dst, size_t nbytes,
 // past ~8), with an explicit BWA3_LOAD_THREADS override for tuning.
 // Exposed (declared in FMI_search.h) so the env-parse validation is
 // unit-testable without loading a real index.
-int index_load_threads(int n_threads)
+int index_load_threads(int n_threads, bool *override_applied)
 {
+    if (override_applied != nullptr) *override_applied = false;
     int t = n_threads > 0 ? n_threads : 1;
     if (t > 8) t = 8;
     const char *e = getenv("BWA3_LOAD_THREADS");
@@ -241,6 +245,7 @@ int index_load_threads(int n_threads)
         } else {
             if (v > 64) v = 64;   // ceiling; the load is bandwidth-bound past ~8
             t = (int)v;
+            if (override_applied != nullptr) *override_applied = true;
         }
     }
     return t;
@@ -359,6 +364,78 @@ static void fmi_build_path(char *out, size_t outsz, const char *prefix, const ch
     }
 }
 
+/* --huge-pages: map the occurrence table on 1 GB pages, then fault its pages in
+ * over `nthreads` threads before the index readers fill it (see
+ * bwamem_hugetlb_prefault for why). Only the occurrence table: its Occ lookups
+ * are where seeding's page walks are, and on a host whose 1 GB guest pages do
+ * reach the TLB they remove nearly all of them. The suffix-array samples stay on
+ * the default (THP-advised) allocation: mapping them too removed no measurable
+ * walks on such a host. On a host whose hypervisor backs guest memory with 2 MB
+ * pages, 1 GB guest pages give no TLB reach, so there the flag costs only the
+ * zeroing of the reserved pages at load.
+ * A table that is too small (BWAMEM_HUGETLB_MIN_BYTES), or cannot be mapped or
+ * faulted in, is left unmapped, and the caller allocates it as usual: its
+ * contents, and so the output, are the same either way. One [M::load_index]
+ * line reports the outcome; the tag is fixed, not __func__, since the docs quote
+ * it. `mode` is ON, or one of the test seams in bwamem_hugetlb_mode_t. */
+static void fmi_map_occ_table_huge(bwamem_hugetlb_mode_t mode, size_t cp_occ_bytes,
+                                   int nthreads, bwamem_hugetlb_buf_t *cp)
+{
+    /* err: 0 mapped (or prefault failed), -1 too small, else the map errno. */
+    int err = 0;
+    bwamem_hugetlb_buf_t buf = {NULL, 0};
+    if (mode == BWAMEM_HUGETLB_FORCE_FAIL) {
+        err = ECANCELED;
+    } else if (mode == BWAMEM_HUGETLB_TEST_PLAIN) {
+        err = bwamem_hugetlb_map_plain_for_test(cp_occ_bytes, &buf);
+    } else if (mode == BWAMEM_HUGETLB_TEST_PREFAULT_FAIL) {
+        err = bwamem_hugetlb_map_protected_for_test(cp_occ_bytes, &buf);
+    } else if (mode != BWAMEM_HUGETLB_ON_ANY_SIZE && cp_occ_bytes <= BWAMEM_HUGETLB_MIN_BYTES) {
+        err = -1;
+    } else {
+        err = bwamem_hugetlb_map(cp_occ_bytes, &buf);
+    }
+    /* Mapping reserves the pages; faulting them in is what costs time. The
+     * plain test mapping is not pre-faulted: that would commit and zero every
+     * page of it on normal pages. */
+    if (mode != BWAMEM_HUGETLB_TEST_PLAIN) bwamem_hugetlb_prefault(&buf, nthreads);
+    *cp = buf;
+    const double gib = (double)cp_occ_bytes / (1024.0 * 1024.0 * 1024.0);
+    const size_t pages = bwamem_hugetlb_round_up(cp_occ_bytes) >> 30;
+    if (err == ENOSYS) {
+        fprintf(stderr, "[M::load_index] --huge-pages: 1 GB pages are supported only on "
+                "Linux; using default pages for the index\n");
+    } else if (buf.base != NULL) {
+        fprintf(stderr, "[M::load_index] --huge-pages: occurrence table (%.2f GiB) on "
+                "%zu x 1 GB pages\n", gib, buf.map_bytes >> 30);
+    } else if (err == -1) {
+        fprintf(stderr, "[M::load_index] --huge-pages: occurrence table (%.2f GiB) is too "
+                "small for 1 GB pages (%zu MiB or less); using default pages for it\n",
+                gib, BWAMEM_HUGETLB_MIN_BYTES >> 20);
+    } else if (err == ENOMEM) {
+        fprintf(stderr, "[M::load_index] --huge-pages: could not map the occurrence table "
+                "(%.2f GiB) on %zu x 1 GB pages (%s: the host's 1 GB pool is missing or "
+                "too small, see /sys/kernel/mm/hugepages/hugepages-1048576kB; or a hugetlb "
+                "cgroup reservation limit, or a process limit such as RLIMIT_AS or "
+                "vm.max_map_count, was reached); using default pages for it\n",
+                gib, pages, strerror(err));
+    } else if (err == EINVAL) {
+        fprintf(stderr, "[M::load_index] --huge-pages: could not map the occurrence table "
+                "(%.2f GiB) on 1 GB pages (%s: this kernel or CPU has no 1 GB huge page "
+                "size, see /sys/kernel/mm/hugepages/hugepages-1048576kB); using default "
+                "pages for it\n", gib, strerror(err));
+    } else if (err != 0) {
+        fprintf(stderr, "[M::load_index] --huge-pages: could not map the occurrence table "
+                "(%.2f GiB) on 1 GB pages (%s); using default pages for it\n",
+                gib, strerror(err));
+    } else {
+        fprintf(stderr, "[M::load_index] --huge-pages: could not fault in the 1 GB pages "
+                "for the occurrence table (%.2f GiB; needs Linux 5.14+ for "
+                "MADV_POPULATE_WRITE, or a hugetlb cgroup usage limit was reached); "
+                "using default pages for it\n", gib);
+    }
+}
+
 FMI_search::FMI_search(const char *fname)
 {
     fprintf(stderr, "* Entering FMI_search\n");
@@ -372,6 +449,9 @@ FMI_search::FMI_search(const char *fname)
     cp_occ = NULL;
     shm_base = NULL;
     shm_len = 0;
+    cp_occ_huge = bwamem_hugetlb_buf_t{NULL, 0};
+    seed_jump = NULL;
+    seed_jump_depth = 0;
 
     /* one_hot_mask_array is now a file-scope compile-time constant table (see
      * FMI_search.h); nothing to allocate or initialize here. */
@@ -390,8 +470,11 @@ FMI_search::~FMI_search()
     } else {
         if (sa_ms_byte) _mm_free(sa_ms_byte);
         if (sa_ls_word) _mm_free(sa_ls_word);
-        if (cp_occ)     _mm_free(cp_occ);
+        if (cp_occ_huge.base != NULL) bwamem_hugetlb_unmap(&cp_occ_huge);
+        else if (cp_occ)              _mm_free(cp_occ);
     }
+    /* Process-private on both paths (never part of the shm segment). */
+    if (seed_jump) _mm_free(seed_jump);
 }
 
 int64_t FMI_search::cp_occ_size_bytes() const {
@@ -400,6 +483,147 @@ int64_t FMI_search::cp_occ_size_bytes() const {
 
 int64_t FMI_search::sa_sample_count() const {
     return (reference_seq_len >> sa_compx) + 1;
+}
+
+/* ===== Seed jump table (see FMI_search.h, seed_jump) =====
+ *
+ * Used by the bwtSeed walks (bsd_plan_jump) and the SMEM forward walks
+ * (ls_init_slot, ls_advance_forward_table), so despite its name
+ * BWA3_BWTSEED_JUMP also sets the table for the first- and second-pass SMEM
+ * walks.
+ * Depth: BWA3_BWTSEED_JUMP (0 = no table, so every walk steps from its first
+ * base as before; 2..SEED_JUMP_DEPTH_MAX = the table's depth), default
+ * SEED_JUMP_DEPTH_DEFAULT. Unset or empty silently means the default, as for
+ * the other integer knobs; any other value is reported and the default used. An internal tuning knob: output is byte-identical
+ * at every value. At depth D the table holds (4^(D+1) - 4) / 3 entries of 24
+ * bytes: 2 MB at 8, 33.6 MB at 10, 134 MB at 11, 537 MB at 12. */
+#define SEED_JUMP_DEPTH_DEFAULT 10
+#define SEED_JUMP_DEPTH_MAX     12
+/* Levels 1..SEED_JUMP_PREFIX are built serially; deeper levels are built per
+ * subtree of a SEED_JUMP_PREFIX-base prefix (64 of them), one subtree at a time
+ * per worker, so no level needs a barrier. */
+#define SEED_JUMP_PREFIX        3
+/* Parents ahead whose two cp_occ blocks a builder prefetches. */
+#define SEED_JUMP_PF            16
+
+static int seed_jump_env_depth()
+{
+    const char *e = getenv("BWA3_BWTSEED_JUMP");
+    if (e == NULL || *e == '\0') return SEED_JUMP_DEPTH_DEFAULT;
+    /* Digits only: strtol alone would also take leading space and a sign. */
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(e, &end, 10);
+    if (*e < '0' || *e > '9' || errno != 0 || end == e || *end != '\0'
+        || v == 1 || v > SEED_JUMP_DEPTH_MAX) {
+        fprintf(stderr, "ERROR: BWA3_BWTSEED_JUMP=\"%s\" is not 0 or an integer in [2, %d]; "
+                "ignoring it and using the default depth %d\n", e, SEED_JUMP_DEPTH_MAX,
+                SEED_JUMP_DEPTH_DEFAULT);
+        return SEED_JUMP_DEPTH_DEFAULT;
+    }
+    return (int)v;
+}
+
+/* Level L's children of the level L - 1 strings [first, first + n): child c
+ * of parent q is q * 4 + c, computed exactly as bsd_advance_step steps (swap
+ * k <-> l, backwardExt with 3 - c, swap back). */
+void FMI_search::seed_jump_children(int L, int64_t first, int64_t n)
+{
+    const SeedJumpEntry *par = seed_jump + seed_jump_level_off(L - 1) + first;
+    SeedJumpEntry *ch = seed_jump + seed_jump_level_off(L) + first * 4;
+    for (int64_t i = 0; i < n; i++) {
+#ifdef ENABLE_PREFETCH
+        if (i + SEED_JUMP_PF < n) {
+            const SeedJumpEntry &q = par[i + SEED_JUMP_PF];
+            _mm_prefetch((const char *)(&cp_occ[(q.l >> CP_SHIFT)]), _MM_HINT_T0);
+            _mm_prefetch((const char *)(&cp_occ[((q.l + q.s) >> CP_SHIFT)]), _MM_HINT_T0);
+        }
+#endif
+        SMEM smem_;
+        memset(&smem_, 0, sizeof(smem_));
+        smem_.k = par[i].l;
+        smem_.l = par[i].k;
+        smem_.s = par[i].s;
+        /* All four before any store, so the compiler can share the two
+         * blocks' loads and popcounts among them (a store to ch[] may alias
+         * cp_occ). */
+        SMEM r[4];
+        for (int c = 0; c < 4; c++) r[c] = backwardExt(smem_, (uint8_t)(3 - c));
+        for (int c = 0; c < 4; c++) {
+            ch[i * 4 + c].k = r[c].l;
+            ch[i * 4 + c].l = r[c].k;
+            ch[i * 4 + c].s = r[c].s;
+        }
+    }
+}
+
+namespace {
+struct SeedJumpBuild {
+    FMI_search          *fmi;
+    std::atomic<int64_t> next;
+    int64_t              n_prefix;
+};
+}  // namespace
+
+void *FMI_search::seed_jump_worker(void *arg)
+{
+    SeedJumpBuild *b = (SeedJumpBuild *)arg;
+    for (;;) {
+        const int64_t p = b->next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= b->n_prefix) break;
+        /* Every level below prefix p, level by level. */
+        for (int L = SEED_JUMP_PREFIX + 1; L <= b->fmi->seed_jump_depth; L++) {
+            const int64_t n = (int64_t)1 << (2 * (L - 1 - SEED_JUMP_PREFIX));
+            b->fmi->seed_jump_children(L, p * n, n);
+        }
+    }
+    return NULL;
+}
+
+void FMI_search::build_seed_jump_table(int n_threads)
+{
+    if (seed_jump != NULL) { _mm_free(seed_jump); seed_jump = NULL; }
+    seed_jump_depth = 0;
+    const int D = seed_jump_env_depth();
+    if (D < 2) return;
+
+    const int64_t total = seed_jump_level_off(D + 1);
+    const size_t bytes = (size_t)total * sizeof(SeedJumpEntry);
+    seed_jump = (SeedJumpEntry *)_mm_malloc(bytes, 64);
+    if (seed_jump == NULL) {
+        /* The table only saves steps, so run without it rather than fail. */
+        fprintf(stderr, "ERROR: could not allocate the %.1f MB seed jump table "
+                "(BWA3_BWTSEED_JUMP depth %d); seeding without it\n", bytes / 1e6, D);
+        return;
+    }
+    bwamem_madv_hugepage(seed_jump, bytes);
+    seed_jump_depth = D;
+
+    for (int a = 0; a < 4; a++) {   // bsd_init_slot's 1-base interval
+        seed_jump[a].k = count[a];
+        seed_jump[a].l = count[3 - a];
+        seed_jump[a].s = count[a + 1] - count[a];
+    }
+    const int P = D < SEED_JUMP_PREFIX ? D : SEED_JUMP_PREFIX;
+    for (int L = 2; L <= P; L++)
+        seed_jump_children(L, 0, (int64_t)1 << (2 * (L - 1)));
+    if (D == P) return;
+
+    SeedJumpBuild b;
+    b.fmi = this;
+    b.next.store(0, std::memory_order_relaxed);
+    b.n_prefix = (int64_t)1 << (2 * P);
+    int nt = n_threads > 0 ? n_threads : 1;
+    if (nt > b.n_prefix) nt = (int)b.n_prefix;
+    std::vector<pthread_t> tids((size_t)nt);
+    std::vector<bool>      spawned((size_t)nt, false);
+    /* A failed spawn only makes the build less parallel: the main thread's
+     * loop takes every prefix no worker took. */
+    for (int i = 1; i < nt; i++)
+        spawned[i] = pthread_create(&tids[i], NULL, seed_jump_worker, &b) == 0;
+    seed_jump_worker(&b);
+    for (int i = 1; i < nt; i++)
+        if (spawned[i]) pthread_join(tids[i], NULL);
 }
 
 void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
@@ -657,7 +881,8 @@ int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
-void FMI_search::load_index(bool load_pac, int n_threads)
+void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
+                            bwamem_hugetlb_mode_t huge_pages)
 {
     /* Try the staged shm segment first. On hit, both the FMI internals
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
@@ -670,8 +895,14 @@ void FMI_search::load_index(bool load_pac, int n_threads)
             /* D3 --meth seed segment is staged bns_only: no PAC section, and
              * idx->pac stays NULL (extension uses meth_orig_pac). */
             bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len, load_pac);
+            /* The seed jump table is process-private (not part of the staged
+             * segment), so an attached index builds its own. */
+            if (build_seed_jump) build_seed_jump_table(index_load_threads(n_threads));
             fprintf(stderr, "* FMI+BNS%s attached from shm; "
                     "skipping disk load.\n", load_pac ? "+PAC" : "");
+            if (huge_pages != BWAMEM_HUGETLB_OFF)
+                fprintf(stderr, "[M::load_index] --huge-pages: no effect on an index "
+                        "attached from shared memory; its pages are the segment's\n");
             return;
         }
     }
@@ -682,7 +913,8 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     int64_t index_alloc = 0;
 
     // Worker count for the big-array reads below (read once, out of any loop).
-    const int load_nt = index_load_threads(n_threads);
+    bool load_nt_overridden = false;
+    const int load_nt = index_load_threads(n_threads, &load_nt_overridden);
 
     char *ref_file_name = file_name;
     //beCalls = 0;
@@ -712,7 +944,7 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     // Fail closed on a truncated/corrupt index, mirroring load_index_from_shm's
     // scalar bounds checks (a bad reference_seq_len/count[]/sentinel_index drives
     // smem.k past cp_occ on the first backwardExt -> wrong seeds, not a crash).
-    // xassert survives a hypothetical -DNDEBUG build where a plain assert would not.
+    // xassert survives an EXTRA_CXXFLAGS=-DNDEBUG opt-out build; a plain assert would not.
     xassert(reference_seq_len > 0 && reference_seq_len <= 0x7fffffffffLL,
             "FMI index: reference_seq_len out of bounds (corrupt .bwt.2bit.64?)");
 
@@ -746,12 +978,30 @@ void FMI_search::load_index(bool load_pac, int n_threads)
 
     err_fread_noeof(&count[0], sizeof(int64_t), 5, cpstream);
     int64_t cp_occ_bytes = cp_occ_size * sizeof(CP_OCC);
-    cp_occ = (CP_OCC *)_mm_malloc(cp_occ_bytes, 64);
-    index_alloc += cp_occ_bytes;
-    assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
-    bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
+    // A buffer on pre-faulted 1 GB pages needs no page faults while it is
+    // filled, so the read is a plain copy out of the page cache and keeps
+    // scaling past the default worker cap (index_load_threads): read it, and
+    // fault its pages in, with every worker the run has. An explicit
+    // BWA3_LOAD_THREADS (a valid one: a malformed value is ignored, as
+    // index_load_threads says) still wins for both, so a filesystem or host
+    // that wants fewer readers keeps its cap.
+    const int huge_load_nt = load_nt_overridden ? load_nt
+                                                : std::max(load_nt, std::min(n_threads, 64));
+    if (huge_pages != BWAMEM_HUGETLB_OFF) {
+        fmi_map_occ_table_huge(huge_pages, (size_t)cp_occ_bytes, huge_load_nt, &cp_occ_huge);
+    }
+    if (cp_occ_huge.base != NULL) {
+        cp_occ = (CP_OCC *)cp_occ_huge.base;
+        index_alloc += cp_occ_bytes;
+    } else {
+        cp_occ = (CP_OCC *)_mm_malloc(cp_occ_bytes, 64);
+        index_alloc += cp_occ_bytes;
+        assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
+        bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
+    }
 
-    fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes,
+                          cp_occ_huge.base != NULL ? huge_load_nt : load_nt);
     int64_t ii = 0;
     // Validate the RAW on-disk count[] before the +1 adjustment below. Doing the
     // bounds/monotonicity checks on the raw values (rather than after +1) is what
@@ -794,26 +1044,15 @@ void FMI_search::load_index(bool load_pac, int n_threads)
                 "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
     }
 
+    // Suffix-array sample arrays: one entry per sampled row (every row when
+    // the SA is not compressed).
     #if SA_COMPRESSION
-
-    int64_t reference_seq_len_ = (reference_seq_len >> sa_compx) + 1;
-    int64_t sa_ms_bytes = reference_seq_len_ * sizeof(int8_t);
-    int64_t sa_ls_bytes = reference_seq_len_ * sizeof(uint32_t);
-    sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
-    index_alloc += sa_ms_bytes;
-    assert_not_null(sa_ms_byte, sa_ms_bytes, index_alloc);
-    sa_ls_word = (uint32_t *)_mm_malloc(sa_ls_bytes, 64);
-    index_alloc += sa_ls_bytes;
-    assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
-    bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
-    bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
-    fmi_pread_from_stream(cpstream, cp_file_name, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
-    fmi_pread_from_stream(cpstream, cp_file_name, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
-
+    const int64_t sa_count = (reference_seq_len >> sa_compx) + 1;
     #else
-
-    int64_t sa_ms_bytes = reference_seq_len * sizeof(int8_t);
-    int64_t sa_ls_bytes = reference_seq_len * sizeof(uint32_t);
+    const int64_t sa_count = reference_seq_len;
+    #endif
+    const int64_t sa_ms_bytes = sa_count * (int64_t)sizeof(int8_t);
+    const int64_t sa_ls_bytes = sa_count * (int64_t)sizeof(uint32_t);
     sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
     index_alloc += sa_ms_bytes;
     assert_not_null(sa_ms_byte, sa_ms_bytes, index_alloc);
@@ -824,8 +1063,6 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
     fmi_pread_from_stream(cpstream, cp_file_name, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
     fmi_pread_from_stream(cpstream, cp_file_name, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
-
-    #endif
 
     sentinel_index = -1;
     #if SA_COMPRESSION
@@ -855,6 +1092,9 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     }
     fprintf(stderr, "\nsentinel_index: %lld\n", (long long)x);
     #endif
+
+    // cp_occ, count[] and sentinel_index are in: build the seed jump table.
+    if (build_seed_jump) build_seed_jump_table(load_nt);
 
     fprintf(stderr, "* Count:\n");
     for(x = 0; x < 5; x++)
@@ -918,6 +1158,7 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
         if(a < 4)
         {
             SMEM smem;
+            smem.info = 0;   // carries no SA tag (ls_s1_sa_tag)
             smem.rid = rid;
             smem.m = x;
             smem.n = x;
@@ -1106,8 +1347,106 @@ enum LockstepPhase : uint8_t {
     PH_FWD      = 0,  // forward extension inner loop active
     PH_BWD_INIT = 1,  // between-phases housekeeping pending
     PH_BWD      = 2,  // backward search outer loop active
-    PH_DONE     = 3   // slot finished (ready: match_buf not yet retired) or idle
+    PH_DONE     = 3,  // slot finished (ready: match_buf not yet retired) or idle
+    PH_S1_LF    = 4,  // unique forward match: LF walk from k to a sampled SA row
+    PH_S1_CMP   = 5,  // unique forward match: compare the rest of the read with the text
+    PH_FWD_TABLE = 6  // forward walk's first visit: its first steps from seed_jump
 };
+
+/* A phase-1 forward walk that reaches a unique match (s == 1) goes on comparing
+ * the read with the reference text only when at least this many read bases are
+ * left: resolving the match's text position costs an LF walk to a sampled SA
+ * row (the SA is sampled by row, so about 7 steps on average at the default
+ * 1 sample in 8 rows; sa_compx is per index) and a pac read. */
+static constexpr int32_t LS_S1_MIN_REST = 16;
+
+/* The text position of a unique forward match, kept in SMEM.info (a field
+ * nothing else reads) for SA resolution. When ls_s1_lf_step resolves
+ * v = SA[k] for a walk that started at start_pos (the match's m), it stores
+ * q = v - start_pos with bit 63 set. Every SMEM the walk emits from that
+ * entry, the entry itself or a backward extension of it, has s == 1 and
+ * SA[k] = q + m: a backward step that keeps s == 1 moves the one suffix's
+ * start a base left (SA[LF(k)] = SA[k] - 1) as it moves m a base left.
+ * get_sa_entries_prefetch then writes the coordinate q + m instead of walking
+ * k to a sampled row a second time, when its caller trusts the tag (see
+ * trust_s1_tag there). mem_collect_smem then passes the tag on by containment
+ * (s1_tag_contained). Every other SMEM the seeding path makes has info 0. */
+static constexpr uint64_t LS_S1_SA_TAG = 1ULL << 63;
+static inline uint64_t ls_s1_sa_tag(int64_t q)
+{
+    return LS_S1_SA_TAG | ((uint64_t)q & ~LS_S1_SA_TAG);
+}
+static inline int64_t ls_s1_sa_q(uint64_t info)
+{
+    return (int64_t)(info << 1) >> 1;   // q, sign-extended from bit 62
+}
+/* A unique match carrying the tag, and its one SA coordinate (q + m). */
+static inline bool ls_s1_tagged(const SMEM &smem)
+{
+    return smem.s == 1 && (smem.info & LS_S1_SA_TAG) != 0;
+}
+static inline int64_t ls_s1_sa_coord(const SMEM &smem)
+{
+    return ls_s1_sa_q(smem.info) + (int64_t)smem.m;
+}
+
+/* An untagged s == 1 SMEM U of a read that lies inside a tagged SMEM T of the
+ * same read (m_T <= m_U and n_U <= n_T) takes T's info unchanged: read[m_U..n_U]
+ * occurs once in the text, and T's one occurrence, at q_T + m_T, holds it at
+ * q_T + m_U, so SA[k_U] = q_T + m_U, the relation the tag states. Any T that
+ * contains U gives the same q. a[0..n) is one read's SMEMs sorted by (m, n)
+ * (mem_collect_smem's per-read sort), so one forward pass keeps, of the tagged
+ * SMEMs before i, the one with the largest n (all have m_T <= m_i). A U whose
+ * only container has the same m sorts before it (n_U <= n_T), so a tagged T
+ * also tags the untagged s == 1 SMEMs of its m run that precede it. Containment
+ * is transitive, so SMEMs tagged here need not join the running maximum.
+ * The common case (an untagged SMEM) takes no data-dependent branch.
+ * Every step above relies on the one-read, (m, n)-sorted precondition: an
+ * unsorted or mixed-read array would hand a tag to an SMEM that is not inside
+ * its source and so write a wrong coordinate without any other symptom. The
+ * precondition is therefore checked (one predictable compare per SMEM). */
+void FMI_search::s1_tag_contained(SMEM *a, int64_t n)
+{
+    int64_t best_n = -1;      // largest n_T over the tagged s == 1 SMEMs before i
+    uint64_t best_info = 0;
+    int64_t run = 0;          // first index of i's m run
+    uint32_t m_prev = UINT32_MAX;
+    for (int64_t i = 0; i < n; i++) {
+        const uint64_t info = a[i].info;
+        const uint32_t m = a[i].m;
+        const bool s1 = a[i].s == 1;
+        const int64_t ni = (int64_t)a[i].n;
+        if (__builtin_expect(i != 0 && !(a[i].rid == a[0].rid &&
+                                         (m > m_prev || (m == m_prev && a[i].n >= a[i - 1].n))), 0))
+            err_fatal(__func__, "SMEMs must be one read's, sorted by (m, n), but SMEM %lld "
+                      "(rid %u, m %u, n %u) follows SMEM %lld (rid %u, m %u, n %u) and the "
+                      "run started at rid %u", (long long)i, a[i].rid, a[i].m, a[i].n,
+                      (long long)(i - 1), a[i - 1].rid, a[i - 1].m, a[i - 1].n, a[0].rid);
+        run = (m == m_prev) ? run : i;
+        m_prev = m;
+        if (s1 & ((info & LS_S1_SA_TAG) != 0)) {
+            for (int64_t j = run; j < i; j++)
+                if (a[j].s == 1 && (a[j].info & LS_S1_SA_TAG) == 0) a[j].info = info;
+            if (ni > best_n) {
+                best_n = ni;
+                best_info = info;
+            }
+        } else {
+            a[i].info = (s1 & (ni <= best_n)) ? best_info : info;
+        }
+    }
+}
+
+/* The unique-match text compare (ls_s1_*), and with it every SA tag, needs the
+ * reference this index was built from: its pac, loaded with the index unless
+ * the caller skipped it (--meth loads the seed index without), and of the
+ * length the index's text implies (forward + reverse complement + sentinel). */
+bool FMI_search::s1_text_available() const
+{
+    return idx != nullptr && idx->pac != nullptr && idx->bns != nullptr &&
+           2 * idx->bns->l_pac + 1 == reference_seq_len;
+}
+
 
 // Per-thread cache for the lockstep SMEM driver's prev[]/match_buf[]
 // buffers. RAII wrapper exists so the buffers are released at thread
@@ -1127,12 +1466,12 @@ struct LockstepSmemCache {
 };
 
 // LISA trick #4: hybrid SoA. The per-slot "hot" state stays compact
-// (~80 bytes) so cross-slot access (e.g. T1 prefetch lookahead against
-// slots[(s+N/2)%N]) hits a tight L1-resident array instead of jumping
-// 32KB strides across embedded buffers. The bulk arrays (prev[],
-// match_buf[]; ~32 KB each) live in separate per-slot allocations,
-// referenced by pointer. Accessor syntax (s->prev[i], s->match_buf[i])
-// is unchanged from the embedded-array version.
+// (168 bytes) so the driver's pass over slots[0..N) hits a tight
+// L1-resident array instead of jumping 32KB strides across embedded
+// buffers. The bulk arrays (prev[], match_buf[]; ~32 KB each) live in
+// separate per-slot allocations, referenced by pointer (prev and prev_top
+// bound the slot's prev entries; the forward phase writes them downward
+// from prev_top, see the members below).
 struct FMI_search::BatchSlot {
     // Input identity — copied at init, never mutated thereafter.
     int32_t input_idx;           // index into the caller's input arrays
@@ -1156,10 +1495,36 @@ struct FMI_search::BatchSlot {
     int32_t match_count;
     bool    ready;
 
-    // Pointers into per-slot bulk arrays (allocated by the driver, sized
-    // by max_readlength).
+    // Per-slot bulk arrays (driver-allocated, >= max_readlength entries). The
+    // forward phase writes its prev entries downward from prev_top (one past
+    // the slot's prev buffer); a walk from start_pos makes at most readlength -
+    // start_pos <= max_readlength of them, so the last, lowest one is at or
+    // above the buffer's base. ls_prepare_backward points prev at it, leaving
+    // prev[0..numPrev) in the reversed order the scalar path builds by
+    // swapping, with no swap; the backward phase reads and compacts via prev.
     SMEM    *prev;
+    SMEM    *prev_top;
     SMEM    *match_buf;
+
+    // Unique-match text compare (PH_S1_LF, PH_S1_CMP): the LF walk's current
+    // row and step count, then (PH_S1_CMP) the text position of read base j.
+    int64_t lf_row;
+    int64_t lf_off;
+    // The walk's first steps from the jump table (seed_jump): when read[x ..
+    // x + jdp) is jdp >= 2 ACGT bases (jdp <= seed_jump_depth), jcode is their
+    // 2-bit code, first base most significant, and the slot's first forward
+    // visit (PH_FWD_TABLE, ls_advance_forward_table) takes depths 2..jdp from
+    // the table. jdp == 0: every step is a backwardExt.
+    uint32_t jcode;
+    int32_t  jdp;
+    // The bwtSeed pass's first walk on this read (BsdFirstWalk), while the
+    // forward phase still has to note where it stops: the record, the first
+    // step at which it may stop (min_len - 1) and its max_intv. bsd_j is
+    // INT32_MAX when nothing is pending, so the forward step's one test
+    // (j >= bsd_j) is false.
+    BsdFirstWalk *bsd;
+    int32_t bsd_j;
+    int32_t bsd_intv;
 };
 
 void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
@@ -1174,53 +1539,35 @@ void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
 #endif
 }
 
-/* T1 (L2) variant — used for cross-slot N/2-step lookahead. The T0 prefetch
- * above lands at "this slot's next step" granularity; T1 here lands at
- * "this slot's step ~N/2 from now". For N=8 that's 4 stepping-passes ahead,
- * giving DRAM-latency-class lookahead when the cp_occ working set spills
- * out of L2/L3.
- *
- * Target the interval the lookahead slot will actually read next, which
- * differs by phase:
- *
- *   PH_BWD: ls_advance_backward_step runs entirely out of prev[] and NEVER
- *           rewrites smem, so smem here is the STALE leftover from the end of
- *           the forward phase. The next backward step calls backwardExt on
- *           prev[0] first, reading cp_occ[prev[0].k] and
- *           cp_occ[prev[0].k + prev[0].s]; warm those two blocks.
- *   otherwise: warm smem.l and smem.l + smem.s, the blocks the next forward
- *           step reads for its sp/ep.
- *
- * The lookahead slot's phase is effectively random from step to step, so a
- * phase test (and a loop over prev[]) mispredicts heavily. Instead the two
- * prefetches are always issued, with the interval chosen by mask selects. Only
- * the two blocks the next step reads first are warmed; warming more (all of
- * smem's blocks, or every live prev[p]) needs the branches back and measured
- * slower.
- * For PH_DONE / PH_BWD_INIT slots smem holds a stale but in-range interval
- * (zeros for a never-used slot), so the prefetch is merely wasted. prev[0] is
- * only dereferenced when phase == PH_BWD, where numPrev >= 1 holds. Pure hint,
- * so output is unchanged. */
-void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
+// The 2-bit code of q[0..n), first base most significant, for a jump-table
+// lookup; *any is the OR of the n bases, so *any >= 4 when one is an N.
+static inline uint32_t seed_jump_pack(const uint8_t *q, int32_t n, uint32_t *any)
+{
+    uint32_t code = 0, a = 0;
+    for (int32_t i = 0; i < n; i++) {
+        code = (code << 2) | (q[i] & 3u);
+        a |= q[i];
+    }
+    *any = a;
+    return code;
+}
+
+// Hint a jump-table entry: a 24-byte entry can straddle two lines.
+inline void FMI_search::seed_jump_prefetch(const SeedJumpEntry *e)
 {
 #ifdef ENABLE_PREFETCH
-    /* Written as ?: (even with BWA_UNPREDICTABLE) clang still emitted a branch
-     * on the phase test, so the select is mask arithmetic behind BWA_OPAQUE
-     * (macro.h). Checked branch-free with clang 19 on x86-64 and arm64. */
-    uint64_t mask = (uint64_t)0 - (uint64_t)(s->phase == PH_BWD);
-    BWA_OPAQUE(mask);
-    const SMEM *m = (const SMEM *)(((uintptr_t)s->prev & mask) | ((uintptr_t)&s->smem & ~mask));
-    const int64_t lo = (int64_t)(((uint64_t)m->k & mask) | ((uint64_t)m->l & ~mask));
-    _mm_prefetch((const char *)(&cp_occ[(lo) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(lo + m->s) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)e, _MM_HINT_T0);
+    _mm_prefetch((const char *)e + sizeof(SeedJumpEntry) - 1, _MM_HINT_T0);
 #else
-    (void)s;
+    (void)e;
 #endif
 }
 
 // Populate a slot from the caller's input arrays at the given input_idx.
 // After this call either:
 //   phase == PH_FWD  — slot is ready to step the forward-extension inner loop
+//   phase == PH_FWD_TABLE — the same, with its first steps planned from the
+//                      jump table (ls_advance_forward_table)
 //   phase == PH_DONE — the first base is non-ACGT; scalar skips this read, so
 //                      we match that (zero matches emitted, ready to retire).
 void FMI_search::ls_init_slot(BatchSlot *s,
@@ -1230,10 +1577,12 @@ void FMI_search::ls_init_slot(BatchSlot *s,
                               const int32_t *rid_array,
                               const bseq1_t *seq_,
                               const int32_t *query_cum_len_ar,
-                              const uint8_t *enc_qdb)
+                              const uint8_t *enc_qdb,
+                              BsdFirstWalkHint *bsd_hint)
 {
     s->input_idx   = input_idx;
     s->rid         = rid_array[input_idx];
+    s->bsd_j       = INT32_MAX;
     s->start_pos   = query_pos_array[input_idx];
     s->min_intv    = min_intv_array[input_idx];
     /* backwardExt_konly leaves the new k stale on its s'->0 exit and relies on
@@ -1254,6 +1603,7 @@ void FMI_search::ls_init_slot(BatchSlot *s,
     int32_t x = s->start_pos;
     uint8_t a = enc_qdb[s->offset + x];
     if (a < 4) {
+        s->smem.info = 0;   // no text position yet (ls_s1_sa_tag)
         s->smem.rid = s->rid;
         s->smem.m   = x;
         s->smem.n   = x;
@@ -1262,6 +1612,42 @@ void FMI_search::ls_init_slot(BatchSlot *s,
         s->smem.s   = count[a + 1] - count[a];
         s->j        = x + 1;
         s->phase    = PH_FWD;
+        /* Plan the walk's first steps from the jump table: the longest run
+         * read[x .. x + jdp) of ACGT bases with jdp <= seed_jump_depth (0 when
+         * there is no table), and hint the entries of depths 2..jdp a pass
+         * ahead of the visit that reads them (between the cp_occ blocks the
+         * other slots stream, even levels 5-7, 512 KB, miss L2 unhinted). */
+        s->jdp = 0;
+        int32_t lim = s->readlength - x;
+        if (lim > seed_jump_depth) lim = seed_jump_depth;
+        if (lim >= 2) {
+            const uint8_t *q = enc_qdb + s->offset + x;
+            uint32_t any;
+            uint32_t code = seed_jump_pack(q, lim, &any);
+            int32_t d = lim;
+            if (any >= 4) {   // an N: the run ends at the first one
+                d = 1;
+                while (q[d] < 4) d++;
+                code >>= 2 * (lim - d);
+            }
+            if (d >= 2) {
+                s->jcode = code;
+                s->jdp   = d;
+                s->phase = PH_FWD_TABLE;
+#ifdef ENABLE_PREFETCH
+                for (int32_t L = 2; L <= d; L++) {
+                    seed_jump_prefetch(seed_jump + seed_jump_level_off(L) + (code >> (2 * (d - L))));
+                }
+#endif
+            }
+        }
+        /* The bwtSeed pass walks from x = 0 with the same steps as this walk
+         * as long as this one goes on, which at min_intv 1 is while s >= 1. */
+        if (bsd_hint != nullptr && x == 0 && s->min_intv == 1 && bsd_hint->max_intv >= 1) {
+            s->bsd      = &bsd_hint->rec[s->rid];
+            s->bsd_j    = bsd_hint->min_len - 1;
+            s->bsd_intv = bsd_hint->max_intv;
+        }
     } else {
         // Scalar path skips the whole read when the first base is N.
         // Match that by going straight to DONE with zero matches.
@@ -1269,18 +1655,57 @@ void FMI_search::ls_init_slot(BatchSlot *s,
         s->ready = true;
     }
 }
+// The bwtSeed pass's first walk (BsdFirstWalk) at forward step j = s->j, which
+// extended read[0..j-1] to the interval (k, l, sz): the walk stops here when
+// sz < max_intv (the caller tests j >= min_len - 1), emitting the interval as
+// its seed when sz > 0, and goes on at x = j + 1.
+inline void FMI_search::ls_bsd_note(BatchSlot *s, int64_t k, int64_t l, int64_t sz)
+{
+    if (sz < s->bsd_intv) {
+        BsdFirstWalk *r = s->bsd;
+        r->k = k;
+        r->l = l;
+        r->s = sz;
+        r->n = s->j;
+        r->x = s->j + 1;
+        s->bsd_j = INT32_MAX;
+    }
+}
+
+// The forward walk stops before the bwtSeed walk has: at read base p, the read's
+// end (p >= readlength), a non-ACGT base, or an ACGT base the interval does not
+// extend with (s = 0 from step p on). From there the bwtSeed walk steps with
+// s = 0, which ends it at the first non-ACGT base p (x = p + 1), at the first
+// step p >= min_len - 1 (s = 0 < max_intv, no seed; x = p + 1), or at the
+// read's end (x = readlength).
+void FMI_search::ls_bsd_resolve(BatchSlot *s, const uint8_t *enc_qdb, int32_t p)
+{
+    const uint8_t *q = enc_qdb + s->offset;
+    const int32_t rl = s->readlength;
+    while (p < rl && q[p] < 4 && p < s->bsd_j) p++;
+    BsdFirstWalk *r = s->bsd;
+    r->s = 0;
+    r->x = p < rl ? p + 1 : rl;
+    s->bsd_j = INT32_MAX;
+}
+
 // Advance one slot through one step of forward extension.
 // Mirrors the inner j-loop body of the scalar getSMEMsOnePosOneThread
 // (src/FMI_search.cpp — the for(j = x+1; j < readlength; j++) loop).
 // On the step that exits forward-ext (end-of-read, non-ACGT at j, or
-// s < min_intv), transitions phase to PH_BWD_INIT.
-void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
+// s < min_intv), transitions phase to PH_BWD_INIT. When s1_text is set and the
+// step leaves a unique match (s == 1) with at least LS_S1_MIN_REST read bases
+// to go, transitions to PH_S1_LF instead (ls_s1_lf_step, ls_s1_compare).
+void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
+                                         bool s1_text)
 {
     if (s->j >= s->readlength) {
         // Ran off the end of the read; keep the still-valid smem if any.
         if (s->smem.s >= s->min_intv) {
-            s->prev[s->numPrev++] = s->smem;
+            s->prev_top[-1 - s->numPrev] = s->smem;
+            s->numPrev++;
         }
+        if (s->bsd_j != INT32_MAX) ls_bsd_resolve(s, enc_qdb, s->j);
         s->phase = PH_BWD_INIT;
         return;
     }
@@ -1290,8 +1715,10 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
     if (a >= 4) {
         // Non-ACGT base terminates forward ext.
         if (s->smem.s >= s->min_intv) {
-            s->prev[s->numPrev++] = s->smem;
+            s->prev_top[-1 - s->numPrev] = s->smem;
+            s->numPrev++;
         }
+        if (s->bsd_j != INT32_MAX) ls_bsd_resolve(s, enc_qdb, s->j);
         s->phase = PH_BWD_INIT;
         return;
     }
@@ -1306,17 +1733,32 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
     newSmem.n = s->j;
 
     int32_t s_neq_mask = (newSmem.s != s->smem.s);
-    s->prev[s->numPrev] = s->smem;
+    s->prev_top[-1 - s->numPrev] = s->smem;
     s->numPrev += s_neq_mask;
 
     if (newSmem.s < s->min_intv) {
+        /* With a bwtSeed walk pending, min_intv is 1: s = 0 from here on. */
+        if (s->bsd_j != INT32_MAX) ls_bsd_resolve(s, enc_qdb, s->j);
         s->next_x = s->j;
         s->phase = PH_BWD_INIT;
         return;
     }
 
+    if (s->j >= s->bsd_j) ls_bsd_note(s, newSmem.k, newSmem.l, newSmem.s);
     s->smem = newSmem;
     s->j++;
+    /* A unique match (s == 1; newSmem.s >= min_intv above, so min_intv <= 1)
+     * keeps its k on every further forward step: the one suffix it names is
+     * either extended or dropped. So instead of stepping the rest of the read
+     * one base at a time, resolve that suffix's text position from k and
+     * compare the read with the text (ls_s1_lf_step, ls_s1_compare). */
+    if (s1_text && newSmem.s == 1 && s->readlength - s->j >= LS_S1_MIN_REST) {
+        s->lf_row = newSmem.k;
+        s->lf_off = 0;
+        s->phase  = PH_S1_LF;
+        ls_prefetch_sa_row(newSmem.k);
+        return;
+    }
 #ifdef ENABLE_PREFETCH
     /* The NEXT forward step swaps k<->l (see smem_ above) before calling
      * backwardExt, which reads sp = smem.k and ep = smem.k + smem.s. After the
@@ -1331,19 +1773,265 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
 #endif
 }
 
-// Between-phases housekeeping: reverse prev[] and set up backward-phase
-// cursors. After this call the slot is either PH_BWD (ready for
-// ls_advance_backward_step) or PH_DONE (nothing to do — backward outer
-// loop would terminate on the first step, so we short-circuit to the
-// final prev[0] emit and done).
+// Prefetch what the next call_one_step on row p reads: the SA sample lines
+// for a sampled row, else the row's checkpoint block (the same selection as
+// get_sa_entries_prefetch's prefetch_row). A hint only.
+inline void FMI_search::ls_prefetch_sa_row(int64_t p) const
+{
+#ifdef ENABLE_PREFETCH
+    uintptr_t m = (uintptr_t)0 - (uintptr_t)((p & sa_compx_mask) == 0);
+    BWA_OPAQUE(m);
+    const uintptr_t cp = (uintptr_t)&cp_occ[p >> CP_SHIFT];
+    const uintptr_t ms = (uintptr_t)&sa_ms_byte[p >> sa_compx];
+    const uintptr_t ls = (uintptr_t)&sa_ls_word[p >> sa_compx];
+    _mm_prefetch((const char *)((ms & m) | (cp & ~m)), _MM_HINT_T0);
+    _mm_prefetch((const char *)((ls & m) | (cp & ~m)), _MM_HINT_T0);
+#else
+    (void)p;
+#endif
+}
+
+// The bidirectional index's text is the forward reference (pac, l_pac bases)
+// followed by its reverse complement (libsais_build.cpp, write_doubled_pac).
+// ls_text_match compares read bases q[j..rl) with text bases t.. and returns
+// the first j at which they differ or the text ends (t reaches 2 * l_pac), or
+// rl. A non-ACGT read base (> 3) never equals a text base. The aligned bodies
+// compare 8 bases at a time: a pac byte expands through a table to its four
+// bases, one per byte in text order (forward), or complemented in reverse
+// order (the reverse-complement half, read from the end of pac backwards).
+struct LsPacLut {
+    uint32_t fwd[256];
+    uint32_t rev[256];
+    constexpr LsPacLut() : fwd(), rev() {
+        for (int b = 0; b < 256; b++) {
+            uint32_t f = 0, r = 0;
+            for (int i = 0; i < 4; i++) {
+                const uint32_t base = (uint32_t)(b >> (6 - 2 * i)) & 3;  // _get_pac order
+                f |= base << (8 * i);
+                r |= (3 - base) << (8 * (3 - i));
+            }
+            fwd[b] = f;
+            rev[b] = r;
+        }
+    }
+};
+static constexpr LsPacLut ls_pac_lut{};
+
+static inline int32_t ls_text_match(const uint8_t *q, int32_t j, int32_t rl,
+                                    const uint8_t *pac, int64_t l_pac, int64_t t)
+{
+    const int64_t tend = 2 * l_pac;
+    while (j < rl && t < l_pac) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        if ((t & 3) == 0) {
+            while (j + 8 <= rl && t + 8 <= l_pac) {
+                uint64_t r;
+                memcpy(&r, q + j, 8);
+                const uint8_t *pb = pac + (t >> 2);
+                const uint64_t x = r ^ ((uint64_t)ls_pac_lut.fwd[pb[0]] |
+                                        ((uint64_t)ls_pac_lut.fwd[pb[1]] << 32));
+                if (x != 0) return j + (int32_t)(__builtin_ctzll(x) >> 3);
+                j += 8;
+                t += 8;
+            }
+            if (!(j < rl && t < l_pac)) break;
+        }
+#endif
+        if (q[j] != (uint8_t)_get_pac(pac, t)) return j;
+        j++;
+        t++;
+    }
+    while (j < rl && t < tend) {
+        const int64_t u = tend - 1 - t;   // pac base whose complement is text base t
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        if ((u & 3) == 3) {
+            int64_t uu = u;
+            while (j + 8 <= rl && uu >= 7) {
+                uint64_t r;
+                memcpy(&r, q + j, 8);
+                const uint8_t *pb = pac + (uu >> 2);
+                const uint64_t x = r ^ ((uint64_t)ls_pac_lut.rev[pb[0]] |
+                                        ((uint64_t)ls_pac_lut.rev[pb[-1]] << 32));
+                if (x != 0) return j + (int32_t)(__builtin_ctzll(x) >> 3);
+                j += 8;
+                uu -= 8;
+            }
+            t = tend - 1 - uu;
+            if (!(j < rl && t < tend)) break;
+            if (q[j] != (uint8_t)(3 - _get_pac(pac, uu))) return j;
+            j++;
+            t++;
+            continue;
+        }
+#endif
+        if (q[j] != (uint8_t)(3 - _get_pac(pac, u))) return j;
+        j++;
+        t++;
+    }
+    return j;
+}
+
+// One pass of a unique match's SA walk: one LF step from lf_row toward a
+// sampled row, or, on a sampled (or the sentinel) row, the match's text
+// position. call_one_step is the SA resolver's own step, with the exact
+// sentinel offset (drop_sentinel_offset 0) under every --compat, since the
+// position here locates text, not a reported coordinate.
+void FMI_search::ls_s1_lf_step(BatchSlot *s, const uint8_t *pac, int64_t l_pac)
+{
+    int64_t v;
+    if (call_one_step(s->lf_row, v, s->lf_off, 0) == 0) {
+        s->lf_row = v;
+        ls_prefetch_sa_row(v);
+        return;
+    }
+    // v = SA[k], where read[m..n] starts in the text; read base j = n + 1
+    // faces text base v + (j - m). Keep v for SA resolution (ls_s1_sa_tag);
+    // m is still the walk's start_pos here.
+    s->smem.info = ls_s1_sa_tag(v - (int64_t)s->smem.m);
+    const int64_t t = v + (int64_t)(s->j - (int32_t)s->smem.m);
+    s->lf_row = t;
+    s->phase  = PH_S1_CMP;
+#ifdef ENABLE_PREFETCH
+    // The bases still to compare span at most a couple of pac lines: hint the
+    // first and the last (clamped to the text; the walk stops at its end).
+    const int64_t tend = 2 * l_pac;
+    int64_t t_last = t + (int64_t)(s->readlength - s->j) - 1;
+    if (t_last > tend - 1) t_last = tend - 1;
+    const int64_t t0 = t < tend ? t : tend - 1;
+    const int64_t b0 = (t0 < l_pac ? t0 : tend - 1 - t0) >> 2;
+    const int64_t b1 = (t_last < l_pac ? t_last : tend - 1 - t_last) >> 2;
+    _mm_prefetch((const char *)&pac[b0], _MM_HINT_T0);
+    _mm_prefetch((const char *)&pac[b1], _MM_HINT_T0);
+#else
+    (void)l_pac;
+#endif
+}
+
+// Finish a unique match's forward walk by comparing read bases j.. with text
+// bases lf_row.., and take the exit the base-at-a-time walk would take at the
+// first base that ends it: the read's end (next_x stays readlength), a
+// non-ACGT read base (next_x = j + 1), or a base the text does not continue
+// with, the text's end (the sentinel) included (next_x = j). Every exit keeps
+// the match (s = 1 >= min_intv) as the walk's last prev entry, with n = j - 1;
+// k and s are those the walk would end with. l is left stale, as the backward
+// phase's backwardExt_konly leaves it: nothing reads l after seeding.
+void FMI_search::ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
+                               const uint8_t *pac, int64_t l_pac)
+{
+    const uint8_t *q = enc_qdb + s->offset;
+    const int32_t rl = s->readlength;
+    const int32_t j = ls_text_match(q, s->j, rl, pac, l_pac, s->lf_row);
+    const int32_t next_x = j >= rl ? rl : q[j] > 3 ? j + 1 : j;
+    /* A pending bwtSeed walk had s = 1 on read bases s->j .. j - 1 and stops
+     * on the first of them at or past min_len - 1 when 1 < max_intv (step
+     * s->j - 1 came before min_len - 1, or ls_bsd_note would have recorded it),
+     * with this match's k as its seed; otherwise it goes on from base j. */
+    if (s->bsd_j != INT32_MAX) {
+        if (s->bsd_intv > 1 && s->bsd_j < j) {
+            BsdFirstWalk *r = s->bsd;
+            r->k = s->smem.k;
+            r->l = s->smem.l;
+            r->s = 1;
+            r->n = s->bsd_j;
+            r->x = s->bsd_j + 1;
+            s->bsd_j = INT32_MAX;
+        } else {
+            ls_bsd_resolve(s, enc_qdb, j);
+        }
+    }
+    s->smem.n = j - 1;
+    s->next_x = next_x;
+    s->prev_top[-1 - s->numPrev] = s->smem;
+    s->numPrev++;
+    s->phase = PH_BWD_INIT;
+}
+
+// A walk's first forward visit when ls_init_slot planned table steps (jdp >= 2):
+// the steps to depths 2..jdp, read[x + 1 .. x + jdp), each one as
+// ls_advance_forward_step takes it, with the new interval read from the jump
+// table instead of a backwardExt. A table entry is the interval the walk's own
+// forward step reaches from the 1-base interval (seed_jump_children), and
+// read[x .. x + jdp) is ACGT inside the read, so only the step's s < min_intv
+// exit (phase 2's min_intv = s + 1 included) and the unique-match hand-off to
+// PH_S1_LF can end the run early. Otherwise the slot steps on from depth
+// jdp + 1 with the same prefetch as a forward step.
+void FMI_search::ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
+                                          bool s1_text)
+{
+    const int32_t dp = s->jdp;
+    const uint32_t code = s->jcode;
+    const int32_t x = s->start_pos;
+    const int32_t min_intv = s->min_intv;
+    SMEM *const top = s->prev_top;
+    int32_t numPrev = s->numPrev;
+    SMEM cur = s->smem;
+    s->jdp = 0;
+
+    int64_t off = seed_jump_level_off(1);
+    for (int32_t d = 2; d <= dp; d++) {
+        off = off * 4 + 4;   // seed_jump_level_off(d)
+        const SeedJumpEntry *e = seed_jump + off + (code >> (2 * (dp - d)));
+        const int32_t j = x + d - 1;
+        SMEM nw = cur;
+        nw.k = e->k;
+        nw.l = e->l;
+        nw.s = e->s;
+        nw.n = j;
+
+        top[-1 - numPrev] = cur;
+        numPrev += (nw.s != cur.s);
+
+        if (nw.s < min_intv) {
+            s->numPrev = numPrev;
+            s->smem = cur;
+            s->j = j;
+            /* With a bwtSeed walk pending, min_intv is 1: s = 0 from here on. */
+            if (s->bsd_j != INT32_MAX) ls_bsd_resolve(s, enc_qdb, j);
+            s->next_x = j;
+            s->phase = PH_BWD_INIT;
+            return;
+        }
+        if (j >= s->bsd_j) {
+            s->j = j;
+            ls_bsd_note(s, nw.k, nw.l, nw.s);
+        }
+        cur = nw;
+        if (s1_text && nw.s == 1 && s->readlength - (j + 1) >= LS_S1_MIN_REST) {
+            s->numPrev = numPrev;
+            s->smem = cur;
+            s->j = j + 1;
+            s->next_x = j + 1;
+            s->lf_row = nw.k;
+            s->lf_off = 0;
+            s->phase  = PH_S1_LF;
+            ls_prefetch_sa_row(nw.k);
+            return;
+        }
+    }
+    s->numPrev = numPrev;
+    s->smem = cur;
+    s->j = x + dp;
+    s->next_x = x + dp;
+    s->phase = PH_FWD;
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(cur.l) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(cur.l + cur.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+}
+
+// Between-phases housekeeping: point prev at the forward phase's entries and
+// set up backward-phase cursors. The slot leaves as PH_BWD (ready for
+// ls_advance_backward_step) or PH_DONE (the backward outer loop would end on
+// its first step, so go straight to the final prev[0] emit).
 void FMI_search::ls_prepare_backward(BatchSlot *s)
 {
-    // Reverse prev[] in place (matches scalar behavior before backward loop).
-    for (int p = 0; p < (s->numPrev / 2); p++) {
-        SMEM tmp = s->prev[p];
-        s->prev[p] = s->prev[s->numPrev - p - 1];
-        s->prev[s->numPrev - p - 1] = tmp;
-    }
+    static_assert(sizeof(void *) != 8 || sizeof(BatchSlot) == 168,
+                  "BatchSlot size changed: update the slot-size comments");
+    // The forward phase wrote its numPrev entries downward from prev_top, so
+    // from the last one written they run in the reversed order the scalar path
+    // makes by swapping. The backward phase's compaction writes prev[numCurr]
+    // with numCurr <= p, at or below the entry it reads: inside the entries.
+    s->prev = s->prev_top - s->numPrev;
     s->cur_j = s->readlength;
     s->j = s->start_pos - 1;  // first position for the backward outer loop
 
@@ -1362,11 +2050,10 @@ void FMI_search::ls_prepare_backward(BatchSlot *s)
     }
 #ifdef ENABLE_PREFETCH
     // The first backward step extends every prev entry from its k and k + s
-    // checkpoint blocks. The forward step prefetched only the l side, and the
-    // half-batch look-ahead (ls_prefetch_cp_occ_t1) warms only prev[0]'s two
-    // blocks, into L2, once it sees this slot in PH_BWD; prev[1..] get no hint
-    // at all. Hint every entry into L1 now, a full pass of the other slots
-    // ahead of that step. A hint only; nothing reads its result.
+    // checkpoint blocks. The forward step prefetched only the l side, so
+    // without this no prev entry's k-side blocks get a hint. Hint every entry
+    // into L1 now, a full pass of the other slots ahead of that step. A hint
+    // only; nothing reads its result.
     for (int p = 0; p < s->numPrev; p++) {
         _mm_prefetch((const char *)(&cp_occ[(s->prev[p].k) >> CP_SHIFT]), _MM_HINT_T0);
         _mm_prefetch((const char *)(&cp_occ[(s->prev[p].k + s->prev[p].s) >> CP_SHIFT]), _MM_HINT_T0);
@@ -1393,13 +2080,13 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
         if (a > 3) goto DONE;
 
         /* numPrev==1 straight-line path: the two-loop machinery and the curr_s
-         * dedup collapse to a single element. Byte-identical. This is a hand-kept
-         * specialization of the two general loops below (the emit predicate, the
-         * prefetch pair, and the numCurr/j-- bookkeeping are duplicated here) — a
-         * future edit to that logic in the general loops MUST be mirrored into
-         * this block, or numPrev==1 reads (unique matches — the common case this
-         * path accelerates) silently diverge. The lockstep parity test guards
-         * this (see Case 13, which drives real interior-start backward walks). */
+         * dedup collapse to a single element. Byte-identical. A hand-kept copy
+         * of the general loops below (emit predicate, prefetch pair, numCurr/j--
+         * bookkeeping): mirror any edit to that logic here, or numPrev==1 reads
+         * (unique matches, the common case) silently diverge; the lockstep
+         * parity test's Case 13 guards it. It keeps the member call and s->
+         * reads on purpose: one step has no per-iteration reloads for the
+         * general loops' hoisted locals to save. */
         if (s->numPrev == 1) {
             SMEM smem = s->prev[0];
             SMEM newSmem = backwardExt_konly(smem, a);
@@ -1424,42 +2111,55 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
             return;
         }
 
+        /* The slot's fields, cp_occ and count[a] are read once into locals for
+         * the two general loops, and numPrev / j written back once after them.
+         * Read through s and this, clang reloads them after every prev[] store
+         * (the SMEM stores may alias them as far as it can tell), an extra L1
+         * load ahead of each prev[p] load, compare and prefetch. prev[] and
+         * match_buf[] are driver-owned buffers that overlap neither the slot nor
+         * the index, so this is byte-identical. */
+        SMEM *const prev = s->prev;
+        const int32_t numPrev = s->numPrev;
+        const int32_t min_intv = s->min_intv;
+        const int32_t j = s->j;
+        const CP_OCC *const cpo = cp_occ;
+        const int64_t count_a = count[a];
         int p;
-        for (p = 0; p < s->numPrev; p++) {
-            SMEM smem = s->prev[p];
-            SMEM newSmem = backwardExt_konly(smem, a);
-            newSmem.m = s->j;
-            if ((newSmem.s < s->min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
-                s->cur_j = s->j;
+        for (p = 0; p < numPrev; p++) {
+            SMEM smem = prev[p];
+            SMEM newSmem = backwardExt_konly_cp(cpo, count_a, smem, a);
+            newSmem.m = j;
+            if ((newSmem.s < min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
+                s->cur_j = j;
                 s->match_buf[s->match_count++] = smem;
                 break;
             }
-            if ((newSmem.s >= s->min_intv) && (newSmem.s != curr_s)) {
+            if ((newSmem.s >= min_intv) && (newSmem.s != curr_s)) {
                 curr_s = newSmem.s;
-                s->prev[numCurr++] = newSmem;
+                prev[numCurr++] = newSmem;
 #ifdef ENABLE_PREFETCH
-                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
                 break;
             }
         }
         p++;
-        for (; p < s->numPrev; p++) {
-            SMEM smem = s->prev[p];
-            SMEM newSmem = backwardExt_konly(smem, a);
-            newSmem.m = s->j;
-            if ((newSmem.s >= s->min_intv) && (newSmem.s != curr_s)) {
+        for (; p < numPrev; p++) {
+            SMEM smem = prev[p];
+            SMEM newSmem = backwardExt_konly_cp(cpo, count_a, smem, a);
+            newSmem.m = j;
+            if ((newSmem.s >= min_intv) && (newSmem.s != curr_s)) {
                 curr_s = newSmem.s;
-                s->prev[numCurr++] = newSmem;
+                prev[numCurr++] = newSmem;
 #ifdef ENABLE_PREFETCH
-                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
             }
         }
         s->numPrev = numCurr;
-        s->j--;                // advance for the next outer step
+        s->j = j - 1;          // advance for the next outer step
         if (numCurr == 0) goto DONE;
         return;                // stay in PH_BWD; next call continues
     }
@@ -1481,7 +2181,7 @@ DONE:
 // ===== Lockstep bwtSeed batching =====
 // Per-slot state for the forward-only bwtSeed walk. Mirrors the locals of
 // the scalar bwtSeedStrategyAllPosOneThread inner-j loop, plus an outer-x
-// cursor. Each slot owns the entire scalar `while (x < readlength)` outer
+// cursor. Each slot owns the entire scalar `while (x < x_end)` outer
 // loop — outer transitions are handled inline in bsd_advance_step (Heng
 // review action: don't burn a stepping-pass on outer-only housekeeping
 // when the inner-j loop is shallow, which is exactly bwtSeed's regime).
@@ -1517,13 +2217,29 @@ struct FMI_search::BwtSeedSlot {
     SMEM    smem;          // current SA interval; rid/m fixed at outer-x init
     int32_t x;             // outer cursor: position of current smem's seed base
     int32_t j;             // inner cursor: next j to step; j < 0 = need outer seek
+    int32_t x_end;         // first x from which no walk can emit (bsd_init_slot)
 
     BwtSeedPhase phase;
     int32_t match_count;
     bool    ready;
 
     SMEM   *match_buf;     // -> thread-local cache slice, sized = max_readlength
+
+    // Jump-table entry for read[x .. x + jd), planned (and prefetched) when the
+    // walk started at x and taken on the slot's next visit; NULL = step.
+    const SeedJumpEntry *jump;
 };
+
+// First x from which no bwtSeed walk can emit. A walk from x emits only at a
+// step whose length n - m + 1 is at least minSeedLen, and its last possible
+// step ends at the read's last base, so a walk starting at
+// x >= readlength - minSeedLen + 1 never emits, nor does any walk after it.
+// minSeedLen <= 1 (-k 0 or below) keeps the read end as the bound, so no walk
+// starts past the read. Shared by the scalar and lockstep drivers.
+static inline int32_t bwtseed_x_end(int32_t readlength, int32_t minSeedLen)
+{
+    return minSeedLen > 1 ? readlength - minSeedLen + 1 : readlength;
+}
 
 // Same-slot T0 prefetch for the next inner-j step. The bwtSeed walk is
 // forward-only: bsd_advance_step swaps k<->l and calls backwardExt on the
@@ -1542,30 +2258,46 @@ void FMI_search::bsd_prefetch_cp_occ(const BwtSeedSlot *s)
 #endif
 }
 
-// Cross-slot T1 (L2) prefetch — same two-line target as T0 (the swapped
-// interval at smem.l; see bsd_prefetch_cp_occ) but at L2 hint, used in the
-// driver's (s + N/2) % N lookahead to cover DRAM-class latency when cp_occ
-// spills out of L3.
-void FMI_search::bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s)
+// Plan the jump for a walk that starts at s->x (smem already the 1-base
+// interval, j = x + 1): when read[x .. x + jd) is jd ACGT bases, point s->jump
+// at that string's entry in the level-jd table jlev and prefetch it; the next
+// visit (bsd_advance_step) takes it. Otherwise s->jump stays NULL and the walk
+// steps from x as before, reaching the N or the read end exactly as it did.
+// The read-end check cannot fire for a walk that starts before x_end
+// (bsd_init_slot), since jd <= minSeedLen - 1 (clamped in
+// bwtSeedStrategyAllPosOneThread_lockstep); it keeps the read in bounds anyway.
+void FMI_search::bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
+                               const SeedJumpEntry *jlev, int32_t jd)
 {
-#ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
-#else
-    (void)s;
-#endif
+    if (s->x + jd > s->readlength) return;
+    const uint8_t *q = enc_qdb + s->offset + s->x;
+    uint32_t any;
+    const uint32_t code = seed_jump_pack(q, jd, &any);
+    if (any >= 4) return;   // some base >= 4 (N): the walk stops there
+    s->jump = jlev + code;
+    seed_jump_prefetch(s->jump);
 }
 
 // Initialize a fresh slot for the given input read. Scans forward from
 // x=0 for the first ACGT base (matching the scalar's outer while-loop
-// skipping non-ACGT) and either enters BSD_FWD with smem seeded, or jumps
-// straight to BSD_DONE when the read is entirely non-ACGT.
+// skipping non-ACGT) and either enters BSD_FWD with smem seeded (and its
+// jump planned, bsd_plan_jump), or goes straight to BSD_DONE when no walk left
+// in the read can emit. With a hint, a read whose first walk the SMEM pass
+// recorded starts after that walk instead.
+//
+// No walk from x_end on can emit (bwtseed_x_end): it would only step to an N
+// or the read end. The slot retires as soon as its cursor reaches x_end (here,
+// at the outer seek, or where a walk ends in bsd_advance_step) instead of
+// walking there.
 void FMI_search::bsd_init_slot(BwtSeedSlot *s,
                                int32_t input_idx,
                                const int32_t *max_intv_array,
                                const bseq1_t *seq_,
                                const int32_t *query_cum_len_ar,
-                               const uint8_t *enc_qdb)
+                               const uint8_t *enc_qdb,
+                               const SeedJumpEntry *jlev, int32_t jd,
+                               int32_t minSeedLen,
+                               const BsdFirstWalkHint *bsd_hint)
 {
     s->input_idx   = input_idx;
     s->max_intv    = max_intv_array[input_idx];
@@ -1573,16 +2305,37 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
     s->offset      = query_cum_len_ar[input_idx];
     s->match_count = 0;
     s->ready       = false;
+    s->jump        = nullptr;
+    s->x_end       = bwtseed_x_end(s->readlength, minSeedLen);
 
     int32_t x = 0;
-    while (x < s->readlength && enc_qdb[s->offset + x] >= 4) x++;
+    /* The SMEM pass recorded this read's first walk (BsdFirstWalk): emit its
+     * seed and go on where it ended, as the walk itself would. */
+    if (bsd_hint != nullptr) {
+        const BsdFirstWalk *r = &bsd_hint->rec[input_idx];
+        if (r->x > 0 && s->max_intv == bsd_hint->max_intv) {
+            if (r->s > 0) {
+                s->smem.info = 0;   // untagged: get_sa_entries_prefetch reads info
+                s->smem.rid = (uint32_t)input_idx;
+                s->smem.m   = 0;
+                s->smem.n   = r->n;
+                s->smem.k   = r->k;
+                s->smem.l   = r->l;
+                s->smem.s   = r->s;
+                s->match_buf[s->match_count++] = s->smem;
+            }
+            x = r->x;
+        }
+    }
+    while (x < s->x_end && enc_qdb[s->offset + x] >= 4) x++;
     s->x = x;
-    if (x >= s->readlength) {
+    if (x >= s->x_end) {
         s->phase = BSD_DONE;
         s->ready = true;
         return;
     }
     uint8_t a = enc_qdb[s->offset + x];
+    s->smem.info = 0;   // untagged: get_sa_entries_prefetch reads info
     s->smem.rid = (uint32_t)input_idx;
     s->smem.m   = x;
     s->smem.n   = x;
@@ -1591,13 +2344,16 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
     s->smem.s   = count[a + 1] - count[a];
     s->j        = x + 1;
     s->phase    = BSD_FWD;
+    if (jd > 0) bsd_plan_jump(s, enc_qdb, jlev, jd);
 }
 
-// Advance one slot by one unit of work. Always does at least one cp_occ
-// access per call when the slot is active, so the lockstep pipeline keeps
-// uniform per-pass memory parallelism (Heng action 2a — collapse outer
-// transition into the step function rather than burning a stepping-pass
-// on housekeeping).
+// Advance one slot by one unit of work. Does one cp_occ access per call when
+// the slot is active, so the lockstep pipeline keeps uniform per-pass memory
+// parallelism (Heng action 2a — collapse outer transition into the step
+// function rather than burning a stepping-pass on housekeeping), except at a
+// walk's start when a jump is planned: that visit only prefetches the jump
+// table entry, and the next one loads it in place of the walk's first
+// jd - 1 steps.
 //
 // The semantics are identical to the scalar bwtSeedStrategyAllPosOneThread
 // inner-j body + outer-x advancement:
@@ -1615,15 +2371,32 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
 //   x = next_x;
 void FMI_search::bsd_advance_step(BwtSeedSlot *s,
                                   const uint8_t *enc_qdb,
-                                  int32_t minSeedLen)
+                                  int32_t minSeedLen,
+                                  const SeedJumpEntry *jlev, int32_t jd)
 {
+    // Jump planned when this walk started at x (prefetched then): the interval
+    // of read[x .. x + jd), the state the walk reaches after jd - 1 steps, none
+    // of which can exit (length < minSeedLen, no N, inside the read).
+    if (s->jump != nullptr) {
+        const SeedJumpEntry e = *s->jump;
+        s->jump   = nullptr;
+        s->smem.k = e.k;
+        s->smem.l = e.l;
+        s->smem.s = e.s;
+        s->smem.n = s->x + jd - 1;
+        s->j      = s->x + jd;
+        bsd_prefetch_cp_occ(s);
+        return;
+    }
+
     // Outer seek: if j < 0 the slot just broke out of an inner-j extension
     // and needs to (re-)init smem at the next ACGT x. Spin through non-ACGT
     // bases inline (scalar does the same — at most O(N_run) here, and N runs
-    // are rare in Illumina data). Falls through to one inner-j step.
+    // are rare in Illumina data). Falls through to one inner-j step. From
+    // x_end on no walk can emit (bsd_init_slot), so the slot retires there.
     if (s->j < 0) {
-        while (s->x < s->readlength && enc_qdb[s->offset + s->x] >= 4) s->x++;
-        if (s->x >= s->readlength) {
+        while (s->x < s->x_end && enc_qdb[s->offset + s->x] >= 4) s->x++;
+        if (s->x >= s->x_end) {
             s->phase = BSD_DONE;
             s->ready = true;
             return;
@@ -1636,24 +2409,34 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
         s->smem.l   = count[3 - a];
         s->smem.s   = count[a + 1] - count[a];
         s->j        = s->x + 1;
+        if (jd > 0) {
+            bsd_plan_jump(s, enc_qdb, jlev, jd);
+            if (s->jump != nullptr) return;   // jump on the next visit
+        }
         // Fall through to inner-j step.
     }
 
     // Inner-j step.
     if (s->j >= s->readlength) {
         // Scalar: inner for-loop exhausted; next_x stays at last iteration's
-        // j+1 = readlength. Setting x = readlength and j = -1 signals the
-        // next stepping pass to retire (the seek above will hit x >= L).
+        // j+1 = readlength, at or past x_end, so the slot retires now.
         s->x = s->readlength;
         s->j = -1;
+        s->phase = BSD_DONE;
+        s->ready = true;
         return;
     }
 
     uint8_t a = enc_qdb[s->offset + s->j];
     if (a >= 4) {
-        // Scalar: non-ACGT in inner-j sets next_x = j+1 and breaks.
+        // Scalar: non-ACGT in inner-j sets next_x = j+1 and breaks. A walk
+        // ending at x_end or past it is the read's last (bsd_init_slot).
         s->x = s->j + 1;
         s->j = -1;
+        if (s->x >= s->x_end) {
+            s->phase = BSD_DONE;
+            s->ready = true;
+        }
         return;
     }
 
@@ -1674,6 +2457,10 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
         }
         s->x = s->j + 1;
         s->j = -1;
+        if (s->x >= s->x_end) {
+            s->phase = BSD_DONE;
+            s->ready = true;
+        }
         return;
     }
 
@@ -1693,7 +2480,8 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          int32_t max_readlength,
                                          int32_t minSeedLen,
                                          SMEM *matchArray,
-                                         int64_t *__numTotalSmem)
+                                         int64_t *__numTotalSmem,
+                                         BsdFirstWalkHint *bsd_hint)
 {
     size_t query_pos_bytes = (size_t)numReads * sizeof(int32_t);
     int32_t *query_pos_array = (int32_t *)_mm_malloc(query_pos_bytes, 64);
@@ -1702,6 +2490,12 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
     int32_t i;
     for(i = 0; i < numReads; i++)
         query_pos_array[i] = 0;
+    /* Mark every read's BsdFirstWalk unrecorded before round 1, so a record
+     * the bwtSeed pass trusts (x > 0) is always this call's. Only the lockstep
+     * forward walk records one; other builds leave them all unrecorded. */
+    if (bsd_hint != nullptr)
+        for(i = 0; i < numReads; i++)
+            bsd_hint->rec[rid_array[i]].x = -1;
 
     int32_t numActive = numReads;
     (*__numTotalSmem) = 0;
@@ -1733,7 +2527,10 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          max_readlength,
                                          minSeedLen,
                                          matchArray,
-                                         __numTotalSmem);
+                                         __numTotalSmem,
+                                         bsd_hint);
+        // Only the first round's walks start at query position 0.
+        bsd_hint = nullptr;
 #else
         getSMEMsOnePosOneThread(enc_qdb,
                                 query_pos_array,
@@ -1765,7 +2562,8 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                                                    int32_t max_readlength,
                                                    int32_t minSeedLen,
                                                    SMEM *matchArray,
-                                                   int64_t *__numTotalSmem)
+                                                   int64_t *__numTotalSmem,
+                                                   BsdFirstWalkHint *bsd_hint)
 {
     (void)batch_size;
 
@@ -1778,7 +2576,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     xassert(N >= 1 && N <= SMEM_LOCKSTEP_N_MAX,
             "g_smem_lockstep_n out of range [1, SMEM_LOCKSTEP_N_MAX]");
     // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
-    // state (~80 B per slot, full array fits in 1-2 cache lines for N=8).
+    // state (168 B per slot: ~2.6 KB at N=16, ~5.3 KB at N=32; see BatchSlot).
     // Bulk per-slot buffers (prev/match_buf) live separately and are reused
     // across calls via thread_local caches sized from the batch's
     // max_readlength so reads of any length fit (see issue #44 / PR #55).
@@ -1804,6 +2602,12 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
      * (env pin, opt-in probe, host-tuned default, or compile-time default). */
     BatchSlot slots[SMEM_LOCKSTEP_N_MAX] = {};
     static thread_local LockstepSmemCache cache;
+    /* The unique-match text compare (ls_s1_*) runs only when the index's
+     * reference is at hand (s1_text_available); otherwise the forward walk
+     * steps every base. */
+    const bool s1_text = s1_text_available();
+    const uint8_t *s1_pac = s1_text ? idx->pac : nullptr;
+    const int64_t s1_l_pac = s1_text ? idx->bns->l_pac : 0;
     const size_t per_slot_smems = (size_t)max_readlength;
     if (per_slot_smems > cache.per_slot || N > cache.n_slots) {
         if (cache.prev  != nullptr) _mm_free(cache.prev);
@@ -1823,7 +2627,10 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
         cache.n_slots  = (int32_t)alloc_slots;
     }
     for (int32_t s = 0; s < N; s++) {
+        // The forward phase writes below prev_top; ls_prepare_backward moves
+        // prev to its last entry, so the base set here is only a defined value.
         slots[s].prev      = cache.prev  + (size_t)s * cache.per_slot;
+        slots[s].prev_top  = cache.prev  + (size_t)(s + 1) * cache.per_slot;
         slots[s].match_buf = cache.match + (size_t)s * cache.per_slot;
     }
 
@@ -1831,7 +2638,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     int32_t initial = (numReads < N) ? numReads : N;
     for (int32_t s = 0; s < initial; s++) {
         ls_init_slot(&slots[s], s, query_pos_array, min_intv_array,
-                     rid_array, seq_, query_cum_len_ar, enc_qdb);
+                     rid_array, seq_, query_cum_len_ar, enc_qdb, bsd_hint);
         if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
     }
     // Any unused slots (numReads < N) start idle: DONE with no input, so the
@@ -1855,16 +2662,29 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     int32_t idle       = N - initial;   // slots with no input
     int64_t numTotalSmem = *__numTotalSmem;
 
-    while (parked.cursor < numReads) {
+    while (parked.cursor() < numReads) {
         // --- Stepping pass: advance each slot by one phase-step. ---
         for (int32_t s = 0; s < N; s++) {
             BatchSlot *sl = &slots[s];
             switch (sl->phase) {
                 case PH_FWD:
-                    ls_advance_forward_step(sl, enc_qdb);
+                    ls_advance_forward_step(sl, enc_qdb, s1_text);
                     // If forward just transitioned to PH_BWD_INIT, run the
                     // between-phases housekeeping immediately. prepare_backward
                     // may transition straight to PH_DONE (e.g. empty prev[]).
+                    if (sl->phase == PH_BWD_INIT) {
+                        ls_prepare_backward(sl);
+                    }
+                    break;
+                case PH_S1_LF:
+                    ls_s1_lf_step(sl, s1_pac, s1_l_pac);
+                    break;
+                case PH_S1_CMP:
+                    ls_s1_compare(sl, enc_qdb, s1_pac, s1_l_pac);
+                    ls_prepare_backward(sl);
+                    break;
+                case PH_FWD_TABLE:
+                    ls_advance_forward_table(sl, enc_qdb, s1_text);
                     if (sl->phase == PH_BWD_INIT) {
                         ls_prepare_backward(sl);
                     }
@@ -1888,7 +2708,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                               matchArray, &numTotalSmem);
                 if (next_input < numReads && parked.admits(next_input)) {
                     ls_init_slot(sl, next_input, query_pos_array, min_intv_array,
-                                 rid_array, seq_, query_cum_len_ar, enc_qdb);
+                                 rid_array, seq_, query_cum_len_ar, enc_qdb, bsd_hint);
                     if (sl->phase == PH_FWD) ls_prefetch_cp_occ(sl);
                     next_input++;
                 } else {
@@ -1897,17 +2717,11 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                     idle++;
                 }
             }
-            // LISA trick #5: cross-slot T1 (L2) prefetch with N/2-step lookahead.
-            // The same-slot T0 prefetch issued inside ls_advance_*_step covers
-            // the next single-step access; this T1 prefetch on slot[s+N/2] keeps
-            // a copy in L2 for that slot's access ~N/2 stepping-passes from now,
-            // hiding DRAM-class latency when cp_occ entries spill out of L3.
-            // N is runtime (g_smem_lockstep_n), so `% N` is a real idiv every
-            // step. s < N and N/2 < N => s + N/2 < 2N, so one compare + subtract
-            // replaces the division. Byte-identical.
-            int32_t s_la = s + (N >> 1);
-            if (s_la >= N) s_la -= N;
-            ls_prefetch_cp_occ_t1(&slots[s_la]);
+            /* No cross-slot prefetch for another slot's next visit: each slot
+             * already hints what its next step reads, at the end of its last one
+             * (ls_advance_forward_step, ls_advance_forward_table,
+             * ls_advance_backward_step, ls_prepare_backward, ls_s1_lf_step) or when
+             * filled (ls_init_slot's jump-table entry, ls_prefetch_cp_occ). */
         }
 
         // --- Refill the slots the window turned away, now that it may admit
@@ -1917,7 +2731,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                 BatchSlot *sl = &slots[s];
                 if (sl->input_idx >= 0) continue;
                 ls_init_slot(sl, next_input, query_pos_array, min_intv_array,
-                             rid_array, seq_, query_cum_len_ar, enc_qdb);
+                             rid_array, seq_, query_cum_len_ar, enc_qdb, bsd_hint);
                 if (sl->phase == PH_FWD) ls_prefetch_cp_occ(sl);
                 next_input++;
                 idle--;
@@ -1947,13 +2761,16 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
     for(i = 0; i < numReads; i++)
     {
         int readlength = seq_[i].l_seq;
+        // No walk from x_end on can emit (bwtseed_x_end), so the read ends there.
+        const int x_end = bwtseed_x_end(readlength, minSeedLen);
         int32_t x = 0;
-        while(x < readlength)
+        while(x < x_end)
         {
             int next_x = x + 1;
 
             // Forward search
             SMEM smem;
+            smem.info = 0;   // carries no SA tag (ls_s1_sa_tag)
             smem.rid = i;
             smem.m = x;
             smem.n = x;
@@ -2032,9 +2849,10 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
 // load queue rather than serializing on per-read load latency.
 //
 // Structurally parallel to getSMEMsOnePosOneThread_lockstep above; see that
-// function's comments for the prefetch model (same-slot T0 inside the step
-// function + cross-slot T1 at (s + N/2) % N in the driver) and the hybrid
-// SoA per-slot/bulk-buffer layout rationale.
+// function's comments for the hybrid SoA per-slot/bulk-buffer layout
+// rationale. Prefetch model: same-slot T0 only, at the end of each step
+// (bsd_advance_step) and at slot init; as in the SMEM driver, there is no
+// cross-slot T1 lookahead (see the stepping pass below).
 int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
                                                             int32_t *max_intv_array,
                                                             int32_t numReads,
@@ -2042,9 +2860,11 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
                                                             int32_t *query_cum_len_ar,
                                                             int32_t minSeedLen,
                                                             SMEM *matchArray,
-                                                            int32_t max_readlength)
+                                                            int32_t max_readlength,
+                                                            const BsdFirstWalkHint *bsd_hint)
 {
     if (numReads <= 0) return 0;
+    if (bsd_hint != nullptr && bsd_hint->min_len != minSeedLen) bsd_hint = nullptr;
 
     // Runtime lockstep width (g_bwtseed_lockstep_n, resolved once at startup from
     // a BWA3_BWTSEED_LOCKSTEP_N pin, else the host default: 32 on AMD Zen 5
@@ -2084,11 +2904,23 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
         slots[s].match_buf = cache.match + (size_t)s * cache.per_slot;
     }
 
+    // Jump depth for this call: walks jump from their first base to length
+    // jd = min(table depth, minSeedLen - 1) (bsd_plan_jump); 0 = step only
+    // (no table, BWA3_BWTSEED_JUMP=0, or jd < 2, where there is nothing to skip).
+    int32_t jd = 0;
+    const SeedJumpEntry *jlev = nullptr;
+    if (seed_jump != nullptr) {
+        jd = seed_jump_depth < minSeedLen - 1 ? seed_jump_depth : minSeedLen - 1;
+        if (jd >= 2) jlev = seed_jump + seed_jump_level_off(jd);
+        else jd = 0;
+    }
+
     // Seed the first min(N, numReads) slots.
     const int32_t initial = (numReads < N) ? numReads : N;
     for (int32_t s = 0; s < initial; s++) {
-        bsd_init_slot(&slots[s], s, max_intv_array, seq_, query_cum_len_ar, enc_qdb);
-        if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
+        bsd_init_slot(&slots[s], s, max_intv_array, seq_, query_cum_len_ar, enc_qdb, jlev, jd,
+                      minSeedLen, bsd_hint);
+        if (slots[s].phase == BSD_FWD && slots[s].jump == nullptr) bsd_prefetch_cp_occ(&slots[s]);
     }
     // Unused slots get input_idx = -1 so the flush pass skips them.
     for (int32_t s = initial; s < N; s++) {
@@ -2106,14 +2938,15 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
         // Stepping pass: advance each active slot by one unit of work.
         for (int32_t s = 0; s < N; s++) {
             if (slots[s].phase == BSD_FWD) {
-                bsd_advance_step(&slots[s], enc_qdb, minSeedLen);
+                bsd_advance_step(&slots[s], enc_qdb, minSeedLen, jlev, jd);
             }
-            // Cross-slot T1 lookahead — same pattern as the SMEM lockstep's
-            // (s + N/2) % N L2 prefetch.
-            const int32_t s_la = (s + (N / 2)) % N;
-            if (slots[s_la].phase == BSD_FWD && slots[s_la].j >= 0) {
-                bsd_prefetch_cp_occ_t1(&slots[s_la]);
-            }
+            // No cross-slot prefetch for another slot's next visit: a slot that
+            // steps next already hinted its two cp_occ lines (smem.l and
+            // smem.l + smem.s) at the end of its last step (bsd_advance_step) or
+            // at init; a slot with a planned jump next reads only its jump-table
+            // entry, which bsd_plan_jump prefetched; and a fresh seed (j < 0)
+            // reads lines that are not known until its next start x is found.
+            // A second hint would only repeat the first or miss.
         }
 
         // Flush pass: emit retired slots in input order; recycle into the
@@ -2132,8 +2965,10 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
 
             if (next_input < numReads) {
                 bsd_init_slot(&slots[s], next_input,
-                              max_intv_array, seq_, query_cum_len_ar, enc_qdb);
-                if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
+                              max_intv_array, seq_, query_cum_len_ar, enc_qdb, jlev, jd,
+                              minSeedLen, bsd_hint);
+                if (slots[s].phase == BSD_FWD && slots[s].jump == nullptr)
+                    bsd_prefetch_cp_occ(&slots[s]);
                 next_input++;
             } else {
                 slots[s].input_idx = -1;
@@ -2146,6 +2981,61 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
 }
 
 
+/* ---- Shared pieces of the SMEM rid counting sort (sortSMEMs and
+ * smem_sort_rid_mn). ---- */
+
+/* Grow a reused scratch buffer to hold at least `need` elements: free + fresh
+ * 64-byte-aligned allocation, null-checked, never shrunk (so a buffer is
+ * bounded by the largest batch it has seen). Contents are not preserved. */
+template <typename T>
+static T *smem_scratch_reserve(T *&buf, int64_t &cap, int64_t need)
+{
+    if (need > cap) {
+        _mm_free(buf);
+        buf = (T *) _mm_malloc((size_t)need * sizeof(T), 64);
+        if (buf == NULL) {
+            fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
+            exit(EXIT_FAILURE);
+        }
+        cap = need;
+    }
+    return buf;
+}
+
+/* rid range present in a[0, n), n >= 1. A per-thread block holds only its own
+ * reads, so the dense rid index is offset by the observed minimum. */
+static int64_t smem_rid_range(const SMEM *a, int64_t n, uint32_t *minRidOut)
+{
+    uint32_t minRid = a[0].rid, maxRid = a[0].rid;
+    for (int64_t i = 1; i < n; i++) {
+        uint32_t r = a[i].rid;
+        if (r < minRid) minRid = r;
+        if (r > maxRid) maxRid = r;
+    }
+    *minRidOut = minRid;
+    return (int64_t)maxRid - (int64_t)minRid + 1;
+}
+
+/* Stable counting scatter of a[0, n) by rid: out[] receives make(i) for each
+ * input i, grouped by ascending rid, keeping input order within a rid. cnt
+ * must hold `range` entries; on return cnt[r] is the END offset of bucket r
+ * (its start is cnt[r - 1], or 0 for r == 0). cnt is zeroed over [0, range)
+ * here -- only the used prefix, not the whole capacity. */
+template <typename T, typename Make>
+static void smem_rid_scatter(const SMEM *a, int64_t n, uint32_t minRid, int64_t range,
+                             int64_t *cnt, T *out, Make make)
+{
+    memset(cnt, 0, (size_t)range * sizeof(int64_t));
+    for (int64_t i = 0; i < n; i++)
+        cnt[a[i].rid - minRid]++;
+    int64_t sum = 0;
+    for (int64_t r = 0; r < range; r++) { int64_t c = cnt[r]; cnt[r] = sum; sum += c; }
+    for (int64_t i = 0; i < n; i++) {
+        int64_t b = (int64_t)a[i].rid - minRid;
+        out[cnt[b]++] = make(i);
+    }
+}
+
 void FMI_search::sortSMEMs(SMEM *matchArray,
         int64_t numTotalSmem[],
         int32_t numReads,
@@ -2153,23 +3043,22 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
         int nthreads,
         SmemSortScratch &scratch)
 {
-    /* The only property the caller needs from this sort is that every SMEM of a
-     * given read (rid) is contiguous and the reads appear in ascending rid
-     * order: mem_collect_smem then walks each rid block and re-sorts it with
-     * ks_introsort(mem_intv1) keyed purely on (m, n). The old qsort's secondary
-     * (m asc, n desc) ordering was therefore thrown away — and SMEMs that tie on
-     * (rid, m, n) are byte-identical (same read span => same SA interval), so the
-     * unstable re-sort's handling of them cannot depend on their incoming order.
+    /* Stable counting sort of each per-thread block by rid: every SMEM of a
+     * read (rid) becomes contiguous, reads in ascending rid order, and SMEMs of
+     * one rid keep their incoming relative order. No (m, n) order is applied.
+     *
+     * The aligner no longer calls this (mem_collect_smem uses smem_sort_rid_mn,
+     * which also orders each read by (m, n)); it is kept for the integration
+     * tests, which diff its output, so its order must not change. The
+     * smem_sort_rid_mn unit test pins it to a stable sort by rid.
      *
      * rid is a dense index in [0, numReads), so a counting sort by rid replaces
-     * the O(n log n) function-pointer qsort with an O(n + rid_range) pass.
-     *
-     * The count/offset array (`cnt`) and the stable-scatter buffer (`tmp`) live
-     * in caller-owned scratch that is allocated once and reused across batches
-     * (audit SEED-15), replacing the old per-batch calloc/_mm_malloc + free.
-     * FMI_search is shared across worker threads, so no member scratch may be
-     * used here; the scratch instead comes from the caller's per-thread
-     * mem_cache slot (mmc->smem_sort_scratch[tid]) and is never shared. */
+     * the old O(n log n) function-pointer qsort with an O(n + rid_range) pass.
+     * The count/offset array (`cnt`) and the scatter buffer (`tmp`) live in
+     * caller-owned scratch that is allocated once and reused across batches
+     * (audit SEED-15). FMI_search is shared across worker threads, so no member
+     * scratch may be used here; the scratch comes from the caller and is never
+     * shared. */
     int tid;
     int32_t perThreadQuota = (numReads + (nthreads - 1)) / nthreads;
     for(tid = 0; tid < nthreads; tid++)
@@ -2180,57 +3069,75 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
         int32_t first = tid * perThreadQuota;
         SMEM *myMatchArray = matchArray + (int64_t)first * readlength;
 
-        /* rid range actually present in this block (dense, but a per-thread
-         * block only holds its own reads, so offset by the observed minimum). */
-        uint32_t minRid = myMatchArray[0].rid, maxRid = myMatchArray[0].rid;
-        for (int64_t i = 1; i < smem_count; i++) {
-            uint32_t r = myMatchArray[i].rid;
-            if (r < minRid) minRid = r;
-            if (r > maxRid) maxRid = r;
-        }
-        int64_t range = (int64_t)maxRid - (int64_t)minRid + 1;
+        uint32_t minRid;
+        int64_t range = smem_rid_range(myMatchArray, smem_count, &minRid);
+        int64_t *cnt = smem_scratch_reserve(scratch.cnt, scratch.cntCap, range);
+        SMEM    *tmp = smem_scratch_reserve(scratch.tmp, scratch.tmpCap, smem_count);
 
-        /* Grow the reused scratch on demand; it is never shrunk. cnt is zeroed
-         * over [0, range) below — exactly what the old per-call calloc did — so
-         * only the used prefix must be reset, not the whole capacity. tmp is
-         * fully overwritten by the scatter, so it needs no initialization. */
-        if (range > scratch.cntCap) {
-            _mm_free(scratch.cnt);
-            scratch.cnt = (int64_t *) _mm_malloc((size_t)range * sizeof(int64_t), 64);
-            if (scratch.cnt == NULL) {
-                fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
-                exit(EXIT_FAILURE);
-            }
-            scratch.cntCap = range;
-        }
-        if (smem_count > scratch.tmpCap) {
-            _mm_free(scratch.tmp);
-            scratch.tmp = (SMEM *) _mm_malloc((size_t)smem_count * sizeof(SMEM), 64);
-            if (scratch.tmp == NULL) {
-                fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
-                exit(EXIT_FAILURE);
-            }
-            scratch.tmpCap = smem_count;
-        }
-        int64_t *cnt = scratch.cnt;
-        SMEM    *tmp = scratch.tmp;
-
-        memset(cnt, 0, (size_t)range * sizeof(int64_t));
-
-        for (int64_t i = 0; i < smem_count; i++)
-            cnt[myMatchArray[i].rid - minRid]++;
-
-        int64_t sum = 0;
-        for (int64_t r = 0; r < range; r++) { int64_t c = cnt[r]; cnt[r] = sum; sum += c; }
-
-        /* stable scatter: same-rid SMEMs keep their incoming relative order */
-        for (int64_t i = 0; i < smem_count; i++) {
-            int64_t b = (int64_t)myMatchArray[i].rid - minRid;
-            tmp[cnt[b]++] = myMatchArray[i];
-        }
+        smem_rid_scatter(myMatchArray, smem_count, minRid, range, cnt, tmp,
+                         [myMatchArray](int64_t i) { return myMatchArray[i]; });
         /* tmp is distinct scratch storage and cannot overlap myMatchArray */
         memcpy(myMatchArray, tmp, (size_t)smem_count * sizeof(SMEM));
     }
+}
+
+/* (sort key, source index) pair for smem_sort_rid_mn; forward-declared as
+ * SmemKeyIdx in FMI_search.h so the layout stays private to this file. */
+struct smem_key_idx
+{
+    uint64_t key;   /* (uint64_t)m << 32 | n */
+    uint64_t idx;   /* position of the SMEM in the unsorted array */
+};
+
+/* Per-rid order of mem_collect_smem: the key (m << 32 | n) ascending. This
+ * MUST order exactly as bwamem.cpp's intv_lt1 (KSORT_INIT(mem_intv1)), which
+ * defined the order before this sort replaced it; the unit test
+ * test/unit/test_smem_sort_rid_mn.cpp enforces it against that comparator. */
+#define smem_key_lt(a, b) ((a).key < (b).key)
+KSORT_INIT(smem_key_idx, SmemKeyIdx, smem_key_lt)
+
+void smem_sort_rid_mn(SMEM *a, int64_t n, SmemSortScratch &scratch)
+{
+    /* Same result as sortSMEMs (nthreads = 1) followed by a per-rid
+     * ks_introsort(mem_intv1), by construction:
+     *  - the stable counting scatter by rid is the same, except that it moves a
+     *    16-byte (key, idx) pair instead of the 48-byte SMEM, so every rid
+     *    bucket starts in the same incoming order;
+     *  - each bucket is then sorted by the same ks_introsort algorithm with an
+     *    identically-ordering comparator on the same keys, so it makes the same
+     *    comparisons and applies the same swaps -- the same permutation, ties
+     *    included;
+     *  - each SMEM is then gathered into scratch and copied back (two 48-byte
+     *    moves, against a scatter + copy-back + every sort shift before).
+     * The rid buckets come straight from the counting offsets, so no rescan
+     * for rid boundaries is needed either. */
+    if (n <= 1) return;
+
+    uint32_t minRid;
+    int64_t range = smem_rid_range(a, n, &minRid);
+    int64_t    *cnt = smem_scratch_reserve(scratch.cnt, scratch.cntCap, range);
+    SMEM       *tmp = smem_scratch_reserve(scratch.tmp, scratch.tmpCap, n);
+    SmemKeyIdx *p   = smem_scratch_reserve(scratch.pairs, scratch.pairsCap, n);
+
+    smem_rid_scatter(a, n, minRid, range, cnt, p, [a](int64_t i) {
+        SmemKeyIdx e;
+        e.key = ((uint64_t)a[i].m << 32) | (uint64_t)a[i].n;
+        e.idx = (uint64_t)i;
+        return e;
+    });
+
+    int64_t start = 0;
+    for (int64_t r = 0; r < range; r++) {
+        int64_t end = cnt[r];
+        if (end - start > 1)
+            ks_introsort(smem_key_idx, (size_t)(end - start), p + start);
+        start = end;
+    }
+
+    for (int64_t i = 0; i < n; i++)
+        tmp[i] = a[p[i].idx];
+    /* tmp is distinct scratch storage and cannot overlap a */
+    memcpy(a, tmp, (size_t)n * sizeof(SMEM));
 }
 
 
@@ -2437,7 +3344,7 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         /* The BWT symbol at sp is one-hot across the four bit-planes, and the
          * bases are close to uniformly distributed, so testing the planes one
          * branch at a time mispredicts on most steps. Test all four at once
-         * and select the symbol without a branch; the empty case (no plane
+         * and pick the symbol with a ternary over them; the empty case (no plane
          * set) is the sentinel row, kept as the one real branch since it is
          * nearly never taken. The occurrence count then reuses the k-only
          * backward step's NEON popcount, whose d-register loads keep the
@@ -2448,12 +3355,12 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         const unsigned t2 = (unsigned)((one_hot_bwt_str[2] >> y_pp_) & 1);
         const unsigned t3 = (unsigned)((one_hot_bwt_str[3] >> y_pp_) & 1);
         if ((t0 | t1 | t2 | t3) == 0) {
-            // Sentinel ($) row (no bit-plane set, the scalar path's b == 4): its
-            // suffix-array value is 0 and we walked `offset` LF steps to reach it,
-            // so the SA entry is 0 + offset. drop_sentinel_offset (=> 0) reproduces
-            // bwa-mem2's dropped walk for --compat=bwa-mem2; the default keeps the
-            // accumulated offset, matching the scalar branch and the compressed
-            // sibling get_sa_entry_compressed.
+            // Sentinel ($) row (no bit-plane set; the x86 arm's planes == 0):
+            // its suffix-array value is 0 and we walked `offset` LF steps to
+            // reach it, so the SA entry is 0 + offset. drop_sentinel_offset
+            // (=> 0) reproduces bwa-mem2's dropped walk for --compat=bwa-mem2;
+            // the default keeps the accumulated offset, matching the x86 arm
+            // and the compressed sibling get_sa_entry_compressed.
             sa_entry = drop_sentinel_offset ? 0 : offset;
             return 1;
         }
@@ -2461,17 +3368,21 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         const int64_t occ_sp = cp_occ[occ_id_pp_].cp_count[b] +
             occ_popcount64(&one_hot_bwt_str[b], &one_hot_mask_array[sp & CP_MASK]);
 #else
-        if((one_hot_bwt_str[0] >> y_pp_) & 1)
-            b = 0;
-        else if((one_hot_bwt_str[1] >> y_pp_) & 1)
-            b = 1;
-        else if((one_hot_bwt_str[2] >> y_pp_) & 1)
-            b = 2;
-        else if((one_hot_bwt_str[3] >> y_pp_) & 1)
-            b = 3;
-        else
-            b = 4;
-        if (b == 4) {
+        /* As on NEON above: the symbol at sp is one-hot across the four
+         * bit-planes and the bases are near uniform, so a plane-at-a-time
+         * branch chain mispredicts on most LF steps, and in this
+         * multi-lane pipelined resolver a mispredict also discards
+         * the other lanes' in-flight work. Gather the four plane bits into
+         * one 4-bit mask and take its lowest set bit, which matches the
+         * plane-at-a-time test's priority (lowest plane wins). An empty
+         * mask is the sentinel row, kept as the one real branch since it
+         * is nearly never taken. */
+        const unsigned planes =
+              (unsigned)((one_hot_bwt_str[0] >> y_pp_) & 1)
+            | ((unsigned)((one_hot_bwt_str[1] >> y_pp_) & 1) << 1)
+            | ((unsigned)((one_hot_bwt_str[2] >> y_pp_) & 1) << 2)
+            | ((unsigned)((one_hot_bwt_str[3] >> y_pp_) & 1) << 3);
+        if (planes == 0) {
             // Sentinel ($) row: its suffix-array value is 0, and we have walked
             // `offset` LF steps to reach it, so the SA entry is 0 + offset. The
             // compressed sibling get_sa_entry_compressed returns `offset` here for
@@ -2483,7 +3394,8 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
             sa_entry = drop_sentinel_offset ? 0 : offset;
             return 1;
         }
-        
+        b = (uint8_t)__builtin_ctz(planes);
+
         GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
 #endif
         
@@ -2815,8 +3727,13 @@ struct KsDedupTable {
 };
 } // namespace
 
-/* Stats: distinct-vs-total resolved POSITIONS (weighted by min(s,max_occ), the
- * actual resolve cost), summed across threads, printed once at exit. */
+/* Stats: distinct-vs-total resolved POSITIONS (weighted by min(s,max_occ)),
+ * summed across threads, printed once at exit. These count coordinates: an SMEM
+ * whose coordinate comes from its SA tag (trust_s1_tag) counts as a distinct
+ * position although nothing is walked for it. The AUTO controller's inputs
+ * (ks_distinct_positions, ks_dup_positions) count LF walks instead, so the two
+ * differ when tags are trusted; "saved" here is the share of coordinates that
+ * dedup copies, not of LF walks. */
 static std::atomic<uint64_t> g_ksdedup_total_pos{0};
 static std::atomic<uint64_t> g_ksdedup_distinct_pos{0};
 
@@ -2844,7 +3761,7 @@ static struct KsDedupStatsDumper {
 void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                                          int64_t *coordCountArray, int64_t count,
                                          const int32_t max_occ, int tid, int64_t &id_,
-                                         int drop_sentinel_offset)
+                                         int drop_sentinel_offset, bool trust_s1_tag)
 {
     // Internal invariant for direct callers. max_occ is a divisor below
     // (`step = s / max_occ`) and the dedup slot-run width `c = min(s, max_occ)`,
@@ -2853,7 +3770,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     // the public fmi_seed_sa_prefetch facade still no-ops on <= 0 for its own
     // documented contract (it returns before reaching here), so this guard only
     // catches a future direct caller passing a bad value -- fail loud rather than
-    // silently produce no seeds. xassert survives a hypothetical -DNDEBUG build.
+    // silently produce no seeds. xassert survives an EXTRA_CXXFLAGS=-DNDEBUG opt-out build.
     xassert(max_occ > 0, "get_sa_entries_prefetch: max_occ must be > 0");
 
     // uint32_t i;
@@ -2921,17 +3838,40 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
      * Thread-local + grow-only to avoid per-chunk allocation. */
     static thread_local std::vector<int64_t> ks_dup_base, ks_rep_base, ks_dup_cnt;
     static thread_local KsDedupTable ks_tab;
-    /* Maps each staged pos_ar entry -> its destination coordArray slot. In the
-     * plain path staging index == coordArray slot (1:1), but the dedup path
-     * skips duplicate intervals, so pos_ar compacts and the two diverge: a
-     * rep's k-th staged position must land in its OWN slot-run base + k, not in
-     * the compacted pos_ar index. The pipeline reads this to place each result.
-     * (Sized to mem_lim like pos_ar; only used when dedup is on.) */
+    /* Maps each staged pos_ar entry -> its destination coordArray slot. When
+     * every SMEM is staged (the plain path with SA tags not trusted), staging
+     * index == coordArray slot (1:1). The dedup path skips duplicate intervals
+     * and, with SA tags trusted (use_tag below), both paths skip tagged SMEMs,
+     * so pos_ar compacts and the two diverge: a staged position must land in
+     * its OWN slot (a rep's slot-run base + k), not in the compacted pos_ar
+     * index. The pipeline reads this to place each result. (Sized to mem_lim
+     * like pos_ar; only used when dedup is on or SA tags are trusted.) */
     static thread_local std::vector<int64_t> ks_dst;
+    /* A unique match whose text position the seeding path already resolved
+     * (ls_s1_sa_tag, FMI_search.cpp's lockstep SMEM driver) gets its one
+     * coordinate written here, at staging, and no LF walk. Only a caller whose
+     * SMEMs all come from bwa-mem3's own seeding (which leaves info 0 on every
+     * SMEM it does not tag) passes trust_s1_tag; the fmi_seed_sa_prefetch
+     * facade takes SMEMs from external code and does not.
+     * CONTRACT: trusting the tag is only correct if every SMEM producer on the
+     * seeding path leaves info 0 on an SMEM it does not tag. Nothing checks it
+     * here (a stale bit 63 on an s == 1 SMEM would be written as a wrong
+     * coordinate), so a new or changed producer must zero info. The SMEM parity
+     * tests check info == 0 on the untagged output of every producer
+     * (getSMEMsOnePosOneThread and its lockstep driver, and both
+     * bwtSeedStrategyAllPosOneThread drivers). The tag holds the
+     * exact SA value, so it is used only at drop_sentinel_offset 0: under
+     * --compat=bwa-mem2 a walk that reaches the sentinel row reports 0, and
+     * how far a walk goes before it meets a sampled row is not bounded (the SA
+     * is sampled by row). Skipping SMEMs breaks the plain path's staging index
+     * == coordArray slot identity, so with the tag trusted every staged
+     * position records its slot in ks_dst, as the dedup path does. */
+    const bool use_tag = trust_s1_tag && drop_sentinel_offset == 0;
+    const bool remap = dedup || use_tag;
     /* Grow-only (like the pos_ar scratch): only indices [0, id) are written
      * before they are read, so a plain resize every call would re-zero the tail
      * and thrash the allocator for no benefit. Keep the high-water capacity. */
-    if (dedup && ks_dst.size() < (size_t)mem_lim) ks_dst.resize((size_t)mem_lim);
+    if (remap && ks_dst.size() < (size_t)mem_lim) ks_dst.resize((size_t)mem_lim);
 
     if (!dedup) {
         for(int i = 0; i < count; i++)
@@ -2939,6 +3879,24 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             int32_t c = 0;
             SMEM smem = smemArray[i];
             if (smem.s < 0) smem.s = 0;   // clamp negative/empty interval (see mem_lim loop)
+            if (use_tag) {
+                if (ls_s1_tagged(smem)) {
+                    coordArray[totalCoordCount] = ls_s1_sa_coord(smem);
+                    *coordCountArray += 1;
+                    totalCoordCount += 1;
+                    continue;
+                }
+                int64_t hi = smem.k + smem.s;
+                int64_t step = (smem.s > max_occ) ? smem.s / max_occ : 1;
+                for(int64_t j = smem.k; (j < hi) && (c < max_occ); j+=step, c++)
+                {
+                    ks_dst[id] = totalCoordCount + c;
+                    pos_ar[id++] = j;
+                }
+                *coordCountArray += c;
+                totalCoordCount += c;
+                continue;
+            }
             int64_t hi = smem.k + smem.s;
             int64_t step = (smem.s > max_occ) ? smem.s / max_occ : 1;
             int64_t j;
@@ -2965,11 +3923,15 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         if (ks_measure) ks_t_stage0 = std::chrono::steady_clock::now();
         ks_tab.reset(count);
         ks_dup_base.clear(); ks_rep_base.clear(); ks_dup_cnt.clear();
-        uint64_t stat_total = 0, stat_distinct = 0;
+        uint64_t stat_total = 0, stat_distinct = 0, stat_dup_walk = 0;
         for(int i = 0; i < count; i++)
         {
             SMEM smem = smemArray[i];
             if (smem.s < 0) smem.s = 0;   // clamp negative/empty interval (see mem_lim loop)
+            /* A tagged SMEM (see use_tag) keeps its rep/duplicate role: a rep
+             * has its coordinate written here instead of staged, and a
+             * duplicate copies its rep's slot as any duplicate does. */
+            const bool tagged = use_tag && ls_s1_tagged(smem);
             int64_t hi = smem.k + smem.s;
             int64_t step = (smem.s > max_occ) ? smem.s / max_occ : 1;
             /* c is min(s, max_occ) -- the slot-run width. Compute it up front
@@ -2987,10 +3949,14 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                  * coordArray destination (run_base + cc) so the pipeline writes
                  * results into this rep's own slot-run, not the compacted
                  * pos_ar index. */
-                int32_t cc = 0;
-                for(int64_t j = smem.k; (j < hi) && (cc < max_occ); j+=step, cc++) {
-                    ks_dst[id] = run_base + cc;
-                    pos_ar[id++] = j;
+                if (tagged) {
+                    coordArray[run_base] = ls_s1_sa_coord(smem);
+                } else {
+                    int32_t cc = 0;
+                    for(int64_t j = smem.k; (j < hi) && (cc < max_occ); j+=step, cc++) {
+                        ks_dst[id] = run_base + cc;
+                        pos_ar[id++] = j;
+                    }
                 }
                 stat_distinct += (uint64_t)c;
             } else {
@@ -2998,6 +3964,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                 ks_dup_base.push_back(run_base);
                 ks_rep_base.push_back(ks_tab.base[rep]);
                 ks_dup_cnt.push_back(c);
+                if (!tagged) stat_dup_walk += (uint64_t)c;
             }
             *coordCountArray += c;
             totalCoordCount  += c;
@@ -3006,8 +3973,12 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         if (ks_measure) {
             ks_stage_ns = std::chrono::duration<double, std::nano>(
                               std::chrono::steady_clock::now() - ks_t_stage0).count();
-            ks_distinct_positions = (int64_t)stat_distinct;
-            ks_dup_positions      = (int64_t)(stat_total - stat_distinct);
+            /* The controller prices LF walks: the positions walked (id; every
+             * distinct position but a tagged rep's) and the duplicates whose
+             * walk dedup skips (a tagged duplicate has none to skip). Without
+             * tags these are stat_distinct and stat_total - stat_distinct. */
+            ks_distinct_positions = id;
+            ks_dup_positions      = (int64_t)stat_dup_walk;
         }
         if (ks_dedup_stats_on()) {
             g_ksdedup_total_pos.fetch_add(stat_total, std::memory_order_relaxed);
@@ -3016,13 +3987,15 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     }
     
     /* Out-param is the resolved-COORDINATE count, not the compacted staging
-     * count. In the plain path these are equal (staging index == coordArray
-     * slot, 1:1), but the dedup path stages only reps into pos_ar (local `id`),
-     * so `id` under-counts by the skipped duplicates. totalCoordCount advances
-     * by min(s,max_occ) for every SMEM in both paths, so accumulating it keeps
-     * *id_ mode-invariant -- the fmi_seed_sa_prefetch facade documents *id as
-     * the coordinate count, and external consumers must not see it shrink when
-     * 'auto'/'on' dedup engages. (`id` stays the pipeline's compacted bound.) */
+     * count. These are equal only when every SMEM is staged (the plain path
+     * with SA tags not trusted). The dedup path stages only reps into pos_ar
+     * (local `id`), and with SA tags trusted both paths skip tagged SMEMs, so
+     * `id` under-counts by the skipped duplicates and tagged SMEMs.
+     * totalCoordCount advances by min(s,max_occ) for every SMEM in both paths,
+     * so accumulating it keeps *id_ invariant to dedup and to tags -- the
+     * fmi_seed_sa_prefetch facade documents *id as the coordinate count, and
+     * external consumers must not see it shrink when 'auto'/'on' dedup engages.
+     * (`id` stays the pipeline's compacted bound.) */
     id_ += totalCoordCount;
 
     /* Number of SA rows walked concurrently. Each lane's next checkpoint block
@@ -3074,7 +4047,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     {
         int64_t pos =  pos_ar[i];
         working_set[j] = pos;
-        map_pos[j] = dedup ? ks_dst[i] : i;   // dedup remaps to the rep's slot-run
+        map_pos[j] = remap ? ks_dst[i] : i;   // dedup or a tag remaps to the slot
         offset[j] = 0;
         
         prefetch_row(pos);
@@ -3106,7 +4079,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                 {
                     pos = pos_ar[i];
                     working_set[k] = pos;
-                    map_pos[k] = dedup ? ks_dst[i] : i;   // dedup remaps to the rep's slot-run
+                    map_pos[k] = remap ? ks_dst[i] : i;   // dedup or a tag remaps to the slot
                     i++;
                     offset[k] = 0;
                     

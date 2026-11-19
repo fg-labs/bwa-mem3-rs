@@ -841,3 +841,167 @@ fn rescue_heavy_fixture_matches_between_batched_and_legacy_paths() {
         sys::bwa_shim_idx_free(idx);
     }
 }
+
+/// Set by `no_fields` if the shim ever calls it.
+static FIELDS_EMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A field sink the refusal test passes but the shim must never call. It
+/// records the call rather than panicking: unwinding out of an `extern "C"`
+/// function is undefined behaviour on the MSRV.
+///
+/// # Safety
+/// Never dereferences its arguments.
+unsafe extern "C" fn no_fields(
+    _ctx: *mut std::os::raw::c_void,
+    _origin_kind: u32,
+    _origin_idx: usize,
+    _mate: u8,
+    _is_primary: std::os::raw::c_int,
+    _f: *const sys::BwaAlignedFields,
+) {
+    FIELDS_EMITTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A raw `mem_opt_t` caller skips `MemOpts::validate_for_alignment`, so every
+/// C alignment entry point refuses an unstorable mismatch penalty itself:
+/// `bwa_shim_opts_fill_scmat` leaves the matrices at the last storable `b`,
+/// and aligning would score with them while MAPQ and primary marking read the
+/// new `b`. Handles each call consumes are released on the refusal too.
+#[test]
+fn c_entry_points_refuse_an_unstorable_mismatch_penalty() {
+    let Some((_dir, prefix)) = common::phix_index() else {
+        return;
+    };
+    let idx = common::load_idx(&prefix);
+    let opts = common::new_opts();
+    let pes = common::new_pestat();
+    // SAFETY: constructor with no arguments; returns an owned scratch handle.
+    let sc = unsafe { sys::bwa_shim_scratch_new() };
+    let fx = common::simulate(4, 100, 300, 11);
+    let pairs = fx.pairs();
+    // Inputs built under storable options, so only the penalty is wrong below.
+    // SAFETY: valid `idx`/`opts`/`sc` handles; `pairs` (fixture-owned) outlives
+    // both calls and `pairs.len()` matches it.
+    let (seeds, regs) = unsafe {
+        (
+            sys::bwa_shim_seed_batch(idx, opts, pairs.as_ptr(), pairs.len()),
+            sys::bwa_shim_seed_extend(idx, opts, sc, &batch_of(&pairs)),
+        )
+    };
+    assert!(
+        !seeds.is_null() && !regs.is_null(),
+        "{}",
+        common::last_error()
+    );
+    // SAFETY: constructor taking a plain int; returns an owned cohort handle.
+    let cohort = unsafe { sys::bwa_shim_resident_cohort_new(0) };
+    let mut first = 0usize;
+    // SAFETY: valid cohort handle; `first` is a live out-parameter.
+    let seg = unsafe { sys::bwa_shim_resident_reserve_pairs(cohort, 2, &mut first) };
+    assert!(
+        !cohort.is_null() && !seg.is_null(),
+        "{}",
+        common::last_error()
+    );
+
+    // A COLLAPSED-style `b = 2 * a` for `a = 100`: past what the matrices hold.
+    // SAFETY: `opts` is a valid, uniquely-owned `mem_opt_t`; POD field write.
+    unsafe {
+        (*opts).b = 200;
+        sys::bwa_shim_opts_fill_scmat(opts);
+    }
+    let refused = |what: &str| {
+        let err = common::last_error();
+        assert!(
+            err.starts_with(&format!(
+                "{what}: the effective mismatch penalty is 200, outside 0..128"
+            )),
+            "{what}: {err}"
+        );
+    };
+    let ids = sys::BwaIdBases {
+        first_single_id: 0,
+        first_pair_id: 0,
+    };
+    let mut sink = Sink(Vec::new());
+    let mut memo = sys::BwaMemoStats {
+        dup_pairs: 0,
+        copied: 0,
+        fallback_aligned: 0,
+    };
+    // SAFETY: every handle is live and valid; `pairs` outlives the calls; the
+    // sink context is `&mut sink`, live for each call; `extend_batch` and
+    // `pair_emit` consume `seeds` / `regs` on every path, so neither is used or
+    // freed afterward.
+    unsafe {
+        let n = pairs.len();
+        assert!(sys::bwa_shim_seed_batch(idx, opts, pairs.as_ptr(), n).is_null());
+        refused("seed_batch");
+        let b = sys::bwa_shim_extend_batch(idx, opts, seeds, pairs.as_ptr(), n, pes, pes);
+        assert!(b.is_null());
+        refused("extend_batch");
+        assert!(sys::bwa_shim_align_batch(idx, opts, pairs.as_ptr(), n, pes, pes).is_null());
+        refused("align_batch");
+        assert_eq!(
+            sys::bwa_shim_estimate_pestat(idx, opts, pairs.as_ptr(), n, pes),
+            -1
+        );
+        refused("estimate_pestat");
+        assert!(sys::bwa_shim_seed_extend(idx, opts, sc, &batch_of(&pairs)).is_null());
+        refused("seed_extend");
+        let rs: [*const sys::BwaRegs; 1] = [regs];
+        assert_eq!(
+            sys::bwa_shim_pestat_cohort(idx, opts, rs.as_ptr(), 1, pes),
+            -1
+        );
+        refused("pestat_cohort");
+        let ctx = (&mut sink as *mut Sink).cast();
+        let rc = sys::bwa_shim_pair_emit(idx, opts, sc, regs, pes, ids, Some(sink_fn), ctx);
+        assert_eq!(rc, -1);
+        refused("pair_emit");
+        assert_eq!(sys::bwa_shim_resident_seed_extend(idx, opts, sc, seg), -1);
+        refused("resident_seed_extend");
+        let reps = [-1i64];
+        let rc = sys::bwa_shim_resident_seed_extend_reps(idx, opts, sc, seg, reps.as_ptr(), 1);
+        assert_eq!(rc, -1);
+        refused("resident_seed_extend_reps");
+        assert_eq!(
+            sys::bwa_shim_resident_resolve_memo(idx, opts, sc, cohort, &mut memo),
+            -1
+        );
+        refused("resident_resolve_memo");
+        assert_eq!(
+            sys::bwa_shim_resident_pestat_cohort(idx, opts, cohort, pes),
+            -1
+        );
+        refused("resident_pestat_cohort");
+        let rc =
+            sys::bwa_shim_resident_pair_emit(idx, opts, sc, seg, pes, ids, 0, Some(sink_fn), ctx);
+        assert_eq!(rc, -1);
+        refused("resident_pair_emit");
+        let rc = sys::bwa_shim_resident_pair_emit_fields(
+            idx,
+            opts,
+            sc,
+            seg,
+            pes,
+            ids,
+            0,
+            Some(no_fields),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, -1);
+        refused("resident_pair_emit_fields");
+    }
+    assert!(sink.0.is_empty());
+    assert!(!FIELDS_EMITTED.load(std::sync::atomic::Ordering::SeqCst));
+    // SAFETY: the remaining live owned handles, each freed once and unused
+    // afterward (`seg` is owned by `cohort`).
+    unsafe {
+        sys::bwa_shim_resident_cohort_free(cohort);
+        sys::bwa_shim_pestat_free(pes);
+        sys::bwa_shim_scratch_free(sc);
+        sys::bwa_shim_opts_free(opts);
+        sys::bwa_shim_idx_free(idx);
+    }
+}

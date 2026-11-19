@@ -26,7 +26,9 @@ doing.
 
 ```bash
 cargo ci-fmt      # format check
-cargo ci-lint     # clippy with -D warnings
+cargo ci-lint     # clippy with -D warnings (CI and the hook also set
+                  # CLIPPY_CONF_DIR=$PWD/.config/clippy, which holds tests to the MSRV;
+                  # it needs clippy 1.87+, so the hook skips it on older toolchains)
 cargo ci-build    # build everything
 cargo ci-test     # unit + integration tests
 

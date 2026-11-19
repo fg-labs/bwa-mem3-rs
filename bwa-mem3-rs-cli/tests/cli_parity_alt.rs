@@ -9,7 +9,8 @@
 //! unexercised — exactly the code this diff added. This fixture builds a
 //! two-contig reference whose second contig is a copy of a region of the first
 //! and is marked ALT via a `<prefix>.alt` file, then asserts byte-for-byte
-//! parity with `bwa-mem3 mem` over the full record (tags included).
+//! parity with `bwa-mem3 mem` over the full record (tags included), and over
+//! the `@SQ` header lines, where the ALT contig carries `AH:*`.
 //!
 //! Requires `bwa-mem3` + `samtools`; set `BWA_MEM3_BIN` if not on PATH. Skips
 //! gracefully otherwise.
@@ -222,4 +223,25 @@ fn cli_parity_alt_contig_pa_and_supplementary() {
         cli.len(),
         diffs.iter().take(8).cloned().collect::<Vec<_>>().join("\n")
     );
+
+    // The header too: bwa-mem3 marks an ALT contig's @SQ with AH:*
+    // (bwa_format_sq_line), which bwa-rs gets by building its header with
+    // upstream's bwa_build_sam_hdr rather than writing SN/LN itself.
+    let cli_sq: Vec<String> = common::samtools_header_lines(&cli_bam)
+        .into_iter()
+        .filter(|l| l.starts_with("@SQ"))
+        .collect();
+    assert!(
+        cli_sq
+            .iter()
+            .any(|l| l.starts_with("@SQ\tSN:chrALT\t") && l.ends_with("\tAH:*")),
+        "the CLI wrote no AH:* on the ALT contig's @SQ, so the header check is vacuous: {cli_sq:?}"
+    );
+    // bwa-rs's side is its stored header text: samtools could rebuild SN/LN
+    // from the binary reference list if the text omitted them.
+    let rs_sq: Vec<String> = common::stored_bam_header_lines(&rs_bam)
+        .into_iter()
+        .filter(|l| l.starts_with("@SQ"))
+        .collect();
+    assert_eq!(rs_sq, cli_sq, "@SQ differs from bwa-mem3 mem");
 }

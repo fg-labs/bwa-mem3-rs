@@ -8,8 +8,19 @@ resolver = "2"
 # It is kept out of `default-members`, and excluded from the `--workspace` ci-*
 # aliases in .cargo/config.toml, so the pure-Rust CI never builds the pyo3
 # extension -- maturin builds it explicitly from the bwa-mem3-py/ directory.
-members = ["bwa-mem3-sys", "bwa-mem3-rs", "bwa-mem3-rs-cli", "bwa-mem3-py"]
-default-members = ["bwa-mem3-sys", "bwa-mem3-rs", "bwa-mem3-rs-cli"]
+members = [
+    "bwa-mem3-sys",
+    "bwa-mem3-rs",
+    "bwa-mem3-rs-cli",
+    "bwa-mem3-py",
+    "bwa-mem3-test-util",
+]
+default-members = [
+    "bwa-mem3-sys",
+    "bwa-mem3-rs",
+    "bwa-mem3-rs-cli",
+    "bwa-mem3-test-util",
+]
 
 [workspace.package]
 version = "0.4.4"

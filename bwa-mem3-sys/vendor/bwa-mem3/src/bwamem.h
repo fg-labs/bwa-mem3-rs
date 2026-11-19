@@ -132,9 +132,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * three free the conversion cell (OT: ref-C x read-T; OB: ref-G x read-A); they
  * differ in to what value, and whether the mirror cell is freed too:
  *   COLLAPSED: conversion + mirror both freed to +a (C/T interchangeable,
- *              bwameth-compatible placement, -B 2).
+ *              bwameth-compatible placement, -B 2). Opt-in.
  *   GENOMIC:   conversion freed to +a, mirror kept as a mismatch (variant-aware,
- *              -B 4, rank-1 batched-expressible).
+ *              -B 4, rank-1 batched-expressible). The em-seq/bisulfite default.
  *   NEUTRAL:   conversion freed to 0 (tolerated but not rewarded), mirror kept a
  *              mismatch (-B 4). For TAPS, whose conversions are sparse (~3% of C),
  *              a full-match reward over-credits spurious C->T alignments; scoring
@@ -145,6 +145,17 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  *              the freed-capable tiers (NEON/AVX2/AVX512BW) exactly like
  *              GENOMIC/COLLAPSED, and falls back to scalar ksw_align2 on the
  *              freed-less x86 tiers (sse41/sse42/avx) as all three modes do. */
+/* --md modes (mem_opt_t.md_mode): which MD:Z each mapped record carries, in SAM
+ * and both BAM writers; XA/XB entries never carry MD, so it does not apply to
+ * them. FULL (the default) lists every reference base the read differs from.
+ * SHORT lists only the mismatches the scoring matrix penalises, the ones NM
+ * counts, so under --meth it leaves out the conversions the matrix frees;
+ * without --meth every mismatch is penalised and SHORT equals FULL. NONE writes
+ * no MD. The values are bwa_gen_cigar4's `want_md` (0 none, 1 literal, 2 short),
+ * so mem_reg2aln passes the mode straight through. NONE is 0, so an opt that
+ * is not built by mem_opt_init must set md_mode itself. */
+enum mem_md_mode { MEM_MD_NONE = 0, MEM_MD_FULL = 1, MEM_MD_SHORT = 2 };
+
 enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
                         MEM_METH_SCORING_NEUTRAL = 2 };
 
@@ -244,6 +255,8 @@ typedef struct mem_opt_t {
      * (1 = OT, 0 = OB) via mem_opt_meth_mat(). */
     int8_t mat_ot[25];      // OT (C→T) meth matrix; valid only under --meth
     int8_t mat_ob[25];      // OB (G→A) meth matrix; valid only under --meth
+    int8_t mat7_ot[49];     // 7x7 OT/OB matrices over the --meth-context cpg
+    int8_t mat7_ob[49];     // alphabet (meth_model.h); conversion freed at CpG only
     int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam). Orthogonal
                             // to meth_mode: --meth picks alignment semantics, --bam
                             // picks the container, on every mode alike.
@@ -261,17 +274,22 @@ typedef struct mem_opt_t {
                             // feature, no upstream reference to preserve); --meth-seed-prune
                             // =off|baseline (or env BWAMEM3_METH_SEED_PRUNE) overrides.
                             // ~30% faster --meth at ~0 truth accuracy cost; NOT byte-identical.
-    int    meth_chem;       // methylation chemistry (--meth=emseq|taps): meth_chem_t.
-                            // Selects XM:Z call polarity ONLY -- seeding, the
-                            // converted index and the scoring matrices are shared,
-                            // because both chemistries produce the same C->T /
-                            // G->A base change as far as the aligner can see.
+    int    meth_chem;       // methylation chemistry (--meth=emseq|taps|5base): meth_chem_t.
+                            // Selects the XM:Z call polarity and the defaults that
+                            // follow from conversion density (--meth-scoring, the
+                            // rescue-prune mode); seeding, the converted index and
+                            // each mode's scoring matrix are shared, because every
+                            // chemistry produces the same C->T / G->A base change
+                            // as far as the aligner can see. 5base is TAPS.
     int    meth_tags;       // bitmask of Bismark tags to emit (--meth-tags):
                             // MEM_METH_TAG_{XR,XG,XM}. Tags not selected are
                             // neither computed nor emitted -- clearing XM skips
                             // the per-read meth_build_xm() pass entirely.
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
     int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
+    int    meth_context;    // --meth-context: where a conversion is free, a meth_ctx_t
+                            // value (meth_opts.h): METH_CTX_ALL (default; every C) or
+                            // METH_CTX_CPG (only at a CpG).
     /* Derive the proper-pair FLAG bit (0x2) from the alignment actually EMITTED
      * (a[which]) instead of the top-scoring region (a[0]). Opt-in; 0 = match
      * bwa and bwa-mem2, which both use a[0] unconditionally.
@@ -291,6 +309,7 @@ typedef struct mem_opt_t {
      * matches both and no target needs a say in it. --compat and this option
      * are instead mutually exclusive (see main_mem). */
     int    proper_pair_from_emitted;
+    int    md_mode;         // --md: a mem_md_mode value (MEM_MD_FULL default)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
     int    smem_dedup;        // 1 = dedup fully-identical SMEMs before SA expansion (--smem-dedup); 0 = off (default, byte-identical to baseline)
     int    alnreg_sort_fast;  // 1 = strict-total-order comparator + pdqsort at the mem_sort_dedup_patch sort sites (set by --fast); 0 = bwa-mem2's re-only comparator + ks_introsort (default, bwa-mem2-compatible)
@@ -410,7 +429,16 @@ typedef struct mem_alnreg_t {
      * as unranked; the --dedup-reads memo copy instead carries the
      * representative's rank, which the sort validates rather than trusts. */
     int32_t dedup_re_rank;
-    mem_chain_t *c;
+    /* `c` and `hash` never live at the same time, so they share 8 bytes.
+     * c: back-pointer to the originating chain, set at alnreg creation and read
+     * only by the seedcov walks inside extension; mem_kernel2_core NULLs it at
+     * exit, after which the chain is freed. hash: the tie-break key, written
+     * first by mem_mark_primary_se in the SAM stage and read only after that.
+     * Mate rescue memsets its new records, so they start at 0 like the rest. */
+    union {
+        mem_chain_t *c;
+        uint64_t hash;
+    };
     int score;      // best local SW score
     int truesc;     // actual score corresponding to the aligned region; possibly smaller than $score
     int sub;        // 2nd best SW score
@@ -418,19 +446,21 @@ typedef struct mem_alnreg_t {
     int csub;       // SW score of a tandem hit
     int sub_n;      // approximate number of suboptimal hits
     int w;          // actual band width used in extension
-    int seedcov;    // length of regions coverged by seeds
+    int seedcov;    // length of seeds fully inside the region; read only by the legacy MAPQ (-Q <= 0).
+                    // Extension paths recount it only under mem_want_seedcov (else it stays 0);
+                    // mate rescue sets it directly
     int secondary;  // index of the parent hit shadowing the current hit; <0 if primary
     int secondary_all;
     int seedlen0;   // length of the starting seed
     int chain_n_hits; // max SMEM SA-occurrence count across this chain's seeds (1 = no repetitive seed)
-    int n_comp:30, is_alt:2; // number of sub-alignments chained together
-    float frac_rep;
-    uint64_t hash;
-    int flg;
+    /* n_comp: number of sub-alignments chained together (count only; no output
+     * reads it). The two --meth hypotheses (-1/0/1) ride in the same word as
+     * signed 2-bit fields, so they no longer cost a word of their own. */
+    signed int n_comp:26, is_alt:2;
     /* D3 (--meth, PR-3): bisulfite hypothesis (1=OT, 0=OB, -1=non-meth),
      * propagated from the originating chain so PR-4's asymmetric extension and
      * the output (XG strand) layers can select the right matrix/strand. */
-    int8_t meth_hypothesis;
+    signed int meth_hypothesis:2;
     /* D3 (--meth, fix): STRAND-ADJUSTED extension hypothesis = meth_hypothesis
      * XOR is_rev. bwa-mem extends reverse-strand seeds against the reverse-
      * complemented reference window, so a conversion that the OT matrix frees
@@ -440,12 +470,13 @@ typedef struct mem_alnreg_t {
      * matrix, their real conversions are scored as mismatches, and the 5' end
      * soft-clips. Set at alnreg creation from the seed strand; -1 = non-meth.
      * (Output XG/XM still use the raw meth_hypothesis — the genome strand.) */
-    int8_t meth_strand_hyp;
+    signed int meth_strand_hyp:2;
+    float frac_rep;
 } mem_alnreg_t;
 #ifdef __cplusplus
-static_assert(sizeof(mem_alnreg_t) == 112,
-              "mem_alnreg_t must stay 112 bytes: dedup_re_rank fills the padding after rid; "
-              "growing the record raises the gather traffic the dedup sorts are bound by");
+static_assert(sizeof(mem_alnreg_t) == 96,
+              "mem_alnreg_t must stay 96 bytes: it is held for every region of every read in a "
+              "batch, and the dedup sorts that gather it are bound by its size");
 #endif
 
 typedef struct { size_t n, m; mem_alnreg_t *a; int capped_w; } mem_alnreg_v;
@@ -525,8 +556,8 @@ typedef struct
     SMEM    *lockstep_match_buf[MAX_THREADS];
     int64_t  lockstep_buf_cap[MAX_THREADS];
 
-    // Reusable per-thread scratch for FMI_search::sortSMEMs' rid counting sort
-    // (audit SEED-15). Owned here so the count/offset and stable-scatter buffers
+    // Reusable per-thread scratch for smem_sort_rid_mn's rid counting sort (audit
+    // SEED-15). Owned here so the count/offset, (key, idx) and gather buffers
     // are allocated once and grown on demand instead of malloc/free'd per batch.
     // Each worker thread touches only its own [tid] slot, so the reuse is safe
     // by construction even though the FMI_search instance itself is shared.
@@ -678,7 +709,8 @@ int mem_skip_contained_ext_sound(const mem_opt_t *opt);
  * the caller must fall back to the exact full-width ladder. No-op at default
  * parameters. Defined in bwamem.cpp. */
 int mem_band_cert_params_safe(const mem_opt_t *opt);
-/* (Re)derive the --meth per-hypothesis matrices (mat_ot/mat_ob) from opt->mat +
+/* (Re)derive the --meth per-hypothesis matrices (mat_ot/mat_ob, and the 7x7
+ * mat7_ot/mat7_ob of meth_model.h) from opt->mat +
  * opt->a. Call after any rebuild of opt->mat (e.g. CLI -A/-B/-x parsing) so meth
  * scoring tracks the user's options instead of the init-time defaults. */
 void mem_opt_fill_meth_mat(mem_opt_t *opt);
@@ -754,16 +786,86 @@ void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);  /* --extend-csub: seed 
 int  mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
                           int *capped_w_out);   /* --max-extend-chains count cap + --extend-tie-frac gate */
 int  mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o);  /* --extend-csub PE competitor floor */
+/* The 8-bit banded-SW routing gate: whether a pair may take getScores8. Exposed for
+ * test/bandedswa_negative_h0_test.cpp; see bwamem.cpp for the envelope it enforces. */
+int  bsw8_envelope_ok(int len1, int len2, int w, int score_a, int zdrop, int h0);
+/* The extension tier classifier: stably partitions pairArray into 8-bit, 16-bit and
+ * scalar runs and returns each tier's count. tempArray needs at least count slots and
+ * must not overlap pairArray; it is not written when every pair is 8-bit or count == 0,
+ * and count == 0 leaves pairArray untouched too. Exposed for
+ * test/bandedswa_negative_h0_test.cpp and test/unit/test_ext_tier_partition.cpp. */
+void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArray,
+                     int &numPairs128, int &numPairs16,
+                     int &numPairs1, int score_a, int w, int zdrop);
+/* The 16-bit kernel's pair order, chosen per call: len1-major (len2 ties) when strictly more
+ * than half of the pairs have len1 < len2, else len2-major (len1 ties); sortPairsLen16 applies
+ * it as two stable counting sorts (hist: MAX_SEQ_LEN16 + 1 slots; tempArray: count slots, not
+ * overlapping pairArray). `diverted` keys len1 as max(len1, len2), the diverted 8-bit call's
+ * key. Exposed for test/unit/test_bsw16_pair_order.cpp; see bwamem.cpp. */
+bool bsw16_len1_major_order(const SeqPair *pairArray, int32_t count);
+void sortPairsLen16(SeqPair *pairArray, int32_t count, SeqPair *tempArray, int32_t *hist,
+                    bool diverted);
+/* Test seam for test/unit/test_bandedswa_lane_indep.cpp and test/unit/test_bsw16_pair_order.cpp;
+ * the aligner does not call it. Runs one extension-tier kernel call on `bsw` the way the aligner
+ * does outside --meth: extension dedup (BWAMEM3_DEDUP / mem_dedup_configure) over the n pairs,
+ * then the tier's pair sort and kernel call --
+ *   BSW_EXT_CALL_SCALAR: scalarBandedSWAWrapper, input order;
+ *   BSW_EXT_CALL_16:     sortPairsLen16(.., false), then getScores16;
+ *   BSW_EXT_CALL_8:      w <= BSW_EXT_CALL_8_MAX_W: a stable len2 sort, then getScores8;
+ *                        w above it (the int8 band limit): sortPairsLen16(.., true), then
+ *                        getScores16.
+ * Results land in each pair's score/tle/qle/gscore/gtle/max_off; pa is left reordered, so read
+ * results back by (seqid, regid). Buffers: pa at least roundup(n, SIMD_WIDTH8) slots (the
+ * kernels write the padding lanes; see IBandedPairWiseSW::getScores8), sort_scratch at least as
+ * many and not overlapping pa, hist MAX_SEQ_LEN16 + 1 slots. Any other tier value is fatal. */
+enum BswExtCall : int { BSW_EXT_CALL_SCALAR = 0, BSW_EXT_CALL_16 = 1, BSW_EXT_CALL_8 = 2 };
+enum { BSW_EXT_CALL_8_MAX_W = 124 };   /* the 8-bit tier's widest band; past it the call diverts */
+void bsw_extend_tier_call(BswExtCall tier, IBandedPairWiseSW *bsw, SeqPair *pa, uint8_t *ref,
+                          uint8_t *qer, int n, int32_t w, SeqPair *sort_scratch, int32_t *hist);
 
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
+
+/* The paired path's ALT record of one end: region n_pri (the first non-primary
+ * region) when it is emitted as a supplementary ALT record, else -1. The emitter
+ * (mem_sam_pe_batch_post) reads XA of this slot and of the pair's primary only. */
+static inline int mem_pe_alt_slot(const mem_opt_t *opt, const mem_alnreg_v *a, int n_pri)
+{
+    if (n_pri >= (int) a->n) return -1;
+    const mem_alnreg_t *p = &a->a[n_pri];
+    return p->score < opt->T || p->secondary >= 0 || !p->is_alt ? -1 : n_pri;
+}
+
+/* The SE/no-pair emitter's ordered region filter. XA generation uses the same
+ * decision for its owner slots, without changing the all-hit HN counts. */
+static inline int mem_reg2sam_emits_region(const mem_opt_t *opt, const mem_alnreg_v *a, int k)
+{
+    const mem_alnreg_t *p = &a->a[k];
+    if (p->score < opt->T) return 0;
+    if (p->secondary >= 0 && (p->is_alt || !(opt->flag & MEM_F_ALL))) return 0;
+    if (p->secondary >= 0 && p->secondary < INT_MAX &&
+        p->score < a->a[p->secondary].score * opt->drop_ratio) return 0;
+    return 1;
+}
 
 /* ONLY work after mem_mark_primary_se(); out_hn may be NULL.
  * `meth_orig_query` is forwarded to mem_reg2aln for each XA sub-entry so they
  * regenerate under the same NM/MD policy as the primary record (see
- * mem_reg2aln). NULL (the default) keeps the legacy literal regen. */
+ * mem_reg2aln). NULL (the default) keeps the legacy literal regen.
+ * `want0`/`want1`: when want0 >= 0, only the XA strings of primaries want0 and
+ * want1 are built (the others stay NULL); the hit counts in *out_hn still cover
+ * every primary. -1 (the default) builds all of them.
+ * `emitted_only` additionally restricts strings to SE/no-pair emitted owners;
+ * it never restricts HN counts. */
 char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                    const mem_alnreg_v *a, int l_query, const char *query,
-                   int **out_hn, const char *meth_orig_query = NULL);
+                   int **out_hn, const char *meth_orig_query = NULL,
+                   int want0 = -1, int want1 = -1, bool emitted_only = false);
+/* Per-thread count of XA hits whose global alignment mem_gen_alt took from an
+ * earlier duplicate hit of the same read (mem_core_key) instead of computing it.
+ * Nothing in the aligner reads it: it lets the unit tests see that reuse happened,
+ * which the output alone cannot show. It is live in every build (one thread-local
+ * increment per reused hit) because the tests link the shipped objects. */
+extern thread_local long mem_gen_alt_n_reused;
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq1_t *s,
                  int n, const mem_aln_t *list, int which, const mem_aln_t *m_);
 
@@ -850,7 +952,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          int mate_meth_ot = -1, int known_skip = -1);
 /* known_skip (mem_matesw_batch_pre and mem_matesw_batch_post): -1 scans ma for the anchor's skip
  * set; 0..15 is that set (bit r for orientation r, as mem_matesw_skip computes it) for exactly
- * this anchor against exactly this ma, which the caller vouches for. */
+ * this anchor against exactly this ma, which the caller vouches for (from a sorted copy of ma's
+ * rb values, rescue_rb_index.h, or the set _pre recorded while ma is unchanged). */
 
 /* Given two alignment begin positions (rb) on the 2-bit-packed concat-with-
  * reverse-complement index, infer the pair orientation (0=FF, 1=FR, 2=RF,
@@ -866,6 +969,14 @@ int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
  * mem_matesw_batch_post compute, through a static helper that also takes a known skip set). */
 bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const mem_pestat_t pes[4],
                      int skip[4]);
+
+/* The --rescue-kmer anchor scan of the oriented mate `ms` in the window ref[0..M), as the unit
+ * tests call it: the votes on the winning diagonal and the distinct query k-mers indexed, or -1 for
+ * both when the scan did not run (window or mate shorter than k, or no k-mer indexed). Same
+ * arguments as the static matesw_kmer_anchor that mem_matesw_batch_pre calls; k is
+ * opt->rescue_kmer. */
+void mem_matesw_kmer_anchor_counts(const mem_opt_t *opt, const uint8_t *ref, int M, const uint8_t *ms,
+                                   int l_ms, int is_rev, int collapse, int *best_v, int *n_kmer);
 
 /* mem_matesw_skip's test for one region at `rb`, as four intervals of mate rb values, one per
  * orientation: bit r of the skip set is pes[r].failed, or some mate region's rb lies in
@@ -904,6 +1015,15 @@ unsigned mem_matesw_skip_probe(const mem_matesw_skip_query_t *q, const int64_t *
 int mem_proper_pair_extra_flag(const mem_opt_t *opt, int64_t l_pac,
                                const mem_alnreg_v a[2], const int which[2],
                                const mem_pestat_t pes[4]);
+
+/* Pick the best proper pair among the first n_pri[r] regions of each end. Returns the
+ * best pair score (0 when no pair forms), writes the indices of the pair's regions to
+ * z[], the runner-up pair score to *sub, and to *n_sub the number of pairs below the
+ * best that score within one mismatch or gap of the runner-up. Defined in
+ * bwamem_pair.cpp. */
+int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+             const mem_pestat_t pes[4], bseq1_t s[2], mem_alnreg_v a[2], int id,
+             int *sub, int *n_sub, int z[2], int n_pri[2]);
 
 int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                      int64_t &pcnt, int64_t &pcnt8, kswr_t *aln,
@@ -959,6 +1079,16 @@ typedef struct {
     int tie_free;
 } mem_rescue_dedup_state_t;
 
+/* The rb values of the regions one mem_matesw_batch_post call pushed into `ma` (at most one per
+ * orientation), for a caller that keeps a sorted copy of ma's rb values across calls
+ * (rescue_rb_index.h). The call never rewrites the rb of a region already in ma: its dedups pass
+ * bns == NULL, so they only drop regions and reorder them. So ma->n == n_before + n means nothing
+ * was dropped and ma's rb values are the old ones plus rb[0, n). */
+typedef struct {
+    int n;
+    int64_t rb[4];
+} mem_rescue_pushed_rb_t;
+
 /* The dedup-only call mem_sort_dedup_patch(opt, 0, 0, 0, n, a), byte for byte,
  * that also reports whether its output is a fixed point (src/bwamem.cpp has
  * the argument). */
@@ -994,7 +1124,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const char *ms_orig = NULL,
                           const int8_t *mat = NULL, int mate_meth_ot = -1,
                           mem_rescue_dedup_state_t *dedup_state = NULL,
-                          int known_skip = -1);
+                          int known_skip = -1, mem_rescue_pushed_rb_t *pushed_rb = NULL);
 
 /* The scalar mem_sam_pe / mem_pair_resolve pairing path was removed; the batched
  * mem_sam_pe_batch* path above is the only mate-rescue/pairing path. */
@@ -1056,11 +1186,16 @@ void mem_readmemo_teardown(void);
  * @param regs        this slice's alnreg output (cohort regs + the same offset);
  *                    must remain live until mem_pair_and_emit_cohort() runs
  *
+ * pes0 is the -I insert-size distribution (NULL when it is inferred). When
+ * the slice's SAM does not depend on the rest of the cohort (single-end, or
+ * paired-end with pes0), each read is emitted here as it is aligned and
+ * mem_pair_and_emit_cohort() skips its SAM pass.
+ *
  * w.seqs / w.regs / w.n_processed are saved and restored around the call.
  */
 void mem_align_cohort_slice(mem_opt_t *opt, int64_t n_processed,
                             int n, bseq1_t *seqs, mem_alnreg_v *regs,
-                            worker_t &w);
+                            const mem_pestat_t *pes0, worker_t &w);
 
 /**
  * Infer the insert size over a complete cohort, then pair and emit it.
@@ -1102,10 +1237,34 @@ void mem_pair_and_emit_cohort(mem_opt_t *opt, int64_t n_processed,
  * `want_md` 0 builds no MD string: the returned cigar holds only the n_cigar
  * ops, so the result must not be passed to anything that reads MD after them
  * (mem_aln2sam). NM, the CIGAR and everything else are unchanged. Used for the
- * XA hits in mem_gen_alt, which read only the CIGAR and NM. */
+ * XA hits in mem_gen_alt, which read only the CIGAR and NM. `want_md` 1 (the
+ * default) asks for the MD that `opt->md_mode` selects, which under --md none
+ * is no MD at all: whether MD bytes follow the ops is recorded nowhere in the
+ * returned aln, so a writer must test the same `opt->md_mode != MEM_MD_NONE`
+ * before reading them, as mem_aln2sam, mem_aln_to_bam and meth_mem_aln_to_bam
+ * do.
+ *
+ * `reuse` and `made` (want_md 0 only) let mem_gen_alt compute the global alignment
+ * of duplicate hits once: the CIGAR ops and NM before the end-deletion squeeze and
+ * the clips, keyed by mem_core_key. With `reuse` they are taken from it instead of
+ * computed; it must be what this region computes (an equal key). With `made` the
+ * computed ops are appended to *made and the NM stored in *made_NM. Everything after
+ * that step runs as usual. */
+typedef struct { const uint32_t *cigar; int n_cigar, NM; } mem_cigar_core_t;
 mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                       int l_seq, const char *seq, const mem_alnreg_t *ar,
-                      const char *meth_orig_query = NULL, int want_md = 1);
+                      const char *meth_orig_query = NULL, int want_md = 1,
+                      const mem_cigar_core_t *reuse = NULL,
+                      std::vector<uint32_t> *made = NULL, int *made_NM = NULL);
+
+/* What the global alignment of a region (its CIGAR ops and NM, see mem_reg2aln)
+ * depends on besides the read and `opt`: two regions of one read with equal keys
+ * get the same ops and NM. mem_core_key returns 0 (no key) for a region whose
+ * window is empty or does not lie on one strand. */
+typedef struct { int qb, qe, rev, truesc, w, hyp; int64_t rlen, fb; } mem_core_key_t;
+int mem_core_key(const bntseq_t *bns, const mem_alnreg_t *ar, mem_core_key_t *k);
+int mem_core_key_equal(const bntseq_t *bns, const uint8_t *pac, const mem_core_key_t *x,
+                       const mem_core_key_t *y);
 
 
 /**

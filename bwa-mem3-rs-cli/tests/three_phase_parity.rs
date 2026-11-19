@@ -843,45 +843,15 @@ impl BamRecord {
     }
 }
 
-/// Split one BAM record body (no `block_size` prefix) into core bytes + aux.
+/// Split one BAM record body (no `block_size` prefix) into core bytes + aux,
+/// through the shared decoder (which rejects a truncated record or tag).
 fn decode_body(body: &[u8]) -> BamRecord {
-    let u32_at = |i: usize| u32::from_le_bytes(body[i..i + 4].try_into().unwrap()) as usize;
-    let l_read_name = usize::from(body[8]);
-    let n_cigar = usize::from(u16::from_le_bytes([body[12], body[13]]));
-    let l_seq = u32_at(16);
-    let aux_start = 32 + l_read_name + 4 * n_cigar + l_seq.div_ceil(2) + l_seq;
-    let mut aux = Vec::new();
-    let mut i = aux_start;
-    while i < body.len() {
-        let tag = [body[i], body[i + 1]];
-        let ty = body[i + 2];
-        let v = i + 3;
-        let len = match ty {
-            b'A' | b'c' | b'C' => 1,
-            b's' | b'S' => 2,
-            b'i' | b'I' | b'f' => 4,
-            b'Z' | b'H' => {
-                body[v..]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .expect("unterminated Z/H aux value")
-                    + 1
-            }
-            b'B' => {
-                let width = match body[v] {
-                    b'c' | b'C' => 1,
-                    b's' | b'S' => 2,
-                    _ => 4,
-                };
-                5 + width * u32_at(v + 1)
-            }
-            other => panic!("unknown BAM aux type {:?}", other as char),
-        };
-        aux.push((tag, ty, body[v..v + len].to_vec()));
-        i = v + len;
-    }
+    let aux = bwa_mem3_test_util::aux_tags(body)
+        .into_iter()
+        .map(|t| (t.key, t.ty, t.value.to_vec()))
+        .collect();
     BamRecord {
-        core: body[..aux_start].to_vec(),
+        core: body[..bwa_mem3_test_util::aux_start(body)].to_vec(),
         aux,
     }
 }

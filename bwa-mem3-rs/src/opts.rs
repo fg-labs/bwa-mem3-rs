@@ -64,11 +64,12 @@ impl TryFrom<i32> for SeedOrder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethScoring {
     /// C↔T and G↔A interchangeable (both matrix cells freed) — reproduces
-    /// bwameth. This is bwa-mem3's default.
+    /// bwameth. bwa-mem3's default through v0.16.0; select it explicitly to
+    /// keep that output.
     Collapsed = 0,
     /// Only the bisulfite-conversion cell is freed; the mirror stays a
     /// mismatch, so genuine variants still score as mismatches (variant-aware,
-    /// truthful NM/MD).
+    /// truthful NM/MD). bwa-mem3's default as of v0.17.0.
     Genomic = 1,
     /// Like [`Genomic`](Self::Genomic), but the conversion cell scores `0` —
     /// tolerated rather than rewarded. Added in bwa-mem3 v0.9.0 and made the
@@ -114,7 +115,7 @@ impl TryFrom<i32> for MethScoring {
 ///
 /// That flips the `XM:Z` methylation call. TAPS also changes one default that
 /// [`MemOpts::apply_meth_defaults`] applies: [`MethScoring::Neutral`] instead
-/// of [`MethScoring::Collapsed`] (TAPS conversions are ~20-30× rarer, so a
+/// of [`MethScoring::Genomic`] (TAPS conversions are ~20-30× rarer, so a
 /// full match over-credits spurious C→T alignments). The SPEC30 seed-pruning
 /// default applies to both chemistries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +187,101 @@ impl TryFrom<i32> for MethSeedPrune {
     }
 }
 
+/// Where a methylation conversion is free (`--meth-context`), mirroring
+/// bwa-mem3's `meth_ctx_t` (v0.16.0+). Only meaningful under
+/// [`MemOpts::set_meth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethContext {
+    /// A conversion (C→T on the OT strand, G→A on OB) is free at every C
+    /// (G). bwa-mem3's default.
+    All = 0,
+    /// A conversion (C→T on OT, G→A on OB) is free only at a CpG, so
+    /// off-target conversion, damage or a variant at any other C (G) scores as
+    /// a mismatch. Requires
+    /// [`MethChem::Taps`] (which covers Illumina 5-base) and a scoring mode
+    /// other than [`MethScoring::Collapsed`];
+    /// [`MemOpts::apply_meth_defaults`] rejects any other combination.
+    Cpg = 1,
+}
+
+impl TryFrom<i32> for MethContext {
+    type Error = crate::Error;
+
+    /// Map the raw `meth_ctx_t` value to a [`MethContext`].
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) for
+    /// a value bwa-mem3 does not define.
+    fn try_from(v: i32) -> std::result::Result<Self, Self::Error> {
+        match v {
+            0 => Ok(MethContext::All),
+            1 => Ok(MethContext::Cpg),
+            other => Err(crate::Error::UnrecognizedEnum {
+                kind: "meth_context",
+                value: other,
+            }),
+        }
+    }
+}
+
+/// How the `MD:Z` tag is written (`--md`), mirroring bwa-mem3's `mem_md_mode`
+/// (v0.17.0+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MdMode {
+    /// No `MD:Z` tag.
+    None = 0,
+    /// The literal `MD`: every reference base the read differs from. The
+    /// default.
+    Full = 1,
+    /// Only the mismatches the scoring matrix penalises, the ones `NM`
+    /// counts. Under `--meth` that leaves out the differences the matrix
+    /// frees, not necessarily every conversion: with [`MethContext::Cpg`] an
+    /// off-CpG C→T is still penalised, so it counts toward `NM` and appears
+    /// here. Without `--meth` every mismatch is penalised and this equals
+    /// [`Full`](Self::Full).
+    Short = 2,
+}
+
+impl TryFrom<i32> for MdMode {
+    type Error = crate::Error;
+
+    /// Map the raw `mem_md_mode` value to an [`MdMode`].
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) for
+    /// a value bwa-mem3 does not define.
+    fn try_from(v: i32) -> std::result::Result<Self, Self::Error> {
+        match v {
+            0 => Ok(MdMode::None),
+            1 => Ok(MdMode::Full),
+            2 => Ok(MdMode::Short),
+            other => Err(crate::Error::UnrecognizedEnum {
+                kind: "md_mode",
+                value: other,
+            }),
+        }
+    }
+}
+
+/// A [`MemOpts::phase_snapshot`]: the alignment-bearing option bytes a
+/// split-phase handle was seeded with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PhaseOpts(Box<[u8]>);
+
+impl PhaseOpts {
+    /// `Ok` if `self` (the options a call was given) equals `seeded`, the
+    /// snapshot the regions it consumes were seeded with.
+    pub(crate) fn check_against(&self, seeded: &PhaseOpts, what: &str) -> Result<()> {
+        if self == seeded {
+            Ok(())
+        } else {
+            Err(crate::Error::InvalidOpts(format!(
+                "{what}: the options differ from those the reads were seeded with; every \
+                 phase of a batch or cohort must use the same alignment options (only the \
+                 MD mode and the paired-end flag may change)"
+            )))
+        }
+    }
+}
+
 /// bwa-mem3 alignment options (`mem_opt_t`).
 pub struct MemOpts {
     pub(crate) handle: *mut sys::mem_opt_t,
@@ -212,13 +308,15 @@ impl MemOpts {
     /// The `@HD` header line the active output-compatibility target calls for
     /// (no trailing newline), or `None` when that target emits no `@HD`.
     ///
-    /// A caller writing its own SAM/BAM header should use this instead of a
-    /// literal. bwa-mem3's `compat_target_t` is the single place that decides
-    /// output shaping, and upstream folded three hand-written `@HD` literals
-    /// into it after they drifted apart (fg-labs/bwa-mem3#288); a fourth
-    /// literal here would reintroduce exactly that. This crate's own CLI got it
-    /// wrong before this accessor existed, emitting `@HD VN:1.6 SO:unknown`
-    /// against the reference `@HD VN:1.5 SO:unsorted GO:query`.
+    /// A caller writing its own SAM/BAM header should prefer
+    /// [`BwaIndex::sam_header`](crate::BwaIndex::sam_header), which returns
+    /// the whole `@HD` + `@SQ` block from bwa-mem3's own builder (including
+    /// `AH:*` on ALT contigs). This accessor is for a caller that needs only
+    /// `@HD`, in place of a literal: bwa-mem3's `compat_target_t` is the
+    /// single place that decides output shaping, and upstream folded three
+    /// hand-written `@HD` literals into it after they drifted apart
+    /// (fg-labs/bwa-mem3#288), so a literal here would reintroduce exactly
+    /// that.
     ///
     /// The default target (`off`, bwa-mem3's native output) emits one; that is
     /// the only target reachable today, since this crate exposes no `--compat`
@@ -244,13 +342,28 @@ impl MemOpts {
     ///   [`set_meth_seed_prune`](Self::set_meth_seed_prune) was called;
     /// - the certified adaptive band off (byte-identical either way).
     ///
+    /// Like `bwa-mem3 mem`, it applies nothing unless
+    /// [`set_meth(true)`](Self::set_meth) came first; only the scoring
+    /// matrices are refilled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOpts`](crate::Error::InvalidOpts), leaving the
+    /// options unchanged, for a [`MethContext::Cpg`] that `bwa-mem3 mem`
+    /// refuses: without `--meth`, with [`MethChem::EmSeq`], or with
+    /// [`MethScoring::Collapsed`] scoring. Under `--meth` it also refuses a
+    /// [match score](Self::set_match_score) outside `1..=127`, the range
+    /// `bwa-mem3 mem` accepts for `-A`: the bundle multiplies it by up to 100.
+    ///
     /// Each bundle constant is **scaled by the match score** `a`, because
     /// bwameth quotes them at bwa's default `a == 1` and bwa scales every other
     /// score-derived default the same way. At the default `a == 1` the scaling
     /// is a no-op.
     ///
     /// The bundle is bwa-mem3's own `mem_opt_apply_meth_defaults`, so it cannot
-    /// drift from upstream, and the scoring matrices are refilled afterwards.
+    /// drift from upstream, and the scoring matrices are refilled afterwards
+    /// (except while the resulting mismatch penalty is outside `0..=128`, as
+    /// for the [`set_mismatch_penalty`](Self::set_mismatch_penalty) setter).
     ///
     /// # Ordering
     ///
@@ -258,6 +371,8 @@ impl MemOpts {
     /// directions:
     ///
     /// **Set before** — these are *inputs*:
+    /// - [`set_meth(true)`](Self::set_meth): as in `bwa-mem3 mem`, every
+    ///   default here is skipped when `--meth` is off;
     /// - [`set_match_score`](Self::set_match_score), since every constant is
     ///   expressed in units of it;
     /// - [`set_meth_chem`](Self::set_meth_chem), since TAPS picks the scoring
@@ -279,14 +394,19 @@ impl MemOpts {
     /// `-B 2` applies to COLLAPSED alone; [`Genomic`](MethScoring::Genomic) and
     /// [`Neutral`](MethScoring::Neutral) are variant-aware and keep bwa's
     /// default, so under those two a `-B` set *before* the call survives it.
-    pub fn apply_meth_defaults(&mut self) -> &mut Self {
-        unsafe { sys::bwa_shim_opts_apply_meth_defaults_masked(self.handle, self.meth_explicit) };
-        self
+    pub fn apply_meth_defaults(&mut self) -> Result<&mut Self> {
+        let rc = unsafe {
+            sys::bwa_shim_opts_apply_meth_defaults_masked(self.handle, self.meth_explicit)
+        };
+        if rc != 0 {
+            return Err(crate::Error::InvalidOpts(crate::error::shim_last_message()));
+        }
+        Ok(self)
     }
 
     /// Apply a bwa-mem3 `-x` preset on top of current values.
     #[must_use]
-    pub fn with_mode(self, mode: Mode) -> Self {
+    pub fn with_mode(mut self, mode: Mode) -> Self {
         let o = unsafe { &mut *self.handle };
         match mode {
             Mode::Pacbio => {
@@ -321,8 +441,19 @@ impl MemOpts {
         // until rebuilt -- the same coupling the `a`/`b` setters maintain.
         // Upstream does this too, re-running bwa_fill_scmat after parsing -x
         // (fastmap.cpp:2726, in main_mem).
-        unsafe { sys::bwa_shim_opts_fill_scmat(self.handle) };
+        self.refill_matrices();
         self
+    }
+
+    /// Rebuild the scoring matrices from `a`/`b` (`bwa_fill_scmat`, plus the
+    /// `--meth` copies), as every `a`/`b` change must. The shim skips it while
+    /// `b` is outside `0..=128`: `bwa_fill_scmat` negates it as a C `int`,
+    /// which overflows for `i32::MIN`, and such options cannot align anyway
+    /// ([`check_effective_scoring`](Self::check_effective_scoring)). The next
+    /// storable `b` rebuilds them from the current `a`.
+    fn refill_matrices(&mut self) {
+        // SAFETY: `handle` is a live `mem_opt_t` owned by `self`.
+        unsafe { sys::bwa_shim_opts_fill_scmat(self.handle) };
     }
 
     /// Enable or disable paired-end mode.
@@ -400,12 +531,14 @@ impl MemOpts {
     /// Set the match score (`-A`).
     ///
     /// Rebuilds the scoring matrices, which several alignment paths read
-    /// instead of `a`/`b` directly — see [`Self::set_mismatch_penalty`].
+    /// instead of `a`/`b` directly — see [`Self::set_mismatch_penalty`] —
+    /// unless the stored mismatch penalty is outside `0..=128`; the next
+    /// storable penalty then rebuilds them from this score.
     pub fn set_match_score(&mut self, v: i32) -> &mut Self {
         unsafe {
             (*self.handle).a = v;
-            sys::bwa_shim_opts_fill_scmat(self.handle);
         }
+        self.refill_matrices();
         self
     }
 
@@ -422,11 +555,20 @@ impl MemOpts {
     /// the score would change for MAPQ and heuristics but not for alignment
     /// itself. Upstream always pairs the write with `bwa_fill_scmat`
     /// (`fastmap.cpp:2726`, in `main_mem`).
+    ///
+    /// As in `bwa-mem3 mem`, every alignment entry point rejects a penalty
+    /// outside `0..=128` (the kernels store its negation in 8 bits), and under
+    /// [`set_meth(true)`](Self::set_meth) also `0`, with
+    /// [`Error::InvalidOpts`](crate::Error::InvalidOpts). Such a penalty is
+    /// stored but does not rebuild the matrices (`bwa_fill_scmat` negates it
+    /// as a C `int`, which overflows for `i32::MIN`), so until a storable
+    /// penalty is set again [`scoring_matrix`](Self::scoring_matrix) shows
+    /// the last storable one; the options cannot align in the meantime.
     pub fn set_mismatch_penalty(&mut self, v: i32) -> &mut Self {
         unsafe {
             (*self.handle).b = v;
-            sys::bwa_shim_opts_fill_scmat(self.handle);
         }
+        self.refill_matrices();
         self
     }
 
@@ -437,7 +579,9 @@ impl MemOpts {
     /// off-diagonal `-b`, and every ambiguous-base cell `-1`. Exposed because
     /// several paths read `a`/`b` directly while the kernels read only this,
     /// so it is the only way to observe whether the two agree — see
-    /// [`set_mismatch_penalty`](Self::set_mismatch_penalty).
+    /// [`set_mismatch_penalty`](Self::set_mismatch_penalty). While the stored
+    /// penalty is outside `0..=128` it is not rebuilt, and still reflects the
+    /// last storable one.
     #[must_use]
     pub fn scoring_matrix(&self) -> [i8; 25] {
         unsafe { (*self.handle).mat }
@@ -671,7 +815,9 @@ impl MemOpts {
     /// ([`BwaIndex::load_meth`](crate::BwaIndex::load_meth)): reads are
     /// projected to match the converted seed index, alignment runs in original
     /// coordinates, and each record carries Bismark `XR:Z` / `XG:Z` / `XM:Z`
-    /// tags. Toggling this rebuilds the per-hypothesis scoring matrices.
+    /// tags. Toggling this rebuilds the per-hypothesis scoring matrices,
+    /// unless the mismatch penalty is outside `0..=128`; the next storable
+    /// penalty then rebuilds them.
     ///
     /// `set_meth(true)` only flips a flag; it **must** be paired with a meth
     /// dual index ([`BwaIndex::load_meth`](crate::BwaIndex::load_meth)).
@@ -691,7 +837,12 @@ impl MemOpts {
     }
 
     /// Bisulfite scoring mode (`--meth-scoring`); only meaningful under
-    /// [`set_meth(true)`](Self::set_meth). Rebuilds the scoring matrices.
+    /// [`set_meth(true)`](Self::set_meth). Rebuilds the scoring matrices,
+    /// unless the mismatch penalty is outside `0..=128`; the next storable
+    /// penalty then rebuilds them under this mode.
+    /// Defaults to [`MethScoring::Genomic`] (bwa-mem3 v0.17.0+;
+    /// [`MethScoring::Collapsed`] before), so pass `Collapsed` to keep the
+    /// pre-v0.17.0 `--meth` output.
     ///
     /// An explicit mode wins over the [`MethChem::Taps`] default that
     /// [`apply_meth_defaults`](Self::apply_meth_defaults) would otherwise pick.
@@ -704,7 +855,8 @@ impl MemOpts {
         self
     }
     /// Bisulfite scoring mode (`--meth-scoring`); only meaningful under
-    /// [`set_meth(true)`](Self::set_meth).
+    /// [`set_meth(true)`](Self::set_meth). Defaults to
+    /// [`MethScoring::Genomic`] (bwa-mem3 v0.17.0+).
     ///
     /// # Errors
     ///
@@ -733,6 +885,246 @@ impl MemOpts {
     /// the vendored bwa-mem3 reports a chemistry this crate does not know.
     pub fn meth_chem(&self) -> Result<MethChem> {
         MethChem::try_from(unsafe { (*self.handle).meth_chem })
+    }
+
+    /// Where a methylation conversion is free (`--meth-context`); only
+    /// meaningful under [`set_meth(true)`](Self::set_meth). Only stored here:
+    /// a [`MethContext::Cpg`] that `bwa-mem3 mem` refuses (without `--meth`,
+    /// with [`MethChem::EmSeq`], or with [`MethScoring::Collapsed`]) is
+    /// rejected by [`apply_meth_defaults`](Self::apply_meth_defaults) and again
+    /// by every alignment call, as [`Error::InvalidOpts`](crate::Error::InvalidOpts).
+    ///
+    /// Unlike the CLI, which refuses any explicit `--meth-context` without
+    /// `--meth`, an explicit [`MethContext::All`] without `--meth` is accepted:
+    /// it is the default, so it cannot be told apart from an unset context,
+    /// and it has no effect.
+    pub fn set_meth_context(&mut self, ctx: MethContext) -> &mut Self {
+        unsafe {
+            (*self.handle).meth_context = ctx as i32;
+        }
+        self
+    }
+    /// Where a methylation conversion is free (`--meth-context`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) if
+    /// the vendored bwa-mem3 reports a context this crate does not know.
+    pub fn meth_context(&self) -> Result<MethContext> {
+        MethContext::try_from(unsafe { (*self.handle).meth_context })
+    }
+
+    /// Every option check `bwa-mem3 mem` makes before aligning, judged on the
+    /// options as they stand ([`check_effective_scoring`](Self::check_effective_scoring)
+    /// and [`check_meth_options`](Self::check_meth_options)). Every alignment
+    /// entry point runs it, through `check_alignment_preconditions`, so a
+    /// combination the CLI refuses cannot reach the aligner however the
+    /// setters were ordered.
+    pub(crate) fn validate_for_alignment(&self) -> Result<()> {
+        self.check_effective_scoring()?;
+        self.check_meth_options()
+    }
+
+    /// Reject `--meth` options that `bwa-mem3 mem` refuses, judged on the
+    /// options as they stand: a non-positive effective mismatch penalty under
+    /// `--meth` (`fastmap.cpp`'s post-defaults check: NM is derived from the
+    /// scoring matrix, so `-B 0` collapses it to zero), and a
+    /// [`MethContext::Cpg`] without `--meth`, with [`MethChem::EmSeq`], or with
+    /// [`MethScoring::Collapsed`]. The context checks are the shim's
+    /// (`bwa_shim_opts_meth_context_error`), the same copy
+    /// [`apply_meth_defaults`](Self::apply_meth_defaults) runs against the
+    /// scoring it is about to resolve; repeating them here catches a later
+    /// setter, or a skipped `apply_meth_defaults`.
+    pub(crate) fn check_meth_options(&self) -> Result<()> {
+        if self.meth() {
+            let b = self.mismatch_penalty();
+            if b <= 0 {
+                return Err(crate::Error::InvalidOpts(format!(
+                    "--meth requires a positive mismatch penalty, but the effective penalty is \
+                     {b}; a non-positive penalty makes every substitution free or rewarded, \
+                     which collapses NM to zero and hides real variants (check -B, \
+                     MemOpts::set_mismatch_penalty)"
+                )));
+            }
+        }
+        // SAFETY: `handle` is a live `mem_opt_t` owned by `self`. The result is
+        // NULL or a NUL-terminated string valid until the next shim call on
+        // this thread, copied out before any other.
+        let msg = unsafe { sys::bwa_shim_opts_meth_context_error(self.handle) };
+        if msg.is_null() {
+            return Ok(());
+        }
+        let msg = unsafe { std::ffi::CStr::from_ptr(msg) };
+        Err(crate::Error::InvalidOpts(
+            msg.to_string_lossy().into_owned(),
+        ))
+    }
+
+    /// Reject options `bwa-mem3 mem` refuses on every path, judged on the
+    /// options as they stand. First the ranges its parser holds for the knobs
+    /// this crate can set (`-A` in `1..=127`, `-w` in `0..=i32::MAX >> 2`,
+    /// `-O` non-negative, `-E` positive, `-U` non-negative, `-c` positive),
+    /// since the setters accept any `i32`; then its `check_effective_scoring`
+    /// (`fastmap.cpp`): a mismatch penalty outside `0..=128`, since the kernels
+    /// store its negation in 8 bits (256 would wrap to a free mismatch) and a
+    /// negative one breaks the 8-bit admission tests and the MAPQ model; and a
+    /// gap open plus extension above `2^29 - 1`, which overflows the banded
+    /// kernels' gap arithmetic. Every alignment entry point runs this.
+    ///
+    /// The parse ranges are memory safety, not CLI parity: outside them the
+    /// kernels overflow signed `int` arithmetic (`-U`: `score -
+    /// pen_unpaired`), divide by zero (`-c` is the SA-resolve step divisor),
+    /// or write past the rows a band owns (a negative `-w`). The messages are
+    /// upstream's, naming the setter alongside the flag. `-L`/`-T` are absent
+    /// because upstream bounds neither.
+    pub(crate) fn check_effective_scoring(&self) -> Result<()> {
+        const OE_MAX: i64 = (1 << 29) - 1;
+        let invalid = |msg: String| Err(crate::Error::InvalidOpts(msg));
+        let a = self.match_score();
+        if !(1..=127).contains(&a) {
+            return invalid(format!(
+                "-A match score must be an integer in 1..127 (got {a}): a score of 0 or less \
+                 leaves nothing to align, and the alignment kernels store it in 8 bits \
+                 (MemOpts::set_match_score)"
+            ));
+        }
+        // SAFETY: `handle` is a live `mem_opt_t` owned by `self`; reads only.
+        let (w, o_del, e_del, o_ins, e_ins, pen_unpaired, max_occ) = unsafe {
+            let h = &*self.handle;
+            (
+                h.w,
+                h.o_del,
+                h.e_del,
+                h.o_ins,
+                h.e_ins,
+                h.pen_unpaired,
+                h.max_occ,
+            )
+        };
+        if !(0..=i32::MAX >> 2).contains(&w) {
+            return invalid(format!(
+                "-w band width must be an integer in 0..{} (got {w}) (MemOpts::set_band_width)",
+                i32::MAX >> 2
+            ));
+        }
+        if o_del < 0 || o_ins < 0 {
+            return invalid(format!(
+                "-O gap-open penalty must be a non-negative integer in 0..{} (got \
+                 {o_del},{o_ins}) (MemOpts::set_gap_open)",
+                i32::MAX
+            ));
+        }
+        if e_del < 1 || e_ins < 1 {
+            return invalid(format!(
+                "-E gap-extension penalty must be a positive integer in 1..{} (got \
+                 {e_del},{e_ins}) (MemOpts::set_gap_extend)",
+                i32::MAX
+            ));
+        }
+        if pen_unpaired < 0 {
+            return invalid(format!(
+                "-U unpaired penalty must be a non-negative integer in 0..{} (got \
+                 {pen_unpaired}) (MemOpts::set_unpaired_penalty)",
+                i32::MAX
+            ));
+        }
+        if max_occ < 1 {
+            return invalid(format!(
+                "-c max occurrences must be a positive integer in 1..{} (got {max_occ}) \
+                 (MemOpts::set_max_occurrences)",
+                i32::MAX
+            ));
+        }
+        let b = self.mismatch_penalty();
+        if !(0..=128).contains(&b) {
+            return Err(crate::Error::InvalidOpts(format!(
+                "the effective mismatch penalty is {b}, outside 0..128: a negative penalty \
+                 scores a mismatch above zero, which the 8-bit alignment kernels and the \
+                 mapping-quality model do not allow, and the kernels store its negation in 8 \
+                 bits (check -B, MemOpts::set_mismatch_penalty; unlike `bwa-mem3 mem -A`, \
+                 MemOpts::set_match_score does not rescale it)"
+            )));
+        }
+        let (del, ins) = (
+            i64::from(o_del) + i64::from(e_del),
+            i64::from(o_ins) + i64::from(e_ins),
+        );
+        if del > OE_MAX || ins > OE_MAX {
+            return Err(crate::Error::InvalidOpts(format!(
+                "the effective gap open plus extension penalty is {del} for deletions and \
+                 {ins} for insertions; each must be at most {OE_MAX} so the alignment \
+                 kernels' gap scores stay in range (check -O and -E, MemOpts::set_gap_open \
+                 and MemOpts::set_gap_extend)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The options as they bear on alignment, for checking that every phase
+    /// of a split-phase alignment (seeding, extension, the cohort pestat,
+    /// pairing and emission) sees the same ones: the raw `mem_opt_t` bytes
+    /// with the fields that cannot change the result blanked. Those are the
+    /// emission-only knobs (`md_mode` and the `MEM_F_XB` bit, which only shape
+    /// the tags written), and the two the shim overrides on its own per-call
+    /// copy in every phase (`MEM_F_PE`, set for the pair group and cleared for
+    /// singles, and `n_threads`, forced to 1). Every other field is compared,
+    /// so a field a future bwa-mem3 adds is covered by default.
+    pub(crate) fn phase_snapshot(&self) -> PhaseOpts {
+        let n = std::mem::size_of::<sys::mem_opt_t>();
+        let mut bytes = vec![0u8; n];
+        // The byte range of the field at `p`, from its own type, so a field
+        // upstream widens is still blanked whole.
+        fn span<T>(base: *const sys::mem_opt_t, p: *const T) -> std::ops::Range<usize> {
+            let off = p as usize - base as usize;
+            off..off + std::mem::size_of::<T>()
+        }
+        // SAFETY: `handle` is a live `mem_opt_t` owned by `self`, allocated
+        // zeroed by `mem_opt_init` (calloc), so its padding bytes are
+        // initialized too; `bytes` holds exactly `n` bytes. The field pointers
+        // are taken without creating references.
+        let (md, threads, flag) = unsafe {
+            std::ptr::copy_nonoverlapping(self.handle.cast::<u8>(), bytes.as_mut_ptr(), n);
+            let h = self.handle.cast_const();
+            // `flag` is read back as an `i32` to clear two bits; a retyped
+            // field must fail to compile here rather than be misread.
+            let flag: *const i32 = std::ptr::addr_of!((*h).flag);
+            (
+                span(h, std::ptr::addr_of!((*h).md_mode)),
+                span(h, std::ptr::addr_of!((*h).n_threads)),
+                span(h, flag),
+            )
+        };
+        bytes[md].fill(0);
+        bytes[threads].fill(0);
+        let flag_bytes: [u8; 4] = bytes[flag.clone()].try_into().unwrap();
+        let flag_val = i32::from_ne_bytes(flag_bytes) & !((sys::MEM_F_XB | sys::MEM_F_PE) as i32);
+        bytes[flag].copy_from_slice(&flag_val.to_ne_bytes());
+        PhaseOpts(bytes.into_boxed_slice())
+    }
+
+    /// Reject options that differ from `seeded`, the snapshot taken when the
+    /// regions `what` consumes were seeded: those regions were scored under
+    /// the old options, and pairing, rescue and `mem_reg2aln` under the new
+    /// ones would mix the two in one record.
+    pub(crate) fn check_phase(&self, seeded: &PhaseOpts, what: &str) -> Result<()> {
+        self.phase_snapshot().check_against(seeded, what)
+    }
+
+    /// How the `MD:Z` tag is written (`--md`). Defaults to [`MdMode::Full`].
+    pub fn set_md_mode(&mut self, mode: MdMode) -> &mut Self {
+        unsafe {
+            (*self.handle).md_mode = mode as i32;
+        }
+        self
+    }
+    /// How the `MD:Z` tag is written (`--md`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnrecognizedEnum`](crate::Error::UnrecognizedEnum) if
+    /// the vendored bwa-mem3 reports a mode this crate does not know.
+    pub fn md_mode(&self) -> Result<MdMode> {
+        MdMode::try_from(unsafe { (*self.handle).md_mode })
     }
 
     /// Bisulfite seed pruning (`--meth-seed-prune`); only meaningful under
@@ -1043,18 +1435,18 @@ mod tests {
     #[test]
     fn meth_knobs_roundtrip() {
         let mut o = MemOpts::new().unwrap();
-        // Defaults: meth off, collapsed scoring.
+        // Defaults: meth off, genomic scoring (bwa-mem3 v0.17.0, #756).
         assert!(!o.meth());
-        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Genomic);
         assert!(!o.meth_chimera_qc());
         o.set_meth(true)
-            .set_meth_scoring(MethScoring::Genomic)
+            .set_meth_scoring(MethScoring::Collapsed)
             .set_meth_chimera_qc(true);
         assert!(o.meth());
-        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Genomic);
-        assert!(o.meth_chimera_qc());
-        o.set_meth_scoring(MethScoring::Collapsed);
         assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
+        assert!(o.meth_chimera_qc());
+        o.set_meth_scoring(MethScoring::Genomic);
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Genomic);
         o.set_meth(false);
         assert!(!o.meth());
     }
@@ -1218,6 +1610,39 @@ mod tests {
         ));
     }
 
+    /// The raw `mem_opt_t` bytes, for "left exactly as they were" checks: a
+    /// refused call must not change any field, not just the few a test names.
+    fn raw_bytes(o: &MemOpts) -> Vec<u8> {
+        let n = std::mem::size_of::<sys::mem_opt_t>();
+        // SAFETY: `handle` is a live, zero-initialized `mem_opt_t` of `n` bytes.
+        unsafe { std::slice::from_raw_parts(o.handle.cast::<u8>(), n).to_vec() }
+    }
+
+    /// Every scoring matrix the options carry: the base one, the per-strand
+    /// `--meth` copies, and the `--meth-context cpg` 7x7 pair
+    /// (`meth_model_fill_mats`), all rebuilt together by one refill.
+    fn all_matrices(o: &MemOpts) -> Vec<i8> {
+        // SAFETY: `handle` is a live `mem_opt_t` owned by `o`; reads only.
+        let h = unsafe { &*o.handle };
+        [
+            &h.mat[..],
+            &h.mat_ot[..],
+            &h.mat_ob[..],
+            &h.mat7_ot[..],
+            &h.mat7_ob[..],
+        ]
+        .concat()
+    }
+
+    /// Assert that `r` is `InvalidOpts` with a message containing `needle`.
+    fn assert_invalid<T>(r: Result<T>, needle: &str) {
+        match r {
+            Err(crate::Error::InvalidOpts(m)) => assert!(m.contains(needle), "{m}"),
+            Err(e) => panic!("expected InvalidOpts({needle}), got {e}"),
+            Ok(_) => panic!("expected InvalidOpts({needle}), got Ok"),
+        }
+    }
+
     /// Fresh options with `--meth` on and the chemistry set, as a caller sets
     /// them up before `apply_meth_defaults`.
     fn meth_opts(chem: MethChem) -> MemOpts {
@@ -1235,10 +1660,28 @@ mod tests {
             MethSeedPrune::Off,
             "mem_opt_init default"
         );
-        o.apply_meth_defaults();
+        o.apply_meth_defaults().unwrap();
         assert_eq!(o.meth_chem().unwrap(), MethChem::EmSeq);
-        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
+        assert_eq!(
+            o.meth_scoring().unwrap(),
+            MethScoring::Genomic,
+            "em-seq scores GENOMIC by default as of bwa-mem3 v0.17.0"
+        );
         assert_eq!(o.meth_seed_prune().unwrap(), MethSeedPrune::Spec30);
+        assert_eq!(
+            o.mismatch_penalty(),
+            default_b,
+            "GENOMIC is variant-aware: no -B 2"
+        );
+    }
+
+    #[test]
+    fn explicit_collapsed_scoring_takes_bwameths_mismatch_penalty() {
+        let mut o = meth_opts(MethChem::EmSeq);
+        let default_b = o.mismatch_penalty();
+        o.set_meth_scoring(MethScoring::Collapsed);
+        o.apply_meth_defaults().unwrap();
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Collapsed);
         assert_eq!(o.mismatch_penalty(), 2, "COLLAPSED takes bwameth's -B 2");
         assert_ne!(default_b, 2, "the -B check above must not hold vacuously");
     }
@@ -1247,7 +1690,7 @@ mod tests {
     fn taps_defaults_to_neutral_scoring_and_keeps_bwas_mismatch_penalty() {
         let mut o = meth_opts(MethChem::Taps);
         let default_b = o.mismatch_penalty();
-        o.apply_meth_defaults();
+        o.apply_meth_defaults().unwrap();
         assert_eq!(o.meth_scoring().unwrap(), MethScoring::Neutral);
         assert_eq!(o.meth_seed_prune().unwrap(), MethSeedPrune::Spec30);
         assert_eq!(
@@ -1264,13 +1707,15 @@ mod tests {
             .set_meth(true)
             .set_meth_scoring(MethScoring::Genomic)
             .set_meth_chem(MethChem::Taps)
-            .apply_meth_defaults();
+            .apply_meth_defaults()
+            .unwrap();
         assert_eq!(before.meth_scoring().unwrap(), MethScoring::Genomic);
 
         let mut after = meth_opts(MethChem::Taps);
         after
             .set_meth_scoring(MethScoring::Collapsed)
-            .apply_meth_defaults();
+            .apply_meth_defaults()
+            .unwrap();
         assert_eq!(
             after.meth_scoring().unwrap(),
             MethScoring::Collapsed,
@@ -1279,10 +1724,486 @@ mod tests {
     }
 
     #[test]
+    fn md_mode_roundtrips_and_defaults_to_full() {
+        let mut o = MemOpts::new().unwrap();
+        assert_eq!(o.md_mode().unwrap(), MdMode::Full, "mem_opt_init default");
+        for mode in [MdMode::None, MdMode::Short, MdMode::Full] {
+            o.set_md_mode(mode);
+            assert_eq!(o.md_mode().unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn meth_context_roundtrips_and_defaults_to_all() {
+        let mut o = MemOpts::new().unwrap();
+        assert_eq!(o.meth_context().unwrap(), MethContext::All);
+        o.set_meth_context(MethContext::Cpg);
+        assert_eq!(o.meth_context().unwrap(), MethContext::Cpg);
+    }
+
+    #[test]
+    fn meth_context_and_md_mode_map_raw_values() {
+        assert_eq!(MethContext::try_from(0).unwrap(), MethContext::All);
+        assert_eq!(MethContext::try_from(1).unwrap(), MethContext::Cpg);
+        assert!(matches!(
+            MethContext::try_from(2),
+            Err(crate::Error::UnrecognizedEnum {
+                kind: "meth_context",
+                value: 2
+            })
+        ));
+        assert_eq!(MdMode::try_from(0).unwrap(), MdMode::None);
+        assert_eq!(MdMode::try_from(1).unwrap(), MdMode::Full);
+        assert_eq!(MdMode::try_from(2).unwrap(), MdMode::Short);
+        assert!(matches!(
+            MdMode::try_from(3),
+            Err(crate::Error::UnrecognizedEnum {
+                kind: "md_mode",
+                value: 3
+            })
+        ));
+    }
+
+    /// The COLLAPSED check judges the scoring as `meth_opts_finalize` would
+    /// resolve it: under TAPS an unset scoring becomes NEUTRAL, so a COLLAPSED
+    /// value the caller did not choose is not a conflict, while an explicit one
+    /// is.
+    #[test]
+    fn cpg_collapsed_check_uses_the_resolved_taps_scoring() {
+        let mut implicit = meth_opts(MethChem::Taps);
+        implicit.set_meth_context(MethContext::Cpg);
+        // A COLLAPSED value that did not come through set_meth_scoring.
+        unsafe { (*implicit.handle).meth_scoring = MethScoring::Collapsed as i32 };
+        implicit.apply_meth_defaults().unwrap();
+        assert_eq!(implicit.meth_scoring().unwrap(), MethScoring::Neutral);
+
+        let mut explicit = meth_opts(MethChem::Taps);
+        explicit
+            .set_meth_context(MethContext::Cpg)
+            .set_meth_scoring(MethScoring::Collapsed);
+        assert_invalid(
+            explicit.apply_meth_defaults(),
+            "incompatible with --meth-scoring collapsed",
+        );
+    }
+
+    /// The bundle multiplies the match score by up to 100, so under `--meth` a
+    /// score outside `-A`'s `1..=127` is refused before it is applied (a large
+    /// one would overflow `int`), with every option left as it was. The message
+    /// is `check_effective_scoring`'s, word for word: the shim carries its own
+    /// copy for raw C callers. Without `--meth` nothing is multiplied and the
+    /// entry points judge the score.
+    #[test]
+    fn apply_meth_defaults_refuses_an_out_of_range_match_score() {
+        for a in [0, 128, 21_474_837, i32::MAX] {
+            let mut o = meth_opts(MethChem::Taps);
+            o.set_match_score(a);
+            let before = raw_bytes(&o);
+            let Err(crate::Error::InvalidOpts(scoring_msg)) = o.check_effective_scoring() else {
+                panic!("a = {a}: check_effective_scoring accepted it");
+            };
+            match o.apply_meth_defaults() {
+                Err(crate::Error::InvalidOpts(msg)) => assert_eq!(msg, scoring_msg, "a = {a}"),
+                Err(e) => panic!("a = {a}: expected InvalidOpts, got {e}"),
+                Ok(_) => panic!("a = {a}: accepted"),
+            }
+            assert!(raw_bytes(&o) == before, "a = {a}: options changed");
+        }
+        let mut ok = meth_opts(MethChem::Taps);
+        ok.set_match_score(127);
+        ok.apply_meth_defaults().unwrap();
+        assert_eq!(ok.unpaired_penalty(), 12_700);
+
+        let mut off = MemOpts::new().unwrap();
+        off.set_match_score(i32::MAX);
+        off.apply_meth_defaults().unwrap();
+    }
+
+    /// The apply-time check can be skipped, or undone by a later setter, so the
+    /// alignment entry points re-check the options as they stand.
+    #[test]
+    fn check_meth_options_judges_the_options_as_they_stand() {
+        let mut o = meth_opts(MethChem::Taps);
+        o.set_meth_context(MethContext::Cpg);
+        o.apply_meth_defaults().unwrap();
+        o.check_meth_options().unwrap();
+
+        o.set_meth_scoring(MethScoring::Collapsed);
+        assert_invalid(
+            o.check_meth_options(),
+            "incompatible with --meth-scoring collapsed",
+        );
+        o.set_meth_scoring(MethScoring::Neutral)
+            .set_meth_chem(MethChem::EmSeq);
+        assert_invalid(
+            o.check_meth_options(),
+            "requires --meth=taps or --meth=5base",
+        );
+
+        let mut skipped = meth_opts(MethChem::EmSeq);
+        skipped.set_meth_context(MethContext::Cpg);
+        assert_invalid(
+            skipped.check_meth_options(),
+            "requires --meth=taps or --meth=5base",
+        );
+
+        let mut off = MemOpts::new().unwrap();
+        off.set_meth_context(MethContext::Cpg);
+        assert_invalid(off.check_meth_options(), "--meth-context requires --meth");
+        off.set_meth_context(MethContext::All);
+        off.check_meth_options().unwrap();
+    }
+
+    /// `bwa-mem3 mem --meth` refuses a non-positive effective mismatch
+    /// penalty (NM is derived from the scoring matrix, so `-B 0` collapses it
+    /// to zero); without `--meth` a zero penalty is allowed.
+    #[test]
+    fn check_meth_options_rejects_a_non_positive_penalty_under_meth() {
+        for b in [0, -1] {
+            let mut o = meth_opts(MethChem::EmSeq);
+            o.apply_meth_defaults().unwrap();
+            o.set_mismatch_penalty(b);
+            let Err(err) = o.check_meth_options() else {
+                panic!("expected an error for -B {b}");
+            };
+            assert!(
+                matches!(&err, crate::Error::InvalidOpts(m)
+                    if m.contains("--meth requires a positive mismatch penalty")
+                        && m.contains(&format!("effective penalty is {b}"))),
+                "{err}"
+            );
+        }
+
+        let mut off = MemOpts::new().unwrap();
+        off.set_mismatch_penalty(0);
+        off.check_meth_options().unwrap();
+    }
+
+    /// `bwa-mem3 mem`'s `check_effective_scoring`, on every path (not only
+    /// `--meth`): the kernels store `-b` in 8 bits, so `b` must lie in
+    /// `0..=128` (256 would wrap to a free mismatch), and each `o + e` must
+    /// leave the banded kernels' gap arithmetic in range.
+    #[test]
+    fn check_effective_scoring_mirrors_the_cli() {
+        let err_has = |o: &MemOpts, needle: &str| match o.check_effective_scoring() {
+            Err(crate::Error::InvalidOpts(m)) => assert!(m.contains(needle), "{m}"),
+            other => panic!("expected InvalidOpts({needle}), got {other:?}"),
+        };
+        for meth in [false, true] {
+            for b in [-1, 129, 256] {
+                let mut o = MemOpts::new().unwrap();
+                o.set_meth(meth).set_mismatch_penalty(b);
+                err_has(
+                    &o,
+                    &format!("effective mismatch penalty is {b}, outside 0..128"),
+                );
+            }
+            for b in [0, 1, 128] {
+                let mut o = MemOpts::new().unwrap();
+                o.set_meth(meth).set_mismatch_penalty(b);
+                o.check_effective_scoring().unwrap();
+            }
+        }
+        // Each of deletions and insertions is bounded on its own.
+        let oe_max = (1 << 29) - 1;
+        let mut o = MemOpts::new().unwrap();
+        o.set_gap_open(oe_max - 1, oe_max - 1).set_gap_extend(1, 1);
+        o.check_effective_scoring().unwrap();
+        o.set_gap_open(oe_max, 6);
+        err_has(&o, &format!("penalty is {} for deletions", oe_max + 1));
+        o.set_gap_open(6, oe_max);
+        err_has(&o, &format!("{} for insertions", oe_max + 1));
+
+        // The signs `bwa-mem3 mem` holds at parse, checked first: a negative
+        // open or a non-positive extension, whose sum `i32::MIN + -1` would
+        // pass the upper bound and overflow the kernels' `int` arithmetic.
+        let mut o = MemOpts::new().unwrap();
+        o.set_gap_open(0, 0).set_gap_extend(1, 1);
+        o.check_effective_scoring().unwrap();
+        o.set_gap_open(i32::MIN, 6);
+        err_has(&o, "-O gap-open penalty must be a non-negative integer");
+        o.set_gap_open(6, -1);
+        err_has(&o, "-O gap-open penalty must be a non-negative integer");
+        o.set_gap_open(6, 6).set_gap_extend(-1, 1);
+        err_has(&o, "-E gap-extension penalty must be a positive integer");
+        o.set_gap_extend(1, 0);
+        err_has(&o, "-E gap-extension penalty must be a positive integer");
+
+        // `-A`: 1..=127, as `bwa-mem3 mem` parses it (the matrix stores it in
+        // 8 bits).
+        for a in [0, -1, 128] {
+            let mut o = MemOpts::new().unwrap();
+            o.set_match_score(a);
+            err_has(
+                &o,
+                &format!("-A match score must be an integer in 1..127 (got {a})"),
+            );
+        }
+        let mut o = MemOpts::new().unwrap();
+        o.set_match_score(127);
+        o.check_effective_scoring().unwrap();
+
+        // The other ranges the parser holds, each guarding the kernels rather
+        // than parity: `-w` sizes the band rows, `-U` is subtracted from a
+        // score in `int`, and `-c` divides the SA-resolve step.
+        let max_w = i32::MAX >> 2;
+        for (set, ok, bad, needle) in [
+            (
+                MemOpts::set_band_width as fn(&mut MemOpts, i32) -> &mut MemOpts,
+                [0, max_w],
+                [-1, max_w + 1],
+                "-w band width must be an integer in 0..",
+            ),
+            (
+                MemOpts::set_unpaired_penalty,
+                [0, i32::MAX],
+                [-1, i32::MIN],
+                "-U unpaired penalty must be a non-negative integer",
+            ),
+            (
+                MemOpts::set_max_occurrences,
+                [1, i32::MAX],
+                [0, i32::MIN],
+                "-c max occurrences must be a positive integer",
+            ),
+        ] {
+            for v in ok {
+                let mut o = MemOpts::new().unwrap();
+                set(&mut o, v);
+                o.check_effective_scoring().unwrap();
+            }
+            for v in bad {
+                let mut o = MemOpts::new().unwrap();
+                set(&mut o, v);
+                err_has(&o, needle);
+                err_has(&o, &format!("(got {v})"));
+            }
+        }
+    }
+
+    /// `set_mismatch_penalty` refills the matrices only for a penalty the
+    /// kernels can store, so `i32::MIN` never reaches `bwa_fill_scmat`'s `-b`
+    /// (signed overflow); the matrix then still reflects the last storable
+    /// penalty, and alignment refuses the options.
+    #[test]
+    fn an_unstorable_mismatch_penalty_leaves_the_matrix_alone() {
+        let mut o = MemOpts::new().unwrap();
+        o.set_mismatch_penalty(128);
+        assert_eq!(
+            o.scoring_matrix()[1],
+            -128,
+            "128 is storable: off-diagonal -128"
+        );
+        let at_128 = all_matrices(&o);
+        for b in [i32::MIN, -1, 129] {
+            o.set_mismatch_penalty(b);
+            assert_eq!(o.mismatch_penalty(), b);
+            assert_eq!(
+                all_matrices(&o),
+                at_128,
+                "-B {b} must not refill the matrix"
+            );
+            assert_invalid(
+                o.check_effective_scoring(),
+                &format!("effective mismatch penalty is {b}"),
+            );
+        }
+
+        // Nor may a match-score change refill it while the stored penalty is
+        // unstorable; the next storable penalty rebuilds from the current -A.
+        o.set_mismatch_penalty(i32::MIN).set_match_score(2);
+        assert_eq!(
+            all_matrices(&o),
+            at_128,
+            "-A must not refill with -B i32::MIN"
+        );
+        o.set_mismatch_penalty(4);
+        let m = o.scoring_matrix();
+        assert_eq!((m[0], m[1]), (2, -4), "rebuilt from -A 2 and -B 4");
+    }
+
+    /// `apply_meth_defaults` refills the matrices in the shim, after the
+    /// COLLAPSED bundle may have replaced `b`; it must skip that refill on the
+    /// same terms as `refill_matrices` when the resulting `b` is unstorable.
+    #[test]
+    fn apply_meth_defaults_leaves_the_matrix_alone_for_an_unstorable_penalty() {
+        for meth in [false, true] {
+            for b in [i32::MIN, -1, 129] {
+                let mut o = MemOpts::new().unwrap();
+                o.set_meth(meth);
+                if meth {
+                    // GENOMIC keeps the caller's -B through the bundle.
+                    o.set_meth_scoring(MethScoring::Genomic);
+                }
+                let before = all_matrices(&o);
+                o.set_mismatch_penalty(b);
+                o.apply_meth_defaults().unwrap();
+                assert_eq!(o.mismatch_penalty(), b, "meth={meth}: -B {b} kept");
+                assert_eq!(
+                    all_matrices(&o),
+                    before,
+                    "meth={meth}: -B {b} must not refill the matrices"
+                );
+            }
+        }
+
+        // TAPS with no explicit scoring resolves to NEUTRAL inside the call,
+        // which would rewrite the conversion cells of the meth matrices; that
+        // refill is skipped too while -B is unstorable.
+        for b in [i32::MIN, -1, 129] {
+            let mut o = meth_opts(MethChem::Taps);
+            o.set_mismatch_penalty(b);
+            let before = all_matrices(&o);
+            o.apply_meth_defaults().unwrap();
+            assert_eq!(o.meth_scoring().unwrap(), MethScoring::Neutral);
+            assert_eq!(
+                all_matrices(&o),
+                before,
+                "implicit TAPS NEUTRAL, -B {b}: must not refill the matrices"
+            );
+        }
+
+        // COLLAPSED replaces an unstorable -B with 2a, which then refills.
+        let mut o = MemOpts::new().unwrap();
+        o.set_meth(true).set_meth_scoring(MethScoring::Collapsed);
+        o.set_mismatch_penalty(i32::MIN);
+        o.apply_meth_defaults().unwrap();
+        assert_eq!(o.mismatch_penalty(), 2);
+        assert_eq!(o.scoring_matrix()[1], -2, "rebuilt from the bundle's -B 2");
+    }
+
+    /// `set_meth` and `set_meth_scoring` rebuild only the meth matrices, which
+    /// are copies of the base matrix; while `-B` is unstorable they leave all of
+    /// them alone like every other refill, and the next storable `-B` rebuilds
+    /// both from the scoring mode chosen in between.
+    #[test]
+    fn meth_setters_leave_the_matrices_alone_for_an_unstorable_penalty() {
+        let mut o = MemOpts::new().unwrap();
+        o.set_mismatch_penalty(129);
+        let before = all_matrices(&o);
+        o.set_meth(true).set_meth_scoring(MethScoring::Neutral);
+        assert_eq!(
+            all_matrices(&o),
+            before,
+            "set_meth / set_meth_scoring must not refill with -B 129"
+        );
+
+        o.set_mismatch_penalty(4);
+        let (ot, ob) = o.meth_scoring_matrices();
+        assert_eq!(o.scoring_matrix()[1], -4, "rebuilt from -B 4");
+        assert_eq!(ot[5 + 3], 0, "OT C->T cell rebuilt under NEUTRAL");
+        assert_eq!(ob[2 * 5], 0, "OB G->A cell rebuilt under NEUTRAL");
+    }
+
+    /// The phase snapshot ignores only the emission-only knobs (`md_mode`,
+    /// `MEM_F_XB`); any alignment-bearing change makes it differ.
+    #[test]
+    fn phase_snapshot_ignores_only_emission_knobs() {
+        let base = MemOpts::new().unwrap();
+        let seeded = base.phase_snapshot();
+        base.check_phase(&seeded, "t").unwrap();
+
+        let mut emit_only = MemOpts::new().unwrap();
+        emit_only.set_md_mode(MdMode::None);
+        // SAFETY: a live, uniquely owned mem_opt_t; sets one bit of a POD field.
+        unsafe { (*emit_only.handle).flag |= sys::MEM_F_XB as i32 };
+        emit_only.check_phase(&seeded, "t").unwrap();
+
+        // The two fields the shim overrides on its own per-call copy are
+        // blanked too, each on its own.
+        let mut pe = MemOpts::new().unwrap();
+        pe.set_pe(true);
+        pe.check_phase(&seeded, "t").unwrap();
+        let threads = MemOpts::new().unwrap();
+        // SAFETY: a live, uniquely owned mem_opt_t; writes one POD field.
+        unsafe { (*threads.handle).n_threads = 7 };
+        threads.check_phase(&seeded, "t").unwrap();
+
+        let changed: [fn(&mut MemOpts); 5] = [
+            |o| {
+                // A flag bit next to the blanked ones still counts.
+                o.set_soft_clip_supplementary(true);
+            },
+            |o| {
+                o.set_mismatch_penalty(5);
+            },
+            |o| {
+                o.set_meth_context(MethContext::Cpg);
+            },
+            |o| {
+                o.set_meth_chem(MethChem::Taps);
+            },
+            |o| {
+                o.set_minimum_score(31);
+            },
+        ];
+        for (i, change) in changed.iter().enumerate() {
+            let mut o = MemOpts::new().unwrap();
+            change(&mut o);
+            let Err(err) = o.check_phase(&seeded, "pair_emit") else {
+                panic!("change {i} went unnoticed");
+            };
+            assert!(
+                matches!(&err, crate::Error::InvalidOpts(m)
+                    if m.starts_with("pair_emit: the options differ")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpg_context_with_taps_takes_the_neutral_default() {
+        let mut o = meth_opts(MethChem::Taps);
+        o.set_meth_context(MethContext::Cpg);
+        o.apply_meth_defaults().unwrap();
+        assert_eq!(o.meth_scoring().unwrap(), MethScoring::Neutral);
+        assert_eq!(o.meth_seed_prune().unwrap(), MethSeedPrune::Spec30);
+    }
+
+    /// The three `--meth-context cpg` combinations `bwa-mem3 mem` refuses with
+    /// `exit(1)` come back as errors, and leave the options as they were (the
+    /// defaults are not half-applied).
+    #[test]
+    fn invalid_cpg_context_is_an_error_and_changes_nothing() {
+        let mut no_meth = MemOpts::new().unwrap();
+        no_meth.set_meth_context(MethContext::Cpg);
+        let mut emseq = meth_opts(MethChem::EmSeq);
+        emseq.set_meth_context(MethContext::Cpg);
+        let mut collapsed = meth_opts(MethChem::Taps);
+        collapsed
+            .set_meth_context(MethContext::Cpg)
+            .set_meth_scoring(MethScoring::Collapsed);
+        for (mut o, needle) in [
+            (no_meth, "--meth-context requires --meth"),
+            (emseq, "requires --meth=taps or --meth=5base"),
+            (collapsed, "incompatible with --meth-scoring collapsed"),
+        ] {
+            let before = raw_bytes(&o);
+            assert_invalid(o.apply_meth_defaults(), needle);
+            assert!(raw_bytes(&o) == before, "{needle}: options changed");
+        }
+    }
+
+    /// As in `bwa-mem3 mem`, the `--meth` defaults apply only under `--meth`.
+    #[test]
+    fn meth_defaults_are_skipped_without_meth() {
+        let mut o = MemOpts::new().unwrap();
+        o.set_meth_chem(MethChem::Taps);
+        let before = raw_bytes(&o);
+        o.apply_meth_defaults().unwrap();
+        // Not one field: no TAPS scoring default, no SPEC30, no -T/-L/-U/-M,
+        // and the matrix refill rebuilds the same matrices.
+        assert!(
+            raw_bytes(&o) == before,
+            "the defaults applied without --meth"
+        );
+    }
+
+    #[test]
     fn explicit_meth_seed_prune_survives_the_defaults() {
         for prune in [MethSeedPrune::Off, MethSeedPrune::Baseline] {
             let mut o = meth_opts(MethChem::EmSeq);
-            o.set_meth_seed_prune(prune).apply_meth_defaults();
+            o.set_meth_seed_prune(prune).apply_meth_defaults().unwrap();
             assert_eq!(o.meth_seed_prune().unwrap(), prune);
         }
     }

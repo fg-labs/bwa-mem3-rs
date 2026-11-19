@@ -110,7 +110,17 @@ def extend_batch(
     seeds: Seeds,
     pairs: Sequence[ReadPair],
     pestat_in: MemPeStat | None = None,
-) -> tuple[list[Record], MemPeStat]: ...
+) -> tuple[list[Record], MemPeStat]:
+    """
+    Extend pre-computed seeds to alignments, consuming ``seeds``.
+
+    ``opts`` must match the options ``seed_batch`` was given, except that
+    ``set_pe`` may differ; otherwise this raises ``ValueError``. The seeds
+    are consumed even then (a retry with them raises ``ValueError`` too), so
+    call ``seed_batch`` again before retrying.
+    """
+    ...
+
 def estimate_pestat(index: BwaIndex, opts: MemOpts, pairs: Sequence[ReadPair]) -> MemPeStat: ...
 
 class _Shm:

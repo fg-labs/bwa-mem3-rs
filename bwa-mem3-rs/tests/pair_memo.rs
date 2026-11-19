@@ -661,8 +661,9 @@ fn chained_marks_resolve_to_the_first_copy() {
 }
 
 /// A fallback pair holding a `-` base aligns exactly as memo off does: the
-/// fallback re-seeds bases that are already 2-bit, and `-` is the one code
-/// (5) that a second conversion would change.
+/// fallback re-seeds bases that are already 2-bit. Before bwa-mem3 v0.16.0
+/// (#639) `-` was the one code (5) a second conversion changed; it now maps
+/// straight to 4, so this pins that re-conversion stays a no-op.
 #[test]
 fn fallback_keeps_a_dash_base() {
     let Some((idx, opts)) = index_for(false) else {

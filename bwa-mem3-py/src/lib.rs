@@ -19,7 +19,8 @@ use pyo3::types::{PyByteArray, PyBytes, PyList, PyTuple};
 
 fn map_err(e: bwa::Error) -> PyErr {
     match e {
-        bwa::Error::InvalidInput(m) => PyValueError::new_err(m),
+        // A bad argument or a bad option value is the caller's to fix.
+        bwa::Error::InvalidInput(m) | bwa::Error::InvalidOpts(m) => PyValueError::new_err(m),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -501,6 +502,10 @@ fn seed_batch<'py>(
 }
 
 /// Phase 2: extend pre-computed seeds to alignments. Consumes `seeds`.
+/// `opts` must match the options `seed_batch` was given, except that
+/// `set_pe` may differ; otherwise the call raises `ValueError`. The seeds
+/// are consumed even then (a retry with them raises `ValueError` too), so
+/// call `seed_batch` again before retrying.
 ///
 /// Releases the GIL during the native extend call (see `align_batch` for
 /// the threading rationale).

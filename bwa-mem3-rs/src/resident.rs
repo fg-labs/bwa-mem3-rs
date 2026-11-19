@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::align::{
-    c_pair, c_single, check_meth_consistency, record_origin, sink_trampoline, AlignScratch,
+    c_pair, c_single, check_alignment_preconditions, record_origin, sink_trampoline, AlignScratch,
     IdBases, ReadPair, RecordOrigin, RecordSink, SingleRead, SinkCtx,
 };
 use crate::error::{shim_err, shim_last_message, Error, Result};
 use crate::index::BwaIndex;
 use crate::memo::MemoStats;
-use crate::opts::{MemOpts, MemPeStat};
+use crate::opts::{MemOpts, MemPeStat, PhaseOpts};
 
 // ---------------------------------------------------------------------------
 // Structured-fields output
@@ -81,7 +81,8 @@ pub struct AlignedFields<'a> {
     pub sa: Option<&'a [u8]>,
     /// pa:f.
     pub pa: Option<f32>,
-    pub xa: Option<&'a [u8]>,
+    /// The alternative-hit list, with the tag it is written under.
+    pub alt_hits: Option<AltHits<'a>>,
     pub hn: Option<i32>,
     /// D3 (`--meth`) Bismark tags; `None` outside meth mode.
     pub meth: Option<MethFields<'a>>,
@@ -93,6 +94,35 @@ impl AlignedFields<'_> {
     /// mate's strand, and its SEQ/QUAL are emitted reverse-complemented to it.
     pub fn is_rev(&self) -> bool {
         self.flag & 0x10 != 0
+    }
+}
+
+/// An emitted record's alternative-hit list, by the tag the packed record
+/// writes it under: `XA:Z` (`chr,pos,CIGAR,NM;` per hit), or `XB:Z` under
+/// `MEM_F_XB` (bwa's `-u`, settable only on the raw `mem_opt_t`), whose entries
+/// append each hit's AS and MAPQ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltHits<'a> {
+    Xa(&'a [u8]),
+    Xb(&'a [u8]),
+}
+
+impl<'a> AltHits<'a> {
+    /// The two-byte tag name, `XA` or `XB`.
+    #[must_use]
+    pub fn tag(&self) -> &'static [u8; 2] {
+        match self {
+            Self::Xa(_) => b"XA",
+            Self::Xb(_) => b"XB",
+        }
+    }
+
+    /// The list itself, without the trailing NUL.
+    #[must_use]
+    pub fn list(&self) -> &'a [u8] {
+        match *self {
+            Self::Xa(l) | Self::Xb(l) => l,
+        }
     }
 }
 
@@ -195,7 +225,13 @@ impl<'a> AlignedFields<'a> {
             rg,
             sa,
             pa: (f.has_pa != 0).then_some(f.pa),
-            xa,
+            alt_hits: xa.map(|l| {
+                if f.xa_is_xb != 0 {
+                    AltHits::Xb(l)
+                } else {
+                    AltHits::Xa(l)
+                }
+            }),
             hn: flag_opt(f.has_hn, f.hn),
             meth: xr.map(|xr| MethFields { xr, xg, xm }),
         }
@@ -314,6 +350,137 @@ impl ResidentRange {
     }
 }
 
+/// Which options a cohort's regions are seeded with. The first seed-extend of
+/// a non-empty range goes `Tentative` before its native call and publishes
+/// `Bound` only once that call succeeds; a failed (or panicking) attempt
+/// withdraws, so it binds nothing. An empty range, which seeds and emits
+/// nothing, neither binds the snapshot nor is compared against it, at seed or
+/// at emit (its options are still validated and its index still checked, as
+/// for any call). Concurrent first seeds share the tentative binding only when
+/// their options match, so two different option sets never both reach the
+/// aligner, and a seed refused admission (marks on a closed memo) installs no
+/// binding.
+///
+/// This is deliberately looser than the index binding (`index_id`), which the
+/// first call of any kind fixes for good: a failed first seed under the wrong
+/// options leaves the cohort usable with the right ones, where a cohort bound
+/// to options no seed ever succeeded with would have to be thrown away
+/// (`failed_seeds_bind_no_options_and_pe_may_differ` pins this).
+#[derive(Debug, Default)]
+enum PhaseState {
+    #[default]
+    Unbound,
+    Tentative {
+        opts: PhaseOpts,
+        in_flight: usize,
+    },
+    Bound(PhaseOpts),
+}
+
+/// [`PhaseState`] behind a mutex held only for the state transitions, never
+/// across a native call or another lock.
+#[derive(Debug, Default)]
+struct PhaseBinding(Mutex<PhaseState>);
+
+impl PhaseBinding {
+    fn lock(&self) -> MutexGuard<'_, PhaseState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Start a seed-extend under `opts`: bind them tentatively if nothing is
+    /// bound, or check them against the (tentative or published) binding.
+    fn begin_seed(&self, opts: PhaseOpts, what: &str) -> Result<SeedAttempt<'_>> {
+        self.begin_seed_with(opts, what, || Ok(()))
+    }
+
+    /// [`begin_seed`](Self::begin_seed), running `admit` under the mutex once
+    /// the options pass and before the binding is installed or joined. An
+    /// options mismatch never runs `admit`, and a refused `admit` leaves the
+    /// binding as it was, so a seed that cannot reach the aligner never holds
+    /// a tentative binding other options would be refused against. `admit`
+    /// must not block or take a lock.
+    fn begin_seed_with(
+        &self,
+        opts: PhaseOpts,
+        what: &str,
+        admit: impl FnOnce() -> Result<()>,
+    ) -> Result<SeedAttempt<'_>> {
+        let mut st = self.lock();
+        let tentative = match &mut *st {
+            PhaseState::Bound(seeded) => {
+                opts.check_against(seeded, what)?;
+                admit()?;
+                false
+            }
+            PhaseState::Tentative {
+                opts: seeded,
+                in_flight,
+            } => {
+                opts.check_against(seeded, what)?;
+                admit()?;
+                *in_flight += 1;
+                true
+            }
+            PhaseState::Unbound => {
+                admit()?;
+                *st = PhaseState::Tentative { opts, in_flight: 1 };
+                true
+            }
+        };
+        Ok(SeedAttempt {
+            binding: self,
+            tentative,
+            succeeded: false,
+        })
+    }
+
+    /// Check a consuming call's options against the binding; with nothing
+    /// bound, nothing was seeded, so any options pass.
+    fn check(&self, opts: &PhaseOpts, what: &str) -> Result<()> {
+        match &*self.lock() {
+            PhaseState::Bound(seeded) | PhaseState::Tentative { opts: seeded, .. } => {
+                opts.check_against(seeded, what)
+            }
+            PhaseState::Unbound => Ok(()),
+        }
+    }
+}
+
+/// One seed-extend's hold on a [`PhaseBinding`]; resolved by
+/// [`finish`](Self::finish), or as a failure if dropped unfinished (an early
+/// return or a panic).
+struct SeedAttempt<'a> {
+    binding: &'a PhaseBinding,
+    tentative: bool,
+    succeeded: bool,
+}
+
+impl SeedAttempt<'_> {
+    fn finish(mut self, ok: bool) {
+        self.succeeded = ok;
+    }
+}
+
+impl Drop for SeedAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.tentative {
+            return;
+        }
+        let mut st = self.binding.lock();
+        if let PhaseState::Tentative { opts, in_flight } = &mut *st {
+            if self.succeeded {
+                *st = PhaseState::Bound(opts.clone());
+            } else {
+                *in_flight -= 1;
+                if *in_flight == 0 {
+                    *st = PhaseState::Unbound;
+                }
+            }
+        }
+        // `Bound`: another attempt already published the same options.
+    }
+}
+
 /// A whole `-K` cohort's decoded reads + alnreg arrays, kept resident on the C
 /// heap across `seed_extend -> infer_cohort -> pair_emit`. Every sub-batch
 /// works on its own [`ResidentRange`] instead of owning a self-contained
@@ -352,12 +519,17 @@ impl ResidentRange {
 /// - **Lifecycle misuse is an error, not UB.** Writing a slot twice or after
 ///   `seed_extend`, seed-extending an unwritten or already-extended range,
 ///   emitting an unextended or already-emitted range, `infer_cohort` while a
-///   pair range is unextended or after any was emitted, a range from another
-///   cohort, a different [`BwaIndex`] than the one the cohort was first
-///   extended against, options whose `--meth` mode differs from the
-///   cohort's, `infer_cohort` or a pair emit while duplicate marks await
-///   `resolve_memo`, and duplicate marks once the memo is closed (by
-///   `resolve_memo`, `infer_cohort` or a pair emit) all return `Err`.
+///   pair range is unextended or after a non-empty one was emitted, a range
+///   from another cohort, a different [`BwaIndex`] than the one the cohort was
+///   first extended against, options whose `--meth` mode differs from the
+///   cohort's, options that differ from the ones the first successful
+///   seed-extend of a non-empty range bound (a seed-extend or pair emit of an
+///   empty range neither binds them nor is compared against them; the
+///   comparison ignores only the MD mode, the `MEM_F_XB` and paired-end flags,
+///   and the thread count),
+///   `infer_cohort` or a pair emit while duplicate marks await `resolve_memo`,
+///   and duplicate marks once the memo is closed (by `resolve_memo`,
+///   `infer_cohort` or a pair emit) all return `Err`.
 ///
 /// A pair range reserved after `infer_cohort` is not part of that model; it is
 /// the caller's to emit it with a model that fits.
@@ -371,6 +543,10 @@ pub struct ResidentCohort {
     /// then); every later call must use the same index, since the resident
     /// regions hold that index's coordinates.
     index_id: AtomicU64,
+    /// The options the cohort's regions are seeded with
+    /// ([`MemOpts::phase_snapshot`]); every call must use the same ones, since
+    /// the resident regions were scored under them.
+    phase: PhaseBinding,
     /// C-heap bytes this cohort holds for its reads (see
     /// [`heap_bytes`](Self::heap_bytes)); raised by `reserve_*`/`write_*` and
     /// lowered when a range is emitted.
@@ -426,6 +602,7 @@ impl ResidentCohort {
             id: NEXT_COHORT_ID.fetch_add(1, Ordering::Relaxed),
             meth,
             index_id: AtomicU64::new(0),
+            phase: PhaseBinding::default(),
             heap_bytes: AtomicUsize::new(0),
             memo: AtomicU64::new(0),
             memo_resolved: AtomicBool::new(false),
@@ -781,9 +958,25 @@ impl ResidentCohort {
     ) -> Result<()> {
         self.check_owned(range, "seed_extend")?;
         self.check_cohort_meth(opts, "seed_extend")?;
-        check_meth_consistency(idx, opts)?;
+        check_alignment_preconditions(idx, opts)?;
         self.check_index(idx, "seed_extend")?;
+        // The shared range lock first, held until the attempt commits or
+        // rolls back (`seed` drops before `_ranges`): `resolve_memo` and
+        // `infer_cohort`, which take it exclusively, then never see a
+        // tentative binding, only `Unbound` after a failed first seed or the
+        // published options after a successful one.
         let _ranges = self.lock_ranges_shared();
+        // An empty range seeds nothing, so it neither binds the phase snapshot
+        // nor is held to the bound one (`PhaseBinding::check`'s rule for
+        // `Unbound`); the option and index checks above still ran.
+        let seed = if range.n_reads == 0 {
+            None
+        } else {
+            Some(
+                self.phase
+                    .begin_seed(opts.phase_snapshot(), "seed_extend")?,
+            )
+        };
         // SAFETY: `range.segment` is a live segment of this cohort touched by no
         // other call (`&mut range`, checked id); `idx`/`opts`/`scratch.handle`
         // are valid for the call and `scratch` is exclusively borrowed.
@@ -795,7 +988,11 @@ impl ResidentCohort {
                 range.segment,
             )
         };
-        resident_status(rc, "resident_seed_extend")
+        let status = resident_status(rc, "resident_seed_extend");
+        if let Some(seed) = seed {
+            seed.finish(status.is_ok());
+        }
+        status
     }
 
     /// [`seed_extend`](Self::seed_extend) for a pair `range` whose pairs may be
@@ -832,7 +1029,7 @@ impl ResidentCohort {
             )));
         }
         self.check_cohort_meth(opts, WHAT)?;
-        check_meth_consistency(idx, opts)?;
+        check_alignment_preconditions(idx, opts)?;
         self.check_index(idx, WHAT)?;
         let first_pair = (range.first / 2) as u64;
         for (i, rep) in reps.iter().enumerate() {
@@ -863,7 +1060,13 @@ impl ResidentCohort {
             .map(|r| r.map_or(-1, |r| i64::try_from(r).unwrap_or(i64::MAX)))
             .collect();
         let _ranges = self.lock_ranges_shared();
-        self.add_marks(n_dups, WHAT)?;
+        // Every input check is done: only now may this call bind the options,
+        // under the shared range lock as in `seed_extend`. The marks are
+        // admitted between the options check and the binding, so a mismatch
+        // adds no marks and a closed memo binds nothing.
+        let seed = self
+            .phase
+            .begin_seed_with(opts.phase_snapshot(), WHAT, || self.add_marks(n_dups, WHAT))?;
         // SAFETY: as `seed_extend`; `c_reps` holds `range.n_pairs()` entries
         // and outlives the call, and the shim copies it before returning.
         let rc = unsafe {
@@ -877,6 +1080,7 @@ impl ResidentCohort {
             )
         };
         let status = resident_status(rc, "resident_seed_extend_reps");
+        seed.finish(status.is_ok());
         if status.is_err() {
             // The shim stored no marks; take them back. A pair emit that saw
             // them meanwhile refused, as it would for any unresolved mark.
@@ -899,10 +1103,12 @@ impl ResidentCohort {
     ///
     /// # Errors
     ///
+    /// `InvalidOpts` when `opts` differ from the options the cohort was seeded
+    /// with (retry with those), or fail the alignment option checks.
     /// `InvalidInput` when the cohort has marks and a pair range is not
-    /// seed-extended (the message says so), or on an options/index mismatch
-    /// (as `infer_cohort`). A failed call leaves the marks in place, so it can
-    /// be retried once the range is extended.
+    /// seed-extended or a non-empty one was already emitted (the message says
+    /// which), or on a `--meth` mode or index mismatch. A failed call leaves
+    /// the marks in place, so it can be retried.
     pub fn resolve_memo(
         &self,
         idx: &BwaIndex,
@@ -910,10 +1116,14 @@ impl ResidentCohort {
         scratch: &mut AlignScratch,
     ) -> Result<MemoStats> {
         self.check_cohort_meth(opts, "resolve_memo")?;
-        check_meth_consistency(idx, opts)?;
+        check_alignment_preconditions(idx, opts)?;
         self.check_index(idx, "resolve_memo")?;
         let _ranges = self.lock_ranges_exclusive();
         let _table = self.lock_table();
+        // Under the exclusive lock, so no first seed can bind other options
+        // between this check and the native call; a mismatch returns before
+        // the memo closes, leaving the marks for a retry.
+        self.phase.check(&opts.phase_snapshot(), "resolve_memo")?;
         // The exclusive lock excludes `add_marks`, so this load cannot race a mark.
         if self.memo.load(Ordering::Acquire) & !MEMO_CLOSED == 0 {
             // No marks: nothing to copy, whatever state the ranges are in.
@@ -947,7 +1157,8 @@ impl ResidentCohort {
     }
 
     /// `mem_pestat` over the whole cohort's pair region. Every pair range must
-    /// have been seed-extended and none emitted yet, and any duplicate marks
+    /// have been seed-extended and none that holds pairs emitted yet (an empty
+    /// one emits nothing, so it may go early), and any duplicate marks
     /// resolved by [`resolve_memo`](Self::resolve_memo) (else `Err`); waits for
     /// in-flight range calls. It also closes the memo, as the first pair emit
     /// does: no duplicate marks are accepted after it. Feed the result to every
@@ -955,10 +1166,13 @@ impl ResidentCohort {
     /// so it does not depend on the order the ranges were reserved or extended.
     pub fn infer_cohort(&self, idx: &BwaIndex, opts: &MemOpts) -> Result<MemPeStat> {
         self.check_cohort_meth(opts, "infer_cohort")?;
+        check_alignment_preconditions(idx, opts)?;
         self.check_index(idx, "infer_cohort")?;
         let mut out = MemPeStat::zero()?;
         let _ranges = self.lock_ranges_exclusive();
         let _table = self.lock_table();
+        // Under the exclusive lock, as in `resolve_memo`.
+        self.phase.check(&opts.phase_snapshot(), "infer_cohort")?;
         self.check_memo_resolved("infer_cohort")?;
         // SAFETY: `idx`/`opts` valid for the call; `out.as_mut_ptr()` is a live
         // `mem_pestat_t[4]` owned by `out`; the exclusive lock plus the table
@@ -1028,7 +1242,15 @@ impl ResidentCohort {
     ) -> Result<RwLockReadGuard<'_, ()>> {
         self.check_owned(range, what)?;
         self.check_cohort_meth(opts, what)?;
+        // Before the memo closes and the shim consumes the range, so options
+        // changed since `seed_extend` fail here and the range stays emittable.
+        check_alignment_preconditions(idx, opts)?;
         self.check_index(idx, what)?;
+        // An empty range emits nothing, so like its seed (`seed_extend`) it is
+        // not held to the cohort's phase snapshot.
+        if range.n_reads > 0 {
+            self.phase.check(&opts.phase_snapshot(), what)?;
+        }
         if range.region == Region::Pairs && range.n_reads > 0 && pestat.is_none() {
             return Err(Error::InvalidInput(format!(
                 "{what}: a range with pairs requires the cohort pestat"
@@ -1184,3 +1406,104 @@ unsafe impl Send for ResidentCohort {}
 // shared state is atomics (`index_id`, `heap_bytes`, `memo`,
 // `memo_resolved`). The C code keeps no other mutable shared state per cohort.
 unsafe impl Sync for ResidentCohort {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(b: i32) -> PhaseOpts {
+        let mut o = MemOpts::new().unwrap();
+        o.set_mismatch_penalty(b);
+        o.phase_snapshot()
+    }
+
+    fn is_unbound(p: &PhaseBinding) -> bool {
+        matches!(*p.lock(), PhaseState::Unbound)
+    }
+
+    /// A failed first seed binds nothing, so other options may seed next.
+    /// Assert `r` is the options-differ refusal (from a call named `t`).
+    fn assert_differs(r: Result<()>) {
+        assert!(
+            matches!(&r, Err(crate::Error::InvalidOpts(m)) if m.starts_with("t: the options differ")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_first_seed_leaves_the_binding_unset() {
+        let p = PhaseBinding::default();
+        p.begin_seed(snap(4), "t").unwrap().finish(false);
+        assert!(is_unbound(&p));
+        // Dropped unfinished (an early return or panic) counts as a failure.
+        drop(p.begin_seed(snap(4), "t").unwrap());
+        assert!(is_unbound(&p));
+        p.begin_seed(snap(5), "t").unwrap().finish(true);
+        assert!(matches!(&*p.lock(), PhaseState::Bound(s) if *s == snap(5)));
+        assert_differs(p.begin_seed(snap(4), "t").map(|_| ()));
+        p.check(&snap(5), "t").unwrap();
+        assert_differs(p.check(&snap(4), "t"));
+    }
+
+    /// Concurrent first seeds: matching options share the tentative binding,
+    /// different ones are refused before reaching the aligner; the binding is
+    /// published by any success and withdrawn only when every attempt failed.
+    #[test]
+    fn concurrent_first_seeds_share_only_matching_options() {
+        let p = PhaseBinding::default();
+        let a = p.begin_seed(snap(4), "t").unwrap();
+        let b = p.begin_seed(snap(4), "t").unwrap();
+        let Err(err) = p.begin_seed(snap(5), "seed_extend") else {
+            panic!("different options joined an in-flight first seed");
+        };
+        assert!(
+            matches!(&err, crate::Error::InvalidOpts(m) if m.starts_with("seed_extend: the options differ")),
+            "{err}"
+        );
+        // A consuming call sees the tentative binding too.
+        assert_differs(p.check(&snap(5), "t"));
+        a.finish(false);
+        assert!(matches!(
+            &*p.lock(),
+            PhaseState::Tentative { in_flight: 1, .. }
+        ));
+        b.finish(true);
+        assert!(matches!(&*p.lock(), PhaseState::Bound(s) if *s == snap(4)));
+
+        let q = PhaseBinding::default();
+        let a = q.begin_seed(snap(4), "t").unwrap();
+        let b = q.begin_seed(snap(4), "t").unwrap();
+        a.finish(true);
+        b.finish(false); // a later failure does not unbind a published success
+        assert!(matches!(&*q.lock(), PhaseState::Bound(_)));
+    }
+
+    /// A refused admission (a closed memo rejecting marks) installs and joins
+    /// no binding, so it never blocks other options; an options mismatch is
+    /// refused before admission runs, so it admits nothing.
+    #[test]
+    fn admission_runs_after_the_options_check_and_before_the_binding() {
+        let refuse = || Err(crate::Error::InvalidInput("closed".into()));
+        let p = PhaseBinding::default();
+        assert!(p.begin_seed_with(snap(4), "t", refuse).is_err());
+        assert!(is_unbound(&p));
+        // Joining an in-flight binding: a refusal leaves its count alone.
+        let a = p.begin_seed(snap(4), "t").unwrap();
+        assert!(p.begin_seed_with(snap(4), "t", refuse).is_err());
+        assert!(matches!(
+            &*p.lock(),
+            PhaseState::Tentative { in_flight: 1, .. }
+        ));
+        let mut admitted = false;
+        assert_differs(
+            p.begin_seed_with(snap(5), "t", || {
+                admitted = true;
+                Ok(())
+            })
+            .map(|_| ()),
+        );
+        assert!(!admitted, "a mismatched seed was admitted");
+        a.finish(false);
+        assert!(is_unbound(&p));
+    }
+}

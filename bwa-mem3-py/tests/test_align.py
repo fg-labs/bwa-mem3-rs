@@ -87,6 +87,25 @@ def test_seeds_consumed_only_once(aligned_index: str) -> None:
         extend_batch(idx, opts, seeds, pairs)
 
 
+def test_extend_batch_with_changed_options_raises_and_consumes_seeds(
+    aligned_index: str,
+) -> None:
+    """Options changed since seed_batch raise ValueError, and the seeds are spent."""
+    idx = BwaIndex(aligned_index)
+    opts = MemOpts()
+    opts.set_pe(True)
+    pairs = [_synthetic_pair(b"x")]
+
+    seeds = seed_batch(idx, opts, pairs)
+    changed = MemOpts()
+    changed.set_pe(True)
+    changed.mismatch_penalty = 5
+    with pytest.raises(ValueError, match="options differ"):
+        extend_batch(idx, changed, seeds, pairs)
+    with pytest.raises(ValueError, match="seeds already consumed"):
+        extend_batch(idx, opts, seeds, pairs)
+
+
 def test_estimate_pestat_then_align_with_pestat_in(aligned_index: str) -> None:
     """estimate_pestat -> align_batch with pestat_in round-trip."""
     idx = BwaIndex(aligned_index)

@@ -66,7 +66,8 @@ typedef struct BwaAlignedFields {
     const char *rg;
     const char *sa;
     uint8_t     has_pa;  float pa;        /* pa:f */
-    const char *xa;
+    const char *xa;                       /* XA:Z, or XB:Z when xa_is_xb */
+    uint8_t     xa_is_xb;                 /* xa is the XB:Z list (MEM_F_XB, -u): name the tag XB */
     uint8_t     has_hn;  int32_t hn;
     const char *xr;                       /* --meth only */
     const char *xg;                       /* --meth only */

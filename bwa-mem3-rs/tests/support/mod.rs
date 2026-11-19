@@ -360,6 +360,29 @@ pub struct FieldRecord {
     pub meth: Option<(bool, bool)>,
 }
 
+/// The aux-tag keys of a packed BAM record body (without the leading
+/// `block_size`), in order. Panics on a tag that runs past the end of the
+/// body, rather than reporting a truncated tag as present.
+pub fn aux_keys(body: &[u8]) -> Vec<[u8; 2]> {
+    bwa_mem3_test_util::aux_tags(body)
+        .iter()
+        .map(|t| t.key)
+        .collect()
+}
+
+/// The type byte of `key`'s aux tag in a packed BAM record body, if present.
+pub fn aux_type(body: &[u8], key: &[u8; 2]) -> Option<u8> {
+    bwa_mem3_test_util::aux_tags(body)
+        .iter()
+        .find(|t| &t.key == key)
+        .map(|t| t.ty)
+}
+
+/// Whether a packed BAM record body is mapped with a CIGAR (`n_cigar > 0`).
+pub fn has_cigar(body: &[u8]) -> bool {
+    u16::from_le_bytes([body[12], body[13]]) > 0
+}
+
 /// BAM integer aux value as type `i` (int32), the rule the packed path uses:
 /// the bwa-mem3 CLI's BAM writer appends every integer tag as `i`.
 pub fn put_int_tag(out: &mut Vec<u8>, tag: &[u8; 2], v: i32) {
@@ -495,8 +518,8 @@ pub fn serialize_fields(f: &AlignedFields<'_>, read: &FixtureRead, meth: bool) -
         out.extend_from_slice(b"paf");
         out.extend_from_slice(&v.to_le_bytes());
     }
-    if let Some(v) = f.xa {
-        put_str_tag(&mut out, b"XA", v);
+    if let Some(h) = f.alt_hits {
+        put_str_tag(&mut out, h.tag(), h.list());
     }
     if let Some(v) = f.hn {
         put_int_tag(&mut out, b"HN", v);
@@ -555,7 +578,7 @@ impl AlignedFieldsSink for FieldCollector<'_> {
             read_len: read.seq.len(),
             has_sa: f.sa.is_some(),
             has_mc: f.mc.is_some(),
-            has_xa: f.xa.is_some(),
+            has_xa: f.alt_hits.is_some(),
             has_pa: f.pa.is_some(),
             rg: f.rg.map(<[u8]>::to_vec),
             meth: f.meth.map(|m| (m.xg.is_some(), m.xm.is_some())),
@@ -862,4 +885,13 @@ pub fn index_for(meth: bool) -> Option<(Arc<BwaIndex>, MemOpts)> {
 pub struct NullFieldSink;
 impl AlignedFieldsSink for NullFieldSink {
     fn emit(&mut self, _: RecordOrigin, _: Mate, _: bool, _: AlignedFields<'_>) {}
+}
+
+/// A structured sink that counts the records it receives and discards them.
+#[derive(Default)]
+pub struct CountingFieldSink(pub usize);
+impl AlignedFieldsSink for CountingFieldSink {
+    fn emit(&mut self, _: RecordOrigin, _: Mate, _: bool, _: AlignedFields<'_>) {
+        self.0 += 1;
+    }
 }

@@ -63,7 +63,9 @@ mem_opt_t *bwa_shim_opts_new(void);
 void              bwa_shim_opts_free(mem_opt_t *opts);
 
 /* D3 (--meth): (re)build the per-hypothesis bisulfite scoring matrices from the
- * base matrix per opts->meth_scoring. Call after changing meth_scoring. */
+ * base matrix per opts->meth_scoring. Call after changing meth_scoring. A no-op
+ * while opts->b is outside 0..=128 (the base matrix is then stale); the next
+ * bwa_shim_opts_fill_scmat with a storable b rebuilds both. */
 void              bwa_shim_opts_fill_meth_mat(mem_opt_t *opts);
 
 /* Rebuild the 5x5 scoring matrix from opts->a / opts->b, then refresh the
@@ -74,7 +76,12 @@ void              bwa_shim_opts_fill_meth_mat(mem_opt_t *opts);
  * read only opts->mat, which still encodes the previous values. Upstream
  * always pairs the two (bwa_fill_scmat then mem_opt_fill_meth_mat --
  * fastmap.cpp:2726 and :2730, in main_mem), and mem_opt_fill_meth_mat's own
- * contract comment requires it after EVERY rebuild of opts->mat. */
+ * contract comment requires it after EVERY rebuild of opts->mat.
+ *
+ * A `b` outside 0..=128 leaves opts->mat and the bisulfite matrices as they
+ * were (bwa_fill_scmat negates it as an int and stores int8_t cells); the next
+ * call with a storable `b` rebuilds all of them. Until then every alignment
+ * entry point refuses the options (-1 or NULL, with bwa_shim_last_error set). */
 void              bwa_shim_opts_fill_scmat(mem_opt_t *opts);
 
 /* Set common single-integer fields; one function per semantically-distinct knob.
@@ -91,16 +98,23 @@ int bwa_shim_opts_set_int(mem_opt_t *opts, const char *key, int value);
  * compat table; do not free it. */
 const char *bwa_shim_compat_hd_line(const mem_opt_t *opts);
 
-/* `bwa_shim_opts_apply_meth_defaults_masked(opts, 0)` (below): every default
+/* `bwa_shim_opts_apply_meth_defaults_masked(opts, 0)` (below), kept as a
+ * raw-FFI convenience for C callers with no explicit-flag mask: every default
  * listed there applies, including TAPS => NEUTRAL over any `meth_scoring`
- * already set and SPEC30 over any `meth_seed_prune` already set. */
-void bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts);
+ * already set and SPEC30 over any `meth_seed_prune` already set. (The safe
+ * `MemOpts::apply_meth_defaults` passes the mask of the knobs it saw set.) */
+int bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts);
 
 /* Apply what `bwa-mem3 mem --meth` sets for bisulfite alignment, so `--meth`
- * output matches the CLI's, then refill the scoring matrices (the bundle can
- * change `b` and the TAPS default changes `meth_scoring`, so they would
- * otherwise be stale). That is upstream's bwameth-compatibility bundle plus the
- * knobs main_mem sets around it (fastmap.cpp, the `opt->meth_mode` block):
+ * output matches the CLI's, then refill the scoring matrices through
+ * bwa_shim_opts_fill_scmat (the bundle can change `b` and the TAPS default
+ * changes `meth_scoring`, so they would otherwise be stale; a resulting `b`
+ * outside 0..=128 leaves all of them as they were).
+ *
+ * Requires `meth_mode` already set: as in `main_mem`, every default below is
+ * skipped when it is 0, and only the refill runs. The defaults are upstream's
+ * bwameth-compatibility bundle plus the knobs main_mem sets around it
+ * (fastmap.cpp, the `opt->meth_mode` block):
  *   - TAPS chemistry (`meth_chem`) defaults `meth_scoring` to NEUTRAL, unless
  *     BWA_SHIM_METH_SET_SCORING. Applied first, because the bundle's `-B`
  *     branch keys off the resolved scoring mode.
@@ -128,8 +142,24 @@ void bwa_shim_opts_apply_meth_defaults(mem_opt_t *opts);
  *     clobbered.
  *   - `b` (`-B`) is overwritten ONLY under COLLAPSED scoring. GENOMIC and
  *     NEUTRAL keep bwa's default (bwamem.cpp:511-515), so a caller-set `-B`
- *     survives the bundle under those two modes. */
-void bwa_shim_opts_apply_meth_defaults_masked(mem_opt_t *opts, unsigned explicit_mask);
+ *     survives the bundle under those two modes.
+ *
+ * Returns 0, or -1 (message in bwa_shim_last_error, `opts` untouched) for
+ * NULL `opts` or an invalid `meth_context` (bwa_shim_opts_meth_context_error,
+ * judged on the scoring as resolved after the TAPS default): the cross-option
+ * checks upstream's meth_opts_finalize makes with exit(1), made first so
+ * finalize never exits. Under `meth_mode` it also returns -1 for a match score
+ * `a` outside 1..=127 (the range `bwa-mem3 mem` parses `-A` into), since the
+ * bundle multiplies `a` by up to 100 and a larger one would overflow `int`. */
+int bwa_shim_opts_apply_meth_defaults_masked(mem_opt_t *opts, unsigned explicit_mask);
+
+/* The `--meth-context` checks upstream's meth_opts_finalize makes with exit(1),
+ * judged on `opts` as they stand: cpg requires `meth_mode`, refuses em-seq
+ * chemistry, and refuses COLLAPSED scoring; any other value than all/cpg is
+ * refused too. NULL when valid, else the message: static storage, or a
+ * thread-local buffer valid until the next call on this thread; do not free
+ * it. */
+const char *bwa_shim_opts_meth_context_error(const mem_opt_t *opts);
 
 /* PE-stats lifecycle. `pestat_zero` returns a zeroed 4-orientation array. */
 mem_pestat_t *bwa_shim_pestat_zero(void);
@@ -153,7 +183,23 @@ void      bwa_shim_idx_free(BwaIndex *idx);
 size_t    bwa_shim_idx_n_contigs(const BwaIndex *idx);
 const char *bwa_shim_idx_contig_name(const BwaIndex *idx, size_t i);
 int64_t   bwa_shim_idx_contig_len(const BwaIndex *idx, size_t i);
+/* The SAM header text `bwa-mem3 mem` writes for `idx` under `opts`, built by
+ * upstream's bwa_build_sam_hdr: the compat target's @HD, then one @SQ per
+ * contig (SN, LN, and AH:* on an ALT contig; the original reference's contigs
+ * for a --meth dual index). No @PG, no @RG or other user header line (the
+ * CLI's -R / -H), and no index sidecar (.hdr/.dict) merge: that is
+ * `read_sidecar`, deliberately not implemented. Every line ends in
+ * '\n'. Returns a NUL-terminated string to release with
+ * bwa_shim_header_text_free, or NULL (see bwa_shim_last_error). */
+char     *bwa_shim_header_text(const BwaIndex *idx, const mem_opt_t *opts);
+void      bwa_shim_header_text_free(char *text);
 
+/* Every alignment call below that takes `opts` (seed, extend, align, pestat,
+ * pair/emit and the resident-cohort equivalents) refuses options whose `b` is
+ * outside 0..=128 before doing anything else, returning NULL or -1 with the
+ * reason in bwa_shim_last_error: bwa_shim_opts_fill_scmat cannot store such a
+ * `b`, so the matrices would disagree with the `b` the MAPQ model reads. A
+ * handle the call consumes is freed on that path too. */
 BwaSeeds *bwa_shim_seed_batch(
     const BwaIndex *idx, const mem_opt_t *opts,
     const BwaReadPair *pairs, size_t n_pairs);
@@ -232,8 +278,8 @@ typedef void (*BwaRecordSinkFn)(void *ctx, uint32_t origin_kind, size_t origin_i
  * (mem_pestat once, over the concatenated per-read alnreg headers, in the
  * order given). Singles are ignored. `out` = mem_pestat_t[4]. Returns 0 on
  * success, -1 on a null argument (idx/opts/out, or a null regs array or a null
- * regs[k] when n_regs > 0) or an internal allocation failure; callers rely on
- * that -1. */
+ * regs[k] when n_regs > 0), an unstorable `b` or an internal allocation failure;
+ * callers rely on that -1. */
 int bwa_shim_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
                            const BwaRegs *const *regs, size_t n_regs, mem_pestat_t *out);
 
@@ -264,8 +310,9 @@ int bwa_shim_pair_emit(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *s
  * Lifecycle errors return -3: writing a slot twice or after seed_extend,
  * seed-extending an unwritten or already-extended segment, emitting an
  * unextended or already-emitted segment, and pestat while a pair segment is
- * unextended or already emitted. Offsets are in READS: a pair occupies two
- * consecutive reads. */
+ * unextended or holds pairs and was already emitted (an emitted empty segment
+ * blocks neither pestat nor resolve_memo). Offsets are in READS: a pair
+ * occupies two consecutive reads. */
 
 BwaResidentCohort *bwa_shim_resident_cohort_new(int meth_mode);
 void               bwa_shim_resident_cohort_free(BwaResidentCohort *c);
@@ -317,7 +364,7 @@ int bwa_shim_resident_seed_extend(const BwaIndex *idx, const mem_opt_t *opts,
  * pair is not seeded -- bwa_shim_resident_resolve_memo copies its regions later
  * and must run before the cohort's pestat or any emit. All -1 is exactly
  * bwa_shim_resident_seed_extend. Marks are refused on a --meth cohort. Returns
- * 0, -1 on a bad argument, or -3. */
+ * 0, -1 on a bad argument (an unstorable `b` included), or -3. */
 int bwa_shim_resident_seed_extend_reps(const BwaIndex *idx, const mem_opt_t *opts,
                                        BwaScratch *sc, BwaResidentSegment *sg,
                                        const int64_t *reps, size_t n_pairs);
@@ -326,15 +373,16 @@ int bwa_shim_resident_seed_extend_reps(const BwaIndex *idx, const mem_opt_t *opt
  * give every marked duplicate pair its representative's alignment regions when
  * their 2-bit bases match, else seed-extend it on its own (using `sc`); a mark
  * naming a marked pair resolves through it to the first copy. Every pair
- * segment must be extended and none emitted (-3 otherwise, with the reason in
- * the last error); must not run concurrently with any other call on the cohort.
- * Run it before bwa_shim_resident_pestat_cohort. A repeat call returns the same
- * stats. Aborts on allocation failure. Returns 0, -1 on a null arg, or -3. */
+ * segment must be extended and none holding pairs emitted (-3 otherwise, with
+ * the reason in the last error); must not run concurrently with any other call
+ * on the cohort. Run it before bwa_shim_resident_pestat_cohort. A repeat call
+ * returns the same stats. Aborts on allocation failure. Returns 0, -1 on a
+ * null arg or an unstorable `b`, or -3. */
 int bwa_shim_resident_resolve_memo(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *sc,
                                    BwaResidentCohort *c, BwaMemoStats *out);
 
 /* mem_pestat over the whole cohort's pair region. `out` = mem_pestat_t[4].
- * Returns 0, -1 on a null arg / allocation failure, or -3. */
+ * Returns 0, -1 on a null arg / unstorable `b` / allocation failure, or -3. */
 int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
                                     const BwaResidentCohort *c, mem_pestat_t *out);
 
@@ -344,7 +392,8 @@ int bwa_shim_resident_pestat_cohort(const BwaIndex *idx, const mem_opt_t *opts,
  * `ids.first_pair_id`/`first_single_id` is the GLOBAL read ordinal of the
  * segment's first pair/single; `origin_base` is added to the local index for
  * the sink's origin_idx. Records stream to `sink` in input order. Returns 0, -1
- * on a bad argument, -2 when a pair segment has no pestat, or -3. */
+ * on a bad argument (an unstorable `b` included), -2 when a pair segment has no
+ * pestat, or -3. */
 int bwa_shim_resident_pair_emit(const BwaIndex *idx, const mem_opt_t *opts, BwaScratch *sc,
                                 BwaResidentSegment *sg, const mem_pestat_t *pestat,
                                 BwaIdBases ids, size_t origin_base, BwaRecordSinkFn sink,

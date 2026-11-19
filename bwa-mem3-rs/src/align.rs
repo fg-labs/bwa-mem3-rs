@@ -2,7 +2,7 @@
 
 use crate::error::{shim_err, Error, Result};
 use crate::index::BwaIndex;
-use crate::opts::{MemOpts, MemPeStat};
+use crate::opts::{MemOpts, MemPeStat, PhaseOpts};
 
 /// A single read pair. Borrows its sequence and quality bytes; zero copies
 /// across the FFI boundary.
@@ -72,13 +72,31 @@ fn validate_all(pairs: &[ReadPair<'_>]) -> Result<()> {
     Ok(())
 }
 
-/// Reject a bisulfite mode/index mismatch before aligning. `MemOpts::set_meth`
-/// only sets a flag; it must be paired with a meth dual index
-/// ([`BwaIndex::load_meth`]). Aligning meth-mode reads against a plain index
-/// (or vice versa) would silently produce wrong output — projected reads
-/// against an unconverted index, or spurious `XR`/`XG`/`XM` tags — so we fail
-/// fast instead.
-pub(crate) fn check_meth_consistency(idx: &BwaIndex, opts: &MemOpts) -> Result<()> {
+/// Reject a split-phase handle used with a different index than the one it was
+/// seeded against: its regions hold coordinates into that index's reference,
+/// and reading them against another aborts or reads it out of bounds.
+fn check_same_index(seeded_against: u64, idx: &BwaIndex, what: &str) -> Result<()> {
+    if seeded_against == idx.id() {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "{what}: these regions were seeded against a different BwaIndex"
+        )))
+    }
+}
+
+/// Everything an alignment entry point checks about `opts` and `idx` before
+/// aligning: the option checks `bwa-mem3 mem` makes
+/// ([`MemOpts::validate_for_alignment`]), judged on the options as they stand,
+/// then a bisulfite mode/index mismatch. `MemOpts::set_meth` only sets a flag;
+/// it must be paired with a meth dual index ([`BwaIndex::load_meth`]). Aligning
+/// meth-mode reads against a plain index (or vice versa) would silently produce
+/// wrong output (projected reads against an unconverted index, or spurious
+/// `XR`/`XG`/`XM` tags), so we fail fast instead.
+pub(crate) fn check_alignment_preconditions(idx: &BwaIndex, opts: &MemOpts) -> Result<()> {
+    // The options as they stand now, whatever order the setters ran in: the
+    // apply-time check alone can be skipped or undone by a later setter.
+    opts.validate_for_alignment()?;
     match (opts.meth(), idx.is_meth()) {
         (true, false) => Err(Error::InvalidInput(
             "opts have --meth enabled but the index is not a meth dual index \
@@ -119,6 +137,10 @@ fn to_c_pairs(pairs: &[ReadPair<'_>]) -> Vec<bwa_mem3_sys::BwaReadPair> {
 /// Send across threads; a single thread consumes it via [`extend_batch`].
 pub struct Seeds {
     handle: *mut bwa_mem3_sys::BwaSeeds,
+    /// The options these seeds were made with; `extend_batch` must match.
+    opts: PhaseOpts,
+    /// The [`BwaIndex::id`] these seeds were made against.
+    index_id: u64,
 }
 
 impl Drop for Seeds {
@@ -191,10 +213,12 @@ impl Drop for AlignmentBatch {
 
 unsafe impl Send for AlignmentBatch {}
 
-/// Phase 1: seed the batch.
+/// Phase 1: seed the batch. [`extend_batch`] must be given the same options
+/// (only the MD mode and the paired-end flag may change); other options return
+/// [`Error::InvalidOpts`].
 pub fn seed_batch(idx: &BwaIndex, opts: &MemOpts, pairs: &[ReadPair<'_>]) -> Result<Seeds> {
     validate_all(pairs)?;
-    check_meth_consistency(idx, opts)?;
+    check_alignment_preconditions(idx, opts)?;
     let c_pairs = to_c_pairs(pairs);
     let handle = unsafe {
         bwa_mem3_sys::bwa_shim_seed_batch(idx.raw(), opts.as_ptr(), c_pairs.as_ptr(), c_pairs.len())
@@ -202,10 +226,16 @@ pub fn seed_batch(idx: &BwaIndex, opts: &MemOpts, pairs: &[ReadPair<'_>]) -> Res
     if handle.is_null() {
         return Err(shim_err("seed_batch"));
     }
-    Ok(Seeds { handle })
+    Ok(Seeds {
+        handle,
+        opts: opts.phase_snapshot(),
+        index_id: idx.id(),
+    })
 }
 
-/// Phase 2: extend seeds to full alignments. Consumes `seeds`.
+/// Phase 2: extend seeds to full alignments. Consumes `seeds`, even when it
+/// returns an error: after an [`Error::InvalidOpts`] for options that differ
+/// from `seed_batch`'s, seed the batch again before retrying.
 pub fn extend_batch(
     idx: &BwaIndex,
     opts: &MemOpts,
@@ -214,13 +244,20 @@ pub fn extend_batch(
     pestat_in: Option<&MemPeStat>,
 ) -> Result<(AlignmentBatch, MemPeStat)> {
     validate_all(pairs)?;
+    // `Seeds` does not borrow `opts`, so they may have changed since
+    // `seed_batch`; check them before the seeds are handed to the shim.
+    check_alignment_preconditions(idx, opts)?;
+    opts.check_phase(&seeds.opts, "extend_batch")?;
+    check_same_index(seeds.index_id, idx, "extend_batch")?;
     let c_pairs = to_c_pairs(pairs);
     let mut pestat_out = MemPeStat::zero()?;
 
-    // Transfer seeds ownership to the shim; forget the wrapper so its Drop
-    // doesn't double-free.
-    let s_handle = seeds.handle;
-    std::mem::forget(seeds);
+    // Transfer seeds ownership to the shim; null the wrapper's handle so its
+    // Drop (which skips a null handle) doesn't double-free, while the rest of
+    // the wrapper is still dropped.
+    let mut seeds = seeds;
+    let s_handle = std::mem::replace(&mut seeds.handle, std::ptr::null_mut());
+    drop(seeds);
 
     let batch = unsafe {
         bwa_mem3_sys::bwa_shim_extend_batch(
@@ -247,7 +284,7 @@ pub fn align_batch(
     pestat_in: Option<&MemPeStat>,
 ) -> Result<(AlignmentBatch, MemPeStat)> {
     validate_all(pairs)?;
-    check_meth_consistency(idx, opts)?;
+    check_alignment_preconditions(idx, opts)?;
     let c_pairs = to_c_pairs(pairs);
     let mut pestat_out = MemPeStat::zero()?;
 
@@ -274,7 +311,7 @@ pub fn estimate_pestat(
     pairs: &[ReadPair<'_>],
 ) -> Result<MemPeStat> {
     validate_all(pairs)?;
-    check_meth_consistency(idx, opts)?;
+    check_alignment_preconditions(idx, opts)?;
     let c_pairs = to_c_pairs(pairs);
     let mut pestat_out = MemPeStat::zero()?;
     let rc = unsafe {
@@ -298,6 +335,12 @@ impl MemPeStat {
     /// `bwa-mem3 mem` computes it per chunk (`bwamem.cpp:3030-3050`). Feed the
     /// result to every [`pair_emit`] of the same cohort.
     pub fn infer_cohort(idx: &BwaIndex, opts: &MemOpts, regs: &[AlnRegs]) -> Result<Self> {
+        check_alignment_preconditions(idx, opts)?;
+        let now = opts.phase_snapshot();
+        for r in regs {
+            now.check_against(&r.opts, "infer_cohort")?;
+            check_same_index(r.index_id, idx, "infer_cohort")?;
+        }
         let mut out = Self::zero()?;
         let raw: Vec<*const bwa_mem3_sys::BwaRegs> = regs.iter().map(|r| r.raw()).collect();
         // SAFETY: `idx.raw()`/`opts.as_ptr()` are valid for the call; `raw`
@@ -460,6 +503,11 @@ pub struct AlnRegs {
     handle: *mut bwa_mem3_sys::BwaRegs,
     n_pairs: usize,
     n_singles: usize,
+    /// The options these regions were seeded with; every later phase must
+    /// match.
+    opts: PhaseOpts,
+    /// The [`BwaIndex::id`] these regions were seeded against.
+    index_id: u64,
 }
 
 impl AlnRegs {
@@ -507,6 +555,10 @@ unsafe impl Send for AlnRegs {}
 /// Phase 1: seed + single-end-extend every read of `batch` (bwa-mem3's fused
 /// `worker_bwt_aln`). Per-read independent, so a cohort may be split into any
 /// number of batches on any number of threads without changing output.
+///
+/// [`MemPeStat::infer_cohort`] and [`pair_emit`] must be given the same
+/// options as the `seed_extend` that made each [`AlnRegs`] (only the MD mode
+/// and the paired-end flag may change); other options return [`Error::InvalidOpts`].
 pub fn seed_extend(
     idx: &BwaIndex,
     opts: &MemOpts,
@@ -514,7 +566,7 @@ pub fn seed_extend(
     batch: &ReadBatch<'_>,
 ) -> Result<AlnRegs> {
     batch.validate()?;
-    check_meth_consistency(idx, opts)?;
+    check_alignment_preconditions(idx, opts)?;
     let c_pairs = to_c_pairs(batch.pairs);
     let c_singles = to_c_singles(batch.singles);
     let c_batch = bwa_mem3_sys::BwaReadBatch {
@@ -536,6 +588,8 @@ pub fn seed_extend(
         handle,
         n_pairs: batch.pairs.len(),
         n_singles: batch.singles.len(),
+        opts: opts.phase_snapshot(),
+        index_id: idx.id(),
     })
 }
 
@@ -659,7 +713,9 @@ pub(crate) unsafe extern "C" fn sink_trampoline(
 /// Phase 3: pairing + mate rescue + primary marking + emission (bwa-mem3's
 /// `worker_sam`) for one batch. `pestat` is the cohort model from
 /// [`MemPeStat::infer_cohort`]; it may be `None` only for a batch without
-/// pairs. Consumes `regs`.
+/// pairs. Consumes `regs`, even when it returns an error: after an
+/// [`Error::InvalidOpts`] for options that differ from `seed_extend`'s, seed
+/// the batch again before retrying.
 pub fn pair_emit(
     idx: &BwaIndex,
     opts: &MemOpts,
@@ -674,11 +730,18 @@ pub fn pair_emit(
             "pair_emit: a batch with pairs requires the cohort pestat".into(),
         ));
     }
-    let handle = regs.handle;
+    // `AlnRegs` does not borrow `opts`, so they may have changed since
+    // `seed_extend`; check them before the regions are handed to the shim.
+    check_alignment_preconditions(idx, opts)?;
+    opts.check_phase(&regs.opts, "pair_emit")?;
+    check_same_index(regs.index_id, idx, "pair_emit")?;
     // Ownership of the C allocation moves to the shim, which frees it on
-    // every return path (see `bwa_shim_pair_emit`'s contract); forget the
-    // Rust wrapper so its `Drop` doesn't double-free.
-    std::mem::forget(regs);
+    // every return path (see `bwa_shim_pair_emit`'s contract); null the Rust
+    // wrapper's handle so its `Drop` (which skips a null handle) doesn't
+    // double-free, while the rest of the wrapper is still dropped.
+    let mut regs = regs;
+    let handle = std::mem::replace(&mut regs.handle, std::ptr::null_mut());
+    drop(regs);
 
     let mut sink_ctx = SinkCtx { sink, panic: None };
     let ctx_ptr = std::ptr::addr_of_mut!(sink_ctx).cast::<std::ffi::c_void>();

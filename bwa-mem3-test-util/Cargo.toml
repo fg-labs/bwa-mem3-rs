@@ -1,0 +1,13 @@
+[package]
+name = "bwa-mem3-test-util"
+description = "Test-only helpers shared by the bwa-mem3-rs workspace's test suites (not published)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true

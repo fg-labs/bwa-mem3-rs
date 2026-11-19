@@ -226,6 +226,8 @@ impl BwaIndex {
         unsafe { bwa_mem3_sys::bwa_shim_idx_n_contigs(self.handle) }
     }
 
+    /// Contig `i`'s name, or `""` when there is no such contig or its name is
+    /// not UTF-8.
     #[must_use]
     pub fn contig_name(&self, i: usize) -> &str {
         unsafe {
@@ -238,6 +240,30 @@ impl BwaIndex {
         }
     }
 
+    /// Contig `i`'s name, or an error where [`contig_name`](Self::contig_name)
+    /// would return `""`: no such contig, an empty name, or one that is not
+    /// UTF-8.
+    fn checked_contig_name(&self, i: usize) -> Result<&str> {
+        // SAFETY: the handle is live; the shim returns NULL or a pointer to a
+        // NUL-terminated name owned by the index, which outlives `&self`.
+        let name = unsafe {
+            let c = bwa_mem3_sys::bwa_shim_idx_contig_name(self.handle, i);
+            (!c.is_null()).then(|| CStr::from_ptr(c))
+        };
+        match name.map(CStr::to_str) {
+            Some(Ok(n)) if !n.is_empty() => Ok(n),
+            Some(Ok(_)) => Err(Error::Shim(format!(
+                "bam_header: contig {i} has an empty name"
+            ))),
+            Some(Err(e)) => Err(Error::Shim(format!(
+                "bam_header: contig {i}'s name is not UTF-8: {e}"
+            ))),
+            None => Err(Error::Shim(format!(
+                "bam_header: no contig {i} in the index"
+            ))),
+        }
+    }
+
     #[must_use]
     pub fn contig_len(&self, i: usize) -> i64 {
         unsafe { bwa_mem3_sys::bwa_shim_idx_contig_len(self.handle, i) }
@@ -245,6 +271,94 @@ impl BwaIndex {
 
     pub fn contigs(&self) -> impl Iterator<Item = (&str, i64)> + '_ {
         (0..self.n_contigs()).map(move |i| (self.contig_name(i), self.contig_len(i)))
+    }
+
+    /// The SAM header text `bwa-mem3 mem` writes for this index under `opts`,
+    /// built by bwa-mem3's own `bwa_build_sam_hdr`: the compat target's `@HD`
+    /// (see [`MemOpts::compat_hd_line`](crate::MemOpts::compat_hd_line)), then
+    /// one `@SQ` per contig, carrying `AH:*` on an ALT contig. For a `--meth`
+    /// dual index the contigs are the original reference's. Every line ends
+    /// in `\n`.
+    ///
+    /// This is the generated header, with none of the CLI's overrides. Callers
+    /// may append `@PG`, which names the program, and `@RG` (and other `-H`
+    /// lines without `@HD`/`@SQ`), which the CLI writes from `-R`/`-H` and
+    /// which records carry as `RG:Z` under
+    /// [`MemOpts::set_read_group_id`](crate::MemOpts::set_read_group_id).
+    /// `@HD` and `@SQ` records from elsewhere must **replace or merge** these,
+    /// never be appended: `bwa-mem3 mem` takes a `-H` `@HD`/`@SQ` (or else the
+    /// index sidecar's, `<prefix>.hdr` / `.dict`) in place of the generated
+    /// ones, and under `--meth` merges the sidecar's identity tags
+    /// (`M5`/`UR`/`AS`/`SP`) into the generated `@SQ` instead. With a sidecar
+    /// present, then, these lines can differ from the CLI's.
+    ///
+    /// Packed records name contigs by their position in this `@SQ` block (the
+    /// index's contig order), and [`bam_header`](Self::bam_header) writes the
+    /// binary reference list in that same order. So a caller writing through
+    /// `bam_header` may merge tags into these `@SQ` lines but must keep them
+    /// in index order, leaving every record's `tid` and `mtid` as emitted. A
+    /// caller that reorders the contigs must instead write its own binary
+    /// reference list in the new order and remap every `tid` and `mtid` to
+    /// match, as upstream's BAM writer does (`bam_writer.cpp`'s `tid_map`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Shim`] if the header could not be built (allocation
+    /// failure) or is not UTF-8 (it is built from the index's contig names,
+    /// not from anything the caller passed).
+    pub fn sam_header(&self, opts: &crate::MemOpts) -> Result<String> {
+        // SAFETY: both handles are live for the call; the shim returns NULL or
+        // an owned NUL-terminated buffer, copied out here and then released
+        // exactly once with its matching free.
+        unsafe {
+            let p = bwa_mem3_sys::bwa_shim_header_text(self.handle, opts.handle);
+            if p.is_null() {
+                return Err(shim_err("sam_header"));
+            }
+            let text = CStr::from_ptr(p).to_str().map(str::to_owned);
+            bwa_mem3_sys::bwa_shim_header_text_free(p);
+            text.map_err(|e| Error::Shim(format!("sam_header: SAM header is not UTF-8: {e}")))
+        }
+    }
+
+    /// The binary BAM header for this index around SAM header `text` (usually
+    /// [`sam_header`](Self::sam_header) plus the caller's `@PG`/`@RG` lines):
+    /// the `BAM\1` magic, `l_text` and `text`, then the reference list,
+    /// `n_ref` and each contig's `l_name`/name/NUL/`l_ref` in the index's
+    /// order, which is the order packed records' `tid`/`mtid` index. Write it
+    /// once, uncompressed bytes, at the start of the BGZF stream, before the
+    /// first record.
+    ///
+    /// The reference list is always the index's, in index order, whatever
+    /// `text` says, so any `@SQ` lines in `text` must list the same contigs in
+    /// the same order (see [`sam_header`](Self::sam_header)); this is not
+    /// checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] if `text`, the contig count or a contig
+    /// length is not below 2^31, as the BAM format requires of `l_text`,
+    /// `n_ref` and `l_ref`, or a contig name does not fit `l_name`'s 32 bits,
+    /// and [`Error::Shim`] if a contig name in the index is missing, empty or
+    /// not UTF-8 (which [`contig_name`](Self::contig_name) reports as `""`).
+    pub fn bam_header(&self, text: &str) -> Result<Vec<u8>> {
+        let l_text = bam_header_field(text.len(), "the header text length", true)?;
+        let n_ref = bam_header_field(self.n_contigs(), "the contig count", true)?;
+        let mut out = Vec::with_capacity(12 + text.len() + 16 * self.n_contigs());
+        out.extend_from_slice(b"BAM\x01");
+        out.extend_from_slice(&l_text.to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(&n_ref.to_le_bytes());
+        for i in 0..self.n_contigs() {
+            let (name, len) = (self.checked_contig_name(i)?, self.contig_len(i));
+            let l_name = bam_header_field(name.len() + 1, "a contig name length", false)?;
+            out.extend_from_slice(&l_name.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            out.extend_from_slice(&bam_header_field(len, "a contig length", true)?.to_le_bytes());
+        }
+        Ok(out)
     }
 
     /// This index's process-unique identity (see the field doc).
@@ -270,3 +384,47 @@ impl Drop for BwaIndex {
 // `&BwaIndex` or an `Arc<BwaIndex>` for concurrent alignment.
 unsafe impl Send for BwaIndex {}
 unsafe impl Sync for BwaIndex {}
+
+/// One binary-BAM-header length field as its little-endian `u32` value.
+/// `below_2_31` holds it to the format's `[0, 2^31)` range (`l_text`, `n_ref`,
+/// `l_ref`); otherwise it need only fit 32 bits (`l_name`).
+fn bam_header_field(n: usize, what: &str, below_2_31: bool) -> Result<u32> {
+    let max = if below_2_31 {
+        i32::MAX as u32
+    } else {
+        u32::MAX
+    };
+    u32::try_from(n).ok().filter(|&v| v <= max).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "bam_header: {what} ({n}) exceeds the BAM limit of {max}"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bam_header_field;
+
+    #[test]
+    fn bam_header_fields_hold_the_format_limits() {
+        let max = i32::MAX as usize;
+        assert_eq!(
+            bam_header_field(max, "l_text", true).unwrap(),
+            i32::MAX as u32
+        );
+        let err = bam_header_field(max + 1, "l_text", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("bam_header: l_text (2147483648) exceeds the BAM limit of 2147483647"),
+            "{err}"
+        );
+        // l_name need only fit 32 bits.
+        assert_eq!(
+            bam_header_field(max + 1, "l_name", false).unwrap(),
+            1u32 << 31
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert!(bam_header_field(u32::MAX as usize + 1, "l_name", false).is_err());
+    }
+}

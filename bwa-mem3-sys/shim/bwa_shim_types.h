@@ -80,6 +80,9 @@ typedef struct mem_opt_t {
     int8_t mat[25];
     int8_t mat_ot[25];
     int8_t mat_ob[25];
+    /* v0.16.0: 7x7 OT/OB matrices over the --meth-context cpg alphabet. */
+    int8_t mat7_ot[49];
+    int8_t mat7_ob[49];
     int    bam_mode;
     int    bam_level;
     int    bam_threads;
@@ -91,8 +94,12 @@ typedef struct mem_opt_t {
     int    meth_tags;
     char   meth_set_as_failed;
     int    meth_chimera_qc;
+    /* v0.16.0: --meth-context, a meth_ctx_t (METH_CTX_ALL = 0, METH_CTX_CPG = 1). */
+    int    meth_context;
     /* v0.9.0 */
     int    proper_pair_from_emitted;
+    /* v0.17.0: --md, a mem_md_mode (MEM_MD_NONE = 0, MEM_MD_FULL = 1, MEM_MD_SHORT = 2). */
+    int    md_mode;
     int    supp_rep_hard_cap;
     int    smem_dedup;
     /* v0.9.0 */

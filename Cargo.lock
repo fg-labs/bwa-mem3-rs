@@ -131,6 +131,7 @@ name = "bwa-mem3-rs"
 version = "0.4.4"
 dependencies = [
  "bwa-mem3-sys",
+ "bwa-mem3-test-util",
  "libc",
  "rayon",
  "rstest",
@@ -144,6 +145,7 @@ version = "0.4.4"
 dependencies = [
  "anyhow",
  "bwa-mem3-rs",
+ "bwa-mem3-test-util",
  "clap",
  "flate2",
  "mimalloc",
@@ -160,10 +162,15 @@ name = "bwa-mem3-sys"
 version = "0.4.4"
 dependencies = [
  "bindgen",
+ "bwa-mem3-test-util",
  "cc",
  "libc",
  "tempfile",
 ]
+
+[[package]]
+name = "bwa-mem3-test-util"
+version = "0.4.4"
 
 [[package]]
 name = "bytes"
