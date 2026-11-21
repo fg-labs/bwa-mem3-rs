@@ -13,29 +13,71 @@ use crate::error::{shim_err, Error, Result};
 /// never reads `.0123`, so that suffix is deliberately absent here.
 const REQUIRED_INDEX_SUFFIXES: &[&str] = &[".bwt.2bit.64", ".amb", ".ann", ".pac"];
 
-/// Return [`Error::IndexLoad`] naming every [`REQUIRED_INDEX_SUFFIXES`] file
-/// that is not a readable regular file for `prefix`. `Ok(())` means all are
-/// present and openable.
+/// The files a `--meth` dual index needs for its *original* reference. Seeding
+/// runs against the converted seed index; the original is loaded by the shim's
+/// `shim_meth_orig_ref_load` (`bwa_shim_align.cpp`), which reads only the
+/// `bns_restore` files and `.pac`, never the original's FM-index
+/// (`.bwt.2bit.64`). An index built with `bwa-mem3 index --meth --meth-only`,
+/// which packs the original without an FM-index, therefore loads.
+const ORIG_REF_SUFFIXES: &[&str] = &[".amb", ".ann", ".pac"];
+
+/// [`check_files`] for a plain index's [`REQUIRED_INDEX_SUFFIXES`]. When the
+/// FM-index is missing but `<prefix>.meth`'s exists, the prefix is most likely
+/// the original reference of a `--meth --meth-only` dual index, so the error
+/// points at [`BwaIndex::load_meth`].
+fn check_index_files(prefix: &Path) -> Result<()> {
+    check_files(prefix, REQUIRED_INDEX_SUFFIXES, "index").map_err(|err| {
+        let Error::IndexLoad { path, msg } = err else {
+            return err;
+        };
+        let suffixed = |suffix: &str| {
+            let mut file = prefix.as_os_str().to_owned();
+            file.push(suffix);
+            std::path::PathBuf::from(file)
+        };
+        let msg = if !is_readable_file(&suffixed(".bwt.2bit.64"))
+            && is_readable_file(&suffixed(".meth.bwt.2bit.64"))
+        {
+            format!(
+                "{msg} (this looks like the original reference of a `bwa-mem3 index --meth \
+                 --meth-only` index; load it with BwaIndex::load_meth(\"{}.meth\", \"{}\"))",
+                prefix.display(),
+                prefix.display()
+            )
+        } else {
+            msg
+        };
+        Error::IndexLoad { path, msg }
+    })
+}
+
+/// Whether `path` is a regular file that can be opened for reading. The
+/// `is_file` guard short-circuits before [`File::open`](std::fs::File::open),
+/// so a FIFO (whose `O_RDONLY` open would block) is rejected without ever
+/// being opened.
+fn is_readable_file(path: &Path) -> bool {
+    path.is_file() && std::fs::File::open(path).is_ok()
+}
+
+/// Return [`Error::IndexLoad`] naming every `<prefix><suffix>` file in
+/// `suffixes` that is not a readable regular file; `what` names the files in
+/// the message (e.g. "index"). `Ok(())` means all are present and openable.
 ///
 /// A bare existence check is not enough: a directory, FIFO, or unreadable
 /// path satisfies [`Path::exists`] yet still trips the vendored loader's
 /// `exit(1)` on the subsequent `fopen`/`fread`. We mirror what the loader
-/// actually needs — a regular file it can open for reading. The `is_file`
-/// guard short-circuits before [`File::open`], so a FIFO (whose `O_RDONLY`
-/// open would block) is rejected without ever being opened.
-fn check_index_files(prefix: &Path) -> Result<()> {
+/// actually needs, a regular file it can open for reading (see
+/// [`is_readable_file`]).
+fn check_files(prefix: &Path, suffixes: &[&str], what: &str) -> Result<()> {
     let base = prefix.as_os_str();
-    let unusable: Vec<String> = REQUIRED_INDEX_SUFFIXES
+    let unusable: Vec<String> = suffixes
         .iter()
         .map(|suffix| {
             let mut file = base.to_owned();
             file.push(suffix);
             file
         })
-        .filter(|file| {
-            let path = Path::new(file);
-            !path.is_file() || std::fs::File::open(path).is_err()
-        })
+        .filter(|file| !is_readable_file(Path::new(file)))
         .map(|file| Path::new(&file).display().to_string())
         .collect();
     if unusable.is_empty() {
@@ -44,7 +86,7 @@ fn check_index_files(prefix: &Path) -> Result<()> {
         Err(Error::IndexLoad {
             path: prefix.to_owned(),
             msg: format!(
-                "missing or unreadable index file(s): {}",
+                "missing or unreadable {what} file(s): {}",
                 unusable.join(", ")
             ),
         })
@@ -169,6 +211,10 @@ impl BwaIndex {
     /// [`set_meth`](crate::MemOpts::set_meth) is enabled; the emitted records
     /// carry Bismark `XG`/`XR`/`XM` tags and original-reference coordinates, so
     /// the contig accessors below report the original contigs.
+    ///
+    /// The original reference needs only its `.amb`, `.ann` and `.pac` files,
+    /// not its FM-index, so an index built with `bwa-mem3 index --meth
+    /// --meth-only` loads too.
     pub fn load_meth(seed_prefix: impl AsRef<Path>, orig_prefix: impl AsRef<Path>) -> Result<Self> {
         Self::load_meth_with_threads(seed_prefix, orig_prefix, 1)
     }
@@ -191,7 +237,7 @@ impl BwaIndex {
         if !crate::shm::is_staged(seed).unwrap_or(false) {
             check_index_files(seed)?;
         }
-        check_index_files(orig)?;
+        check_files(orig, ORIG_REF_SUFFIXES, "original-reference")?;
 
         let seed_c = prefix_to_cstring(seed, "seed prefix")?;
         let orig_c = prefix_to_cstring(orig, "orig prefix")?;
@@ -403,7 +449,60 @@ fn bam_header_field(n: usize, what: &str, below_2_31: bool) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::bam_header_field;
+    use super::{bam_header_field, check_files, check_index_files, ORIG_REF_SUFFIXES};
+    use crate::error::Error;
+
+    /// A `--meth` original reference needs each of `.amb`/`.ann`/`.pac`, and
+    /// not the FM-index `.bwt.2bit.64` that `bwa-mem3 index --meth-only` omits:
+    /// with exactly one of the three absent, the error names exactly that file.
+    #[rstest::rstest]
+    #[case::amb(".amb")]
+    #[case::ann(".ann")]
+    #[case::pac(".pac")]
+    fn orig_ref_check_requires_exactly_amb_ann_pac(#[case] absent: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ref.fa");
+        for suffix in ORIG_REF_SUFFIXES.iter().filter(|s| **s != absent) {
+            std::fs::write(dir.path().join(format!("ref.fa{suffix}")), b"x").unwrap();
+        }
+        let Err(Error::IndexLoad { msg, .. }) =
+            check_files(&prefix, ORIG_REF_SUFFIXES, "original-reference")
+        else {
+            panic!("expected an IndexLoad error");
+        };
+        assert_eq!(
+            msg,
+            format!(
+                "missing or unreadable original-reference file(s): {}{absent}",
+                prefix.display()
+            )
+        );
+
+        std::fs::write(dir.path().join(format!("ref.fa{absent}")), b"x").unwrap();
+        check_files(&prefix, ORIG_REF_SUFFIXES, "original-reference").unwrap();
+    }
+
+    /// A plain load of a `--meth-only` original prefix (no FM-index, but a
+    /// `.meth` seed index beside it) points at `load_meth`; any other missing
+    /// FM-index gets the plain message.
+    #[rstest::rstest]
+    #[case::meth_only_original(true)]
+    #[case::no_seed_index(false)]
+    fn plain_check_hints_load_meth_for_a_meth_only_original(#[case] seed_present: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ref.fa");
+        for suffix in ORIG_REF_SUFFIXES {
+            std::fs::write(dir.path().join(format!("ref.fa{suffix}")), b"x").unwrap();
+        }
+        if seed_present {
+            std::fs::write(dir.path().join("ref.fa.meth.bwt.2bit.64"), b"x").unwrap();
+        }
+        let Err(Error::IndexLoad { msg, .. }) = check_index_files(&prefix) else {
+            panic!("expected an IndexLoad error");
+        };
+        assert!(msg.contains("ref.fa.bwt.2bit.64"), "{msg}");
+        assert_eq!(msg.contains("BwaIndex::load_meth"), seed_present, "{msg}");
+    }
 
     #[test]
     fn bam_header_fields_hold_the_format_limits() {

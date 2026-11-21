@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use bwa_mem3_rs::{
     align_batch, build_info, extend_batch, pair_emit, seed_batch, seed_extend, version,
-    AlignScratch, AlignedFields, AlignedFieldsSink, AlnRegs, BwaIndex, IdBases, Mate, MemOpts,
-    MemPeStat, ReadBatch, ReadPair, RecordOrigin, RecordSink, RecordVec, ResidentCohort,
+    AlignScratch, AlignedFields, AlignedFieldsSink, AlnRegs, BwaIndex, Error, IdBases, Mate,
+    MemOpts, MemPeStat, ReadBatch, ReadPair, RecordOrigin, RecordSink, RecordVec, ResidentCohort,
     ResidentRange, SingleRead,
 };
 use rstest::rstest;
@@ -311,43 +311,95 @@ fn load_meth_with_threads_matches_load_meth() {
         eprintln!("skip: bwa-mem3 not available to build a PhiX meth index");
         return;
     };
-    let mut seed = meth.prefix.clone().into_os_string();
-    seed.push(".meth");
+    let seed = suffixed(&meth.prefix, ".meth");
     let threaded = BwaIndex::load_meth_with_threads(&seed, &meth.prefix, 4).unwrap();
     assert!(threaded.is_meth());
     assert_eq!(
         threaded.contigs().collect::<Vec<_>>(),
         meth.idx.contigs().collect::<Vec<_>>()
     );
+    assert_eq!(meth_records(&threaded), meth_records(&meth.idx));
+}
 
+/// The field fixture aligned as a `--meth` batch (bwa-mem3's `--meth`
+/// defaults) against `idx`, as `(pair_idx, record bytes)`. Panics if the
+/// fixture yields no records, so a comparison of two results is never vacuous.
+fn meth_records(idx: &BwaIndex) -> Vec<(usize, Vec<u8>)> {
     let fixture = field_fixture();
-    let pv: Vec<ReadPair<'_>> = fixture
-        .pairs
-        .iter()
-        .map(|(r1, r2)| ReadPair {
-            name_r1: &r1.name,
-            seq_r1: &r1.seq,
-            qual_r1: r1.qual.as_deref(),
-            name_r2: &r2.name,
-            seq_r2: &r2.seq,
-            qual_r2: r2.qual.as_deref(),
-        })
-        .collect();
+    let pv: Vec<ReadPair<'_>> = fixture.pairs.iter().map(as_read_pair).collect();
     let mut opts = MemOpts::new().unwrap();
     opts.set_pe(true)
         .set_meth(true)
         .apply_meth_defaults()
         .unwrap();
-    let records = |idx: &BwaIndex| -> Vec<(usize, Vec<u8>)> {
-        let (batch, _) = align_batch(idx, &opts, &pv, None).unwrap();
-        batch
-            .iter()
-            .map(|r| (r.pair_idx, r.bytes.to_vec()))
-            .collect()
+    let (batch, _) = align_batch(idx, &opts, &pv, None).unwrap();
+    let records: Vec<(usize, Vec<u8>)> = batch
+        .iter()
+        .map(|r| (r.pair_idx, r.bytes.to_vec()))
+        .collect();
+    assert!(!records.is_empty(), "the meth fixture produced no records");
+    records
+}
+
+/// A `bwa-mem3 index --meth --meth-only` PhiX index, in its own temp dir (so a
+/// test may remove files from it): `(dir, original prefix)`. `None` (skip)
+/// without a `bwa-mem3` that supports `--meth-only`.
+fn phix_meth_only() -> Option<(tempfile::TempDir, std::path::PathBuf)> {
+    if !supports_meth_only() {
+        return None;
+    }
+    let (dir, prefix) =
+        build_reference(&[("phix", &phix_bases())], &[], &["--meth", "--meth-only"])?;
+    assert!(
+        !suffixed(&prefix, ".bwt.2bit.64").exists(),
+        "--meth-only should not build the original's FM-index"
+    );
+    Some((dir, prefix))
+}
+
+/// A `bwa-mem3 index --meth --meth-only` index has no FM-index for the original
+/// reference, which [`BwaIndex::load_meth`] never reads: it loads, and aligns a
+/// `--meth` batch byte for byte like the full dual index.
+#[test]
+fn load_meth_accepts_a_meth_only_index() {
+    let Some(meth) = phix_meth() else {
+        eprintln!("skip: bwa-mem3 not available to build a PhiX meth index");
+        return;
     };
-    let single = records(&meth.idx);
-    assert!(!single.is_empty(), "the meth fixture produced no records");
-    assert_eq!(records(&threaded), single);
+    let Some((_dir, prefix)) = phix_meth_only() else {
+        return;
+    };
+    let meth_only = BwaIndex::load_meth(suffixed(&prefix, ".meth"), &prefix).unwrap();
+    assert!(meth_only.is_meth());
+    assert_eq!(meth_records(&meth_only), meth_records(&meth.idx));
+}
+
+/// On a `--meth-only` index, each original-reference file `load_meth` still
+/// needs (`.amb`, `.ann`, `.pac`) is checked up front: without it, `load_meth`
+/// returns a recoverable [`Error::IndexLoad`] naming that file, instead of the
+/// vendored loader exiting the process.
+#[rstest]
+#[case::amb(".amb")]
+#[case::ann(".ann")]
+#[case::pac(".pac")]
+fn load_meth_names_a_missing_original_reference_file(#[case] suffix: &str) {
+    let Some((_dir, prefix)) = phix_meth_only() else {
+        return;
+    };
+    let file = suffixed(&prefix, suffix);
+    std::fs::remove_file(&file).unwrap();
+    let Err(Error::IndexLoad { msg, .. }) =
+        BwaIndex::load_meth(suffixed(&prefix, ".meth"), &prefix)
+    else {
+        panic!("expected an IndexLoad error");
+    };
+    assert_eq!(
+        msg,
+        format!(
+            "missing or unreadable original-reference file(s): {}",
+            file.display()
+        )
+    );
 }
 
 /// A `--meth-context cpg` combination `bwa-mem3 mem` refuses fails at
