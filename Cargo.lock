@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-py"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bwa-mem3-rs",
  "pyo3",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-rs"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bwa-mem3-sys",
  "bwa-mem3-test-util",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-rs-cli"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "bwa-mem3-rs",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-sys"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bindgen",
  "bwa-mem3-test-util",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-test-util"
-version = "0.6.0"
+version = "0.6.1"
 
 [[package]]
 name = "bytes"
@@ -180,9 +180,9 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
 name = "cc"
-version = "1.11.2"
+version = "1.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33ef9e3e8154a45c7a95cff4c1299702106ad94062d7bb85fdc5d3a5afd91d45"
+checksum = "02f0e023adb368345ce0ca6cdfc0f24a06554468d0e8503e14a0841de79bfa69"
 dependencies = [
  "find-msvc-tools",
  "shlex 2.0.1",
@@ -216,9 +216,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.8"
+version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac230478587d0269d8d6998b82ae69ea51509d55df66d9e92edd1f986904cd4a"
+checksum = "844c5c0b65be192cb68d570cca1b21a6444431d24e39c084dc0336177015337c"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -238,9 +238,9 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.8"
+version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "895c9d8d2ac2dd8b8a29f3724a14e72aaaa6debcf8c38c82f97305c6a172767a"
+checksum = "b4c174f11f949b9ca8c60580925e282b9cbd5454750e506f08648b2038080cd7"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -632,9 +632,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "pin-project-lite"
-version = "0.2.17"
+version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
 
 [[package]]
 name = "portable-atomic"
