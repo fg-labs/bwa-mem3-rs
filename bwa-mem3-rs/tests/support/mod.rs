@@ -55,6 +55,37 @@ pub fn find_bwa_mem3() -> Option<String> {
     found
 }
 
+/// `path` with `suffix` appended to its last component (`ref.fa` + `.meth` is
+/// `ref.fa.meth`), as bwa-mem3 names its index files.
+pub fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Whether the `bwa-mem3` found by [`find_bwa_mem3`] supports `index
+/// --meth-only` (added in 0.18.0), read from the usage `bwa-mem3 index` prints
+/// on stderr. A binary without it makes the caller skip, unless
+/// `BWA_MEM3_RS_REQUIRE_TOOLS` is set, which turns that into a hard failure.
+pub fn supports_meth_only() -> bool {
+    let Some(bwa) = find_bwa_mem3() else {
+        return false;
+    };
+    let out = Command::new(&bwa)
+        .arg("index")
+        .output()
+        .expect("run bwa-mem3 index");
+    let supported = String::from_utf8_lossy(&out.stderr).contains("--meth-only");
+    if !supported {
+        assert!(
+            std::env::var_os("BWA_MEM3_RS_REQUIRE_TOOLS").is_none(),
+            "BWA_MEM3_RS_REQUIRE_TOOLS is set but {bwa} has no `index --meth-only` (needs 0.18.0+)"
+        );
+        eprintln!("skip: {bwa} has no `index --meth-only` (needs bwa-mem3 0.18.0+)");
+    }
+    supported
+}
+
 /// Write `contigs` as `ref.fa` in a fresh temp dir, list `alt` contigs in
 /// `ref.fa.alt` (which marks them as ALT loci when the index loads), and index
 /// it with `bwa-mem3 index <extra_args>`. `None` (skip) without the tools.
@@ -124,8 +155,7 @@ pub fn phix_meth() -> Option<&'static RefIndex> {
     REF.get_or_init(|| {
         let bases = phix_bases();
         let (dir, prefix) = build_reference(&[("phix", &bases)], &[], &["--meth"])?;
-        let mut seed = prefix.clone().into_os_string();
-        seed.push(".meth");
+        let seed = suffixed(&prefix, ".meth");
         let idx = Arc::new(BwaIndex::load_meth(&seed, &prefix).expect("load PhiX meth index"));
         Some(RefIndex {
             _dir: dir,

@@ -61,8 +61,9 @@ enum Cmd {
         #[arg(short = 'k', long)]
         min_seed_len: Option<i32>,
         /// Bisulfite (BS-seq) alignment (`--meth[=emseq|taps|5base]`). Requires a
-        /// dual index built with `bwa-mem3 index --meth`: `<prefix>` is the
-        /// original reference and `<prefix>.meth` the converted seed index.
+        /// dual index built with `bwa-mem3 index --meth` (with or without
+        /// `--meth-only`): `<prefix>` is the original reference and
+        /// `<prefix>.meth` the converted seed index.
         /// Emits Bismark `XR`/`XG`/`XM` tags. The chemistry decides which base
         /// `XM` calls methylated and defaults to `emseq`; as with `bwa-mem3`,
         /// give it as `--meth=taps`, not `--meth taps`.
